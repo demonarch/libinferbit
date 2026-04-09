@@ -179,21 +179,46 @@ void ib_quantize_int2(
     for (int r = 0; r < rows; r++) {
         read_row_fp32(row_buf, src_data, src_dtype, cols, r);
 
-        /* Find max absolute value */
-        float max_abs = 0.0f;
+        /*
+         * Optimal ternary quantization (TWN paper approach):
+         *
+         * 1. Compute mean of absolute values
+         * 2. Threshold = 0.7 * mean(|w|) — values above become +1/-1, below become 0
+         * 3. Scale = mean of absolute values of non-zero elements after thresholding
+         *
+         * This minimizes the L2 error between original and ternary weights.
+         */
+
+        /* Compute mean absolute value */
+        float sum_abs = 0.0f;
         for (int c = 0; c < cols; c++) {
-            float a = fabsf(row_buf[c]);
-            if (a > max_abs) max_abs = a;
+            sum_abs += fabsf(row_buf[c]);
+        }
+        float mean_abs = sum_abs / (float)cols;
+        float threshold = 0.7f * mean_abs;
+
+        /* Determine which values become non-zero, compute optimal scale */
+        float sum_nonzero_abs = 0.0f;
+        int count_nonzero = 0;
+        for (int c = 0; c < cols; c++) {
+            if (fabsf(row_buf[c]) > threshold) {
+                sum_nonzero_abs += fabsf(row_buf[c]);
+                count_nonzero++;
+            }
         }
 
-        /* Scale: the dequantized value for +1/-1 is ±scale */
-        float scale = max_abs;
+        /* Scale = mean absolute value of the kept weights */
+        float scale;
+        if (count_nonzero > 0) {
+            scale = sum_nonzero_abs / (float)count_nonzero;
+        } else {
+            scale = mean_abs > 0 ? mean_abs : 6.104e-05f;
+        }
         if (scale < 6.104e-05f) scale = 6.104e-05f;
-        float threshold = scale / 3.0f;
 
         out_scales[r] = f32_to_fp16(scale);
 
-        /* Quantize to ternary: > threshold → +1, < -threshold → -1, else → 0 */
+        /* Quantize to ternary: |v| > threshold → sign(v), else → 0 */
         /* Pack 4 values per byte: encoding 0=-1, 1=0, 2=+1 */
         uint8_t* dst = out_weights + (size_t)r * (cols / 4);
         for (int c = 0; c < cols; c += 4) {
