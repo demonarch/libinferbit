@@ -185,6 +185,12 @@ typedef struct {
         const float* input, int M, int N
     );
 
+    /* INT2 ternary matmul: weights are {-1, 0, +1}, 4 per byte */
+    void (*matmul_int2)(
+        float* out, const void* weights, const float* scales,
+        const float* input, int M, int N
+    );
+
     /* RMSNorm: out[N] = rmsnorm(input[N], weight[N], eps) */
     void (*rmsnorm)(
         float* out, const float* input, const float* weight,
@@ -307,6 +313,8 @@ int ib_convert_gguf(const char* input_path, const char* output_path,
 void ib_quantize_int8(int8_t* out, uint16_t* scales, const void* src,
                       const char* dtype, int rows, int cols);
 void ib_quantize_int4(uint8_t* out, uint16_t* scales, const void* src,
+                      const char* dtype, int rows, int cols);
+void ib_quantize_int2(uint8_t* out, uint16_t* scales, const void* src,
                       const char* dtype, int rows, int cols);
 void ib_copy_norm_fp16(uint16_t* out, const void* src, const char* dtype, int size);
 

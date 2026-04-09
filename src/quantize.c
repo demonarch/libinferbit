@@ -164,6 +164,55 @@ void ib_quantize_int4(
     free(row_buf);
 }
 
+/* ── Quantize a matrix to INT2 (ternary: {-1, 0, +1}) ──────── */
+
+void ib_quantize_int2(
+    uint8_t* out_weights,      /* [rows * cols / 4] packed 2-bit values */
+    uint16_t* out_scales,      /* [rows] FP16 */
+    const void* src_data,
+    const char* src_dtype,
+    int rows, int cols
+) {
+    float* row_buf = malloc(cols * sizeof(float));
+    if (!row_buf) return;
+
+    for (int r = 0; r < rows; r++) {
+        read_row_fp32(row_buf, src_data, src_dtype, cols, r);
+
+        /* Find max absolute value */
+        float max_abs = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            float a = fabsf(row_buf[c]);
+            if (a > max_abs) max_abs = a;
+        }
+
+        /* Scale: the dequantized value for +1/-1 is ±scale */
+        float scale = max_abs;
+        if (scale < 6.104e-05f) scale = 6.104e-05f;
+        float threshold = scale / 3.0f;
+
+        out_scales[r] = f32_to_fp16(scale);
+
+        /* Quantize to ternary: > threshold → +1, < -threshold → -1, else → 0 */
+        /* Pack 4 values per byte: encoding 0=-1, 1=0, 2=+1 */
+        uint8_t* dst = out_weights + (size_t)r * (cols / 4);
+        for (int c = 0; c < cols; c += 4) {
+            uint8_t packed = 0;
+            for (int k = 0; k < 4 && c + k < cols; k++) {
+                float v = row_buf[c + k];
+                uint8_t t;
+                if (v > threshold)       t = 2;  /* +1 */
+                else if (v < -threshold) t = 0;  /* -1 */
+                else                     t = 1;  /* 0 */
+                packed |= (t << (k * 2));
+            }
+            dst[c / 4] = packed;
+        }
+    }
+
+    free(row_buf);
+}
+
 /* ── Copy FP16 norm weights (no quantization) ───────────────── */
 
 void ib_copy_norm_fp16(

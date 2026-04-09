@@ -144,7 +144,7 @@ static void tensor_matmul(
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
     }
 
-    if (t->bits == 4 || t->bits == 8) {
+    if (t->bits == 2 || t->bits == 4 || t->bits == 8) {
         /* Use parallel matmul if thread pool available and matrix is large enough */
         ib_parallel_matmul(m->thread_pool, out, weights, scale_buf, input, M, N, t->bits);
     } else if (t->bits == 16) {

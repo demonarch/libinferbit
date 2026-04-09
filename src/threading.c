@@ -179,7 +179,12 @@ static void parallel_matmul_task(void* arg, int thread_id, int start, int end) {
     int N = a->N;
     int rows = end - start;
 
-    if (a->bits == 4) {
+    if (a->bits == 2) {
+        const uint8_t* w = (const uint8_t*)a->weights;
+        const uint8_t* row_start = w + (size_t)start * (N / 4);
+        ib_kern.matmul_int2(a->out + start, row_start, a->scales + start,
+                            a->input, rows, N);
+    } else if (a->bits == 4) {
         const uint8_t* w = (const uint8_t*)a->weights;
         const uint8_t* row_start = w + (size_t)start * (N / 2);
         ib_kern.matmul_int4(a->out + start, row_start, a->scales + start,
@@ -196,8 +201,9 @@ void ib_parallel_matmul(ib_thread_pool* tp, float* out, const void* weights,
                         const float* scales, const float* input,
                         int M, int N, int bits) {
     if (!tp || M < 64) {
-        if (bits == 4) ib_kern.matmul_int4(out, weights, scales, input, M, N);
-        else           ib_kern.matmul_int8(out, weights, scales, input, M, N);
+        if (bits == 2)      ib_kern.matmul_int2(out, weights, scales, input, M, N);
+        else if (bits == 4) ib_kern.matmul_int4(out, weights, scales, input, M, N);
+        else                ib_kern.matmul_int8(out, weights, scales, input, M, N);
         return;
     }
 

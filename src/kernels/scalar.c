@@ -101,14 +101,16 @@ static void scalar_silu_mul(float* out, const float* gate, const float* up, int 
 
 ib_kernels ib_kern;
 
-/* Defined in avx2.c and neon.c */
+/* Defined in avx2.c, neon.c, ternary.c */
 void ib_init_kernels_avx2(ib_kernels* kern);
 void ib_init_kernels_neon(ib_kernels* kern);
+void ib_init_kernels_int2(ib_kernels* kern);
 
 void ib_init_kernels(ib_simd_level level) {
     /* Always start with scalar fallbacks */
     ib_kern.matmul_int4 = scalar_matmul_int4;
     ib_kern.matmul_int8 = scalar_matmul_int8;
+    ib_kern.matmul_int2 = NULL;  /* Set by ib_init_kernels_int2 */
     ib_kern.rmsnorm     = scalar_rmsnorm;
     ib_kern.rope        = scalar_rope;
     ib_kern.softmax     = scalar_softmax;
@@ -129,4 +131,7 @@ void ib_init_kernels(ib_simd_level level) {
         default:
             break;
     }
+
+    /* INT2 ternary kernel — always register (has its own SIMD detection) */
+    ib_init_kernels_int2(&ib_kern);
 }

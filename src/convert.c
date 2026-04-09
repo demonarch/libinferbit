@@ -303,6 +303,25 @@ static ib_written_tensor write_quantized_tensor_ts(
 
         free(qw);
         free(scales);
+    } else if (bits == 2) {
+        size_t w_size = (size_t)rows * cols / 4;
+        uint8_t* qw = malloc(w_size);
+        uint16_t* scales = malloc(rows * sizeof(uint16_t));
+
+        ib_quantize_int2(qw, scales, data, dtype, rows, cols);
+
+        fwrite(qw, 1, w_size, f);
+        result.weight_size = w_size;
+        *offset += w_size;
+
+        *offset = write_aligned(f, *offset);
+        result.scale_offset = *offset;
+        result.scale_size = rows * 2;
+        fwrite(scales, 2, rows, f);
+        *offset += result.scale_size;
+
+        free(qw);
+        free(scales);
     } else if (bits == 16) {
         /* FP16 norm — just copy/convert */
         size_t size = (size_t)rows * (cols > 1 ? cols : 1);
