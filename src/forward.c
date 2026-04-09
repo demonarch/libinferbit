@@ -239,10 +239,22 @@ static int forward_single(inferbit_model* m, int token_id, int pos, float* logit
         tensor_matmul(m, &layer->k_proj, k, xb, kv_dim, hidden, scale_buf);
         tensor_matmul(m, &layer->v_proj, v, xb, kv_dim, hidden, scale_buf);
 
-        /* RoPE on Q and K */
+        /* RoPE: apply to each Q head paired with its corresponding K head.
+         * For GQA, multiple Q heads share one K head. Apply RoPE to each
+         * K head only once (on the first Q head that maps to it). */
         for (int h = 0; h < n_heads; h++) {
-            ib_kern.rope(q + h * head_dim, k + (h / heads_per_kv) * head_dim,
-                         head_dim, pos, theta);
+            int kv_h = h / heads_per_kv;
+            int is_first = (h % heads_per_kv == 0);
+            if (is_first) {
+                ib_kern.rope(q + h * head_dim, k + kv_h * head_dim,
+                             head_dim, pos, theta);
+            } else {
+                /* Apply RoPE to Q only — use a scratch buffer for K */
+                float k_scratch[256];
+                memcpy(k_scratch, k + kv_h * head_dim, head_dim * sizeof(float));
+                ib_kern.rope(q + h * head_dim, k_scratch, head_dim, pos, theta);
+                /* Discard k_scratch — K was already rotated */
+            }
         }
 
         /* Write K, V to cache */

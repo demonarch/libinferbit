@@ -220,6 +220,82 @@ const char*     ib_st_tensor_dtype_at(const ib_safetensors* sf, int index);
 int             ib_st_tensor_ndim_at(const ib_safetensors* sf, int index);
 int             ib_st_tensor_shape_at(const ib_safetensors* sf, int index, int dim);
 
+/* ── Multi-shard safetensors ─────────────────────────────────── */
+
+typedef struct ib_safetensors_multi ib_safetensors_multi;
+
+ib_safetensors_multi* ib_st_multi_open(const char* dir_path);
+void                  ib_st_multi_close(ib_safetensors_multi* multi);
+int  ib_st_multi_find(const ib_safetensors_multi* multi, const char* name,
+                      int* out_shard, int* out_tensor);
+int  ib_st_multi_find_suffix(const ib_safetensors_multi* multi, const char* suffix,
+                             int* out_shard, int* out_tensor);
+const void* ib_st_multi_tensor_data(const ib_safetensors_multi* multi, int shard, int tensor);
+const char* ib_st_multi_tensor_dtype(const ib_safetensors_multi* multi, int shard, int tensor);
+int         ib_st_multi_tensor_shape(const ib_safetensors_multi* multi, int shard, int tensor, int dim);
+int         ib_st_multi_num_shards(const ib_safetensors_multi* multi);
+
+/* ── GGUF parser ────────────────────────────────────────────── */
+
+typedef struct ib_gguf ib_gguf;
+
+ib_gguf*    ib_gguf_open(const char* path);
+void        ib_gguf_close(ib_gguf* gg);
+int         ib_gguf_num_tensors(const ib_gguf* gg);
+int         ib_gguf_find(const ib_gguf* gg, const char* name);
+int         ib_gguf_find_suffix(const ib_gguf* gg, const char* suffix);
+const void* ib_gguf_tensor_data(const ib_gguf* gg, int index);
+size_t      ib_gguf_tensor_size(const ib_gguf* gg, int index);
+int         ib_gguf_tensor_type(const ib_gguf* gg, int index);
+int         ib_gguf_tensor_shape(const ib_gguf* gg, int index, int dim);
+int         ib_gguf_tensor_ndim(const ib_gguf* gg, int index);
+const char* ib_gguf_tensor_name(const ib_gguf* gg, int index);
+int         ib_gguf_meta_int(const ib_gguf* gg, const char* key, int def);
+float       ib_gguf_meta_float(const ib_gguf* gg, const char* key, float def);
+const char* ib_gguf_meta_string(const ib_gguf* gg, const char* key);
+/* ib_gguf_get_config declared after ib_model_config below */
+
+/* ── Tensor source (unified single/multi-shard access) ──────── */
+
+typedef struct ib_tensor_source ib_tensor_source;
+
+ib_tensor_source* ib_ts_open(const char* path);  /* file or directory */
+void              ib_ts_close(ib_tensor_source* ts);
+int  ib_ts_find(const ib_tensor_source* ts, const char* name,
+                int* out_shard, int* out_tensor);
+int  ib_ts_find_suffix(const ib_tensor_source* ts, const char* suffix,
+                       int* out_shard, int* out_tensor);
+const void* ib_ts_tensor_data(const ib_tensor_source* ts, int shard, int tensor);
+const char* ib_ts_tensor_dtype(const ib_tensor_source* ts, int shard, int tensor);
+int         ib_ts_tensor_shape(const ib_tensor_source* ts, int shard, int tensor, int dim);
+
+/* ── Config JSON parser ─────────────────────────────────────── */
+
+typedef struct {
+    char  arch[64];
+    int   num_layers;
+    int   hidden_size;
+    int   num_heads;
+    int   num_kv_heads;
+    int   head_dim;
+    int   intermediate_size;
+    int   vocab_size;
+    int   max_context_length;
+    float rope_theta;
+    float norm_epsilon;
+    char  norm_type[16];
+    char  activation[16];
+    int   tie_word_embeddings;
+} ib_model_config;
+
+int ib_parse_config_json(const char* path, ib_model_config* cfg);
+int ib_gguf_get_config(const ib_gguf* gg, ib_model_config* cfg);
+
+/* ── GGUF converter ─────────────────────────────────────────── */
+
+int ib_convert_gguf(const char* input_path, const char* output_path,
+                    const inferbit_convert_config* cfg);
+
 /* ── Quantization ───────────────────────────────────────────── */
 
 void ib_quantize_int8(int8_t* out, uint16_t* scales, const void* src,

@@ -33,9 +33,14 @@ set(INFERBIT_SOURCES
     src/forward.c
     src/threading.c
     src/ibf_loader.c
+    src/gguf.c
     src/safetensors.c
+    src/safetensors_multi.c
+    src/tensor_source.c
+    src/config_json.c
     src/quantize.c
     src/convert.c
+    src/convert_gguf.c
     src/cJSON.c
 )
 

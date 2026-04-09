@@ -58,8 +58,48 @@ typedef struct {
     char lm_head[128];
 } ib_tensor_names;
 
+static int detect_naming_ts(const ib_tensor_source* ts, ib_tensor_names* names) {
+    int s, t;
+    if (ib_ts_find_suffix(ts, "model.layers.0.self_attn.q_proj.weight", &s, &t) == 0) {
+        strcpy(names->prefix, "model.");
+        strcpy(names->layer_fmt, "layers.%d.");
+        strcpy(names->q_proj, "self_attn.q_proj.weight");
+        strcpy(names->k_proj, "self_attn.k_proj.weight");
+        strcpy(names->v_proj, "self_attn.v_proj.weight");
+        strcpy(names->o_proj, "self_attn.o_proj.weight");
+        strcpy(names->gate_proj, "mlp.gate_proj.weight");
+        strcpy(names->up_proj, "mlp.up_proj.weight");
+        strcpy(names->down_proj, "mlp.down_proj.weight");
+        strcpy(names->input_norm, "input_layernorm.weight");
+        strcpy(names->post_norm, "post_attention_layernorm.weight");
+        strcpy(names->embed, "model.embed_tokens.weight");
+        strcpy(names->final_norm, "model.norm.weight");
+        strcpy(names->lm_head, "lm_head.weight");
+        return 0;
+    }
+    if (ib_ts_find_suffix(ts, "layers.0.self_attn.q_proj.weight", &s, &t) == 0) {
+        strcpy(names->prefix, "");
+        strcpy(names->layer_fmt, "layers.%d.");
+        strcpy(names->q_proj, "self_attn.q_proj.weight");
+        strcpy(names->k_proj, "self_attn.k_proj.weight");
+        strcpy(names->v_proj, "self_attn.v_proj.weight");
+        strcpy(names->o_proj, "self_attn.o_proj.weight");
+        strcpy(names->gate_proj, "mlp.gate_proj.weight");
+        strcpy(names->up_proj, "mlp.up_proj.weight");
+        strcpy(names->down_proj, "mlp.down_proj.weight");
+        strcpy(names->input_norm, "input_layernorm.weight");
+        strcpy(names->post_norm, "post_attention_layernorm.weight");
+        strcpy(names->embed, "embed_tokens.weight");
+        strcpy(names->final_norm, "norm.weight");
+        strcpy(names->lm_head, "lm_head.weight");
+        return 0;
+    }
+    ib_set_error("unrecognized tensor naming convention");
+    return -1;
+}
+
+/* Legacy version for single-file (kept for existing tests) */
 static int detect_naming(const ib_safetensors* sf, ib_tensor_names* names) {
-    /* Try LLaMA/Mistral naming first */
     if (ib_st_find_suffix(sf, "model.layers.0.self_attn.q_proj.weight") >= 0) {
         strcpy(names->prefix, "model.");
         strcpy(names->layer_fmt, "layers.%d.");
@@ -101,6 +141,17 @@ static int detect_naming(const ib_safetensors* sf, ib_tensor_names* names) {
     return -1;
 }
 
+/* Find layer tensor via tensor_source. Sets shard+tensor indices. Returns 0 on found. */
+static int find_layer_tensor_ts(const ib_tensor_source* ts, const ib_tensor_names* names,
+                                 int layer, const char* suffix, int* shard, int* tensor) {
+    char full_name[512];
+    char layer_part[64];
+    snprintf(layer_part, sizeof(layer_part), names->layer_fmt, layer);
+    snprintf(full_name, sizeof(full_name), "%s%s%s", names->prefix, layer_part, suffix);
+    return ib_ts_find(ts, full_name, shard, tensor);
+}
+
+/* Legacy single-file version for detect functions */
 static int find_layer_tensor(const ib_safetensors* sf, const ib_tensor_names* names, int layer, const char* suffix) {
     char full_name[512];
     char layer_part[64];
@@ -191,18 +242,18 @@ static size_t write_aligned(FILE* f, size_t current_offset) {
     return aligned;
 }
 
-static ib_written_tensor write_quantized_tensor(
+static ib_written_tensor write_quantized_tensor_ts(
     FILE* f, size_t* offset,
-    const ib_safetensors* sf, int tensor_idx,
+    const ib_tensor_source* ts, int shard, int tensor_idx,
     int bits
 ) {
     ib_written_tensor result = {0};
     if (tensor_idx < 0) return result;
 
-    const void* data = ib_st_tensor_data(sf, tensor_idx);
-    const char* dtype = ib_st_tensor_dtype_at(sf, tensor_idx);
-    int rows = ib_st_tensor_shape_at(sf, tensor_idx, 0);
-    int cols = ib_st_tensor_shape_at(sf, tensor_idx, 1);
+    const void* data = ib_ts_tensor_data(ts, shard, tensor_idx);
+    const char* dtype = ib_ts_tensor_dtype(ts, shard, tensor_idx);
+    int rows = ib_ts_tensor_shape(ts, shard, tensor_idx, 0);
+    int cols = ib_ts_tensor_shape(ts, shard, tensor_idx, 1);
     if (cols == 0) cols = 1;
 
     result.rows = rows;
@@ -333,37 +384,112 @@ int inferbit_convert(
     }
     if (!cfg.progress) cfg.progress = progress_noop;
 
-    /* Detect format */
-    inferbit_format fmt = inferbit_detect_format(input_path);
-    if (fmt == INFERBIT_FORMAT_GGUF) {
-        ib_set_error("GGUF conversion not yet implemented");
-        return INFERBIT_ERROR_INTERNAL;
+    /* Detect if input is a directory or single file */
+    struct stat input_stat;
+    if (stat(input_path, &input_stat) != 0) {
+        ib_set_error("cannot stat input: %s: %s", input_path, strerror(errno));
+        return INFERBIT_ERROR_LOAD;
     }
-    if (fmt != INFERBIT_FORMAT_SAFETENSORS) {
-        ib_set_error("unrecognized input format: %s", input_path);
-        return INFERBIT_ERROR_FORMAT;
+    int is_dir = S_ISDIR(input_stat.st_mode);
+
+    inferbit_format fmt = INFERBIT_FORMAT_UNKNOWN;
+    if (!is_dir) {
+        fmt = inferbit_detect_format(input_path);
+        if (fmt == INFERBIT_FORMAT_GGUF) {
+            return ib_convert_gguf(input_path, output_path, &cfg);
+        }
+        if (fmt != INFERBIT_FORMAT_SAFETENSORS) {
+            ib_set_error("unrecognized input format: %s", input_path);
+            return INFERBIT_ERROR_FORMAT;
+        }
     }
 
     cfg.progress(0.0f, "opening", cfg.progress_ctx);
 
-    /* Open safetensors */
-    ib_safetensors* sf = ib_st_open(input_path);
-    if (!sf) return INFERBIT_ERROR_LOAD;
+    /* Open tensor source (handles both single-file and directory/multi-shard) */
+    ib_tensor_source* ts = ib_ts_open(input_path);
+    if (!ts) return INFERBIT_ERROR_LOAD;
 
     cfg.progress(0.05f, "detecting architecture", cfg.progress_ctx);
 
+    /* Try to read config.json for exact architecture params */
+    ib_model_config model_cfg;
+    int has_config = 0;
+    char config_path[1024];
+
+    if (is_dir) {
+        snprintf(config_path, sizeof(config_path), "%s/config.json", input_path);
+    } else {
+        /* Look for config.json in same directory as the file */
+        const char* last_slash = strrchr(input_path, '/');
+        if (last_slash) {
+            size_t dir_len = last_slash - input_path;
+            snprintf(config_path, sizeof(config_path), "%.*s/config.json", (int)dir_len, input_path);
+        } else {
+            snprintf(config_path, sizeof(config_path), "config.json");
+        }
+    }
+    has_config = (ib_parse_config_json(config_path, &model_cfg) == 0);
+
     /* Detect naming convention */
     ib_tensor_names names;
-    if (detect_naming(sf, &names) != 0) {
-        ib_st_close(sf);
+    if (detect_naming_ts(ts, &names) != 0) {
+        ib_ts_close(ts);
         return INFERBIT_ERROR_FORMAT;
     }
 
-    /* Detect architecture */
+    /* Determine architecture:
+     * - If config.json found, use its values (authoritative)
+     * - Otherwise, detect from tensor shapes (fallback) */
     ib_detected_arch arch;
-    if (detect_arch(sf, &names, &arch) != 0) {
-        ib_st_close(sf);
-        return INFERBIT_ERROR_FORMAT;
+    if (has_config) {
+        strncpy(arch.arch, model_cfg.arch, sizeof(arch.arch) - 1);
+        arch.num_layers        = model_cfg.num_layers;
+        arch.hidden_size       = model_cfg.hidden_size;
+        arch.num_heads         = model_cfg.num_heads;
+        arch.num_kv_heads      = model_cfg.num_kv_heads;
+        arch.head_dim          = model_cfg.head_dim;
+        arch.intermediate_size = model_cfg.intermediate_size;
+        arch.vocab_size        = model_cfg.vocab_size;
+    } else {
+        /* Fallback: we need a single-shard sf for detect_arch.
+         * For multi-shard without config.json, we open the first shard. */
+        ib_safetensors* probe = ib_st_open(input_path);
+        if (!probe && is_dir) {
+            /* Just detect from tensor source by looking at shapes */
+            int s, t;
+            if (ib_ts_find(ts, names.embed, &s, &t) == 0) {
+                arch.vocab_size  = ib_ts_tensor_shape(ts, s, t, 0);
+                arch.hidden_size = ib_ts_tensor_shape(ts, s, t, 1);
+            }
+            if (ib_ts_find_suffix(ts, names.q_proj, &s, &t) == 0) {
+                int q_out = ib_ts_tensor_shape(ts, s, t, 0);
+                arch.head_dim = 128;
+                if (arch.hidden_size <= 2048) arch.head_dim = 64;
+                arch.num_heads = q_out / arch.head_dim;
+            }
+            if (ib_ts_find_suffix(ts, names.k_proj, &s, &t) == 0) {
+                int k_out = ib_ts_tensor_shape(ts, s, t, 0);
+                arch.num_kv_heads = k_out / arch.head_dim;
+            }
+            if (ib_ts_find_suffix(ts, names.gate_proj, &s, &t) == 0) {
+                arch.intermediate_size = ib_ts_tensor_shape(ts, s, t, 0);
+            }
+            /* Count layers */
+            arch.num_layers = 0;
+            for (int i = 0; i < 1000; i++) {
+                if (find_layer_tensor_ts(ts, &names, i, names.q_proj, &s, &t) != 0) break;
+                arch.num_layers++;
+            }
+            strcpy(arch.arch, "llama");
+        } else if (probe) {
+            detect_arch(probe, &names, &arch);
+            ib_st_close(probe);
+        } else {
+            ib_ts_close(ts);
+            ib_set_error("cannot detect architecture without config.json");
+            return INFERBIT_ERROR_FORMAT;
+        }
     }
 
     cfg.progress(0.1f, "quantizing", cfg.progress_ctx);
@@ -372,33 +498,32 @@ int inferbit_convert(
     FILE* out = fopen(output_path, "wb");
     if (!out) {
         ib_set_error("failed to open output: %s: %s", output_path, strerror(errno));
-        ib_st_close(sf);
+        ib_ts_close(ts);
         return INFERBIT_ERROR_LOAD;
     }
 
-    /* Write placeholder preamble (32 bytes) — we'll rewrite later */
+    /* Write placeholder preamble (32 bytes) */
     uint8_t preamble[32] = {0};
     fwrite(preamble, 1, 32, out);
 
-    /* Leave space for JSON header — we'll write it after we know all offsets.
-     * Reserve a generous amount, then seek back. */
-    size_t json_reserve = 64 * 1024;  /* 64KB should be plenty */
+    /* Reserve space for JSON header */
+    size_t json_reserve = 128 * 1024;  /* 128KB for large models with many layers */
     uint8_t* json_pad = calloc(json_reserve, 1);
     fwrite(json_pad, 1, json_reserve, out);
     free(json_pad);
 
-    /* Weight data starts at aligned offset after reserved header space */
     size_t weight_data_start = align_up(32 + json_reserve, IBF_ALIGNMENT);
     fseek(out, (long)weight_data_start, SEEK_SET);
     size_t offset = weight_data_start;
 
     /* ── Quantize and write embedding ───────────────────────── */
-    int emb_idx = ib_st_find(sf, names.embed);
-    ib_written_tensor emb_wt = write_quantized_tensor(out, &offset, sf, emb_idx, cfg.sensitive_bits);
-
-    /* Make offsets relative to weight_data_start */
-    emb_wt.weight_offset -= weight_data_start;
-    emb_wt.scale_offset  -= weight_data_start;
+    int emb_shard, emb_tensor;
+    ib_written_tensor emb_wt = {0};
+    if (ib_ts_find(ts, names.embed, &emb_shard, &emb_tensor) == 0) {
+        emb_wt = write_quantized_tensor_ts(out, &offset, ts, emb_shard, emb_tensor, cfg.sensitive_bits);
+        emb_wt.weight_offset -= weight_data_start;
+        if (emb_wt.scale_size > 0) emb_wt.scale_offset -= weight_data_start;
+    }
 
     /* ── Quantize and write layers ──────────────────────────── */
     typedef struct {
@@ -413,42 +538,55 @@ int inferbit_convert(
 
         int sens = cfg.sensitive_bits;
         int def  = cfg.default_bits;
+        int s, t;
 
-        lt[l].q  = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.q_proj), sens);
-        lt[l].k  = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.k_proj), sens);
-        lt[l].v  = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.v_proj), sens);
-        lt[l].o  = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.o_proj), def);
-        lt[l].gate = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.gate_proj), def);
-        lt[l].up   = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.up_proj), def);
-        lt[l].down = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.down_proj), def);
-        lt[l].in_norm   = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.input_norm), 16);
-        lt[l].post_norm = write_quantized_tensor(out, &offset, sf, find_layer_tensor(sf, &names, l, names.post_norm), 16);
+        #define CONVERT_TENSOR(dst, name_suffix, bits_val) do { \
+            if (find_layer_tensor_ts(ts, &names, l, name_suffix, &s, &t) == 0) { \
+                dst = write_quantized_tensor_ts(out, &offset, ts, s, t, bits_val); \
+                if (dst.weight_size > 0) dst.weight_offset -= weight_data_start; \
+                if (dst.scale_size > 0) dst.scale_offset -= weight_data_start; \
+            } \
+        } while(0)
 
-        /* Make offsets relative */
-        ib_written_tensor* tensors[] = {&lt[l].q, &lt[l].k, &lt[l].v, &lt[l].o,
-                                         &lt[l].gate, &lt[l].up, &lt[l].down,
-                                         &lt[l].in_norm, &lt[l].post_norm};
-        for (int t = 0; t < 9; t++) {
-            if (tensors[t]->weight_size > 0)
-                tensors[t]->weight_offset -= weight_data_start;
-            if (tensors[t]->scale_size > 0)
-                tensors[t]->scale_offset -= weight_data_start;
-        }
+        CONVERT_TENSOR(lt[l].q, names.q_proj, sens);
+        CONVERT_TENSOR(lt[l].k, names.k_proj, sens);
+        CONVERT_TENSOR(lt[l].v, names.v_proj, sens);
+        CONVERT_TENSOR(lt[l].o, names.o_proj, def);
+        CONVERT_TENSOR(lt[l].gate, names.gate_proj, def);
+        CONVERT_TENSOR(lt[l].up, names.up_proj, def);
+        CONVERT_TENSOR(lt[l].down, names.down_proj, def);
+        CONVERT_TENSOR(lt[l].in_norm, names.input_norm, 16);
+        CONVERT_TENSOR(lt[l].post_norm, names.post_norm, 16);
+
+        #undef CONVERT_TENSOR
     }
 
     cfg.progress(0.9f, "writing output head", cfg.progress_ctx);
 
     /* ── Output norm and head ───────────────────────────────── */
-    int norm_idx = ib_st_find(sf, names.final_norm);
-    ib_written_tensor out_norm_wt = write_quantized_tensor(out, &offset, sf, norm_idx, 16);
-    out_norm_wt.weight_offset -= weight_data_start;
+    int ns, nt_idx;
+    ib_written_tensor out_norm_wt = {0};
+    if (ib_ts_find(ts, names.final_norm, &ns, &nt_idx) == 0) {
+        out_norm_wt = write_quantized_tensor_ts(out, &offset, ts, ns, nt_idx, 16);
+        out_norm_wt.weight_offset -= weight_data_start;
+    }
 
-    int head_idx = ib_st_find(sf, names.lm_head);
-    /* If no lm_head, use embed (tied embeddings) */
-    if (head_idx < 0) head_idx = emb_idx;
-    ib_written_tensor out_head_wt = write_quantized_tensor(out, &offset, sf, head_idx, cfg.sensitive_bits);
-    out_head_wt.weight_offset -= weight_data_start;
-    if (out_head_wt.scale_size > 0) out_head_wt.scale_offset -= weight_data_start;
+    int head_shard = emb_shard, head_tensor = emb_tensor;
+    int tie_embeddings = 1;
+    if (ib_ts_find(ts, names.lm_head, &head_shard, &head_tensor) == 0) {
+        tie_embeddings = 0;
+    }
+    if (has_config) tie_embeddings = model_cfg.tie_word_embeddings;
+
+    ib_written_tensor out_head_wt;
+    if (tie_embeddings) {
+        /* Re-use embedding data */
+        out_head_wt = emb_wt;
+    } else {
+        out_head_wt = write_quantized_tensor_ts(out, &offset, ts, head_shard, head_tensor, cfg.sensitive_bits);
+        out_head_wt.weight_offset -= weight_data_start;
+        if (out_head_wt.scale_size > 0) out_head_wt.scale_offset -= weight_data_start;
+    }
 
     size_t total_weight_size = offset - weight_data_start;
 
@@ -470,12 +608,17 @@ int inferbit_convert(
     cJSON_AddNumberToObject(arch_obj, "head_dim", arch.head_dim);
     cJSON_AddNumberToObject(arch_obj, "intermediate_size", arch.intermediate_size);
     cJSON_AddNumberToObject(arch_obj, "vocab_size", arch.vocab_size);
-    cJSON_AddNumberToObject(arch_obj, "max_context_length", 4096);
-    cJSON_AddNumberToObject(arch_obj, "rope_theta", 10000.0);
-    cJSON_AddNumberToObject(arch_obj, "norm_epsilon", 1e-5);
-    cJSON_AddStringToObject(arch_obj, "norm_type", "rmsnorm");
-    cJSON_AddStringToObject(arch_obj, "activation", "silu");
-    cJSON_AddBoolToObject(arch_obj, "tie_word_embeddings", head_idx == emb_idx);
+    cJSON_AddNumberToObject(arch_obj, "max_context_length",
+        has_config ? model_cfg.max_context_length : 4096);
+    cJSON_AddNumberToObject(arch_obj, "rope_theta",
+        has_config ? (double)model_cfg.rope_theta : 10000.0);
+    cJSON_AddNumberToObject(arch_obj, "norm_epsilon",
+        has_config ? (double)model_cfg.norm_epsilon : 1e-5);
+    cJSON_AddStringToObject(arch_obj, "norm_type",
+        has_config ? model_cfg.norm_type : "rmsnorm");
+    cJSON_AddStringToObject(arch_obj, "activation",
+        has_config ? model_cfg.activation : "silu");
+    cJSON_AddBoolToObject(arch_obj, "tie_word_embeddings", tie_embeddings);
 
     cJSON* quant_obj = cJSON_AddObjectToObject(root, "quantization");
     cJSON_AddNumberToObject(quant_obj, "default_bits", cfg.default_bits);
@@ -582,7 +725,7 @@ int inferbit_convert(
         free(json_str);
         free(lt);
         fclose(out);
-        ib_st_close(sf);
+        ib_ts_close(ts);
         return INFERBIT_ERROR_INTERNAL;
     }
 
@@ -602,7 +745,7 @@ int inferbit_convert(
     free(json_str);
     free(lt);
     fclose(out);
-    ib_st_close(sf);
+    ib_ts_close(ts);
 
     cfg.progress(1.0f, "done", cfg.progress_ctx);
     return INFERBIT_OK;

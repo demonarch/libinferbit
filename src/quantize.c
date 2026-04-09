@@ -94,7 +94,8 @@ void ib_quantize_int8(
 
         /* Compute scale: map [-max_abs, max_abs] to [-127, 127] */
         float scale = max_abs / 127.0f;
-        if (scale < 1e-10f) scale = 1e-10f;
+        /* Clamp to smallest normal FP16 (2^-14 ≈ 6.1e-5) to avoid underflow */
+        if (scale < 6.104e-05f) scale = 6.104e-05f;
         float inv_scale = 1.0f / scale;
 
         out_scales[r] = f32_to_fp16(scale);
@@ -137,7 +138,7 @@ void ib_quantize_int4(
 
         /* Scale: map to [-7, 7] (stored as [0, 15] with bias 8) */
         float scale = max_abs / 7.0f;
-        if (scale < 1e-10f) scale = 1e-10f;
+        if (scale < 6.104e-05f) scale = 6.104e-05f;
         float inv_scale = 1.0f / scale;
 
         out_scales[r] = f32_to_fp16(scale);
