@@ -232,7 +232,7 @@ static void ib_attn_head_task(void* arg, int tid, int start, int end) {
 
 /* ── Single-token forward pass ──────────────────────────────── */
 
-static int forward_single(inferbit_model* m, int token_id, int pos, float* logits) {
+static int forward_single_ex(inferbit_model* m, int token_id, int pos, float* logits, int compute_logits) {
     int hidden   = m->header.hidden_size;
     int n_layers = m->header.num_layers;
     int n_heads  = m->header.num_heads;
@@ -350,14 +350,20 @@ static int forward_single(inferbit_model* m, int token_id, int pos, float* logit
         }
     }
 
-    /* Final RMSNorm */
-    rmsnorm_fp16(x, x, tensor_data(m, &m->output_norm),
-                 eps, hidden, scale_buf);
+    if (compute_logits) {
+        /* Final RMSNorm */
+        rmsnorm_fp16(x, x, tensor_data(m, &m->output_norm),
+                     eps, hidden, scale_buf);
 
-    /* Output head: logits = head @ x */
-    tensor_matmul(m, &m->output_head, logits, x, vocab, hidden, scale_buf);
+        /* Output head: logits = head @ x */
+        tensor_matmul(m, &m->output_head, logits, x, vocab, hidden, scale_buf);
+    }
 
     return INFERBIT_OK;
+}
+
+static int forward_single(inferbit_model* m, int token_id, int pos, float* logits) {
+    return forward_single_ex(m, token_id, pos, logits, 1);
 }
 
 /* ── Public: forward pass ───────────────────────────────────── */
@@ -376,19 +382,42 @@ int ib_forward(inferbit_model* model, const int32_t* tokens, int num_tokens, flo
         return INFERBIT_ERROR_CONTEXT;
     }
 
-    /* Process each token sequentially (prefill + single-token decode) */
+    /* Validate all tokens first */
     for (int i = 0; i < num_tokens; i++) {
-        int pos = kv_pos + i;
-        int token = tokens[i];
-
-        if (token < 0 || token >= model->header.vocab_size) {
-            ib_set_error("token ID out of range: %d (vocab_size=%d)", token, model->header.vocab_size);
+        if (tokens[i] < 0 || tokens[i] >= model->header.vocab_size) {
+            ib_set_error("token ID out of range: %d (vocab_size=%d)", tokens[i], model->header.vocab_size);
             return INFERBIT_ERROR_PARAM;
         }
+    }
 
-        int rc = forward_single(model, token, pos, out_logits);
+    if (num_tokens == 1) {
+        /* Single token — standard decode path */
+        return forward_single(model, tokens[0], kv_pos, out_logits);
+    }
+
+    /*
+     * Batch prefill optimization:
+     * For multi-token input, we only need logits from the LAST token.
+     * Process tokens 0..N-2 through embed + projections + KV cache write only
+     * (skip attention output, MLP contributes to residual but we only need
+     * the final token's state for generation).
+     *
+     * Simplified approach: process all tokens sequentially but skip the
+     * output head matmul (the most expensive single op, vocab_size rows)
+     * for all but the last token.
+     */
+    /*
+     * Batch prefill: skip the output head matmul (vocab_size x hidden)
+     * for all tokens except the last. The output head is typically the
+     * single most expensive matmul (32K x 4K = 128M ops for Mistral-7B).
+     * For a 100-token prompt, this saves 99 output head computations.
+     */
+    for (int i = 0; i < num_tokens - 1; i++) {
+        int pos = kv_pos + i;
+        int rc = forward_single_ex(model, tokens[i], pos, out_logits, 0);
         if (rc != INFERBIT_OK) return rc;
     }
 
-    return INFERBIT_OK;
+    /* Last token — full forward with logits */
+    return forward_single_ex(model, tokens[num_tokens - 1], kv_pos + num_tokens - 1, out_logits, 1);
 }
