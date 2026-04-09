@@ -144,12 +144,11 @@ static void tensor_matmul(
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
     }
 
-    if (t->bits == 4) {
-        ib_kern.matmul_int4(out, weights, scale_buf, input, M, N);
-    } else if (t->bits == 8) {
-        ib_kern.matmul_int8(out, weights, scale_buf, input, M, N);
+    if (t->bits == 4 || t->bits == 8) {
+        /* Use parallel matmul if thread pool available and matrix is large enough */
+        ib_parallel_matmul(m->thread_pool, out, weights, scale_buf, input, M, N, t->bits);
     } else if (t->bits == 16) {
-        /* FP16 matmul: dequantize and multiply */
+        /* FP16 matmul: dequantize and multiply (norms — too small to parallelize) */
         const uint16_t* w = (const uint16_t*)weights;
         for (int i = 0; i < M; i++) {
             float sum = 0.0f;
@@ -181,6 +180,54 @@ static void kv_cache_write_fp32(ib_kv_cache* kv, int pos,
     float* v_store = (float*)kv->value_data;
     memcpy(k_store + (size_t)pos * kv_dim, key, kv_dim * sizeof(float));
     memcpy(v_store + (size_t)pos * kv_dim, value, kv_dim * sizeof(float));
+}
+
+/* ── Parallel attention task ─────────────────────────────────── */
+
+typedef struct {
+    float* q;
+    float* att;
+    float* xb2;
+    float* k_cache;
+    float* v_cache;
+    int head_dim;
+    int kv_dim;
+    int heads_per_kv;
+    int pos;
+    float scale;
+} ib_attn_ctx;
+
+static void ib_attn_head_task(void* arg, int tid, int start, int end) {
+    (void)tid;
+    ib_attn_ctx* c = (ib_attn_ctx*)arg;
+    for (int h = start; h < end; h++) {
+        float* q_h = c->q + h * c->head_dim;
+        int kv_h = h / c->heads_per_kv;
+
+        /* Q*K scores */
+        for (int t = 0; t <= c->pos; t++) {
+            float* k_t = c->k_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
+            float score = 0.0f;
+            for (int d = 0; d < c->head_dim; d++) {
+                score += q_h[d] * k_t[d];
+            }
+            c->att[h * (c->pos + 1) + t] = score * c->scale;
+        }
+
+        /* Softmax */
+        ib_kern.softmax(c->att + h * (c->pos + 1), c->pos + 1);
+
+        /* Weighted sum of values */
+        float* out_h = c->xb2 + h * c->head_dim;
+        memset(out_h, 0, c->head_dim * sizeof(float));
+        for (int t = 0; t <= c->pos; t++) {
+            float a = c->att[h * (c->pos + 1) + t];
+            float* v_t = c->v_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
+            for (int d = 0; d < c->head_dim; d++) {
+                out_h[d] += a * v_t[d];
+            }
+        }
+    }
 }
 
 /* ── Single-token forward pass ──────────────────────────────── */
@@ -261,38 +308,22 @@ static int forward_single(inferbit_model* m, int token_id, int pos, float* logit
         kv_cache_write_fp32(kv, pos, k, v, kv_dim);
         kv->length = pos + 1;
 
-        /* Multi-head attention */
-        float scale = 1.0f / sqrtf((float)head_dim);
+        /* Multi-head attention (parallelized across heads) */
+        float attn_scale = 1.0f / sqrtf((float)head_dim);
 
-        for (int h = 0; h < n_heads; h++) {
-            float* q_h = q + h * head_dim;
-            int kv_h = h / heads_per_kv;  /* GQA: map head to KV head */
+        ib_attn_ctx attn_ctx = {
+            .q = q, .att = att, .xb2 = xb2,
+            .k_cache = (float*)kv->key_data,
+            .v_cache = (float*)kv->value_data,
+            .head_dim = head_dim, .kv_dim = kv_dim,
+            .heads_per_kv = heads_per_kv,
+            .pos = pos, .scale = attn_scale,
+        };
 
-            /* Compute attention scores: att[t] = q_h · k_cached[t] */
-            float* k_cache = (float*)kv->key_data;
-            for (int t = 0; t <= pos; t++) {
-                float* k_t = k_cache + (size_t)t * kv_dim + kv_h * head_dim;
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; d++) {
-                    score += q_h[d] * k_t[d];
-                }
-                att[h * (pos + 1) + t] = score * scale;
-            }
-
-            /* Softmax over attention scores */
-            ib_kern.softmax(att + h * (pos + 1), pos + 1);
-
-            /* Weighted sum of values: xb2[h*head_dim..] = sum_t att[t] * v_cached[t] */
-            float* out_h = xb2 + h * head_dim;
-            memset(out_h, 0, head_dim * sizeof(float));
-            float* v_cache = (float*)kv->value_data;
-            for (int t = 0; t <= pos; t++) {
-                float a = att[h * (pos + 1) + t];
-                float* v_t = v_cache + (size_t)t * kv_dim + kv_h * head_dim;
-                for (int d = 0; d < head_dim; d++) {
-                    out_h[d] += a * v_t[d];
-                }
-            }
+        if (m->thread_pool && n_heads >= 4) {
+            ib_pool_run(m->thread_pool, ib_attn_head_task, &attn_ctx, n_heads, 0);
+        } else {
+            ib_attn_head_task(&attn_ctx, 0, 0, n_heads);
         }
 
         /* Output projection: xb = O_proj @ xb2 */
