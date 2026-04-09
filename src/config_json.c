@@ -138,6 +138,10 @@ int ib_parse_config_json(const char* path, ib_model_config* cfg) {
     /* Tied embeddings */
     cfg->tie_word_embeddings = jbool(root, "tie_word_embeddings", 0);
 
+    /* Special tokens */
+    cfg->bos_token_id = jint(root, "bos_token_id", 1);
+    cfg->eos_token_id = jint(root, "eos_token_id", 2);
+
     cJSON_Delete(root);
     return 0;
 }

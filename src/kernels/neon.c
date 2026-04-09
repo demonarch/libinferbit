@@ -66,34 +66,55 @@ static void neon_matmul_int4(
     const float* input, int M, int N
 ) {
     const uint8_t* w = (const uint8_t*)weights;
+    const uint8x8_t mask_lo = vdup_n_u8(0x0F);
+    const int8x8_t bias = vdup_n_s8(8);
 
     for (int i = 0; i < M; i++) {
         const uint8_t* row = w + (size_t)i * (N / 2);
         float32x4_t acc0 = vdupq_n_f32(0.0f);
         float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
 
         int j = 0;
-        for (; j + 7 < N; j += 8) {
-            /* Load 4 bytes = 8 nibbles */
-            /* Unpack to int32 */
-            int32_t vals[8];
-            for (int k = 0; k < 4; k++) {
-                uint8_t byte = row[j / 2 + k];
-                vals[k * 2]     = (int32_t)(byte & 0x0F) - 8;
-                vals[k * 2 + 1] = (int32_t)((byte >> 4) & 0x0F) - 8;
-            }
+        /* Process 16 values (8 packed bytes) per iteration */
+        for (; j + 15 < N; j += 16) {
+            /* Load 8 bytes = 16 nibbles */
+            uint8x8_t packed = vld1_u8(row + j / 2);
 
-            float32x4_t wf_lo = vcvtq_f32_s32(vld1q_s32(vals));
-            float32x4_t wf_hi = vcvtq_f32_s32(vld1q_s32(vals + 4));
+            /* Extract low and high nibbles */
+            uint8x8_t lo_u8 = vand_u8(packed, mask_lo);
+            uint8x8_t hi_u8 = vshr_n_u8(packed, 4);
 
-            float32x4_t in_lo = vld1q_f32(input + j);
-            float32x4_t in_hi = vld1q_f32(input + j + 4);
+            /* Convert to signed and subtract bias: [0,15] → [-8,7] */
+            int8x8_t lo_s8 = vsub_s8(vreinterpret_s8_u8(lo_u8), bias);
+            int8x8_t hi_s8 = vsub_s8(vreinterpret_s8_u8(hi_u8), bias);
 
-            acc0 = vfmaq_f32(acc0, wf_lo, in_lo);
-            acc1 = vfmaq_f32(acc1, wf_hi, in_hi);
+            /* Interleave: lo[0],hi[0],lo[1],hi[1]... to get original order */
+            int8x8x2_t zipped = vzip_s8(lo_s8, hi_s8);
+
+            /* Widen to int16 then int32 then float */
+            int16x8_t wide0 = vmovl_s8(zipped.val[0]);
+            int16x8_t wide1 = vmovl_s8(zipped.val[1]);
+
+            float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wide0)));
+            float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wide0)));
+            float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wide1)));
+            float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wide1)));
+
+            /* Load 16 input floats */
+            float32x4_t i0 = vld1q_f32(input + j);
+            float32x4_t i1 = vld1q_f32(input + j + 4);
+            float32x4_t i2 = vld1q_f32(input + j + 8);
+            float32x4_t i3 = vld1q_f32(input + j + 12);
+
+            acc0 = vfmaq_f32(acc0, f0, i0);
+            acc1 = vfmaq_f32(acc1, f1, i1);
+            acc2 = vfmaq_f32(acc2, f2, i2);
+            acc3 = vfmaq_f32(acc3, f3, i3);
         }
 
-        float result = vaddvq_f32(vaddq_f32(acc0, acc1));
+        float result = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 
         /* Scalar tail */
         for (; j < N; j += 2) {

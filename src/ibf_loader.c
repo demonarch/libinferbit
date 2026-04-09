@@ -163,6 +163,8 @@ static int parse_header_json(const char* json_str_buf, size_t json_len,
         header->tie_word_embeddings = json_bool(arch, "tie_word_embeddings", 0);
         header->attention_bias      = json_bool(arch, "attention_bias", 0);
         header->mlp_bias            = json_bool(arch, "mlp_bias", 0);
+        header->bos_token_id        = json_int(arch, "bos_token_id", 1);
+        header->eos_token_id        = json_int(arch, "eos_token_id", 2);
     }
 
     /* Quantization */

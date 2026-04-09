@@ -46,6 +46,10 @@ typedef struct {
     bool attention_bias;
     bool mlp_bias;
 
+    /* Special tokens */
+    int bos_token_id;
+    int eos_token_id;
+
     /* Quantization */
     int   default_bits;
     int   sensitive_bits;
@@ -286,6 +290,8 @@ typedef struct {
     char  norm_type[16];
     char  activation[16];
     int   tie_word_embeddings;
+    int   bos_token_id;
+    int   eos_token_id;
 } ib_model_config;
 
 int ib_parse_config_json(const char* path, ib_model_config* cfg);

@@ -267,8 +267,11 @@ int inferbit_generate(
 
     /* Sample first output token from prefill logits */
     int generated = 0;
+    int eos = model->header.eos_token_id;
     int32_t next_token = sample_token(logits, vocab, params, input_tokens, num_input_tokens);
     out_tokens[generated++] = next_token;
+
+    if (next_token == eos) return generated;
 
     /* Decode loop */
     while (generated < max_out_tokens) {
@@ -278,7 +281,7 @@ int inferbit_generate(
         next_token = sample_token(logits, vocab, params, out_tokens, generated);
         out_tokens[generated++] = next_token;
 
-        /* TODO: check for EOS token and stop */
+        if (next_token == eos) break;
     }
 
     return generated;
@@ -322,14 +325,15 @@ int inferbit_generate_stream(
 
     /* Sample and stream */
     int generated = 0;
+    int eos = model->header.eos_token_id;
     int32_t next_token = sample_token(logits, vocab, params, recent, recent_len > max_recent ? max_recent : recent_len);
     recent[recent_len++] = next_token;
-
-    if (callback(next_token, ctx) == 0) {
-        free(recent);
-        return 1;
-    }
     generated++;
+
+    if (next_token == eos || callback(next_token, ctx) == 0) {
+        free(recent);
+        return generated;
+    }
 
     while (generated < params.max_tokens) {
         rc = ib_forward(model, &next_token, 1, logits);
@@ -341,14 +345,9 @@ int inferbit_generate_stream(
         int pen_start = recent_len > max_recent ? recent_len - max_recent : 0;
         next_token = sample_token(logits, vocab, params, recent + pen_start, recent_len - pen_start);
         recent[recent_len++] = next_token;
-
-        if (callback(next_token, ctx) == 0) {
-            generated++;
-            break;
-        }
         generated++;
 
-        /* TODO: check for EOS token */
+        if (next_token == eos || callback(next_token, ctx) == 0) break;
     }
 
     free(recent);

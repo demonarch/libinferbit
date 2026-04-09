@@ -417,6 +417,8 @@ int ib_convert_gguf(const char* input_path, const char* output_path,
     cJSON_AddStringToObject(a, "norm_type", model_cfg.norm_type);
     cJSON_AddStringToObject(a, "activation", model_cfg.activation);
     cJSON_AddBoolToObject(a, "tie_word_embeddings", tie);
+    cJSON_AddNumberToObject(a, "bos_token_id", model_cfg.bos_token_id);
+    cJSON_AddNumberToObject(a, "eos_token_id", model_cfg.eos_token_id);
 
     cJSON* q = cJSON_AddObjectToObject(root, "quantization");
     cJSON_AddNumberToObject(q, "default_bits", cfg->default_bits);

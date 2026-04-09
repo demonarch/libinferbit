@@ -619,6 +619,10 @@ int inferbit_convert(
     cJSON_AddStringToObject(arch_obj, "activation",
         has_config ? model_cfg.activation : "silu");
     cJSON_AddBoolToObject(arch_obj, "tie_word_embeddings", tie_embeddings);
+    cJSON_AddNumberToObject(arch_obj, "bos_token_id",
+        has_config ? model_cfg.bos_token_id : 1);
+    cJSON_AddNumberToObject(arch_obj, "eos_token_id",
+        has_config ? model_cfg.eos_token_id : 2);
 
     cJSON* quant_obj = cJSON_AddObjectToObject(root, "quantization");
     cJSON_AddNumberToObject(quant_obj, "default_bits", cfg.default_bits);
