@@ -204,6 +204,30 @@ extern ib_kernels ib_kern;
 
 void ib_init_kernels(ib_simd_level level);
 
+/* ── Safetensors parser ─────────────────────────────────────── */
+
+typedef struct ib_safetensors ib_safetensors;
+
+ib_safetensors* ib_st_open(const char* path);
+void            ib_st_close(ib_safetensors* sf);
+const void*     ib_st_tensor_data(const ib_safetensors* sf, int index);
+size_t          ib_st_tensor_size(const ib_safetensors* sf, int index);
+int             ib_st_find(const ib_safetensors* sf, const char* name);
+int             ib_st_find_suffix(const ib_safetensors* sf, const char* suffix);
+int             ib_st_num_tensors(const ib_safetensors* sf);
+const char*     ib_st_tensor_name_at(const ib_safetensors* sf, int index);
+const char*     ib_st_tensor_dtype_at(const ib_safetensors* sf, int index);
+int             ib_st_tensor_ndim_at(const ib_safetensors* sf, int index);
+int             ib_st_tensor_shape_at(const ib_safetensors* sf, int index, int dim);
+
+/* ── Quantization ───────────────────────────────────────────── */
+
+void ib_quantize_int8(int8_t* out, uint16_t* scales, const void* src,
+                      const char* dtype, int rows, int cols);
+void ib_quantize_int4(uint8_t* out, uint16_t* scales, const void* src,
+                      const char* dtype, int rows, int cols);
+void ib_copy_norm_fp16(uint16_t* out, const void* src, const char* dtype, int size);
+
 /* ── Forward pass ───────────────────────────────────────────── */
 
 int ib_forward(inferbit_model* model, const int32_t* tokens, int num_tokens, float* out_logits);

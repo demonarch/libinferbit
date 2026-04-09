@@ -33,6 +33,9 @@ set(INFERBIT_SOURCES
     src/forward.c
     src/threading.c
     src/ibf_loader.c
+    src/safetensors.c
+    src/quantize.c
+    src/convert.c
     src/cJSON.c
 )
 
@@ -69,10 +72,15 @@ add_executable(test_forward tests/test_forward.c)
 target_link_libraries(test_forward inferbit_static m)
 target_include_directories(test_forward PRIVATE include)
 
+add_executable(test_convert tests/test_convert.c)
+target_link_libraries(test_convert inferbit_static m)
+target_include_directories(test_convert PRIVATE include)
+
 enable_testing()
 add_test(NAME basic COMMAND test_inferbit)
 add_test(NAME ibf_loader COMMAND test_ibf_loader)
 add_test(NAME forward COMMAND test_forward)
+add_test(NAME convert COMMAND test_convert)
 
 # Install
 install(TARGETS inferbit

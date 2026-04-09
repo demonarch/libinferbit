@@ -128,6 +128,47 @@ size_t      inferbit_model_total_memory(const inferbit_model* model);
 void inferbit_set_draft_model(inferbit_model* model, inferbit_model* draft, int draft_tokens);
 void inferbit_unset_draft_model(inferbit_model* model);
 
+/* ── Conversion ─────────────────────────────────────────────── */
+
+typedef struct {
+    int   default_bits;       /* Quantization bits for MLP layers (2, 4, 8). Default: 4 */
+    int   sensitive_bits;     /* Bits for attention/embeddings (4, 8). Default: 8 */
+    float sparsity;           /* Target structured sparsity 0.0-0.6. Default: 0.0 */
+    int   block_size;         /* Sparsity block size. Default: 8 */
+    int   kv_bits;            /* KV cache quantization bits. Default: 8 */
+    int   threads;            /* Threads for quantization. Default: 0 (auto) */
+    void (*progress)(float pct, const char* stage, void* ctx);  /* Progress callback */
+    void* progress_ctx;
+} inferbit_convert_config;
+
+inferbit_convert_config inferbit_default_convert_config(void);
+
+/* Detect input format from file contents */
+typedef enum {
+    INFERBIT_FORMAT_UNKNOWN     = 0,
+    INFERBIT_FORMAT_SAFETENSORS = 1,
+    INFERBIT_FORMAT_GGUF        = 2,
+    INFERBIT_FORMAT_IBF         = 3,
+} inferbit_format;
+
+inferbit_format inferbit_detect_format(const char* path);
+
+/*
+ * Convert a local model file to .ibf format.
+ *
+ * input_path:  Path to .safetensors or .gguf file (or directory with multiple .safetensors)
+ * output_path: Path for the output .ibf file
+ * config:      Conversion parameters (NULL for defaults)
+ *
+ * Returns INFERBIT_OK on success, error code on failure.
+ * Use inferbit_last_error() for details.
+ */
+int inferbit_convert(
+    const char* input_path,
+    const char* output_path,
+    const inferbit_convert_config* config
+);
+
 #ifdef __cplusplus
 }
 #endif
