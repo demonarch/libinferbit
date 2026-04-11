@@ -346,7 +346,7 @@ inferbit_convert_config inferbit_default_convert_config(void) {
     c.sensitive_bits  = 8;
     c.sparsity        = 0.0f;
     c.block_size      = 8;
-    c.kv_bits         = 8;
+    c.kv_bits         = 16;  /* FP32 KV cache — INT8 KV degrades quality on 7B models */
     c.threads         = 0;
     c.progress        = NULL;
     c.progress_ctx    = NULL;
@@ -547,6 +547,8 @@ int inferbit_convert(
     /* ── Quantize and write layers ──────────────────────────── */
     typedef struct {
         ib_written_tensor q, k, v, o, gate, up, down, in_norm, post_norm;
+        size_t sparsity_offset;
+        size_t sparsity_size;
     } layer_tensors;
 
     layer_tensors* lt = calloc(arch.num_layers, sizeof(layer_tensors));
@@ -578,6 +580,107 @@ int inferbit_convert(
         CONVERT_TENSOR(lt[l].post_norm, names.post_norm, 16);
 
         #undef CONVERT_TENSOR
+
+        if (cfg.sparsity > 0.0f) {
+            /*
+             * Magnitude-based structured sparsity:
+             * Compute L2 norm of each gate_proj output row.
+             * The rows with lowest norms are the least important intermediate neurons.
+             * Mask those out (set to 0 in sparsity mask).
+             */
+            int inter = arch.intermediate_size;
+            int hidden_dim = arch.hidden_size;
+            int gs, gt;
+            if (inter > 0 && find_layer_tensor_ts(ts, &names, l, names.gate_proj, &gs, &gt) == 0) {
+                const void* gate_data = ib_ts_tensor_data(ts, gs, gt);
+                const char* gate_dtype = ib_ts_tensor_dtype(ts, gs, gt);
+
+                /* Compute per-row L2 norms */
+                float* norms = malloc(inter * sizeof(float));
+                float* row_buf = malloc(hidden_dim * sizeof(float));
+                uint8_t* mask = malloc((size_t)inter);
+                if (!norms || !row_buf || !mask) {
+                    free(norms); free(row_buf); free(mask);
+                    ib_set_error("failed to allocate sparsity buffers");
+                    free(lt); fclose(out); ib_ts_close(ts);
+                    return INFERBIT_ERROR_MEMORY;
+                }
+
+                for (int r = 0; r < inter; r++) {
+                    /* Read row as FP32 (reuse quantize.c's read_row logic) */
+                    if (strcmp(gate_dtype, "BF16") == 0 || strcmp(gate_dtype, "F16") == 0 ||
+                        strcmp(gate_dtype, "F32") == 0) {
+                        /* Compute norm directly from source data */
+                        float sum_sq = 0.0f;
+                        if (strcmp(gate_dtype, "F32") == 0) {
+                            const float* src = (const float*)gate_data + (size_t)r * hidden_dim;
+                            for (int c = 0; c < hidden_dim; c++) sum_sq += src[c] * src[c];
+                        } else {
+                            /* BF16 or F16: read 2 bytes per element */
+                            const uint8_t* base = (const uint8_t*)gate_data + (size_t)r * hidden_dim * 2;
+                            for (int c = 0; c < hidden_dim; c++) {
+                                uint16_t v;
+                                memcpy(&v, base + c * 2, 2);
+                                float f;
+                                if (strcmp(gate_dtype, "BF16") == 0) {
+                                    uint32_t b = (uint32_t)v << 16;
+                                    memcpy(&f, &b, 4);
+                                } else {
+                                    /* FP16 */
+                                    uint32_t sign = (uint32_t)(v >> 15) << 31;
+                                    uint32_t exp = (v >> 10) & 0x1F;
+                                    uint32_t mant = v & 0x3FF;
+                                    if (exp == 0) f = 0.0f;
+                                    else { uint32_t b = sign|((exp+112)<<23)|(mant<<13); memcpy(&f,&b,4); }
+                                }
+                                sum_sq += f * f;
+                            }
+                        }
+                        norms[r] = sum_sq;  /* L2 squared is fine for ranking */
+                    } else {
+                        norms[r] = 0.0f;
+                    }
+                }
+
+                /* Find threshold: keep top (1-sparsity) fraction by L2 norm */
+                int keep = (int)roundf((1.0f - cfg.sparsity) * (float)inter);
+                if (keep < 1) keep = 1;
+                if (keep > inter) keep = inter;
+
+                /* Simple selection: find the keep-th largest norm */
+                /* Copy norms, partially sort to find threshold */
+                float* sorted_norms = malloc(inter * sizeof(float));
+                memcpy(sorted_norms, norms, inter * sizeof(float));
+                /* Quick partial sort: just find the threshold value */
+                /* Use nth-element approach: sort descending, threshold is sorted[keep-1] */
+                for (int i = 0; i < keep; i++) {
+                    for (int j = i + 1; j < inter; j++) {
+                        if (sorted_norms[j] > sorted_norms[i]) {
+                            float tmp = sorted_norms[i];
+                            sorted_norms[i] = sorted_norms[j];
+                            sorted_norms[j] = tmp;
+                        }
+                    }
+                }
+                float threshold = sorted_norms[keep - 1];
+                free(sorted_norms);
+
+                /* Build mask */
+                for (int r = 0; r < inter; r++) {
+                    mask[r] = (norms[r] >= threshold) ? 1 : 0;
+                }
+
+                free(norms);
+                free(row_buf);
+
+                offset = write_aligned(out, offset);
+                lt[l].sparsity_offset = offset - weight_data_start;
+                lt[l].sparsity_size = (size_t)inter;
+                fwrite(mask, 1, (size_t)inter, out);
+                offset += (size_t)inter;
+                free(mask);
+            }
+        }
     }
 
     cfg.progress(0.9f, "writing output head", cfg.progress_ctx);
@@ -692,8 +795,8 @@ int inferbit_convert(
         #undef ADD_TENSOR
 
         cJSON* sp = cJSON_AddObjectToObject(layer, "sparsity_mask");
-        cJSON_AddNumberToObject(sp, "offset", 0);
-        cJSON_AddNumberToObject(sp, "size", 0);
+        cJSON_AddNumberToObject(sp, "offset", (double)lt[l].sparsity_offset);
+        cJSON_AddNumberToObject(sp, "size", (double)lt[l].sparsity_size);
 
         cJSON_AddItemToArray(layers_arr, layer);
     }

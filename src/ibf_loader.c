@@ -235,11 +235,21 @@ static int alloc_kv_caches(inferbit_model* model, int context_length, int dynami
     model->kv_caches = calloc(num_layers, sizeof(ib_kv_cache));
     if (!model->kv_caches) return -1;
 
-    /* Bytes per token for one layer's K or V cache.
-     * Milestone 3: store as FP32 regardless of kv_bits for simplicity.
-     * TODO: Milestone 4 — quantized KV storage. */
-    (void)kv_bits;
-    size_t bytes_per_token = (size_t)num_kv_heads * head_dim * sizeof(float);
+    /* Bytes per token for one layer's K or V cache. */
+    size_t kv_dim = (size_t)num_kv_heads * head_dim;
+    size_t bytes_per_token;
+    if (kv_bits >= 16) {
+        bytes_per_token = kv_dim * sizeof(float);
+    } else if (kv_bits == 8) {
+        bytes_per_token = kv_dim;
+    } else if (kv_bits == 4) {
+        bytes_per_token = (kv_dim + 1) / 2;
+    } else if (kv_bits == 2) {
+        bytes_per_token = (kv_dim + 3) / 4;
+    } else {
+        ib_set_error("unsupported kv_bits=%d", kv_bits);
+        return -1;
+    }
 
     for (int i = 0; i < num_layers; i++) {
         ib_kv_cache* kv = &model->kv_caches[i];

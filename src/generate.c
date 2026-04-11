@@ -261,27 +261,100 @@ int inferbit_generate(
     int vocab = model->header.vocab_size;
     float* logits = model->buf_logits;
 
-    /* Prefill: process all input tokens */
     int rc = ib_forward(model, input_tokens, num_input_tokens, logits);
     if (rc != INFERBIT_OK) return rc;
 
-    /* Sample first output token from prefill logits */
     int generated = 0;
     int eos = model->header.eos_token_id;
-    int32_t next_token = sample_token(logits, vocab, params, input_tokens, num_input_tokens);
-    out_tokens[generated++] = next_token;
 
-    if (next_token == eos) return generated;
+    int use_spec = (model->draft_model != NULL && params.temperature < 0.01f);
+    if (use_spec) {
+        inferbit_model* draft = model->draft_model;
+        if (draft->header.vocab_size != vocab) {
+            use_spec = 0;
+        } else {
+            inferbit_kv_clear(draft);
+            rc = ib_forward(draft, input_tokens, num_input_tokens, draft->buf_logits);
+            if (rc != INFERBIT_OK) use_spec = 0;
+        }
+    }
 
-    /* Decode loop */
-    while (generated < max_out_tokens) {
-        rc = ib_forward(model, &next_token, 1, logits);
-        if (rc != INFERBIT_OK) return rc;
-
-        next_token = sample_token(logits, vocab, params, out_tokens, generated);
+    if (!use_spec) {
+        int32_t next_token = sample_token(logits, vocab, params, input_tokens, num_input_tokens);
         out_tokens[generated++] = next_token;
+        if (next_token == eos) return generated;
 
-        if (next_token == eos) break;
+        while (generated < max_out_tokens) {
+            rc = ib_forward(model, &next_token, 1, logits);
+            if (rc != INFERBIT_OK) return rc;
+            next_token = sample_token(logits, vocab, params, out_tokens, generated);
+            out_tokens[generated++] = next_token;
+            if (next_token == eos) break;
+        }
+        return generated;
+    }
+
+    inferbit_model* draft = model->draft_model;
+    float* dlogits = draft->buf_logits;
+    int draft_k = model->draft_tokens > 0 ? model->draft_tokens : 4;
+    if (draft_k > 32) draft_k = 32;
+    int32_t candidates[32];
+
+    while (generated < max_out_tokens) {
+        int base_draft_len = inferbit_kv_length(draft);
+
+        int k = draft_k;
+        if (k > (max_out_tokens - generated)) k = max_out_tokens - generated;
+
+        int32_t dtok = sample_argmax(dlogits, vocab);
+        for (int i = 0; i < k; i++) {
+            candidates[i] = dtok;
+            rc = ib_forward(draft, &dtok, 1, dlogits);
+            if (rc != INFERBIT_OK) return rc;
+            dtok = sample_argmax(dlogits, vocab);
+        }
+
+        int accepted = 0;
+        int mismatch = 0;
+        int32_t mismatch_tok = -1;
+
+        for (int i = 0; i < k && generated < max_out_tokens; i++) {
+            int32_t mtok = sample_argmax(logits, vocab);
+            if (mtok == candidates[i]) {
+                out_tokens[generated++] = mtok;
+                if (mtok == eos) return generated;
+                accepted++;
+                rc = ib_forward(model, &mtok, 1, logits);
+                if (rc != INFERBIT_OK) return rc;
+            } else {
+                mismatch = 1;
+                mismatch_tok = mtok;
+                break;
+            }
+        }
+
+        if (mismatch) {
+            out_tokens[generated++] = mismatch_tok;
+            if (mismatch_tok == eos) return generated;
+            rc = ib_forward(model, &mismatch_tok, 1, logits);
+            if (rc != INFERBIT_OK) return rc;
+
+            inferbit_kv_truncate(draft, base_draft_len + accepted);
+            rc = ib_forward(draft, &mismatch_tok, 1, dlogits);
+            if (rc != INFERBIT_OK) return rc;
+            continue;
+        }
+
+        if (generated >= max_out_tokens) break;
+
+        int32_t extra = sample_argmax(logits, vocab);
+        out_tokens[generated++] = extra;
+        if (extra == eos) return generated;
+
+        rc = ib_forward(model, &extra, 1, logits);
+        if (rc != INFERBIT_OK) return rc;
+        rc = ib_forward(draft, &extra, 1, dlogits);
+        if (rc != INFERBIT_OK) return rc;
     }
 
     return generated;
@@ -326,28 +399,107 @@ int inferbit_generate_stream(
     /* Sample and stream */
     int generated = 0;
     int eos = model->header.eos_token_id;
-    int32_t next_token = sample_token(logits, vocab, params, recent, recent_len > max_recent ? max_recent : recent_len);
-    recent[recent_len++] = next_token;
-    generated++;
 
-    if (next_token == eos || callback(next_token, ctx) == 0) {
+    /* Check for speculative decoding (greedy only) */
+    int use_spec = (model->draft_model != NULL && params.temperature < 0.01f);
+    if (use_spec) {
+        inferbit_model* draft = model->draft_model;
+        if (draft->header.vocab_size != vocab) {
+            use_spec = 0;
+        } else {
+            inferbit_kv_clear(draft);
+            rc = ib_forward(draft, input_tokens, num_input_tokens, draft->buf_logits);
+            if (rc != INFERBIT_OK) use_spec = 0;
+        }
+    }
+
+    if (!use_spec) {
+        /* Standard streaming path */
+        int32_t next_token = sample_token(logits, vocab, params, recent,
+                                          recent_len > max_recent ? max_recent : recent_len);
+        recent[recent_len++] = next_token;
+        generated++;
+
+        if (next_token == eos || callback(next_token, ctx) == 0) {
+            free(recent);
+            return generated;
+        }
+
+        while (generated < params.max_tokens) {
+            rc = ib_forward(model, &next_token, 1, logits);
+            if (rc != INFERBIT_OK) { free(recent); return rc; }
+
+            int pen_start = recent_len > max_recent ? recent_len - max_recent : 0;
+            next_token = sample_token(logits, vocab, params, recent + pen_start, recent_len - pen_start);
+            recent[recent_len++] = next_token;
+            generated++;
+
+            if (next_token == eos || callback(next_token, ctx) == 0) break;
+        }
+
         free(recent);
         return generated;
     }
 
-    while (generated < params.max_tokens) {
-        rc = ib_forward(model, &next_token, 1, logits);
-        if (rc != INFERBIT_OK) {
-            free(recent);
-            return rc;
+    /* Speculative streaming path */
+    inferbit_model* draft = model->draft_model;
+    float* dlogits = draft->buf_logits;
+    int draft_k = model->draft_tokens > 0 ? model->draft_tokens : 4;
+    if (draft_k > 32) draft_k = 32;
+    int32_t candidates[32];
+    int stopped = 0;
+
+    while (generated < params.max_tokens && !stopped) {
+        int base_draft_len = inferbit_kv_length(draft);
+
+        int k = draft_k;
+        if (k > (params.max_tokens - generated)) k = params.max_tokens - generated;
+
+        /* Draft generates k candidates */
+        int32_t dtok = sample_argmax(dlogits, vocab);
+        for (int i = 0; i < k; i++) {
+            candidates[i] = dtok;
+            rc = ib_forward(draft, &dtok, 1, dlogits);
+            if (rc != INFERBIT_OK) { free(recent); return rc; }
+            dtok = sample_argmax(dlogits, vocab);
         }
 
-        int pen_start = recent_len > max_recent ? recent_len - max_recent : 0;
-        next_token = sample_token(logits, vocab, params, recent + pen_start, recent_len - pen_start);
-        recent[recent_len++] = next_token;
-        generated++;
+        /* Verify and stream accepted tokens */
+        int accepted = 0;
+        for (int i = 0; i < k && generated < params.max_tokens; i++) {
+            int32_t mtok = sample_argmax(logits, vocab);
+            if (mtok == candidates[i]) {
+                generated++;
+                if (mtok == eos || callback(mtok, ctx) == 0) { stopped = 1; break; }
+                accepted++;
+                rc = ib_forward(model, &mtok, 1, logits);
+                if (rc != INFERBIT_OK) { free(recent); return rc; }
+            } else {
+                /* Mismatch: emit the main model's token */
+                generated++;
+                if (mtok == eos || callback(mtok, ctx) == 0) { stopped = 1; break; }
+                rc = ib_forward(model, &mtok, 1, logits);
+                if (rc != INFERBIT_OK) { free(recent); return rc; }
+                /* Rollback draft KV cache */
+                inferbit_kv_truncate(draft, base_draft_len + accepted);
+                rc = ib_forward(draft, &mtok, 1, dlogits);
+                if (rc != INFERBIT_OK) { free(recent); return rc; }
+                break;
+            }
+        }
 
-        if (next_token == eos || callback(next_token, ctx) == 0) break;
+        /* If all k accepted, emit one more from main model */
+        if (!stopped && accepted == k && generated < params.max_tokens) {
+            int32_t extra = sample_argmax(logits, vocab);
+            generated++;
+            if (extra == eos || callback(extra, ctx) == 0) { stopped = 1; }
+            else {
+                rc = ib_forward(model, &extra, 1, logits);
+                if (rc != INFERBIT_OK) { free(recent); return rc; }
+                rc = ib_forward(draft, &extra, 1, dlogits);
+                if (rc != INFERBIT_OK) { free(recent); return rc; }
+            }
+        }
     }
 
     free(recent);

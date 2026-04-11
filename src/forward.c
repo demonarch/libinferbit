@@ -145,10 +145,8 @@ static void tensor_matmul(
     }
 
     if (t->bits == 2 || t->bits == 4 || t->bits == 8) {
-        /* Use parallel matmul if thread pool available and matrix is large enough */
         ib_parallel_matmul(m->thread_pool, out, weights, scale_buf, input, M, N, t->bits);
     } else if (t->bits == 16) {
-        /* FP16 matmul: dequantize and multiply (norms — too small to parallelize) */
         const uint16_t* w = (const uint16_t*)weights;
         for (int i = 0; i < M; i++) {
             float sum = 0.0f;
@@ -157,6 +155,78 @@ static void tensor_matmul(
             }
             out[i] = sum;
         }
+    }
+}
+
+/*
+ * Sparse matmul: same as tensor_matmul but skips rows where mask[row] == 0.
+ * Outputs zero for skipped rows. mask is a byte array of length M.
+ */
+static void tensor_matmul_sparse(
+    const inferbit_model* m, const ib_tensor_meta* t,
+    float* out, const float* input, int M, int N,
+    float* scale_buf, const uint8_t* mask
+) {
+    if (!mask) {
+        tensor_matmul(m, t, out, input, M, N, scale_buf);
+        return;
+    }
+
+    /* Count active rows and build index */
+    int active = 0;
+    for (int i = 0; i < M; i++) {
+        if (mask[i]) active++;
+    }
+
+    /* If most rows are active (>80%), just run dense — overhead of sparse indexing isn't worth it */
+    if (active > M * 4 / 5) {
+        tensor_matmul(m, t, out, input, M, N, scale_buf);
+        /* Zero out masked rows */
+        for (int i = 0; i < M; i++) {
+            if (!mask[i]) out[i] = 0.0f;
+        }
+        return;
+    }
+
+    /* Sparse path: only compute active rows */
+    const void* weights = tensor_data(m, t);
+    const void* scales_raw = tensor_scales_raw(m, t);
+
+    if (scales_raw) {
+        scales_to_fp32(scale_buf, scales_raw, M);
+    } else {
+        for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
+    }
+
+    /* Zero entire output first */
+    memset(out, 0, M * sizeof(float));
+
+    /* Compute only active rows */
+    for (int i = 0; i < M; i++) {
+        if (!mask[i]) continue;
+
+        float sum = 0.0f;
+        if (t->bits == 8) {
+            const int8_t* w = (const int8_t*)weights + (size_t)i * N;
+            for (int j = 0; j < N; j++) sum += (float)w[j] * input[j];
+        } else if (t->bits == 4) {
+            const uint8_t* w = (const uint8_t*)weights + (size_t)i * (N / 2);
+            for (int j = 0; j < N; j += 2) {
+                uint8_t byte = w[j / 2];
+                sum += (float)((int8_t)(byte & 0x0F) - 8) * input[j];
+                if (j + 1 < N) sum += (float)((int8_t)((byte >> 4) & 0x0F) - 8) * input[j + 1];
+            }
+        } else if (t->bits == 2) {
+            const uint8_t* w = (const uint8_t*)weights + (size_t)i * (N / 4);
+            for (int j = 0; j < N; j += 4) {
+                uint8_t byte = w[j / 4];
+                sum += (float)((byte & 0x03) - 1) * input[j];
+                if (j+1 < N) sum += (float)(((byte >> 2) & 0x03) - 1) * input[j+1];
+                if (j+2 < N) sum += (float)(((byte >> 4) & 0x03) - 1) * input[j+2];
+                if (j+3 < N) sum += (float)(((byte >> 6) & 0x03) - 1) * input[j+3];
+            }
+        }
+        out[i] = sum * scale_buf[i];
     }
 }
 
@@ -169,17 +239,122 @@ static void rmsnorm_fp16(float* out, const float* input,
     ib_kern.rmsnorm(out, input, weight_buf, eps, N);
 }
 
-/* ── KV cache write ─────────────────────────────────────────── */
+/* ── KV cache quantization helpers ──────────────────────────── */
 
-static void kv_cache_write_fp32(ib_kv_cache* kv, int pos,
-                                 const float* key, const float* value,
-                                 int kv_dim) {
-    /* For now, store as FP32 regardless of kv_bits (simplifies milestone 3) */
-    /* TODO: Milestone 4 — quantize to KV cache bit-width */
-    float* k_store = (float*)kv->key_data;
-    float* v_store = (float*)kv->value_data;
-    memcpy(k_store + (size_t)pos * kv_dim, key, kv_dim * sizeof(float));
-    memcpy(v_store + (size_t)pos * kv_dim, value, kv_dim * sizeof(float));
+static inline void kv_write_int4_row(uint8_t* dst, const float* src, float scale, int n) {
+    float inv = 1.0f / scale;
+    for (int i = 0; i < n; i += 2) {
+        int q0 = (int)roundf(src[i] * inv);
+        int q1 = (i + 1 < n) ? (int)roundf(src[i + 1] * inv) : 0;
+        if (q0 < -7) q0 = -7; if (q0 > 7) q0 = 7;
+        if (q1 < -7) q1 = -7; if (q1 > 7) q1 = 7;
+        uint8_t lo = (uint8_t)(q0 + 8) & 0x0F;
+        uint8_t hi = (uint8_t)(q1 + 8) & 0x0F;
+        dst[i / 2] = lo | (hi << 4);
+    }
+}
+
+static inline void kv_read_int4_row(float* out, const uint8_t* src, float scale, int n) {
+    for (int i = 0; i < n; i += 2) {
+        uint8_t b = src[i / 2];
+        out[i] = ((float)((int)(b & 0x0F) - 8)) * scale;
+        if (i + 1 < n) out[i + 1] = ((float)((int)((b >> 4) & 0x0F) - 8)) * scale;
+    }
+}
+
+static void kv_cache_write(ib_kv_cache* kv, int pos,
+                           const float* key, const float* value,
+                           int kv_dim, int n_kv_heads, int head_dim, int kv_bits) {
+    if (kv_bits >= 16) {
+        float* k_store = (float*)kv->key_data;
+        float* v_store = (float*)kv->value_data;
+        memcpy(k_store + (size_t)pos * kv_dim, key, kv_dim * sizeof(float));
+        memcpy(v_store + (size_t)pos * kv_dim, value, kv_dim * sizeof(float));
+        return;
+    }
+
+    if (kv_bits == 8) {
+        int8_t* k_store = (int8_t*)kv->key_data + (size_t)pos * kv_dim;
+        int8_t* v_store = (int8_t*)kv->value_data + (size_t)pos * kv_dim;
+        for (int h = 0; h < n_kv_heads; h++) {
+            const float* k_h = key + h * head_dim;
+            const float* v_h = value + h * head_dim;
+            float k_max = 0.0f, v_max = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                float ka = fabsf(k_h[d]); if (ka > k_max) k_max = ka;
+                float va = fabsf(v_h[d]); if (va > v_max) v_max = va;
+            }
+            float k_scale = k_max / 127.0f; if (k_scale < 1e-8f) k_scale = 1e-8f;
+            float v_scale = v_max / 127.0f; if (v_scale < 1e-8f) v_scale = 1e-8f;
+            kv->key_scales[(size_t)pos * n_kv_heads + h] = k_scale;
+            kv->value_scales[(size_t)pos * n_kv_heads + h] = v_scale;
+            float k_inv = 1.0f / k_scale;
+            float v_inv = 1.0f / v_scale;
+            for (int d = 0; d < head_dim; d++) {
+                int kq = (int)roundf(k_h[d] * k_inv);
+                int vq = (int)roundf(v_h[d] * v_inv);
+                if (kq < -127) kq = -127; if (kq > 127) kq = 127;
+                if (vq < -127) vq = -127; if (vq > 127) vq = 127;
+                k_store[h * head_dim + d] = (int8_t)kq;
+                v_store[h * head_dim + d] = (int8_t)vq;
+            }
+        }
+        return;
+    }
+
+    if (kv_bits == 4) {
+        size_t row_bytes = (size_t)(kv_dim + 1) / 2;
+        uint8_t* k_store = (uint8_t*)kv->key_data + (size_t)pos * row_bytes;
+        uint8_t* v_store = (uint8_t*)kv->value_data + (size_t)pos * row_bytes;
+        for (int h = 0; h < n_kv_heads; h++) {
+            const float* k_h = key + h * head_dim;
+            const float* v_h = value + h * head_dim;
+            float k_max = 0.0f, v_max = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                float ka = fabsf(k_h[d]); if (ka > k_max) k_max = ka;
+                float va = fabsf(v_h[d]); if (va > v_max) v_max = va;
+            }
+            float k_scale = k_max / 7.0f; if (k_scale < 1e-8f) k_scale = 1e-8f;
+            float v_scale = v_max / 7.0f; if (v_scale < 1e-8f) v_scale = 1e-8f;
+            kv->key_scales[(size_t)pos * n_kv_heads + h] = k_scale;
+            kv->value_scales[(size_t)pos * n_kv_heads + h] = v_scale;
+            kv_write_int4_row(k_store + (size_t)h * ((head_dim + 1) / 2), k_h, k_scale, head_dim);
+            kv_write_int4_row(v_store + (size_t)h * ((head_dim + 1) / 2), v_h, v_scale, head_dim);
+        }
+        return;
+    }
+}
+
+static void kv_cache_read_head(const ib_kv_cache* kv, int is_key, int pos, int kv_head,
+                               int kv_dim, int n_kv_heads, int head_dim, int kv_bits,
+                               float* out_head) {
+    if (kv_bits >= 16) {
+        const float* src = is_key ? (const float*)kv->key_data : (const float*)kv->value_data;
+        const float* row = src + (size_t)pos * kv_dim + kv_head * head_dim;
+        memcpy(out_head, row, head_dim * sizeof(float));
+        return;
+    }
+
+    if (kv_bits == 8) {
+        const int8_t* src = is_key ? (const int8_t*)kv->key_data : (const int8_t*)kv->value_data;
+        const int8_t* row = src + (size_t)pos * kv_dim + kv_head * head_dim;
+        float scale = is_key
+            ? kv->key_scales[(size_t)pos * n_kv_heads + kv_head]
+            : kv->value_scales[(size_t)pos * n_kv_heads + kv_head];
+        for (int d = 0; d < head_dim; d++) out_head[d] = (float)row[d] * scale;
+        return;
+    }
+
+    if (kv_bits == 4) {
+        size_t row_bytes = (size_t)(kv_dim + 1) / 2;
+        const uint8_t* src = is_key ? (const uint8_t*)kv->key_data : (const uint8_t*)kv->value_data;
+        const uint8_t* row = src + (size_t)pos * row_bytes + (size_t)kv_head * ((head_dim + 1) / 2);
+        float scale = is_key
+            ? kv->key_scales[(size_t)pos * n_kv_heads + kv_head]
+            : kv->value_scales[(size_t)pos * n_kv_heads + kv_head];
+        kv_read_int4_row(out_head, row, scale, head_dim);
+        return;
+    }
 }
 
 /* ── Parallel attention task ─────────────────────────────────── */
@@ -188,43 +363,54 @@ typedef struct {
     float* q;
     float* att;
     float* xb2;
-    float* k_cache;
-    float* v_cache;
+    ib_kv_cache* kv;
     int head_dim;
     int kv_dim;
+    int n_kv_heads;
     int heads_per_kv;
     int pos;
+    int kv_bits;
     float scale;
 } ib_attn_ctx;
 
 static void ib_attn_head_task(void* arg, int tid, int start, int end) {
     (void)tid;
     ib_attn_ctx* c = (ib_attn_ctx*)arg;
+    float k_tmp[256];
+    float v_tmp[256];
+
     for (int h = start; h < end; h++) {
         float* q_h = c->q + h * c->head_dim;
         int kv_h = h / c->heads_per_kv;
 
-        /* Q*K scores */
         for (int t = 0; t <= c->pos; t++) {
-            float* k_t = c->k_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
             float score = 0.0f;
-            for (int d = 0; d < c->head_dim; d++) {
-                score += q_h[d] * k_t[d];
+            if (c->kv_bits >= 16) {
+                float* k_cache = (float*)c->kv->key_data;
+                float* k_t = k_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
+                for (int d = 0; d < c->head_dim; d++) score += q_h[d] * k_t[d];
+            } else {
+                kv_cache_read_head(c->kv, 1, t, kv_h, c->kv_dim, c->n_kv_heads,
+                                   c->head_dim, c->kv_bits, k_tmp);
+                for (int d = 0; d < c->head_dim; d++) score += q_h[d] * k_tmp[d];
             }
             c->att[h * (c->pos + 1) + t] = score * c->scale;
         }
 
-        /* Softmax */
         ib_kern.softmax(c->att + h * (c->pos + 1), c->pos + 1);
 
-        /* Weighted sum of values */
         float* out_h = c->xb2 + h * c->head_dim;
         memset(out_h, 0, c->head_dim * sizeof(float));
         for (int t = 0; t <= c->pos; t++) {
             float a = c->att[h * (c->pos + 1) + t];
-            float* v_t = c->v_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
-            for (int d = 0; d < c->head_dim; d++) {
-                out_h[d] += a * v_t[d];
+            if (c->kv_bits >= 16) {
+                float* v_cache = (float*)c->kv->value_data;
+                float* v_t = v_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
+                for (int d = 0; d < c->head_dim; d++) out_h[d] += a * v_t[d];
+            } else {
+                kv_cache_read_head(c->kv, 0, t, kv_h, c->kv_dim, c->n_kv_heads,
+                                   c->head_dim, c->kv_bits, v_tmp);
+                for (int d = 0; d < c->head_dim; d++) out_h[d] += a * v_tmp[d];
             }
         }
     }
@@ -305,7 +491,7 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos, float* lo
         }
 
         /* Write K, V to cache */
-        kv_cache_write_fp32(kv, pos, k, v, kv_dim);
+        kv_cache_write(kv, pos, k, v, kv_dim, n_kv, head_dim, m->header.kv_bits);
         kv->length = pos + 1;
 
         /* Multi-head attention (parallelized across heads) */
@@ -313,11 +499,13 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos, float* lo
 
         ib_attn_ctx attn_ctx = {
             .q = q, .att = att, .xb2 = xb2,
-            .k_cache = (float*)kv->key_data,
-            .v_cache = (float*)kv->value_data,
+            .kv = kv,
             .head_dim = head_dim, .kv_dim = kv_dim,
+            .n_kv_heads = n_kv,
             .heads_per_kv = heads_per_kv,
-            .pos = pos, .scale = attn_scale,
+            .pos = pos,
+            .kv_bits = m->header.kv_bits,
+            .scale = attn_scale,
         };
 
         if (m->thread_pool && n_heads >= 4) {
@@ -338,11 +526,20 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos, float* lo
         rmsnorm_fp16(xb, x, tensor_data(m, &layer->post_attn_norm),
                      eps, hidden, scale_buf);
 
-        /* MLP: gate + up + silu_mul + down */
-        tensor_matmul(m, &layer->gate_proj, hb, xb, inter, hidden, scale_buf);
-        tensor_matmul(m, &layer->up_proj, hb2, xb, inter, hidden, scale_buf);
-        ib_kern.silu_mul(hb, hb, hb2, inter);
-        tensor_matmul(m, &layer->down_proj, xb, hb, hidden, inter, scale_buf);
+        /* MLP: gate + up + silu_mul + down
+         * With sparsity: skip masked intermediate neurons entirely */
+        {
+            const uint8_t* sp_mask = NULL;
+            if (layer->sparsity_mask_size > 0) {
+                sp_mask = (const uint8_t*)m->weight_data + layer->sparsity_mask_offset;
+            }
+            tensor_matmul_sparse(m, &layer->gate_proj, hb, xb, inter, hidden, scale_buf, sp_mask);
+            tensor_matmul_sparse(m, &layer->up_proj, hb2, xb, inter, hidden, scale_buf, sp_mask);
+            ib_kern.silu_mul(hb, hb, hb2, inter);
+            /* down_proj reads from hb which already has zeros for masked rows —
+             * the multiply by zero propagates naturally, no sparse path needed */
+            tensor_matmul(m, &layer->down_proj, xb, hb, hidden, inter, scale_buf);
+        }
 
         /* Residual connection */
         for (int i = 0; i < hidden; i++) {

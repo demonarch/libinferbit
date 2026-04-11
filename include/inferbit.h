@@ -169,6 +169,58 @@ int inferbit_convert(
     const inferbit_convert_config* config
 );
 
+/* ── Evaluation ─────────────────────────────────────────────── */
+
+/*
+ * Compute perplexity over tokenized samples (teacher forcing).
+ * Returns perplexity value, or -1.0 on error.
+ */
+double inferbit_perplexity(
+    inferbit_model* model,
+    const int32_t* const* samples,
+    const int* sample_lengths,
+    int num_samples
+);
+
+/* ── Calibration ────────────────────────────────────────────── */
+
+typedef struct {
+    int    bits;
+    int    sensitive_bits;
+    int    selected;
+    char   ibf_path[512];
+    double perplexity;
+    double tokens_per_sec;
+    double ms_per_token;
+    double memory_mb;
+    int    passes;
+    char   failed[512];
+} inferbit_profile_result;
+
+/*
+ * Search quantization profiles (INT2 → INT4 → INT8), pick first passing gates.
+ * results must point to an array of 3 inferbit_profile_result.
+ * selected_index receives the index of the chosen profile (0-2).
+ */
+int inferbit_calibrate(
+    const char* input_path,
+    const char* output_dir,
+    const int32_t* const* samples,
+    const int* sample_lengths,
+    int num_samples,
+    int output_tokens,
+    int warmup_runs,
+    int measured_runs,
+    double max_perplexity,
+    double min_tokens_per_sec,
+    double max_memory_mb,
+    int threads,
+    void (*progress)(const char* stage, void* ctx),
+    void* progress_ctx,
+    inferbit_profile_result* results,
+    int* selected_index
+);
+
 #ifdef __cplusplus
 }
 #endif

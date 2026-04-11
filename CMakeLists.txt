@@ -42,6 +42,8 @@ set(INFERBIT_SOURCES
     src/quantize.c
     src/convert.c
     src/convert_gguf.c
+    src/eval.c
+    src/calibrate.c
     src/cJSON.c
 )
 
