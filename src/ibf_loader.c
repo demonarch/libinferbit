@@ -12,16 +12,13 @@
  */
 
 #include "inferbit_internal.h"
+#include "platform.h"
 #include "cJSON.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 
 #define IBF_MAGIC      "INFERBIT"
 #define IBF_MAGIC_SIZE 8
@@ -324,24 +321,24 @@ static int alloc_buffers(inferbit_model* model) {
 
 inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     /* Open file */
-    int fd = open(path, O_RDONLY);
+    int fd = ib_open(path, O_RDONLY);
     if (fd < 0) {
         ib_set_error("failed to open %s: %s", path, strerror(errno));
         return NULL;
     }
 
     /* Get file size */
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
+    ib_struct_stat st;
+    if (ib_fstat(fd, &st) < 0) {
         ib_set_error("failed to stat %s: %s", path, strerror(errno));
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
     size_t file_size = (size_t)st.st_size;
 
     if (file_size < IBF_PREAMBLE) {
         ib_set_error("file too small to be IBF: %zu bytes", file_size);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -349,14 +346,14 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     uint8_t preamble[IBF_PREAMBLE];
     if (read(fd, preamble, IBF_PREAMBLE) != IBF_PREAMBLE) {
         ib_set_error("failed to read IBF preamble");
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
     /* Validate magic */
     if (memcmp(preamble, IBF_MAGIC, IBF_MAGIC_SIZE) != 0) {
         ib_set_error("invalid IBF magic number");
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -365,7 +362,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     memcpy(&version, preamble + 8, 4);
     if (version > IBF_VERSION) {
         ib_set_error("unsupported IBF version: %u (max supported: %u)", version, IBF_VERSION);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -375,7 +372,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
 
     if (IBF_PREAMBLE + header_size > file_size) {
         ib_set_error("IBF header size exceeds file size");
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -388,14 +385,14 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     char* json_buf = malloc(header_size + 1);
     if (!json_buf) {
         ib_set_error("failed to allocate JSON header buffer");
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
     ssize_t nread = read(fd, json_buf, header_size);
     if (nread < 0 || (size_t)nread != header_size) {
         ib_set_error("failed to read IBF JSON header");
         free(json_buf);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
     json_buf[header_size] = '\0';
@@ -405,7 +402,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     if (!model) {
         ib_set_error("failed to allocate model");
         free(json_buf);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -415,7 +412,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
                           &model->output_norm, &model->output_head) != 0) {
         free(json_buf);
         free(model);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
     free(json_buf);
@@ -426,7 +423,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
         ib_set_error("IBF header missing required architecture fields");
         free(model->layers);
         free(model);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -442,12 +439,12 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     }
 
     /* Memory-map weight data */
-    void* mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void* mapped = ib_mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (mapped == MAP_FAILED) {
         ib_set_error("failed to mmap %s: %s", path, strerror(errno));
         free(model->layers);
         free(model);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -471,8 +468,8 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     /* Allocate KV caches */
     if (alloc_kv_caches(model, ctx_len, kv_dynamic) != 0) {
         ib_set_error("failed to allocate KV caches");
-        munmap(mapped, file_size);
-        close(fd);
+        ib_munmap(mapped, file_size);
+        ib_close(fd);
         free(model->layers);
         free(model);
         return NULL;
@@ -482,8 +479,8 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     if (alloc_buffers(model) != 0) {
         ib_set_error("failed to allocate activation buffers");
         /* TODO: proper cleanup of kv_caches */
-        munmap(mapped, file_size);
-        close(fd);
+        ib_munmap(mapped, file_size);
+        ib_close(fd);
         free(model->layers);
         free(model);
         return NULL;

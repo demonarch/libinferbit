@@ -15,15 +15,12 @@
  */
 
 #include "inferbit_internal.h"
+#include "platform.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 
 /* ── GGUF types ─────────────────────────────────────────────── */
 
@@ -279,24 +276,24 @@ static int read_meta_value(ib_reader* r, ib_gguf_meta* meta) {
 /* ── Open GGUF file ─────────────────────────────────────────── */
 
 ib_gguf* ib_gguf_open(const char* path) {
-    int fd = open(path, O_RDONLY);
+    int fd = ib_open(path, O_RDONLY);
     if (fd < 0) {
         ib_set_error("failed to open %s: %s", path, strerror(errno));
         return NULL;
     }
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
+    ib_struct_stat st;
+    if (ib_fstat(fd, &st) < 0) {
         ib_set_error("failed to stat %s", path);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
     size_t file_size = (size_t)st.st_size;
 
-    void* base = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void* base = ib_mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) {
         ib_set_error("failed to mmap %s", path);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -306,8 +303,8 @@ ib_gguf* ib_gguf_open(const char* path) {
     uint32_t magic;
     if (read_u32(&r, &magic) != 0 || magic != GGUF_MAGIC) {
         ib_set_error("invalid GGUF magic");
-        munmap(base, file_size);
-        close(fd);
+        ib_munmap(base, file_size);
+        ib_close(fd);
         return NULL;
     }
 
@@ -400,15 +397,15 @@ fail2:
     free(gg);
 fail:
     ib_set_error("failed to parse GGUF header");
-    munmap(base, file_size);
-    close(fd);
+    ib_munmap(base, file_size);
+    ib_close(fd);
     return NULL;
 }
 
 void ib_gguf_close(ib_gguf* gg) {
     if (!gg) return;
-    if (gg->mmap_base) munmap(gg->mmap_base, gg->mmap_size);
-    if (gg->fd >= 0) close(gg->fd);
+    if (gg->mmap_base) ib_munmap(gg->mmap_base, gg->mmap_size);
+    if (gg->fd >= 0) ib_close(gg->fd);
     free(gg->tensors);
     free(gg->metadata);
     free(gg);

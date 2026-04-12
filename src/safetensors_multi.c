@@ -7,10 +7,15 @@
 
 #include "inferbit_internal.h"
 
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
 
 /* ── Multi-shard container ──────────────────────────────────── */
 
@@ -25,16 +30,31 @@ static int cmp_str(const void* a, const void* b) {
 }
 
 ib_safetensors_multi* ib_st_multi_open(const char* dir_path) {
+    char* files[256];
+    int count = 0;
+
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*.safetensors", dir_path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        ib_set_error("failed to open directory: %s", dir_path);
+        return NULL;
+    }
+    do {
+        char full[1024];
+        snprintf(full, sizeof(full), "%s\\%s", dir_path, fd.cFileName);
+        files[count] = strdup(full);
+        count++;
+    } while (FindNextFileA(h, &fd) && count < 256);
+    FindClose(h);
+#else
     DIR* dir = opendir(dir_path);
     if (!dir) {
         ib_set_error("failed to open directory: %s", dir_path);
         return NULL;
     }
-
-    /* Collect .safetensors filenames */
-    char* files[256];
-    int count = 0;
-
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL && count < 256) {
         size_t len = strlen(entry->d_name);
@@ -46,6 +66,7 @@ ib_safetensors_multi* ib_st_multi_open(const char* dir_path) {
         }
     }
     closedir(dir);
+#endif
 
     if (count == 0) {
         ib_set_error("no .safetensors files found in %s", dir_path);

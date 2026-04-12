@@ -6,10 +6,46 @@
  */
 
 #include "inferbit_internal.h"
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+
+#ifdef _WIN32
+#include <windows.h>
+
+/* pthreads-like API on Windows using native threads + SRWLOCK + CONDITION_VARIABLE */
+typedef HANDLE pthread_t;
+typedef SRWLOCK pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+
+#define pthread_mutex_init(m, a)     (InitializeSRWLock(m), 0)
+#define pthread_mutex_destroy(m)     ((void)0)
+#define pthread_mutex_lock(m)        AcquireSRWLockExclusive(m)
+#define pthread_mutex_unlock(m)      ReleaseSRWLockExclusive(m)
+#define pthread_cond_init(c, a)      (InitializeConditionVariable(c), 0)
+#define pthread_cond_destroy(c)      ((void)0)
+#define pthread_cond_wait(c, m)      SleepConditionVariableSRW(c, m, INFINITE, 0)
+#define pthread_cond_signal(c)       WakeConditionVariable(c)
+#define pthread_cond_broadcast(c)    WakeAllConditionVariable(c)
+
+typedef DWORD (WINAPI *win_thread_fn)(LPVOID);
+
+static int pthread_create(pthread_t* t, void* attr, void* (*fn)(void*), void* arg) {
+    (void)attr;
+    *t = CreateThread(NULL, 0, (win_thread_fn)fn, arg, 0, NULL);
+    return (*t == NULL) ? -1 : 0;
+}
+
+static int pthread_join(pthread_t t, void** retval) {
+    (void)retval;
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    return 0;
+}
+
+#else
+#include <pthread.h>
+#endif
 
 /* ── Thread pool ────────────────────────────────────────────── */
 

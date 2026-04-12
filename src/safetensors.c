@@ -8,16 +8,13 @@
  */
 
 #include "inferbit_internal.h"
+#include "platform.h"
 #include "cJSON.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 
 /* ── Tensor entry from safetensors ──────────────────────────── */
 
@@ -43,31 +40,31 @@ struct ib_safetensors {
 /* ── Parse safetensors file ─────────────────────────────────── */
 
 ib_safetensors* ib_st_open(const char* path) {
-    int fd = open(path, O_RDONLY);
+    int fd = ib_open(path, O_RDONLY);
     if (fd < 0) {
         ib_set_error("failed to open %s: %s", path, strerror(errno));
         return NULL;
     }
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
+    ib_struct_stat st;
+    if (ib_fstat(fd, &st) < 0) {
         ib_set_error("failed to stat %s", path);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
     size_t file_size = (size_t)st.st_size;
 
     if (file_size < 8) {
         ib_set_error("file too small for safetensors: %zu", file_size);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
     /* mmap entire file */
-    void* base = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void* base = ib_mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) {
         ib_set_error("failed to mmap %s", path);
-        close(fd);
+        ib_close(fd);
         return NULL;
     }
 
@@ -77,8 +74,8 @@ ib_safetensors* ib_st_open(const char* path) {
 
     if (8 + header_size > file_size) {
         ib_set_error("safetensors header size exceeds file");
-        munmap(base, file_size);
-        close(fd);
+        ib_munmap(base, file_size);
+        ib_close(fd);
         return NULL;
     }
 
@@ -87,8 +84,8 @@ ib_safetensors* ib_st_open(const char* path) {
     cJSON* root = cJSON_ParseWithLength(json_str, (size_t)header_size);
     if (!root) {
         ib_set_error("failed to parse safetensors header JSON");
-        munmap(base, file_size);
-        close(fd);
+        ib_munmap(base, file_size);
+        ib_close(fd);
         return NULL;
     }
 
@@ -147,8 +144,8 @@ ib_safetensors* ib_st_open(const char* path) {
 
 void ib_st_close(ib_safetensors* sf) {
     if (!sf) return;
-    if (sf->mmap_base) munmap(sf->mmap_base, sf->mmap_size);
-    if (sf->fd >= 0) close(sf->fd);
+    if (sf->mmap_base) ib_munmap(sf->mmap_base, sf->mmap_size);
+    if (sf->fd >= 0) ib_close(sf->fd);
     free(sf->tensors);
     free(sf);
 }

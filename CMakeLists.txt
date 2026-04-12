@@ -54,17 +54,31 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     )
 endif()
 
+# Windows-specific settings
+if(WIN32)
+    add_compile_definitions(INFERBIT_BUILD_DLL)
+    set(PLATFORM_LIBS "")
+    # AVX2 flags for MSVC
+    if(MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+        set_source_files_properties(src/kernels/avx2.c PROPERTIES
+            COMPILE_FLAGS "/arch:AVX2"
+        )
+    endif()
+else()
+    set(PLATFORM_LIBS m)
+endif()
+
 # Shared library
 add_library(inferbit SHARED ${INFERBIT_SOURCES})
 target_include_directories(inferbit PUBLIC include)
 target_include_directories(inferbit PRIVATE src)
-target_link_libraries(inferbit m)
+target_link_libraries(inferbit ${PLATFORM_LIBS})
 
 # Static library
 add_library(inferbit_static STATIC ${INFERBIT_SOURCES})
 target_include_directories(inferbit_static PUBLIC include)
 target_include_directories(inferbit_static PRIVATE src)
-target_link_libraries(inferbit_static m)
+target_link_libraries(inferbit_static ${PLATFORM_LIBS})
 set_target_properties(inferbit_static PROPERTIES OUTPUT_NAME inferbit)
 
 # Test executables

@@ -6,17 +6,17 @@
  */
 
 #include "inferbit_internal.h"
+#include "platform.h"
 #include "cJSON.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#ifndef _WIN32
 #include <dirent.h>
+#endif
 
 #define IBF_MAGIC      "INFERBIT"
 #define IBF_ALIGNMENT  64
@@ -356,12 +356,12 @@ inferbit_convert_config inferbit_default_convert_config(void) {
 inferbit_format inferbit_detect_format(const char* path) {
     if (!path) return INFERBIT_FORMAT_UNKNOWN;
 
-    int fd = open(path, O_RDONLY);
+    int fd = ib_open(path, O_RDONLY);
     if (fd < 0) return INFERBIT_FORMAT_UNKNOWN;
 
     uint8_t magic[8];
     ssize_t n = read(fd, magic, 8);
-    close(fd);
+    ib_close(fd);
     if (n < 8) return INFERBIT_FORMAT_UNKNOWN;
 
     if (memcmp(magic, "INFERBIT", 8) == 0) return INFERBIT_FORMAT_IBF;
@@ -404,7 +404,7 @@ int inferbit_convert(
     if (!cfg.progress) cfg.progress = progress_noop;
 
     /* Detect if input is a directory or single file */
-    struct stat input_stat;
+    ib_struct_stat input_stat;
     if (stat(input_path, &input_stat) != 0) {
         ib_set_error("cannot stat input: %s: %s", input_path, strerror(errno));
         return INFERBIT_ERROR_LOAD;

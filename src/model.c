@@ -1,9 +1,7 @@
 #include "inferbit_internal.h"
+#include "platform.h"
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 /* Defined in ibf_loader.c */
 inferbit_model* ibf_load(const char* path, const inferbit_config* config);
@@ -52,14 +50,14 @@ void inferbit_free(inferbit_model* model) {
          * For now, we stored the fd — re-stat to get file size.
          */
         if (model->mmap_fd >= 0) {
-            struct stat st;
-            if (fstat(model->mmap_fd, &st) == 0) {
+            ib_struct_stat st;
+            if (ib_fstat(model->mmap_fd, &st) == 0) {
                 /* Compute mmap base: weight_data minus the weight offset */
                 size_t weight_offset = model->header.weight_data_offset;
                 void* base = (uint8_t*)model->weight_data - weight_offset;
-                munmap(base, (size_t)st.st_size);
+                ib_munmap(base, (size_t)st.st_size);
             }
-            close(model->mmap_fd);
+            ib_close(model->mmap_fd);
         }
     }
 

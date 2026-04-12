@@ -6,6 +6,7 @@
  */
 
 #include "inferbit_internal.h"
+#include "platform.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,7 +76,7 @@ typedef struct {
 
 static double time_now_sec(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ib_clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
