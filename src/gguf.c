@@ -268,7 +268,7 @@ static int read_meta_value(ib_reader* r, ib_gguf_meta* meta) {
         case GGUF_TYPE_STRING: return read_string(r, meta->value.str, sizeof(meta->value.str));
         case GGUF_TYPE_UINT16: { r->pos += 2; return 0; }  /* TODO: proper read */
         case GGUF_TYPE_INT16:  { r->pos += 2; return 0; }
-        case GGUF_TYPE_ARRAY:  return skip_value(r, GGUF_TYPE_ARRAY - 1) != 0 ? -1 : 0; /* Skip arrays for now */
+        case GGUF_TYPE_ARRAY:  return skip_value(r, GGUF_TYPE_ARRAY);
         default: return -1;
     }
 }
