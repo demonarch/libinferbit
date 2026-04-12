@@ -40,6 +40,24 @@ static void scalar_matmul_int8(
     }
 }
 
+static void scalar_matmul_w4a8(
+    float* out, const void* weights, const float* scales_w,
+    const int8_t* input, float scale_a, int M, int N
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    for (int i = 0; i < M; i++) {
+        int32_t sum = 0;
+        for (int j = 0; j < N; j += 2) {
+            uint8_t byte = w[i * (N / 2) + j / 2];
+            int8_t v0 = (int8_t)(byte & 0x0F) - 8;
+            int8_t v1 = (int8_t)((byte >> 4) & 0x0F) - 8;
+            sum += (int32_t)v0 * (int32_t)input[j];
+            if (j + 1 < N) sum += (int32_t)v1 * (int32_t)input[j + 1];
+        }
+        out[i] = (float)sum * scales_w[i] * scale_a;
+    }
+}
+
 static void scalar_rmsnorm(
     float* out, const float* input, const float* weight,
     float eps, int N
@@ -110,6 +128,7 @@ void ib_init_kernels(ib_simd_level level) {
     /* Always start with scalar fallbacks */
     ib_kern.matmul_int4 = scalar_matmul_int4;
     ib_kern.matmul_int8 = scalar_matmul_int8;
+    ib_kern.matmul_w4a8 = scalar_matmul_w4a8;
     ib_kern.matmul_int2 = NULL;  /* Set by ib_init_kernels_int2 */
     ib_kern.rmsnorm     = scalar_rmsnorm;
     ib_kern.rope        = scalar_rope;

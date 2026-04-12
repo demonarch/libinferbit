@@ -207,6 +207,13 @@ typedef struct {
 
     /* Element-wise: out = a * b (SiLU gate) */
     void (*silu_mul)(float* out, const float* gate, const float* up, int N);
+
+    /* W4A8 matmul: INT4 weights × INT8 activation. Output is fp32, multiplied
+     * by scale_w[i] * scale_a. Uses ARM sdot / x86 VNNI when available. */
+    void (*matmul_w4a8)(
+        float* out, const void* weights, const float* scales_w,
+        const int8_t* input, float scale_a, int M, int N
+    );
 } ib_kernels;
 
 /* Global kernel dispatch table */
@@ -334,5 +341,10 @@ void            ib_pool_run(ib_thread_pool* tp,
 void            ib_parallel_matmul(ib_thread_pool* tp, float* out, const void* weights,
                                    const float* scales, const float* input,
                                    int M, int N, int bits);
+void            ib_parallel_matmul_w4a8(ib_thread_pool* tp, float* out,
+                                        const void* weights, const float* scales_w,
+                                        const int8_t* input, float scale_a,
+                                        int M, int N);
+float           ib_quantize_input_int8(const float* input, int8_t* out, int N);
 
 #endif /* INFERBIT_INTERNAL_H */

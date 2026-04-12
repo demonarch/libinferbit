@@ -230,11 +230,89 @@ static void neon_rope(
     }
 }
 
+/* ── W4A8 matmul (INT4 weight × INT8 activation) ─────────────
+ *
+ * Uses ARMv8.2-A dotprod (`sdot`) — 16 INT8 MACs per instruction.
+ * Present on all Apple Silicon and all Neoverse. For older ARMv8.0 we fall
+ * back to a pairwise widen+MLA (no sdot), still 2× vs scalar.
+ */
+
+#if defined(__ARM_FEATURE_DOTPROD)
+#define IB_HAS_DOTPROD 1
+#else
+#define IB_HAS_DOTPROD 0
+#endif
+
+#if IB_HAS_DOTPROD
+__attribute__((target("dotprod")))
+#endif
+static void neon_matmul_w4a8(
+    float* out, const void* weights, const float* scales_w,
+    const int8_t* input, float scale_a, int M, int N
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+
+    for (int i = 0; i < M; i++) {
+        const uint8_t* row = w + (size_t)i * (N / 2);
+        int32x4_t acc = vdupq_n_s32(0);
+
+        int j = 0;
+        /* Process 32 weights (16 packed bytes) per iteration. */
+        for (; j + 31 < N; j += 32) {
+            /* Load 16 packed bytes = 32 nibbles. */
+            uint8x16_t packed = vld1q_u8(row + j / 2);
+
+            /* Split nibbles. */
+            uint8x16_t lo_u8 = vandq_u8(packed, mask_lo);
+            uint8x16_t hi_u8 = vshrq_n_u8(packed, 4);
+            int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias);
+            int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias);
+
+            /* Interleave back into original column order:
+             * nibble j   = lo_s8[k], j+1 = hi_s8[k] (for k = j/2 mod 16). */
+            int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8);
+
+            /* Load 32 INT8 activations. */
+            int8x16_t a0 = vld1q_s8(input + j);
+            int8x16_t a1 = vld1q_s8(input + j + 16);
+
+#if IB_HAS_DOTPROD
+            acc = vdotq_s32(acc, zipped.val[0], a0);
+            acc = vdotq_s32(acc, zipped.val[1], a1);
+#else
+            /* Fallback: widen + multiply + accumulate. */
+            int16x8_t p0 = vmull_s8(vget_low_s8(zipped.val[0]), vget_low_s8(a0));
+            p0 = vmlal_s8(p0, vget_high_s8(zipped.val[0]), vget_high_s8(a0));
+            int16x8_t p1 = vmull_s8(vget_low_s8(zipped.val[1]), vget_low_s8(a1));
+            p1 = vmlal_s8(p1, vget_high_s8(zipped.val[1]), vget_high_s8(a1));
+            acc = vpadalq_s16(acc, p0);
+            acc = vpadalq_s16(acc, p1);
+#endif
+        }
+
+        int32_t sum = vaddvq_s32(acc);
+
+        /* Scalar tail. */
+        for (; j < N; j += 2) {
+            uint8_t byte = row[j / 2];
+            int8_t v0 = (int8_t)(byte & 0x0F) - 8;
+            int8_t v1 = (int8_t)((byte >> 4) & 0x0F) - 8;
+            sum += (int32_t)v0 * (int32_t)input[j];
+            if (j + 1 < N) sum += (int32_t)v1 * (int32_t)input[j + 1];
+        }
+
+        out[i] = (float)sum * scales_w[i] * scale_a;
+    }
+}
+
 /* ── Registration ───────────────────────────────────────────── */
 
 void ib_init_kernels_neon(ib_kernels* kern) {
     kern->matmul_int4 = neon_matmul_int4;
     kern->matmul_int8 = neon_matmul_int8;
+    kern->matmul_w4a8 = neon_matmul_w4a8;
     kern->rmsnorm     = neon_rmsnorm;
     kern->rope        = neon_rope;
     kern->softmax     = neon_softmax;

@@ -9,6 +9,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* W4A8 path toggle: set IB_W4A8=1 in env to route INT4 matmuls through
+ * the INT4×INT8 dot-product kernel. Cached on first call. */
+static int w4a8_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("IB_W4A8");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
 /* ── Weight data access helpers ─────────────────────────────── */
 
 /* Get pointer to weight data for a tensor */
@@ -144,7 +155,16 @@ static void tensor_matmul(
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
     }
 
-    if (t->bits == 2 || t->bits == 4 || t->bits == 8) {
+    if (t->bits == 4 && w4a8_enabled() && ib_kern.matmul_w4a8) {
+        /* Quantize input to INT8 per-call. Activation buffer lives on the
+         * stack for small N, heap otherwise. */
+        int8_t stack_a[4096];
+        int8_t* a_buf = (N <= 4096) ? stack_a : (int8_t*)malloc((size_t)N);
+        float scale_a = ib_quantize_input_int8(input, a_buf, N);
+        ib_parallel_matmul_w4a8(m->thread_pool, out, weights, scale_buf,
+                                a_buf, scale_a, M, N);
+        if (a_buf != stack_a) free(a_buf);
+    } else if (t->bits == 2 || t->bits == 4 || t->bits == 8) {
         ib_parallel_matmul(m->thread_pool, out, weights, scale_buf, input, M, N, t->bits);
     } else if (t->bits == 16) {
         const uint16_t* w = (const uint16_t*)weights;
