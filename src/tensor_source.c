@@ -6,10 +6,10 @@
  */
 
 #include "inferbit_internal.h"
+#include "platform.h"
 
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 struct ib_tensor_source {
     /* Exactly one of these is non-NULL */
@@ -20,8 +20,8 @@ struct ib_tensor_source {
 /* ── Open ───────────────────────────────────────────────────── */
 
 static int is_directory(const char* path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return 0;
+    ib_struct_stat st;
+    if (ib_stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode);
 }
 

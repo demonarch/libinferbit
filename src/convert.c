@@ -405,7 +405,7 @@ int inferbit_convert(
 
     /* Detect if input is a directory or single file */
     ib_struct_stat input_stat;
-    if (stat(input_path, &input_stat) != 0) {
+    if (ib_stat(input_path, &input_stat) != 0) {
         ib_set_error("cannot stat input: %s: %s", input_path, strerror(errno));
         return INFERBIT_ERROR_LOAD;
     }
