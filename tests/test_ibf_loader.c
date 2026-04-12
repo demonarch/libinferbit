@@ -9,7 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#ifdef _WIN32
+#include <io.h>
+#define unlink _unlink
+#else
 #include <unistd.h>
+#endif
 
 static int tests_run = 0;
 static int tests_passed = 0;

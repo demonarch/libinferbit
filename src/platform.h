@@ -50,6 +50,14 @@ static inline int ib_munmap(void* addr, size_t length) {
 #define ib_stat   _stat
 #define ib_struct_stat struct _stat
 
+/* S_ISDIR doesn't exist on MSVC */
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+
+/* unlink → _unlink on Windows */
+#define unlink _unlink
+
 /* O_RDONLY is in fcntl.h */
 
 /* clock_gettime emulation */
