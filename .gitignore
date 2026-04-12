@@ -1,5 +1,6 @@
 # Build directory
 build/
+build-x86/
 
 # Prerequisites
 *.d
@@ -53,3 +54,4 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
