@@ -11,6 +11,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* DLL export/import for Windows */
+#ifdef _WIN32
+  #ifdef INFERBIT_BUILD_DLL
+    #define IB_API __declspec(dllexport)
+  #else
+    #define IB_API __declspec(dllimport)
+  #endif
+#else
+  #define IB_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,10 +33,10 @@ extern "C" {
 #define INFERBIT_VERSION_PATCH 0
 #define INFERBIT_VERSION_STRING "0.1.0"
 
-const char* inferbit_version(void);
-int         inferbit_version_major(void);
-int         inferbit_version_minor(void);
-int         inferbit_version_patch(void);
+IB_API const char* inferbit_version(void);
+IB_API int         inferbit_version_major(void);
+IB_API int         inferbit_version_minor(void);
+IB_API int         inferbit_version_patch(void);
 
 /* ── Error codes ────────────────────────────────────────────── */
 
@@ -37,7 +48,7 @@ int         inferbit_version_patch(void);
 #define INFERBIT_ERROR_PARAM    -5
 #define INFERBIT_ERROR_INTERNAL -6
 
-const char* inferbit_last_error(void);
+IB_API const char* inferbit_last_error(void);
 
 /* ── Opaque types ───────────────────────────────────────────── */
 
@@ -46,21 +57,21 @@ typedef struct inferbit_config inferbit_config;
 
 /* ── Configuration ──────────────────────────────────────────── */
 
-inferbit_config* inferbit_config_create(void);
-void             inferbit_config_free(inferbit_config* config);
+IB_API inferbit_config* inferbit_config_create(void);
+IB_API void             inferbit_config_free(inferbit_config* config);
 
-void inferbit_config_set_threads(inferbit_config* config, int threads);
-void inferbit_config_set_context_length(inferbit_config* config, int length);
-void inferbit_config_set_kv_cache_dynamic(inferbit_config* config, int dynamic);
+IB_API void inferbit_config_set_threads(inferbit_config* config, int threads);
+IB_API void inferbit_config_set_context_length(inferbit_config* config, int length);
+IB_API void inferbit_config_set_kv_cache_dynamic(inferbit_config* config, int dynamic);
 
 /* Native parse mode (dev/debug only) */
-void inferbit_config_set_native_parse(inferbit_config* config, int enabled);
-void inferbit_config_set_native_bits(inferbit_config* config, int bits);
+IB_API void inferbit_config_set_native_parse(inferbit_config* config, int enabled);
+IB_API void inferbit_config_set_native_bits(inferbit_config* config, int bits);
 
 /* ── Model lifecycle ────────────────────────────────────────── */
 
-inferbit_model* inferbit_load(const char* path, const inferbit_config* config);
-void            inferbit_free(inferbit_model* model);
+IB_API inferbit_model* inferbit_load(const char* path, const inferbit_config* config);
+IB_API void            inferbit_free(inferbit_model* model);
 
 /* ── Sampling parameters ────────────────────────────────────── */
 
@@ -73,11 +84,11 @@ typedef struct {
     int   seed;
 } inferbit_sample_params;
 
-inferbit_sample_params inferbit_default_sample_params(void);
+IB_API inferbit_sample_params inferbit_default_sample_params(void);
 
 /* ── Generation ─────────────────────────────────────────────── */
 
-int inferbit_generate(
+IB_API int inferbit_generate(
     inferbit_model*        model,
     const int32_t*         input_tokens,
     int                    num_input_tokens,
@@ -88,7 +99,7 @@ int inferbit_generate(
 
 typedef int (*inferbit_stream_callback)(int32_t token, void* ctx);
 
-int inferbit_generate_stream(
+IB_API int inferbit_generate_stream(
     inferbit_model*        model,
     const int32_t*         input_tokens,
     int                    num_input_tokens,
@@ -97,7 +108,7 @@ int inferbit_generate_stream(
     inferbit_sample_params params
 );
 
-int inferbit_forward(
+IB_API int inferbit_forward(
     inferbit_model*  model,
     const int32_t*   tokens,
     int              num_tokens,
@@ -107,26 +118,26 @@ int inferbit_forward(
 
 /* ── KV-cache control ───────────────────────────────────────── */
 
-void inferbit_kv_clear(inferbit_model* model);
-void inferbit_kv_truncate(inferbit_model* model, int length);
-int  inferbit_kv_length(const inferbit_model* model);
+IB_API void inferbit_kv_clear(inferbit_model* model);
+IB_API void inferbit_kv_truncate(inferbit_model* model, int length);
+IB_API int  inferbit_kv_length(const inferbit_model* model);
 
 /* ── Model info ─────────────────────────────────────────────── */
 
-const char* inferbit_model_architecture(const inferbit_model* model);
-int         inferbit_model_num_layers(const inferbit_model* model);
-int         inferbit_model_hidden_size(const inferbit_model* model);
-int         inferbit_model_vocab_size(const inferbit_model* model);
-int         inferbit_model_max_context(const inferbit_model* model);
-int         inferbit_model_default_bits(const inferbit_model* model);
-size_t      inferbit_model_weight_memory(const inferbit_model* model);
-size_t      inferbit_model_kv_memory(const inferbit_model* model);
-size_t      inferbit_model_total_memory(const inferbit_model* model);
+IB_API const char* inferbit_model_architecture(const inferbit_model* model);
+IB_API int         inferbit_model_num_layers(const inferbit_model* model);
+IB_API int         inferbit_model_hidden_size(const inferbit_model* model);
+IB_API int         inferbit_model_vocab_size(const inferbit_model* model);
+IB_API int         inferbit_model_max_context(const inferbit_model* model);
+IB_API int         inferbit_model_default_bits(const inferbit_model* model);
+IB_API size_t      inferbit_model_weight_memory(const inferbit_model* model);
+IB_API size_t      inferbit_model_kv_memory(const inferbit_model* model);
+IB_API size_t      inferbit_model_total_memory(const inferbit_model* model);
 
 /* ── Speculative decoding ───────────────────────────────────── */
 
-void inferbit_set_draft_model(inferbit_model* model, inferbit_model* draft, int draft_tokens);
-void inferbit_unset_draft_model(inferbit_model* model);
+IB_API void inferbit_set_draft_model(inferbit_model* model, inferbit_model* draft, int draft_tokens);
+IB_API void inferbit_unset_draft_model(inferbit_model* model);
 
 /* ── Conversion ─────────────────────────────────────────────── */
 
@@ -141,7 +152,7 @@ typedef struct {
     void* progress_ctx;
 } inferbit_convert_config;
 
-inferbit_convert_config inferbit_default_convert_config(void);
+IB_API inferbit_convert_config inferbit_default_convert_config(void);
 
 /* Detect input format from file contents */
 typedef enum {
@@ -151,7 +162,7 @@ typedef enum {
     INFERBIT_FORMAT_IBF         = 3,
 } inferbit_format;
 
-inferbit_format inferbit_detect_format(const char* path);
+IB_API inferbit_format inferbit_detect_format(const char* path);
 
 /*
  * Convert a local model file to .ibf format.
@@ -163,7 +174,7 @@ inferbit_format inferbit_detect_format(const char* path);
  * Returns INFERBIT_OK on success, error code on failure.
  * Use inferbit_last_error() for details.
  */
-int inferbit_convert(
+IB_API int inferbit_convert(
     const char* input_path,
     const char* output_path,
     const inferbit_convert_config* config
@@ -175,7 +186,7 @@ int inferbit_convert(
  * Compute perplexity over tokenized samples (teacher forcing).
  * Returns perplexity value, or -1.0 on error.
  */
-double inferbit_perplexity(
+IB_API double inferbit_perplexity(
     inferbit_model* model,
     const int32_t* const* samples,
     const int* sample_lengths,
@@ -202,7 +213,7 @@ typedef struct {
  * results must point to an array of 3 inferbit_profile_result.
  * selected_index receives the index of the chosen profile (0-2).
  */
-int inferbit_calibrate(
+IB_API int inferbit_calibrate(
     const char* input_path,
     const char* output_dir,
     const int32_t* const* samples,
