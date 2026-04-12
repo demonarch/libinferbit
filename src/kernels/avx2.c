@@ -272,11 +272,91 @@ static void avx2_rope(
     }
 }
 
+/* ── W4A8 matmul (INT4 weight × INT8 activation, G=128) ──────
+ *
+ * Plain AVX2 path using `vpmaddwd` (pmaddwd) for INT16 × INT16 → INT32 dot
+ * pairs. No VNNI dependency, so this works on every AVX2 chip (Haswell+).
+ *
+ * A second variant using `vpdpbusd` (AVX-VNNI, Alder Lake / Zen 4+) would
+ * gain another ~1.5–1.8×; adding that is a clean follow-up once we have
+ * an x86 test box available. Not gated here yet because CPUID detection
+ * for AVX-VNNI still needs wiring in ib_detect_simd.
+ */
+static void avx2_matmul_w4a8(
+    float* out, const void* weights, const float* scales_w,
+    const int8_t* input, const float* scales_a, int M, int N
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    const int G = IB_W4A8_GROUP;
+    const int groups = N / G;
+
+    for (int i = 0; i < M; i++) {
+        const uint8_t* row = w + (size_t)i * (N / 2);
+        float row_acc = 0.0f;
+
+        for (int g = 0; g < groups; g++) {
+            const int j0 = g * G;
+            __m256i acc = _mm256_setzero_si256();
+
+            for (int k = 0; k < G; k += 32) {
+                int j = j0 + k;
+
+                /* Unpack 32 INT4 weights ∈ [-8, 7] into two __m256i of INT16. */
+                int16_t wvals[32];
+                for (int p = 0; p < 16; p++) {
+                    uint8_t byte = row[j / 2 + p];
+                    wvals[p * 2]     = (int16_t)((int32_t)(byte & 0x0F) - 8);
+                    wvals[p * 2 + 1] = (int16_t)((int32_t)((byte >> 4) & 0x0F) - 8);
+                }
+                __m256i w_lo16 = _mm256_loadu_si256((const __m256i*)wvals);
+                __m256i w_hi16 = _mm256_loadu_si256((const __m256i*)(wvals + 16));
+
+                /* Load 32 INT8 activations and sign-extend to INT16. */
+                __m128i a_lo8 = _mm_loadu_si128((const __m128i*)(input + j));
+                __m128i a_hi8 = _mm_loadu_si128((const __m128i*)(input + j + 16));
+                __m256i a_lo16 = _mm256_cvtepi8_epi16(a_lo8);
+                __m256i a_hi16 = _mm256_cvtepi8_epi16(a_hi8);
+
+                /* madd: packed s16*s16 → s32 adjacent-pair sum. */
+                __m256i p_lo = _mm256_madd_epi16(w_lo16, a_lo16);
+                __m256i p_hi = _mm256_madd_epi16(w_hi16, a_hi16);
+                acc = _mm256_add_epi32(acc, _mm256_add_epi32(p_lo, p_hi));
+            }
+
+            /* Horizontal sum of 8 × int32. */
+            __m128i hi = _mm256_extracti128_si256(acc, 1);
+            __m128i lo = _mm256_castsi256_si128(acc);
+            __m128i s4 = _mm_add_epi32(lo, hi);
+            s4 = _mm_hadd_epi32(s4, s4);
+            s4 = _mm_hadd_epi32(s4, s4);
+            int32_t sum = _mm_cvtsi128_si32(s4);
+
+            row_acc += (float)sum * scales_a[g];
+        }
+
+        int tail_start = groups * G;
+        if (tail_start < N) {
+            int32_t sum = 0;
+            for (int j = tail_start; j < N; j += 2) {
+                uint8_t byte = row[j / 2];
+                int8_t v0 = (int8_t)(byte & 0x0F) - 8;
+                int8_t v1 = (int8_t)((byte >> 4) & 0x0F) - 8;
+                sum += (int32_t)v0 * (int32_t)input[j];
+                if (j + 1 < N) sum += (int32_t)v1 * (int32_t)input[j + 1];
+            }
+            row_acc += (float)sum * scales_a[groups];
+        }
+
+        out[i] = row_acc * scales_w[i];
+    }
+}
+
 /* ── Registration ───────────────────────────────────────────── */
 
 void ib_init_kernels_avx2(ib_kernels* kern) {
     kern->matmul_int4 = avx2_matmul_int4;
     kern->matmul_int8 = avx2_matmul_int8;
+    kern->matmul_w4a8 = avx2_matmul_w4a8;
     kern->rmsnorm     = avx2_rmsnorm;
     kern->rope        = avx2_rope;
     kern->softmax     = avx2_softmax;
