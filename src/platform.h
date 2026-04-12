@@ -10,11 +10,16 @@
 /* ── Windows ────────────────────────────────────────────────── */
 
 #define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+/* ssize_t doesn't exist on Windows */
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
 
 /* mmap emulation */
 #define PROT_READ     0x1

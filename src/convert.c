@@ -360,7 +360,7 @@ inferbit_format inferbit_detect_format(const char* path) {
     if (fd < 0) return INFERBIT_FORMAT_UNKNOWN;
 
     uint8_t magic[8];
-    ssize_t n = read(fd, magic, 8);
+    int n = (int)ib_read(fd, magic, 8);
     ib_close(fd);
     if (n < 8) return INFERBIT_FORMAT_UNKNOWN;
 

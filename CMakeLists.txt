@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Compiler warnings (platform-specific)
 if(MSVC)
-    add_compile_options(/W3)
+    add_compile_options(/W3 /std:c17 /D_CRT_SECURE_NO_WARNINGS)
     set(CMAKE_C_FLAGS_RELEASE "/O2 /DNDEBUG")
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)

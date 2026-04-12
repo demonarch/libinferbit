@@ -344,7 +344,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
 
     /* Read preamble (32 bytes) */
     uint8_t preamble[IBF_PREAMBLE];
-    if (read(fd, preamble, IBF_PREAMBLE) != IBF_PREAMBLE) {
+    if (ib_read(fd, preamble, IBF_PREAMBLE) != IBF_PREAMBLE) {
         ib_set_error("failed to read IBF preamble");
         ib_close(fd);
         return NULL;
@@ -388,8 +388,8 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
         ib_close(fd);
         return NULL;
     }
-    ssize_t nread = read(fd, json_buf, header_size);
-    if (nread < 0 || (size_t)nread != header_size) {
+    int nread = (int)ib_read(fd, json_buf, (unsigned int)header_size);
+    if (nread < 0 || (unsigned int)nread != header_size) {
         ib_set_error("failed to read IBF JSON header");
         free(json_buf);
         ib_close(fd);
