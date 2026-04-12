@@ -9,10 +9,16 @@
 #include "platform.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
 
 #ifdef _WIN32
 #include <windows.h>
+
+/* C11 stdatomic not reliably available on MSVC — use Interlocked intrinsics */
+typedef volatile LONG atomic_int;
+#define atomic_store(p, v)     InterlockedExchange((p), (v))
+#define atomic_load(p)         InterlockedCompareExchange((p), 0, 0)
+#define atomic_fetch_add(p, v) InterlockedExchangeAdd((p), (v))
+#define atomic_fetch_sub(p, v) InterlockedExchangeAdd((p), -(v))
 
 /* pthreads-like API on Windows using native threads + SRWLOCK + CONDITION_VARIABLE */
 typedef HANDLE pthread_t;
@@ -46,6 +52,7 @@ static int pthread_join(pthread_t t, void** retval) {
 
 #else
 #include <pthread.h>
+#include <stdatomic.h>
 #endif
 
 /* ── Thread pool ────────────────────────────────────────────── */
