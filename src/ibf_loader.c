@@ -448,6 +448,26 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
         return NULL;
     }
 
+    /* Ask the kernel to back this region with huge pages when possible.
+     *
+     * Linux: MADV_HUGEPAGE promotes to transparent 2MB pages (if THP is
+     * enabled) and cuts the TLB miss rate dramatically on multi-GB weight
+     * sets. MADV_WILLNEED + MADV_SEQUENTIAL tell the prefetcher that the
+     * full region will be walked forward.
+     *
+     * macOS: MADV_HUGEPAGE isn't supported, but the kernel automatically
+     * promotes to 16KB pages (which is already 4× the Linux default). We
+     * still hint WILLNEED so the first-touch faults don't stall decode.
+     *
+     * Failures here are benign — they just mean we run at default page
+     * size. We don't check the return. */
+#ifdef MADV_HUGEPAGE
+    madvise(mapped, file_size, MADV_HUGEPAGE);
+#endif
+#ifdef MADV_WILLNEED
+    madvise(mapped, file_size, MADV_WILLNEED);
+#endif
+
     model->weight_data      = (uint8_t*)mapped + weight_offset;
     model->weight_data_size = weight_size;
     model->weight_data_mmap = true;
