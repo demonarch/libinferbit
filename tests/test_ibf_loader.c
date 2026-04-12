@@ -9,6 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+
+static void get_temp_file(char* buf, size_t buflen, const char* name) {
+    const char* tmp = getenv("TEMP");
+    if (!tmp) tmp = getenv("TMP");
+    if (!tmp) tmp = "/tmp";
+    snprintf(buf, buflen, "%s/%s", tmp, name);
+}
 #ifdef _WIN32
 #include <io.h>
 #define unlink _unlink
@@ -29,7 +36,7 @@ static int tests_passed = 0;
 
 /* ── Helper: write a minimal .ibf file ──────────────────────── */
 
-static const char* MINI_IBF_PATH = "/tmp/test_inferbit_mini.ibf";
+static char MINI_IBF_PATH[512];
 
 static const char* MINI_HEADER_JSON =
     "{"
@@ -241,7 +248,9 @@ void test_load_ibf_too_small(void) {
 }
 
 void test_load_wrong_extension(void) {
-    inferbit_model* model = inferbit_load("/tmp/model.safetensors", NULL);
+    char tmp_st[512];
+    get_temp_file(tmp_st, sizeof(tmp_st), "model.safetensors");
+    inferbit_model* model = inferbit_load(tmp_st, NULL);
     assert(model == NULL);
     const char* err = inferbit_last_error();
     assert(err != NULL);
@@ -280,6 +289,8 @@ void test_load_ibf_threads(void) {
 /* ── Main ───────────────────────────────────────────────────── */
 
 int main(void) {
+    get_temp_file(MINI_IBF_PATH, sizeof(MINI_IBF_PATH), "test_inferbit_mini.ibf");
+
     printf("libinferbit IBF loader tests\n");
     printf("─────────────────────────────────────────────\n");
 

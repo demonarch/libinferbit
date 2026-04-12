@@ -12,6 +12,13 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+
+static void get_temp_file(char* buf, size_t buflen, const char* name) {
+    const char* tmp = getenv("TEMP");
+    if (!tmp) tmp = getenv("TMP");
+    if (!tmp) tmp = "/tmp";
+    snprintf(buf, buflen, "%s/%s", tmp, name);
+}
 #ifdef _WIN32
 #include <io.h>
 #define unlink _unlink
@@ -40,7 +47,7 @@ static int tests_passed = 0;
  * Norms FP16 = 1.0 for all elements
  */
 
-static const char* TINY_IBF = "/tmp/test_inferbit_forward.ibf";
+static char TINY_IBF[512];
 
 /* Per-layer weight sizes (INT8 = 1 byte per element):
  * q_proj:  64*64  = 4096
@@ -529,6 +536,8 @@ void test_forward_deterministic(void) {
 /* ── Main ───────────────────────────────────────────────────── */
 
 int main(void) {
+    get_temp_file(TINY_IBF, sizeof(TINY_IBF), "test_inferbit_forward.ibf");
+
     printf("libinferbit forward pass tests\n");
     printf("─────────────────────────────────────────────\n");
 

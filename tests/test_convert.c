@@ -11,6 +11,13 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+
+static void get_temp_file(char* buf, size_t buflen, const char* name) {
+    const char* tmp = getenv("TEMP");
+    if (!tmp) tmp = getenv("TMP");
+    if (!tmp) tmp = "/tmp";
+    snprintf(buf, buflen, "%s/%s", tmp, name);
+}
 #ifdef _WIN32
 #include <io.h>
 #define unlink _unlink
@@ -45,8 +52,8 @@ static int tests_passed = 0;
 #define VOCAB 256
 #define NUM_LAYERS 2
 
-static const char* FAKE_ST = "/tmp/test_inferbit_fake.safetensors";
-static const char* OUTPUT_IBF = "/tmp/test_inferbit_converted.ibf";
+static char FAKE_ST[512];
+static char OUTPUT_IBF[512];
 
 /* FP16 representation of a small value */
 static uint16_t f32_to_fp16(float f) {
@@ -288,6 +295,9 @@ void test_convert_null_args(void) {
 /* ── Main ───────────────────────────────────────────────────── */
 
 int main(void) {
+    get_temp_file(FAKE_ST, sizeof(FAKE_ST), "test_inferbit_fake.safetensors");
+    get_temp_file(OUTPUT_IBF, sizeof(OUTPUT_IBF), "test_inferbit_converted.ibf");
+
     printf("libinferbit converter tests\n");
     printf("─────────────────────────────────────────────\n");
 
