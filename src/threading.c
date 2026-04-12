@@ -264,7 +264,7 @@ typedef struct {
     const void*   weights;
     const float*  scales_w;
     const int8_t* input;
-    float         scale_a;
+    const float*  scales_a;
     int           M;
     int           N;
 } ib_w4a8_arg;
@@ -277,41 +277,56 @@ static void parallel_w4a8_task(void* arg, int thread_id, int start, int end) {
     const uint8_t* w = (const uint8_t*)a->weights;
     const uint8_t* row_start = w + (size_t)start * (N / 2);
     ib_kern.matmul_w4a8(a->out + start, row_start, a->scales_w + start,
-                        a->input, a->scale_a, rows, N);
+                        a->input, a->scales_a, rows, N);
 }
 
 void ib_parallel_matmul_w4a8(ib_thread_pool* tp, float* out, const void* weights,
                              const float* scales_w, const int8_t* input,
-                             float scale_a, int M, int N) {
+                             const float* scales_a, int M, int N) {
     if (!tp || M < 64) {
-        ib_kern.matmul_w4a8(out, weights, scales_w, input, scale_a, M, N);
+        ib_kern.matmul_w4a8(out, weights, scales_w, input, scales_a, M, N);
         return;
     }
-    ib_w4a8_arg arg = { out, weights, scales_w, input, scale_a, M, N };
+    ib_w4a8_arg arg = { out, weights, scales_w, input, scales_a, M, N };
     int chunk = (M + tp->n_threads - 1) / tp->n_threads;
     if (chunk < 16) chunk = 16;
     ib_pool_run(tp, parallel_w4a8_task, &arg, M, chunk);
 }
 
-/* Per-token symmetric INT8 quantization. Returns the scale;
- * caller passes output buffer of N int8s. */
-float ib_quantize_input_int8(const float* input, int8_t* out, int N) {
-    float max_abs = 0.0f;
-    for (int i = 0; i < N; i++) {
-        float a = input[i] < 0 ? -input[i] : input[i];
-        if (a > max_abs) max_abs = a;
+/* Group-wise symmetric INT8 quantization (G=IB_W4A8_GROUP).
+ *
+ * Each group of IB_W4A8_GROUP elements gets its own FP32 scale. Tail group
+ * (if N % GROUP != 0) gets its own scale covering only the remaining
+ * elements. Returns the number of groups written (ceil(N / GROUP)). */
+int ib_quantize_input_int8_g128(const float* input, int8_t* out_q,
+                                float* out_scales, int N) {
+    const int G = IB_W4A8_GROUP;
+    int groups = 0;
+    for (int base = 0; base < N; base += G) {
+        int end = base + G; if (end > N) end = N;
+
+        float max_abs = 0.0f;
+        for (int i = base; i < end; i++) {
+            float a = input[i] < 0 ? -input[i] : input[i];
+            if (a > max_abs) max_abs = a;
+        }
+
+        float scale;
+        if (max_abs < 1e-10f) {
+            scale = 1e-10f;
+            for (int i = base; i < end; i++) out_q[i] = 0;
+        } else {
+            scale = max_abs / 127.0f;
+            float inv = 1.0f / scale;
+            for (int i = base; i < end; i++) {
+                float v = input[i];
+                int q = (int)(v * inv + (v >= 0 ? 0.5f : -0.5f));
+                if (q < -127) q = -127;
+                if (q > 127) q = 127;
+                out_q[i] = (int8_t)q;
+            }
+        }
+        out_scales[groups++] = scale;
     }
-    if (max_abs < 1e-10f) {
-        for (int i = 0; i < N; i++) out[i] = 0;
-        return 1e-10f;
-    }
-    float scale = max_abs / 127.0f;
-    float inv = 1.0f / scale;
-    for (int i = 0; i < N; i++) {
-        int q = (int)(input[i] * inv + (input[i] >= 0 ? 0.5f : -0.5f));
-        if (q < -127) q = -127;
-        if (q > 127) q = 127;
-        out[i] = (int8_t)q;
-    }
-    return scale;
+    return groups;
 }

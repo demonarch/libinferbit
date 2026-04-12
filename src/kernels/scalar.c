@@ -42,19 +42,28 @@ static void scalar_matmul_int8(
 
 static void scalar_matmul_w4a8(
     float* out, const void* weights, const float* scales_w,
-    const int8_t* input, float scale_a, int M, int N
+    const int8_t* input, const float* scales_a, int M, int N
 ) {
     const uint8_t* w = (const uint8_t*)weights;
+    const int G = IB_W4A8_GROUP;
     for (int i = 0; i < M; i++) {
-        int32_t sum = 0;
-        for (int j = 0; j < N; j += 2) {
-            uint8_t byte = w[i * (N / 2) + j / 2];
-            int8_t v0 = (int8_t)(byte & 0x0F) - 8;
-            int8_t v1 = (int8_t)((byte >> 4) & 0x0F) - 8;
-            sum += (int32_t)v0 * (int32_t)input[j];
-            if (j + 1 < N) sum += (int32_t)v1 * (int32_t)input[j + 1];
+        float row_acc = 0.0f;
+        int j = 0;
+        int g = 0;
+        while (j < N) {
+            int end = j + G; if (end > N) end = N;
+            int32_t sum = 0;
+            for (int jj = j; jj < end; jj += 2) {
+                uint8_t byte = w[i * (N / 2) + jj / 2];
+                int8_t v0 = (int8_t)(byte & 0x0F) - 8;
+                int8_t v1 = (int8_t)((byte >> 4) & 0x0F) - 8;
+                sum += (int32_t)v0 * (int32_t)input[jj];
+                if (jj + 1 < end) sum += (int32_t)v1 * (int32_t)input[jj + 1];
+            }
+            row_acc += (float)sum * scales_a[g];
+            j = end; g++;
         }
-        out[i] = (float)sum * scales_w[i] * scale_a;
+        out[i] = row_acc * scales_w[i];
     }
 }
 

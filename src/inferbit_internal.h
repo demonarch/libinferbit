@@ -208,13 +208,23 @@ typedef struct {
     /* Element-wise: out = a * b (SiLU gate) */
     void (*silu_mul)(float* out, const float* gate, const float* up, int N);
 
-    /* W4A8 matmul: INT4 weights × INT8 activation. Output is fp32, multiplied
-     * by scale_w[i] * scale_a. Uses ARM sdot / x86 VNNI when available. */
+    /* W4A8 matmul: INT4 weights × INT8 activation, grouped activation scale.
+     *
+     * Activation is quantized in groups of IB_W4A8_GROUP=128 elements, each
+     * with its own FP32 scale. Output[i] = sum over groups g of
+     *   (weights[i,g] · input[g]) * scales_a[g] * scales_w[i].
+     *
+     * N must be a multiple of IB_W4A8_GROUP (128). Uses ARM sdot / x86 VNNI
+     * when available. */
     void (*matmul_w4a8)(
         float* out, const void* weights, const float* scales_w,
-        const int8_t* input, float scale_a, int M, int N
+        const int8_t* input, const float* scales_a, int M, int N
     );
 } ib_kernels;
+
+/* Activation quantization group size for W4A8. Chosen to fit all transformer
+ * hidden dims used in practice (multiples of 128). */
+#define IB_W4A8_GROUP 128
 
 /* Global kernel dispatch table */
 extern ib_kernels ib_kern;
@@ -343,8 +353,11 @@ void            ib_parallel_matmul(ib_thread_pool* tp, float* out, const void* w
                                    int M, int N, int bits);
 void            ib_parallel_matmul_w4a8(ib_thread_pool* tp, float* out,
                                         const void* weights, const float* scales_w,
-                                        const int8_t* input, float scale_a,
+                                        const int8_t* input, const float* scales_a,
                                         int M, int N);
-float           ib_quantize_input_int8(const float* input, int8_t* out, int N);
+/* Per-group symmetric INT8 quantization. Writes N INT8 values and
+ * ceil(N/IB_W4A8_GROUP) FP32 scales. Returns the number of groups written. */
+int             ib_quantize_input_int8_g128(const float* input, int8_t* out_q,
+                                            float* out_scales, int N);
 
 #endif /* INFERBIT_INTERNAL_H */

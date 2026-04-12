@@ -9,13 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* W4A8 path toggle: set IB_W4A8=1 in env to route INT4 matmuls through
- * the INT4×INT8 dot-product kernel. Cached on first call. */
+/* W4A8 path is on by default. Set IB_W4A8=0 in env to force the FP32
+ * activation fallback (used for A/B comparison and debugging). */
 static int w4a8_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char* e = getenv("IB_W4A8");
-        cached = (e && e[0] == '1') ? 1 : 0;
+        cached = (e && e[0] == '0') ? 0 : 1;
     }
     return cached;
 }
@@ -156,14 +156,20 @@ static void tensor_matmul(
     }
 
     if (t->bits == 4 && w4a8_enabled() && ib_kern.matmul_w4a8) {
-        /* Quantize input to INT8 per-call. Activation buffer lives on the
-         * stack for small N, heap otherwise. */
-        int8_t stack_a[4096];
-        int8_t* a_buf = (N <= 4096) ? stack_a : (int8_t*)malloc((size_t)N);
-        float scale_a = ib_quantize_input_int8(input, a_buf, N);
+        /* Quantize input to INT8 per-group (IB_W4A8_GROUP elements per
+         * scale). Small N uses stack; larger N heap-allocates. */
+        int8_t stack_q[4096];
+        float  stack_s[4096 / IB_W4A8_GROUP + 1];
+        int n_groups = (N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
+        int8_t* q_buf = (N <= 4096) ? stack_q : (int8_t*)malloc((size_t)N);
+        float*  s_buf = (n_groups <= (int)(sizeof stack_s / sizeof *stack_s))
+                        ? stack_s
+                        : (float*)malloc((size_t)n_groups * sizeof(float));
+        ib_quantize_input_int8_g128(input, q_buf, s_buf, N);
         ib_parallel_matmul_w4a8(m->thread_pool, out, weights, scale_buf,
-                                a_buf, scale_a, M, N);
-        if (a_buf != stack_a) free(a_buf);
+                                q_buf, s_buf, M, N);
+        if (q_buf != stack_q) free(q_buf);
+        if (s_buf != stack_s) free(s_buf);
     } else if (t->bits == 2 || t->bits == 4 || t->bits == 8) {
         ib_parallel_matmul(m->thread_pool, out, weights, scale_buf, input, M, N, t->bits);
     } else if (t->bits == 16) {
