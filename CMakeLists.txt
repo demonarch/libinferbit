@@ -4,18 +4,21 @@ project(inferbit C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Compiler warnings
-add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
-
-# Build type defaults to Release
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
+# Compiler warnings (platform-specific)
+if(MSVC)
+    add_compile_options(/W3)
+    set(CMAKE_C_FLAGS_RELEASE "/O2 /DNDEBUG")
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+    set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
+    set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
 endif()
 
-# Release optimizations
-set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
-set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
-set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
+# Build type defaults to Release
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
 # Source files
 set(INFERBIT_SOURCES
@@ -47,23 +50,30 @@ set(INFERBIT_SOURCES
     src/cJSON.c
 )
 
-# AVX2 compile flags (x86_64 only)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    set_source_files_properties(src/kernels/avx2.c PROPERTIES
-        COMPILE_FLAGS "-mavx2 -mfma"
-    )
+# Determine target architecture
+# CMAKE_OSX_ARCHITECTURES overrides CMAKE_SYSTEM_PROCESSOR for macOS cross-compile
+set(TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+if(CMAKE_OSX_ARCHITECTURES)
+    set(TARGET_ARCH "${CMAKE_OSX_ARCHITECTURES}")
 endif()
 
-# Windows-specific settings
-if(WIN32)
-    add_compile_definitions(INFERBIT_BUILD_DLL)
-    set(PLATFORM_LIBS "")
-    # AVX2 flags for MSVC
-    if(MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+# AVX2 compile flags — only when targeting x86_64
+if(TARGET_ARCH MATCHES "x86_64|AMD64")
+    if(MSVC)
         set_source_files_properties(src/kernels/avx2.c PROPERTIES
             COMPILE_FLAGS "/arch:AVX2"
         )
+    else()
+        set_source_files_properties(src/kernels/avx2.c PROPERTIES
+            COMPILE_FLAGS "-mavx2 -mfma"
+        )
     endif()
+endif()
+
+# Platform libraries
+if(WIN32)
+    add_compile_definitions(INFERBIT_BUILD_DLL)
+    set(PLATFORM_LIBS "")
 else()
     set(PLATFORM_LIBS m)
 endif()
@@ -83,19 +93,19 @@ set_target_properties(inferbit_static PROPERTIES OUTPUT_NAME inferbit)
 
 # Test executables
 add_executable(test_inferbit tests/test_basic.c)
-target_link_libraries(test_inferbit inferbit_static m)
+target_link_libraries(test_inferbit inferbit_static ${PLATFORM_LIBS})
 target_include_directories(test_inferbit PRIVATE include)
 
 add_executable(test_ibf_loader tests/test_ibf_loader.c)
-target_link_libraries(test_ibf_loader inferbit_static m)
+target_link_libraries(test_ibf_loader inferbit_static ${PLATFORM_LIBS})
 target_include_directories(test_ibf_loader PRIVATE include)
 
 add_executable(test_forward tests/test_forward.c)
-target_link_libraries(test_forward inferbit_static m)
+target_link_libraries(test_forward inferbit_static ${PLATFORM_LIBS})
 target_include_directories(test_forward PRIVATE include)
 
 add_executable(test_convert tests/test_convert.c)
-target_link_libraries(test_convert inferbit_static m)
+target_link_libraries(test_convert inferbit_static ${PLATFORM_LIBS})
 target_include_directories(test_convert PRIVATE include)
 
 enable_testing()
@@ -108,5 +118,6 @@ add_test(NAME convert COMMAND test_convert)
 install(TARGETS inferbit
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
 )
 install(FILES include/inferbit.h DESTINATION include)
