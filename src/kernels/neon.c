@@ -244,7 +244,7 @@ static void neon_rope(
 #endif
 
 #if IB_HAS_DOTPROD
-__attribute__((target("dotprod")))
+__attribute__((target("dotprod"),noinline))
 #endif
 static void neon_matmul_w4a8(
     float* out, const void* weights, const float* scales_w,
@@ -314,12 +314,346 @@ static void neon_matmul_w4a8(
     }
 }
 
+/* ── W4A8 batched matmul (shared weights across B activation vectors) ─
+ *
+ * Weights are loaded once per row and applied against B independent
+ * activation vectors. The win comes from amortizing the INT4-unpack cost
+ * and, in the memory-bandwidth-bound regime, the weight load itself.
+ *
+ * Implementation note: accumulators MUST stay in NEON registers. If they
+ * spill to stack the batching gain vanishes, because per-sdot memory
+ * traffic dominates. We specialize common B (2, 4, 8) with named locals;
+ * other B use a generic path that is slower but correct.
+ */
+
+/* Inner column-chunk: unpack 32 INT4 weights. Results left in `zL` and
+ * `zH` which together hold 32 signed INT8 weights in the natural order. */
+#define W4A8_UNPACK32(packed_u8x16, zL, zH) \
+    do { \
+        uint8x16_t _p = (packed_u8x16); \
+        uint8x16_t _lo = vandq_u8(_p, mask_lo); \
+        uint8x16_t _hi = vshrq_n_u8(_p, 4); \
+        int8x16_t _lo_s = vsubq_s8(vreinterpretq_s8_u8(_lo), bias); \
+        int8x16_t _hi_s = vsubq_s8(vreinterpretq_s8_u8(_hi), bias); \
+        int8x16x2_t _z = vzipq_s8(_lo_s, _hi_s); \
+        (zL) = _z.val[0]; \
+        (zH) = _z.val[1]; \
+    } while (0)
+
+#if IB_HAS_DOTPROD
+#define W4A8_DOT(acc, wL, wH, a0, a1) \
+    do { (acc) = vdotq_s32(vdotq_s32((acc), (wL), (a0)), (wH), (a1)); } while (0)
+#else
+#define W4A8_DOT(acc, wL, wH, a0, a1) \
+    do { \
+        int16x8_t _p0 = vmull_s8(vget_low_s8(wL),  vget_low_s8(a0));  \
+        _p0 = vmlal_s8(_p0, vget_high_s8(wL), vget_high_s8(a0));      \
+        int16x8_t _p1 = vmull_s8(vget_low_s8(wH),  vget_low_s8(a1));  \
+        _p1 = vmlal_s8(_p1, vget_high_s8(wH), vget_high_s8(a1));      \
+        (acc) = vpadalq_s16((acc), _p0);                              \
+        (acc) = vpadalq_s16((acc), _p1);                              \
+    } while (0)
+#endif
+
+#if IB_HAS_DOTPROD
+__attribute__((target("dotprod"),noinline))
+#endif
+static void neon_matmul_w4a8_batch_b4(
+    float* out, const uint8_t* w, const float* scales_w,
+    const int8_t* input, const float* scales_a, int M, int N
+) {
+    const int G = IB_W4A8_GROUP;
+    const int groups = N / G;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+
+    const int8_t* in0 = input + 0 * N;
+    const int8_t* in1 = input + 1 * N;
+    const int8_t* in2 = input + 2 * N;
+    const int8_t* in3 = input + 3 * N;
+    const float* sa0 = scales_a + 0 * groups;
+    const float* sa1 = scales_a + 1 * groups;
+    const float* sa2 = scales_a + 2 * groups;
+    const float* sa3 = scales_a + 3 * groups;
+
+    for (int i = 0; i < M; i++) {
+        const uint8_t* row = w + (size_t)i * (N / 2);
+        float r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+
+        for (int g = 0; g < groups; g++) {
+            int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+            int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+            int j0 = g * G;
+
+            for (int k = 0; k < G; k += 32) {
+                int j = j0 + k;
+                uint8x16_t packed = vld1q_u8(row + j / 2);
+                int8x16_t zL, zH;
+                W4A8_UNPACK32(packed, zL, zH);
+                W4A8_DOT(a0, zL, zH, vld1q_s8(in0 + j), vld1q_s8(in0 + j + 16));
+                W4A8_DOT(a1, zL, zH, vld1q_s8(in1 + j), vld1q_s8(in1 + j + 16));
+                W4A8_DOT(a2, zL, zH, vld1q_s8(in2 + j), vld1q_s8(in2 + j + 16));
+                W4A8_DOT(a3, zL, zH, vld1q_s8(in3 + j), vld1q_s8(in3 + j + 16));
+            }
+            r0 += (float)vaddvq_s32(a0) * sa0[g];
+            r1 += (float)vaddvq_s32(a1) * sa1[g];
+            r2 += (float)vaddvq_s32(a2) * sa2[g];
+            r3 += (float)vaddvq_s32(a3) * sa3[g];
+        }
+
+        float sw = scales_w[i];
+        out[0 * M + i] = r0 * sw;
+        out[1 * M + i] = r1 * sw;
+        out[2 * M + i] = r2 * sw;
+        out[3 * M + i] = r3 * sw;
+    }
+}
+
+#if IB_HAS_DOTPROD
+__attribute__((target("dotprod"),noinline))
+#endif
+static void neon_matmul_w4a8_batch_b2(
+    float* out, const uint8_t* w, const float* scales_w,
+    const int8_t* input, const float* scales_a, int M, int N
+) {
+    const int G = IB_W4A8_GROUP;
+    const int groups = N / G;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+
+    const int8_t* in0 = input + 0 * N;
+    const int8_t* in1 = input + 1 * N;
+    const float* sa0 = scales_a + 0 * groups;
+    const float* sa1 = scales_a + 1 * groups;
+
+    for (int i = 0; i < M; i++) {
+        const uint8_t* row = w + (size_t)i * (N / 2);
+        float r0 = 0, r1 = 0;
+
+        for (int g = 0; g < groups; g++) {
+            int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+            int j0 = g * G;
+            for (int k = 0; k < G; k += 32) {
+                int j = j0 + k;
+                uint8x16_t packed = vld1q_u8(row + j / 2);
+                int8x16_t zL, zH;
+                W4A8_UNPACK32(packed, zL, zH);
+                W4A8_DOT(a0, zL, zH, vld1q_s8(in0 + j), vld1q_s8(in0 + j + 16));
+                W4A8_DOT(a1, zL, zH, vld1q_s8(in1 + j), vld1q_s8(in1 + j + 16));
+            }
+            r0 += (float)vaddvq_s32(a0) * sa0[g];
+            r1 += (float)vaddvq_s32(a1) * sa1[g];
+        }
+
+        float sw = scales_w[i];
+        out[0 * M + i] = r0 * sw;
+        out[1 * M + i] = r1 * sw;
+    }
+}
+
+/* Generic fallback — correct but slower than specialized variants because
+ * the compiler spills per-batch accumulators to stack. */
+#if IB_HAS_DOTPROD
+__attribute__((target("dotprod"),noinline))
+#endif
+static void neon_matmul_w4a8_batch_generic(
+    float* out, const uint8_t* w, const float* scales_w,
+    const int8_t* input, const float* scales_a, int M, int N, int B
+) {
+    const int G = IB_W4A8_GROUP;
+    const int groups = N / G;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+    if (B > 32) B = 32;
+
+    for (int i = 0; i < M; i++) {
+        const uint8_t* row = w + (size_t)i * (N / 2);
+        float row_acc[32] = {0};
+        for (int g = 0; g < groups; g++) {
+            int32x4_t acc[32];
+            for (int b = 0; b < B; b++) acc[b] = vdupq_n_s32(0);
+            int j0 = g * G;
+            for (int k = 0; k < G; k += 32) {
+                int j = j0 + k;
+                uint8x16_t packed = vld1q_u8(row + j / 2);
+                int8x16_t zL, zH;
+                W4A8_UNPACK32(packed, zL, zH);
+                for (int b = 0; b < B; b++) {
+                    const int8_t* arow = input + (size_t)b * N;
+                    int8x16_t a0 = vld1q_s8(arow + j);
+                    int8x16_t a1 = vld1q_s8(arow + j + 16);
+                    W4A8_DOT(acc[b], zL, zH, a0, a1);
+                }
+            }
+            for (int b = 0; b < B; b++) {
+                int32_t sum = vaddvq_s32(acc[b]);
+                row_acc[b] += (float)sum * scales_a[(size_t)b * groups + g];
+            }
+        }
+        float sw = scales_w[i];
+        for (int b = 0; b < B; b++) out[(size_t)b * M + i] = row_acc[b] * sw;
+    }
+}
+
+static void neon_matmul_w4a8_batch(
+    float* out, const void* weights, const float* scales_w,
+    const int8_t* input, const float* scales_a,
+    int M, int N, int B
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    const int groups = N / IB_W4A8_GROUP;
+
+    if (B == 1) {
+        neon_matmul_w4a8(out, weights, scales_w, input, scales_a, M, N);
+        return;
+    }
+    if (B == 2) {
+        neon_matmul_w4a8_batch_b2(out, w, scales_w, input, scales_a, M, N);
+        return;
+    }
+    if (B == 4) {
+        neon_matmul_w4a8_batch_b4(out, w, scales_w, input, scales_a, M, N);
+        return;
+    }
+    /* For 3 ≤ B ≤ 8 and larger, decompose into chunks of 4, 2, 1 using
+     * specialized helpers. Weights stay hot in L2 across the two passes,
+     * so a B=8 case effectively runs as two B=4 calls with near-full
+     * batching benefit. */
+    int done = 0;
+    while (done < B) {
+        int rem = B - done;
+        const int8_t* in_chunk  = input    + (size_t)done * N;
+        const float*  sa_chunk  = scales_a + (size_t)done * groups;
+        float*        out_chunk = out      + (size_t)done * M;
+        if (rem >= 4) {
+            neon_matmul_w4a8_batch_b4(out_chunk, w, scales_w, in_chunk, sa_chunk, M, N);
+            done += 4;
+        } else if (rem == 2 || rem == 3) {
+            neon_matmul_w4a8_batch_b2(out_chunk, w, scales_w, in_chunk, sa_chunk, M, N);
+            done += 2;
+        } else { /* rem == 1 */
+            neon_matmul_w4a8(out_chunk, weights, scales_w, in_chunk, sa_chunk, M, N);
+            done += 1;
+        }
+    }
+}
+
 /* ── Registration ───────────────────────────────────────────── */
+
+/* ── INT8 × FP32 batched matmul ─────────────────────────────
+ *
+ * Same amortization idea as matmul_w4a8_batch: weights loaded once, applied
+ * against B activation vectors. Used by the LM head during spec-decoding
+ * verify, where we want B positions' logits from a single pass over the
+ * vocab×hidden weight matrix. */
+__attribute__((noinline))
+static void neon_matmul_int8_batch_b4(
+    float* out, const int8_t* w, const float* scales_w,
+    const float* input, int M, int N
+) {
+    const float* in0 = input + 0 * N;
+    const float* in1 = input + 1 * N;
+    const float* in2 = input + 2 * N;
+    const float* in3 = input + 3 * N;
+
+    for (int i = 0; i < M; i++) {
+        const int8_t* row = w + (size_t)i * N;
+        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+        float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+
+        int j = 0;
+        for (; j + 7 < N; j += 8) {
+            int8x8_t w8 = vld1_s8(row + j);
+            int16x8_t w16 = vmovl_s8(w8);
+            float32x4_t wf_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16)));
+            float32x4_t wf_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16)));
+
+            a0 = vfmaq_f32(a0, wf_lo, vld1q_f32(in0 + j));
+            a0 = vfmaq_f32(a0, wf_hi, vld1q_f32(in0 + j + 4));
+            a1 = vfmaq_f32(a1, wf_lo, vld1q_f32(in1 + j));
+            a1 = vfmaq_f32(a1, wf_hi, vld1q_f32(in1 + j + 4));
+            a2 = vfmaq_f32(a2, wf_lo, vld1q_f32(in2 + j));
+            a2 = vfmaq_f32(a2, wf_hi, vld1q_f32(in2 + j + 4));
+            a3 = vfmaq_f32(a3, wf_lo, vld1q_f32(in3 + j));
+            a3 = vfmaq_f32(a3, wf_hi, vld1q_f32(in3 + j + 4));
+        }
+        float s0 = vaddvq_f32(a0), s1 = vaddvq_f32(a1);
+        float s2 = vaddvq_f32(a2), s3 = vaddvq_f32(a3);
+        for (; j < N; j++) {
+            float wv = (float)row[j];
+            s0 += wv * in0[j]; s1 += wv * in1[j];
+            s2 += wv * in2[j]; s3 += wv * in3[j];
+        }
+        float sw = scales_w[i];
+        out[0 * M + i] = s0 * sw;
+        out[1 * M + i] = s1 * sw;
+        out[2 * M + i] = s2 * sw;
+        out[3 * M + i] = s3 * sw;
+    }
+}
+
+__attribute__((noinline))
+static void neon_matmul_int8_batch_b2(
+    float* out, const int8_t* w, const float* scales_w,
+    const float* input, int M, int N
+) {
+    const float* in0 = input + 0 * N;
+    const float* in1 = input + 1 * N;
+
+    for (int i = 0; i < M; i++) {
+        const int8_t* row = w + (size_t)i * N;
+        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+        int j = 0;
+        for (; j + 7 < N; j += 8) {
+            int8x8_t w8 = vld1_s8(row + j);
+            int16x8_t w16 = vmovl_s8(w8);
+            float32x4_t wf_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16)));
+            float32x4_t wf_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16)));
+            a0 = vfmaq_f32(a0, wf_lo, vld1q_f32(in0 + j));
+            a0 = vfmaq_f32(a0, wf_hi, vld1q_f32(in0 + j + 4));
+            a1 = vfmaq_f32(a1, wf_lo, vld1q_f32(in1 + j));
+            a1 = vfmaq_f32(a1, wf_hi, vld1q_f32(in1 + j + 4));
+        }
+        float s0 = vaddvq_f32(a0), s1 = vaddvq_f32(a1);
+        for (; j < N; j++) {
+            float wv = (float)row[j];
+            s0 += wv * in0[j]; s1 += wv * in1[j];
+        }
+        float sw = scales_w[i];
+        out[0 * M + i] = s0 * sw;
+        out[1 * M + i] = s1 * sw;
+    }
+}
+
+static void neon_matmul_int8_batch(
+    float* out, const void* weights, const float* scales_w,
+    const float* input, int M, int N, int B
+) {
+    const int8_t* w = (const int8_t*)weights;
+    int done = 0;
+    while (done < B) {
+        int rem = B - done;
+        const float* in_chunk = input + (size_t)done * N;
+        float*       out_chunk = out  + (size_t)done * M;
+        if (rem >= 4) {
+            neon_matmul_int8_batch_b4(out_chunk, w, scales_w, in_chunk, M, N);
+            done += 4;
+        } else if (rem >= 2) {
+            neon_matmul_int8_batch_b2(out_chunk, w, scales_w, in_chunk, M, N);
+            done += 2;
+        } else {
+            neon_matmul_int8(out_chunk, w, scales_w, in_chunk, M, N);
+            done += 1;
+        }
+    }
+}
 
 void ib_init_kernels_neon(ib_kernels* kern) {
     kern->matmul_int4 = neon_matmul_int4;
     kern->matmul_int8 = neon_matmul_int8;
     kern->matmul_w4a8 = neon_matmul_w4a8;
+    kern->matmul_w4a8_batch = neon_matmul_w4a8_batch;
+    kern->matmul_int8_batch = neon_matmul_int8_batch;
     kern->rmsnorm     = neon_rmsnorm;
     kern->rope        = neon_rope;
     kern->softmax     = neon_softmax;

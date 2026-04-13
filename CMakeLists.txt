@@ -13,6 +13,13 @@ else()
     set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
     set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
+
+    # Tune for the host microarchitecture on Apple Silicon (enables dotprod
+    # scheduling and register pressure assumptions that the kernels rely on
+    # to keep batch accumulators in NEON registers instead of spilling).
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        add_compile_options(-mcpu=apple-m1)
+    endif()
 endif()
 
 # Build type defaults to Release

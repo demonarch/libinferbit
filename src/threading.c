@@ -293,6 +293,103 @@ void ib_parallel_matmul_w4a8(ib_thread_pool* tp, float* out, const void* weights
     ib_pool_run(tp, parallel_w4a8_task, &arg, M, chunk);
 }
 
+/* ── Parallel batched W4A8 matmul (threaded over rows) ───────
+ *
+ * Thread pool splits row range. Each worker runs the single-position W4A8
+ * kernel B times over its row slice, so the kernel registers stay hot for
+ * each batch lane but weight bandwidth is amortized via L2 reuse. This is
+ * slightly less effective than calling the batched kernel itself per
+ * worker, but avoids the out[b*M + i] layout mismatch that the batched
+ * kernel would introduce on a row-sliced output. */
+typedef struct {
+    float*        out;
+    const void*   weights;
+    const float*  scales_w;
+    const int8_t* input;
+    const float*  scales_a;
+    int           M;
+    int           N;
+    int           B;
+} ib_w4a8_batch_arg;
+
+static void parallel_w4a8_batch_task(void* arg, int thread_id, int start, int end) {
+    (void)thread_id;
+    ib_w4a8_batch_arg* a = (ib_w4a8_batch_arg*)arg;
+    int rows = end - start;
+    const uint8_t* w = (const uint8_t*)a->weights;
+    const uint8_t* row_start = w + (size_t)start * (a->N / 2);
+    int groups = a->N / IB_W4A8_GROUP;
+    for (int b = 0; b < a->B; b++) {
+        float* out_slice = a->out + (size_t)b * a->M + start;
+        const int8_t* in = a->input + (size_t)b * a->N;
+        const float* sa = a->scales_a + (size_t)b * groups;
+        ib_kern.matmul_w4a8(out_slice, row_start, a->scales_w + start,
+                            in, sa, rows, a->N);
+    }
+}
+
+void ib_parallel_matmul_w4a8_batch(ib_thread_pool* tp, float* out,
+                                   const void* weights, const float* scales_w,
+                                   const int8_t* input, const float* scales_a,
+                                   int M, int N, int B) {
+    if (!tp || M < 64) {
+        ib_kern.matmul_w4a8_batch(out, weights, scales_w, input, scales_a, M, N, B);
+        return;
+    }
+    ib_w4a8_batch_arg arg = { out, weights, scales_w, input, scales_a, M, N, B };
+    int chunk = (M + tp->n_threads - 1) / tp->n_threads;
+    if (chunk < 16) chunk = 16;
+    ib_pool_run(tp, parallel_w4a8_batch_task, &arg, M, chunk);
+}
+
+/* ── Parallel batched INT8 matmul (threaded over rows) ────────
+ *
+ * The per-kernel batched matmul (neon_matmul_int8_batch) is single-thread.
+ * For a large output head (vocab × hidden = 128K × 4K for Llama) we need
+ * to split rows across the thread pool. Threading the batch axis would
+ * fight cache reuse on weights, so we stay row-parallel. */
+typedef struct {
+    float*       out;
+    const void*  weights;
+    const float* scales_w;
+    const float* input;
+    int          M;
+    int          N;
+    int          B;
+} ib_int8_batch_arg;
+
+static void parallel_int8_batch_task(void* arg, int thread_id, int start, int end) {
+    (void)thread_id;
+    ib_int8_batch_arg* a = (ib_int8_batch_arg*)arg;
+    int rows = end - start;
+    const int8_t* w = (const int8_t*)a->weights;
+    const int8_t* row_start = w + (size_t)start * a->N;
+    /* Per-batch lane dispatch into row slice. The kernel uses M for row
+     * stride in the output, but we're only writing rows [start..end). To
+     * match the global out[b*M + i] layout we place each batch's partial
+     * output at out + b*M + start and run a single-row-dense kernel over
+     * `rows` rows. */
+    for (int b = 0; b < a->B; b++) {
+        float* out_slice = a->out + (size_t)b * a->M + start;
+        const float* in = a->input + (size_t)b * a->N;
+        ib_kern.matmul_int8(out_slice, row_start, a->scales_w + start,
+                            in, rows, a->N);
+    }
+}
+
+void ib_parallel_matmul_int8_batch(ib_thread_pool* tp, float* out,
+                                   const void* weights, const float* scales_w,
+                                   const float* input, int M, int N, int B) {
+    if (!tp || M < 64) {
+        ib_kern.matmul_int8_batch(out, weights, scales_w, input, M, N, B);
+        return;
+    }
+    ib_int8_batch_arg arg = { out, weights, scales_w, input, M, N, B };
+    int chunk = (M + tp->n_threads - 1) / tp->n_threads;
+    if (chunk < 16) chunk = 16;
+    ib_pool_run(tp, parallel_int8_batch_task, &arg, M, chunk);
+}
+
 /* Group-wise symmetric INT8 quantization (G=IB_W4A8_GROUP).
  *
  * Each group of IB_W4A8_GROUP elements gets its own FP32 scale. Tail group

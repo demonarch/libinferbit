@@ -267,19 +267,20 @@ int inferbit_generate(
     int generated = 0;
     int eos = model->header.eos_token_id;
 
-    int use_spec = (model->draft_model != NULL && params.temperature < 0.01f);
-    if (use_spec) {
-        inferbit_model* draft = model->draft_model;
-        if (draft->header.vocab_size != vocab) {
-            use_spec = 0;
-        } else {
-            inferbit_kv_clear(draft);
-            rc = ib_forward(draft, input_tokens, num_input_tokens, draft->buf_logits);
-            if (rc != INFERBIT_OK) use_spec = 0;
-        }
+    int greedy    = (params.temperature < 0.01f);
+    int use_draft = greedy && model->draft_model != NULL &&
+                    model->draft_model->header.vocab_size == vocab;
+    int use_lookup = greedy && !use_draft &&
+                     model->lookup_ngram > 0 && model->lookup_k > 0;
+
+    if (use_draft) {
+        inferbit_kv_clear(model->draft_model);
+        rc = ib_forward(model->draft_model, input_tokens, num_input_tokens,
+                        model->draft_model->buf_logits);
+        if (rc != INFERBIT_OK) use_draft = 0;
     }
 
-    if (!use_spec) {
+    if (!use_draft && !use_lookup) {
         int32_t next_token = sample_token(logits, vocab, params, input_tokens, num_input_tokens);
         out_tokens[generated++] = next_token;
         if (next_token == eos) return generated;
@@ -294,69 +295,125 @@ int inferbit_generate(
         return generated;
     }
 
-    inferbit_model* draft = model->draft_model;
-    float* dlogits = draft->buf_logits;
-    int draft_k = model->draft_tokens > 0 ? model->draft_tokens : 4;
-    if (draft_k > 32) draft_k = 32;
+    /* Speculative decoding (greedy only).
+     *
+     * Invariant: at the top of each round, `logits` holds the main model's
+     * next-token prediction given the sequence emitted so far. We produce k
+     * draft candidates, verify them in a single k-length forward over the
+     * main model, and emit (accepted + 1) tokens per round. KV caches are
+     * rolled back to match what was actually accepted. */
+    int k_cfg = use_draft ? (model->draft_tokens > 0 ? model->draft_tokens : 4)
+                          : model->lookup_k;
+    if (k_cfg < 1)  k_cfg = 1;
+    if (k_cfg > 32) k_cfg = 32;
+
     int32_t candidates[32];
+    int hist_cap = num_input_tokens + max_out_tokens + 8;
+    int32_t* history = (int32_t*)malloc((size_t)hist_cap * sizeof(int32_t));
+    if (!history) return INFERBIT_ERROR_PARAM;
+    int hist_n = 0;
+    for (int i = 0; i < num_input_tokens; i++) history[hist_n++] = input_tokens[i];
+
+    float* verify_logits = (float*)malloc((size_t)k_cfg * vocab * sizeof(float));
+    if (!verify_logits) { free(history); return INFERBIT_ERROR_PARAM; }
 
     while (generated < max_out_tokens) {
-        int base_draft_len = inferbit_kv_length(draft);
-
-        int k = draft_k;
+        int k = k_cfg;
         if (k > (max_out_tokens - generated)) k = max_out_tokens - generated;
+        if (k < 1) break;
 
-        int32_t dtok = sample_argmax(dlogits, vocab);
-        for (int i = 0; i < k; i++) {
-            candidates[i] = dtok;
-            rc = ib_forward(draft, &dtok, 1, dlogits);
-            if (rc != INFERBIT_OK) return rc;
-            dtok = sample_argmax(dlogits, vocab);
-        }
-
-        int accepted = 0;
-        int mismatch = 0;
-        int32_t mismatch_tok = -1;
-
-        for (int i = 0; i < k && generated < max_out_tokens; i++) {
-            int32_t mtok = sample_argmax(logits, vocab);
-            if (mtok == candidates[i]) {
-                out_tokens[generated++] = mtok;
-                if (mtok == eos) return generated;
-                accepted++;
-                rc = ib_forward(model, &mtok, 1, logits);
-                if (rc != INFERBIT_OK) return rc;
-            } else {
-                mismatch = 1;
-                mismatch_tok = mtok;
-                break;
+        /* Produce candidates. */
+        int have = 0;
+        if (use_lookup) {
+            have = ib_lookup_candidates(history, hist_n,
+                                        model->lookup_ngram, k, candidates);
+        } else {
+            inferbit_model* draft = model->draft_model;
+            float* dlogits = draft->buf_logits;
+            for (int i = 0; i < k; i++) {
+                int32_t dtok = sample_argmax(dlogits, vocab);
+                candidates[i] = dtok;
+                rc = ib_forward(draft, &dtok, 1, dlogits);
+                if (rc != INFERBIT_OK) { free(history); free(verify_logits); return rc; }
             }
+            have = k;
         }
 
-        if (mismatch) {
-            out_tokens[generated++] = mismatch_tok;
-            if (mismatch_tok == eos) return generated;
-            rc = ib_forward(model, &mismatch_tok, 1, logits);
-            if (rc != INFERBIT_OK) return rc;
+        int32_t mtok0 = sample_argmax(logits, vocab);
 
-            inferbit_kv_truncate(draft, base_draft_len + accepted);
-            rc = ib_forward(draft, &mismatch_tok, 1, dlogits);
-            if (rc != INFERBIT_OK) return rc;
+        if (have == 0 || candidates[0] != mtok0) {
+            /* No speculation win — emit main's pick and continue. */
+            out_tokens[generated++] = mtok0;
+            history[hist_n++] = mtok0;
+            if (mtok0 == eos) break;
+            rc = ib_forward(model, &mtok0, 1, logits);
+            if (rc != INFERBIT_OK) { free(history); free(verify_logits); return rc; }
+
+            if (use_draft) {
+                inferbit_model* draft = model->draft_model;
+                int base = inferbit_kv_length(draft);
+                inferbit_kv_truncate(draft, base - k);
+                rc = ib_forward(draft, &mtok0, 1, draft->buf_logits);
+                if (rc != INFERBIT_OK) { free(history); free(verify_logits); return rc; }
+            }
             continue;
         }
 
-        if (generated >= max_out_tokens) break;
+        /* c[0] matches main's top pick. Verify c[1..have-1] in one forward. */
+        int base_main = inferbit_kv_length(model);
+        int verify_len = have;
+        rc = ib_forward_positions(model, candidates, verify_len, verify_logits);
+        if (rc != INFERBIT_OK) { free(history); free(verify_logits); return rc; }
 
-        int32_t extra = sample_argmax(logits, vocab);
-        out_tokens[generated++] = extra;
-        if (extra == eos) return generated;
+        /* verify_logits[i] = main's prediction after consuming c[0..i]. */
+        int accept = 1;  /* c[0] already matched */
+        int32_t correction = -1;
+        for (int i = 1; i < verify_len; i++) {
+            int32_t want = sample_argmax(verify_logits + (size_t)(i - 1) * vocab, vocab);
+            if (want == candidates[i]) accept++;
+            else { correction = want; break; }
+        }
 
-        rc = ib_forward(model, &extra, 1, logits);
-        if (rc != INFERBIT_OK) return rc;
-        rc = ib_forward(draft, &extra, 1, dlogits);
-        if (rc != INFERBIT_OK) return rc;
+        int32_t bonus = -1;
+        if (accept == verify_len) {
+            bonus = sample_argmax(verify_logits + (size_t)(verify_len - 1) * vocab, vocab);
+        }
+
+        /* Emit accepted candidates. */
+        int eos_hit = 0;
+        for (int i = 0; i < accept && generated < max_out_tokens; i++) {
+            out_tokens[generated++] = candidates[i];
+            history[hist_n++] = candidates[i];
+            if (candidates[i] == eos) { eos_hit = 1; break; }
+        }
+        if (eos_hit) break;
+
+        /* Roll main KV back to end of accepted prefix, then apply correction
+         * or bonus token. That single-token forward re-seeds `logits`. */
+        inferbit_kv_truncate(model, base_main + accept);
+
+        int32_t seed_tok = (correction >= 0) ? correction : bonus;
+        if (generated < max_out_tokens && seed_tok >= 0) {
+            out_tokens[generated++] = seed_tok;
+            history[hist_n++] = seed_tok;
+            if (seed_tok == eos) break;
+            rc = ib_forward(model, &seed_tok, 1, logits);
+            if (rc != INFERBIT_OK) { free(history); free(verify_logits); return rc; }
+        }
+
+        if (use_draft) {
+            inferbit_model* draft = model->draft_model;
+            int base_draft = inferbit_kv_length(draft);
+            inferbit_kv_truncate(draft, base_draft - (k - accept));
+            if (seed_tok >= 0) {
+                rc = ib_forward(draft, &seed_tok, 1, draft->buf_logits);
+                if (rc != INFERBIT_OK) { free(history); free(verify_logits); return rc; }
+            }
+        }
     }
 
+    free(history);
+    free(verify_logits);
     return generated;
 }
 

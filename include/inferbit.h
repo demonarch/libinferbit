@@ -139,6 +139,19 @@ IB_API size_t      inferbit_model_total_memory(const inferbit_model* model);
 IB_API void inferbit_set_draft_model(inferbit_model* model, inferbit_model* draft, int draft_tokens);
 IB_API void inferbit_unset_draft_model(inferbit_model* model);
 
+/* Prompt-lookup speculation: no external draft model required.
+ *
+ * Each decode step, the last `ngram` output tokens are searched against the
+ * running history (prompt + generated tokens). On a match, the `k` tokens
+ * following the earliest match are used as draft candidates, verified in a
+ * single forward pass over the main model. Cheapest form of speculation —
+ * useful for workloads with repeated structure (code completion, retrieval-
+ * augmented generation, translation, repeated templated output).
+ *
+ * Set ngram = 0 to disable. Typical values: ngram = 2 or 3, k = 4 to 10.
+ * Works with greedy decoding (temperature < 0.01). */
+IB_API void inferbit_set_prompt_lookup(inferbit_model* model, int ngram, int k);
+
 /* ── Conversion ─────────────────────────────────────────────── */
 
 typedef struct {
