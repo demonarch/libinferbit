@@ -20,6 +20,57 @@ static int w4a8_enabled(void) {
     return cached;
 }
 
+/* MLP activation-sparsity threshold. Post-silu_mul, neurons whose
+ * |activation| < threshold * max(|activation|) are zeroed, so their
+ * contribution to the subsequent down_proj matmul is zero.
+ *
+ * On a bandwidth-bound CPU path with packed INT4 row-major weights this
+ * does NOT save memory reads — the kernel still streams every row of
+ * down_proj. It only saves arithmetic on the zeroed columns. The real
+ * bandwidth win from activation sparsity requires a column-major
+ * down_proj layout and a column-sparse matmul kernel, which is Phase 2.
+ *
+ * Phase 1 ships this as a runtime toggle so we can measure quality
+ * impact, tune the threshold, and have the plumbing in place for when
+ * Phase 2 rewires the kernel path.
+ *
+ * Reasonable values per Script 4 (TinyLlama, wikitext):
+ *   0.01  — ~60%% neurons kept, <1%% PPL cost (conservative)
+ *   0.05  — ~17%% neurons kept, ~1-3%% PPL cost (aggressive)
+ *   0.10  — ~5.4%% neurons kept, higher PPL cost (extreme)
+ *   0.0   — disabled (default) */
+static float act_sparsity_threshold(void) {
+    static float cached = -1.0f;
+    if (cached < 0.0f) {
+        const char* e = getenv("IB_ACT_SPARSITY");
+        cached = (e && *e) ? (float)atof(e) : 0.0f;
+        if (cached < 0.0f) cached = 0.0f;
+        if (cached > 1.0f) cached = 1.0f;
+    }
+    return cached;
+}
+
+/* Apply threshold-based activation sparsity in place.
+ *
+ * Computes max |h[i]| then zeros entries whose magnitude is below
+ * threshold * max. Returns number of neurons kept (for diagnostics). */
+static int apply_act_sparsity(float* h, int n, float threshold) {
+    if (threshold <= 0.0f || n <= 0) return n;
+    float m = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = h[i] < 0 ? -h[i] : h[i];
+        if (a > m) m = a;
+    }
+    float cutoff = m * threshold;
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        float a = h[i] < 0 ? -h[i] : h[i];
+        if (a < cutoff) h[i] = 0.0f;
+        else kept++;
+    }
+    return kept;
+}
+
 /* ── Weight data access helpers ─────────────────────────────── */
 
 /* Get pointer to weight data for a tensor */
@@ -635,6 +686,10 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
             tensor_matmul_sparse(m, &layer->gate_proj, hb, xb, inter, hidden, scale_buf, sp_mask);
             tensor_matmul_sparse(m, &layer->up_proj, hb2, xb, inter, hidden, scale_buf, sp_mask);
             ib_kern.silu_mul(hb, hb, hb2, inter);
+            /* DejaVu-style activation sparsity: zero small post-silu
+             * activations so down_proj multiplies them by zero. Phase 1
+             * is compute-only; bandwidth savings need column-major layout. */
+            apply_act_sparsity(hb, inter, act_sparsity_threshold());
             /* down_proj reads from hb which already has zeros for masked rows —
              * the multiply by zero propagates naturally, no sparse path needed */
             tensor_matmul(m, &layer->down_proj, xb, hb, hidden, inter, scale_buf);
@@ -828,6 +883,7 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
                 tensor_matmul_sparse(m, &layer->gate_proj, hb_b, xb_b, inter, hidden, scale_buf, sp_mask);
                 tensor_matmul_sparse(m, &layer->up_proj, hb2_b, xb_b, inter, hidden, scale_buf, sp_mask);
                 ib_kern.silu_mul(hb_b, hb_b, hb2_b, inter);
+                apply_act_sparsity(hb_b, inter, act_sparsity_threshold());
                 tensor_matmul(m, &layer->down_proj, xb_out, hb_b, hidden, inter, scale_buf);
             }
         } else {
@@ -835,10 +891,12 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
                                 scale_buf, q_scratch, sa_scratch);
             tensor_matmul_batch(m, &layer->up_proj, hb2, xb, inter, hidden, B,
                                 scale_buf, q_scratch, sa_scratch);
+            float thr = act_sparsity_threshold();
             for (int b = 0; b < B; b++) {
                 ib_kern.silu_mul(hb + (size_t)b * inter,
                                  hb + (size_t)b * inter,
                                  hb2 + (size_t)b * inter, inter);
+                apply_act_sparsity(hb + (size_t)b * inter, inter, thr);
             }
             tensor_matmul_batch(m, &layer->down_proj, xb, hb, hidden, inter, B,
                                 scale_buf, q_scratch, sa_scratch);
