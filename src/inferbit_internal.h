@@ -417,4 +417,16 @@ void            ib_parallel_matmul_int8_batch(ib_thread_pool* tp, float* out,
 int             ib_quantize_input_int8_g128(const float* input, int8_t* out_q,
                                             float* out_scales, int N);
 
+/* Column-sparse INT4 matmul. See src/kernels/sparse.c for contract. */
+void            ib_matmul_int4_col_sparse_scalar(
+                    float* out, const uint8_t* weights_cm, const float* scales_w,
+                    const int* active_idx, const float* active_vals,
+                    int M, int N, int n_active);
+#if defined(__aarch64__) || defined(_M_ARM64)
+void            ib_matmul_int4_col_sparse_neon(
+                    float* out, const uint8_t* weights_cm, const float* scales_w,
+                    const int* active_idx, const float* active_vals,
+                    int M, int N, int n_active);
+#endif
+
 #endif /* INFERBIT_INTERNAL_H */

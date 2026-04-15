@@ -41,6 +41,7 @@ set(INFERBIT_SOURCES
     src/kernels/avx2.c
     src/kernels/neon.c
     src/kernels/ternary.c
+    src/kernels/sparse.c
     src/forward.c
     src/threading.c
     src/ibf_loader.c
