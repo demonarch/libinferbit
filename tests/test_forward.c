@@ -533,6 +533,65 @@ void test_forward_deterministic(void) {
     unlink(TINY_IBF);
 }
 
+/* End-to-end speculative-decoding exercise on the tiny synthetic model.
+ *
+ * Two copies of the same .ibf are loaded — one as main, one as draft. This
+ * satisfies the vocab-match and greedy requirements of the spec path. With
+ * identical weights the accept rate is 100% (draft predicts exactly what the
+ * main model will predict), which lets us check that the verify/bonus/KV-
+ * rollback logic runs end-to-end without crashing and produces the same
+ * output tokens as non-spec greedy generation. Not a quality/perf bench —
+ * it's a smoke test for the spec control flow. */
+void test_spec_decoding_tiny(void) {
+    write_tiny_ibf();
+    inferbit_config* cfg = inferbit_config_create();
+
+    inferbit_model* main_m  = inferbit_load(TINY_IBF, cfg);
+    inferbit_model* draft_m = inferbit_load(TINY_IBF, cfg);
+    if (!main_m || !draft_m) { fprintf(stderr, "load failed\n"); exit(1); }
+
+    int32_t input[]     = {1, 7, 13, 42};
+    const int N_IN      = 4;
+    const int MAX_OUT   = 12;
+
+    inferbit_sample_params p = inferbit_default_sample_params();
+    p.temperature = 0.0f;  /* Greedy required for spec path */
+    p.seed        = 1;
+    p.max_tokens  = MAX_OUT;
+
+    /* Reference: greedy non-spec generation on main alone. */
+    int32_t ref_out[16];
+    int ref_n = inferbit_generate(main_m, input, N_IN, ref_out, MAX_OUT, p);
+    if (ref_n <= 0) { fprintf(stderr, "ref generate returned %d\n", ref_n); exit(1); }
+
+    /* Reset state on both models so the spec run starts clean. */
+    inferbit_kv_clear(main_m);
+    inferbit_kv_clear(draft_m);
+
+    /* Spec run: same tiny model as draft. With identical weights each draft
+     * candidate should match the main model's argmax, so all k accepted. */
+    inferbit_set_draft_model(main_m, draft_m, 4);
+
+    int32_t spec_out[16];
+    int spec_n = inferbit_generate(main_m, input, N_IN, spec_out, MAX_OUT, p);
+    if (spec_n != ref_n) {
+        fprintf(stderr, "spec generated %d tokens, ref generated %d\n", spec_n, ref_n);
+        exit(1);
+    }
+    for (int i = 0; i < ref_n; i++) {
+        if (spec_out[i] != ref_out[i]) {
+            fprintf(stderr, "spec token %d = %d, ref = %d\n", i, spec_out[i], ref_out[i]);
+            exit(1);
+        }
+    }
+
+    inferbit_unset_draft_model(main_m);
+    inferbit_free(draft_m);
+    inferbit_free(main_m);
+    inferbit_config_free(cfg);
+    unlink(TINY_IBF);
+}
+
 /* ── Main ───────────────────────────────────────────────────── */
 
 int main(void) {
@@ -548,6 +607,7 @@ int main(void) {
     TEST(test_generate_stream);
     TEST(test_kv_clear_and_reuse);
     TEST(test_forward_deterministic);
+    TEST(test_spec_decoding_tiny);
 
     printf("─────────────────────────────────────────────\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);

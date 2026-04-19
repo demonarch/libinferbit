@@ -1,5 +1,6 @@
 #include "inferbit_internal.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -300,6 +301,13 @@ int inferbit_generate(
     if (draft_k > 32) draft_k = 32;
     int32_t candidates[32];
 
+    /* Optional accept-rate telemetry — off unless IB_SPEC_LOG is set. Counts
+     * candidates drafted vs accepted across the generation. Prints a single
+     * summary line at the end. Has no effect on the generated output. */
+    const char* spec_log_env = getenv("IB_SPEC_LOG");
+    int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
+    long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
+
     while (generated < max_out_tokens) {
         int base_draft_len = inferbit_kv_length(draft);
 
@@ -322,7 +330,15 @@ int inferbit_generate(
             int32_t mtok = sample_argmax(logits, vocab);
             if (mtok == candidates[i]) {
                 out_tokens[generated++] = mtok;
-                if (mtok == eos) return generated;
+                if (mtok == eos) {
+                    if (spec_log) {
+                        stat_drafted += k; stat_accepted += accepted + 1; stat_rounds++;
+                        fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
+                                stat_rounds, stat_drafted, stat_accepted,
+                                stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
+                    }
+                    return generated;
+                }
                 accepted++;
                 rc = ib_forward(model, &mtok, 1, logits);
                 if (rc != INFERBIT_OK) return rc;
@@ -333,9 +349,18 @@ int inferbit_generate(
             }
         }
 
+        if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+
         if (mismatch) {
             out_tokens[generated++] = mismatch_tok;
-            if (mismatch_tok == eos) return generated;
+            if (mismatch_tok == eos) {
+                if (spec_log) {
+                    fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
+                            stat_rounds, stat_drafted, stat_accepted,
+                            stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
+                }
+                return generated;
+            }
             rc = ib_forward(model, &mismatch_tok, 1, logits);
             if (rc != INFERBIT_OK) return rc;
 
@@ -349,7 +374,14 @@ int inferbit_generate(
 
         int32_t extra = sample_argmax(logits, vocab);
         out_tokens[generated++] = extra;
-        if (extra == eos) return generated;
+        if (extra == eos) {
+            if (spec_log) {
+                fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
+                        stat_rounds, stat_drafted, stat_accepted,
+                        stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
+            }
+            return generated;
+        }
 
         rc = ib_forward(model, &extra, 1, logits);
         if (rc != INFERBIT_OK) return rc;
@@ -357,6 +389,11 @@ int inferbit_generate(
         if (rc != INFERBIT_OK) return rc;
     }
 
+    if (spec_log) {
+        fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
+                stat_rounds, stat_drafted, stat_accepted,
+                stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
+    }
     return generated;
 }
 
