@@ -28,6 +28,7 @@ set(INFERBIT_SOURCES
     src/model.c
     src/generate.c
     src/kv_cache.c
+    src/prefix_cache.c
     src/speculative.c
     src/simd.c
     src/kernels/scalar.c

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <sys/stat.h>
 
 static void get_temp_file(char* buf, size_t buflen, const char* name) {
     const char* tmp = getenv("TEMP");
@@ -533,6 +534,88 @@ void test_forward_deterministic(void) {
     unlink(TINY_IBF);
 }
 
+/* Exercise the on-disk prefix cache: run a long-enough prompt twice with
+ * greedy sampling. First run populates the cache, second run restores from
+ * it. Outputs must match byte-for-byte. */
+void test_prefix_cache_hit(void) {
+    write_tiny_ibf();
+
+    char cache_dir[512];
+    const char* tmp = getenv("TMPDIR");
+    if (!tmp) tmp = "/tmp";
+    snprintf(cache_dir, sizeof(cache_dir), "%s/ib_prefix_cache_test_%d",
+             tmp, (int)getpid());
+
+    /* Clean any leftover cache from previous runs. */
+    char rmcmd[600];
+    snprintf(rmcmd, sizeof(rmcmd), "rm -rf %s", cache_dir);
+    (void)system(rmcmd);
+
+    setenv("IB_PREFIX_CACHE_DIR", cache_dir, 1);
+    /* min_tokens default is 32 — we need MAX_CTX-room for decode. Use 40 to
+     * clear the threshold without exhausting the 64-token context. */
+    const int N = 40;
+    int32_t input[64];
+    for (int i = 0; i < N; i++) input[i] = (int32_t)((i * 37 + 13) % VOCAB);
+
+    inferbit_sample_params p = inferbit_default_sample_params();
+    p.max_tokens  = 8;
+    p.temperature = 0.0f;   /* Greedy → deterministic */
+    p.seed        = 42;
+
+    /* Run 1: cache miss, populates the cache. */
+    inferbit_config* cfg = inferbit_config_create();
+    inferbit_model* m1 = inferbit_load(TINY_IBF, cfg);
+    if (!m1) { fprintf(stderr, "load m1 failed\n"); exit(1); }
+    int32_t out1[16];
+    int n1 = inferbit_generate(m1, input, N, out1, 8, p);
+    if (n1 <= 0) { fprintf(stderr, "generate #1 returned %d\n", n1); exit(1); }
+    inferbit_free(m1);
+
+    /* The cache file must now exist. */
+    char check_cmd[700];
+    snprintf(check_cmd, sizeof(check_cmd), "ls %s/*.ibkv >/dev/null 2>&1", cache_dir);
+    if (system(check_cmd) != 0) {
+        fprintf(stderr, "cache file not created in %s\n", cache_dir);
+        exit(1);
+    }
+
+    /* Run 2: cache hit. Same prompt → same output. */
+    inferbit_model* m2 = inferbit_load(TINY_IBF, cfg);
+    if (!m2) { fprintf(stderr, "load m2 failed\n"); exit(1); }
+    int32_t out2[16];
+    int n2 = inferbit_generate(m2, input, N, out2, 8, p);
+    if (n2 != n1) { fprintf(stderr, "hit len mismatch: %d vs %d\n", n2, n1); exit(1); }
+    for (int i = 0; i < n1; i++) {
+        if (out1[i] != out2[i]) {
+            fprintf(stderr, "hit token %d mismatch: %d vs %d\n", i, out1[i], out2[i]);
+            exit(1);
+        }
+    }
+    inferbit_free(m2);
+
+    /* Run 3: different prompt must not match the cached entry. */
+    int32_t input_alt[64];
+    for (int i = 0; i < N; i++) input_alt[i] = (int32_t)((i * 41 + 7) % VOCAB);
+    inferbit_model* m3 = inferbit_load(TINY_IBF, cfg);
+    if (!m3) { fprintf(stderr, "load m3 failed\n"); exit(1); }
+    int32_t out3[16];
+    int n3 = inferbit_generate(m3, input_alt, N, out3, 8, p);
+    if (n3 <= 0) { fprintf(stderr, "generate #3 returned %d\n", n3); exit(1); }
+    for (int i = 0; i < n3; i++) {
+        if (out3[i] < 0 || out3[i] >= VOCAB) {
+            fprintf(stderr, "alt token %d out of range: %d\n", i, out3[i]);
+            exit(1);
+        }
+    }
+    inferbit_free(m3);
+
+    inferbit_config_free(cfg);
+    unlink(TINY_IBF);
+    (void)system(rmcmd);
+    unsetenv("IB_PREFIX_CACHE_DIR");
+}
+
 /* ── Main ───────────────────────────────────────────────────── */
 
 int main(void) {
@@ -548,6 +631,7 @@ int main(void) {
     TEST(test_generate_stream);
     TEST(test_kv_clear_and_reuse);
     TEST(test_forward_deterministic);
+    TEST(test_prefix_cache_hit);
 
     printf("─────────────────────────────────────────────\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);

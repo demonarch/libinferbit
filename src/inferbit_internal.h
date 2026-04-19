@@ -231,6 +231,19 @@ extern ib_kernels ib_kern;
 
 void ib_init_kernels(ib_simd_level level);
 
+/* ── Prefix cache (on-disk KV reuse for repeated prompts) ───── */
+
+/* Try to restore KV state for tokens[0..n_tokens-2] from on-disk cache.
+ * Returns restored prefix length (> 0) on hit, 0 on miss, -1 on I/O error
+ * (non-fatal; caller should fall back to normal prefill). */
+int ib_prefix_cache_try_restore(inferbit_model* model,
+                                const int32_t* tokens, int n_tokens);
+
+/* Save KV state for tokens[0..n_tokens-2] after a successful prefill.
+ * Returns 1 on success, 0 on skip/error. */
+int ib_prefix_cache_save(const inferbit_model* model,
+                         const int32_t* tokens, int n_tokens);
+
 /* ── Safetensors parser ─────────────────────────────────────── */
 
 typedef struct ib_safetensors ib_safetensors;

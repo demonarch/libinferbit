@@ -261,8 +261,19 @@ int inferbit_generate(
     int vocab = model->header.vocab_size;
     float* logits = model->buf_logits;
 
-    int rc = ib_forward(model, input_tokens, num_input_tokens, logits);
-    if (rc != INFERBIT_OK) return rc;
+    int rc;
+    int restored = ib_prefix_cache_try_restore(model, input_tokens, num_input_tokens);
+    if (restored > 0) {
+        /* KV for positions 0..restored-1 is loaded; run the remaining tokens
+         * (always 1 in v1) to produce logits for the final input position. */
+        rc = ib_forward(model, input_tokens + restored,
+                        num_input_tokens - restored, logits);
+        if (rc != INFERBIT_OK) return rc;
+    } else {
+        rc = ib_forward(model, input_tokens, num_input_tokens, logits);
+        if (rc != INFERBIT_OK) return rc;
+        ib_prefix_cache_save(model, input_tokens, num_input_tokens);
+    }
 
     int generated = 0;
     int eos = model->header.eos_token_id;
@@ -382,9 +393,18 @@ int inferbit_generate_stream(
     int vocab = model->header.vocab_size;
     float* logits = model->buf_logits;
 
-    /* Prefill */
-    int rc = ib_forward(model, input_tokens, num_input_tokens, logits);
-    if (rc != INFERBIT_OK) return rc;
+    /* Prefill (with optional prefix-cache reuse) */
+    int rc;
+    int restored = ib_prefix_cache_try_restore(model, input_tokens, num_input_tokens);
+    if (restored > 0) {
+        rc = ib_forward(model, input_tokens + restored,
+                        num_input_tokens - restored, logits);
+        if (rc != INFERBIT_OK) return rc;
+    } else {
+        rc = ib_forward(model, input_tokens, num_input_tokens, logits);
+        if (rc != INFERBIT_OK) return rc;
+        ib_prefix_cache_save(model, input_tokens, num_input_tokens);
+    }
 
     /* Track recent tokens for repeat penalty */
     int max_recent = 64;
