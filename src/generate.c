@@ -267,8 +267,9 @@ int inferbit_generate(
 
     int generated = 0;
     int eos = model->header.eos_token_id;
+    int greedy = (params.temperature < 0.01f);
 
-    int use_spec = (model->draft_model != NULL && params.temperature < 0.01f);
+    int use_spec = (model->draft_model != NULL && greedy);
     if (use_spec) {
         inferbit_model* draft = model->draft_model;
         if (draft->header.vocab_size != vocab) {
@@ -280,7 +281,13 @@ int inferbit_generate(
         }
     }
 
-    if (!use_spec) {
+    /* Prompt-lookup speculation: no external draft, draft candidates come
+     * from n-gram match over the running history. Greedy-only. Disabled
+     * automatically when an external draft is in use. */
+    int use_lookup = (!use_spec && greedy &&
+                      model->lookup_ngram > 0 && model->lookup_k > 0);
+
+    if (!use_spec && !use_lookup) {
         int32_t next_token = sample_token(logits, vocab, params, input_tokens, num_input_tokens);
         out_tokens[generated++] = next_token;
         if (next_token == eos) return generated;
@@ -292,6 +299,94 @@ int inferbit_generate(
             out_tokens[generated++] = next_token;
             if (next_token == eos) break;
         }
+        return generated;
+    }
+
+    if (use_lookup) {
+        int hist_cap = num_input_tokens + max_out_tokens + 8;
+        int32_t* history = (int32_t*)malloc((size_t)hist_cap * sizeof(int32_t));
+        if (!history) { ib_set_error("alloc history"); return INFERBIT_ERROR_MEMORY; }
+        memcpy(history, input_tokens, (size_t)num_input_tokens * sizeof(int32_t));
+        int hist_n = num_input_tokens;
+
+        int ngram      = model->lookup_ngram;
+        int lookup_k   = model->lookup_k;
+        int32_t candidates[32];
+
+        const char* spec_log_env = getenv("IB_SPEC_LOG");
+        int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
+        long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
+
+        while (generated < max_out_tokens) {
+            int k = ib_prompt_lookup_search(history, hist_n, ngram, lookup_k, candidates);
+            if (k > (max_out_tokens - generated)) k = max_out_tokens - generated;
+
+            if (k == 0) {
+                /* Miss: one standard decode step. */
+                int32_t t = sample_argmax(logits, vocab);
+                out_tokens[generated++] = t;
+                history[hist_n++] = t;
+                if (t == eos) goto lookup_done;
+                rc = ib_forward(model, &t, 1, logits);
+                if (rc != INFERBIT_OK) { free(history); return rc; }
+                continue;
+            }
+
+            int accepted = 0, mismatch = 0;
+            int32_t mismatch_tok = -1;
+            for (int i = 0; i < k && generated < max_out_tokens; i++) {
+                int32_t mtok = sample_argmax(logits, vocab);
+                if (mtok == candidates[i]) {
+                    out_tokens[generated++] = mtok;
+                    history[hist_n++] = mtok;
+                    if (mtok == eos) {
+                        if (spec_log) {
+                            stat_drafted += k; stat_accepted += accepted + 1; stat_rounds++;
+                        }
+                        goto lookup_done;
+                    }
+                    accepted++;
+                    rc = ib_forward(model, &mtok, 1, logits);
+                    if (rc != INFERBIT_OK) { free(history); return rc; }
+                } else {
+                    mismatch = 1;
+                    mismatch_tok = mtok;
+                    break;
+                }
+            }
+
+            if (spec_log && !mismatch) {
+                stat_drafted += k; stat_accepted += accepted; stat_rounds++;
+            }
+
+            if (mismatch) {
+                if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+                out_tokens[generated++] = mismatch_tok;
+                history[hist_n++] = mismatch_tok;
+                if (mismatch_tok == eos) goto lookup_done;
+                rc = ib_forward(model, &mismatch_tok, 1, logits);
+                if (rc != INFERBIT_OK) { free(history); return rc; }
+                continue;
+            }
+
+            if (generated >= max_out_tokens) break;
+
+            /* All k accepted — emit the bonus token from main. */
+            int32_t extra = sample_argmax(logits, vocab);
+            out_tokens[generated++] = extra;
+            history[hist_n++] = extra;
+            if (extra == eos) goto lookup_done;
+            rc = ib_forward(model, &extra, 1, logits);
+            if (rc != INFERBIT_OK) { free(history); return rc; }
+        }
+
+    lookup_done:
+        if (spec_log) {
+            fprintf(stderr, "[ib-spec-lookup] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
+                    stat_rounds, stat_drafted, stat_accepted,
+                    stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
+        }
+        free(history);
         return generated;
     }
 
@@ -438,7 +533,8 @@ int inferbit_generate_stream(
     int eos = model->header.eos_token_id;
 
     /* Check for speculative decoding (greedy only) */
-    int use_spec = (model->draft_model != NULL && params.temperature < 0.01f);
+    int greedy = (params.temperature < 0.01f);
+    int use_spec = (model->draft_model != NULL && greedy);
     if (use_spec) {
         inferbit_model* draft = model->draft_model;
         if (draft->header.vocab_size != vocab) {
@@ -450,7 +546,10 @@ int inferbit_generate_stream(
         }
     }
 
-    if (!use_spec) {
+    int use_lookup = (!use_spec && greedy &&
+                      model->lookup_ngram > 0 && model->lookup_k > 0);
+
+    if (!use_spec && !use_lookup) {
         /* Standard streaming path */
         int32_t next_token = sample_token(logits, vocab, params, recent,
                                           recent_len > max_recent ? max_recent : recent_len);
@@ -474,6 +573,71 @@ int inferbit_generate_stream(
             if (next_token == eos || callback(next_token, ctx) == 0) break;
         }
 
+        free(recent);
+        return generated;
+    }
+
+    if (use_lookup) {
+        /* Prompt-lookup streaming path: draft from history n-gram match. */
+        int ngram    = model->lookup_ngram;
+        int lookup_k = model->lookup_k;
+        int32_t candidates[32];
+        int stopped = 0;
+
+        const char* spec_log_env = getenv("IB_SPEC_LOG");
+        int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
+        long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
+
+        while (generated < params.max_tokens && !stopped) {
+            int k = ib_prompt_lookup_search(recent, recent_len, ngram, lookup_k, candidates);
+            if (k > (params.max_tokens - generated)) k = params.max_tokens - generated;
+
+            if (k == 0) {
+                int32_t t = sample_argmax(logits, vocab);
+                recent[recent_len++] = t; generated++;
+                if (t == eos || callback(t, ctx) == 0) { stopped = 1; break; }
+                rc = ib_forward(model, &t, 1, logits);
+                if (rc != INFERBIT_OK) { free(recent); return rc; }
+                continue;
+            }
+
+            int accepted = 0, mismatch = 0;
+            for (int i = 0; i < k && generated < params.max_tokens; i++) {
+                int32_t mtok = sample_argmax(logits, vocab);
+                if (mtok == candidates[i]) {
+                    recent[recent_len++] = mtok; generated++;
+                    if (mtok == eos || callback(mtok, ctx) == 0) { stopped = 1; break; }
+                    accepted++;
+                    rc = ib_forward(model, &mtok, 1, logits);
+                    if (rc != INFERBIT_OK) { free(recent); return rc; }
+                } else {
+                    mismatch = 1;
+                    recent[recent_len++] = mtok; generated++;
+                    if (mtok == eos || callback(mtok, ctx) == 0) { stopped = 1; break; }
+                    rc = ib_forward(model, &mtok, 1, logits);
+                    if (rc != INFERBIT_OK) { free(recent); return rc; }
+                    break;
+                }
+            }
+
+            if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+
+            if (stopped || mismatch) continue;
+
+            /* All k accepted — bonus token. */
+            if (generated >= params.max_tokens) break;
+            int32_t extra = sample_argmax(logits, vocab);
+            recent[recent_len++] = extra; generated++;
+            if (extra == eos || callback(extra, ctx) == 0) { stopped = 1; break; }
+            rc = ib_forward(model, &extra, 1, logits);
+            if (rc != INFERBIT_OK) { free(recent); return rc; }
+        }
+
+        if (spec_log) {
+            fprintf(stderr, "[ib-spec-lookup] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
+                    stat_rounds, stat_drafted, stat_accepted,
+                    stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
+        }
         free(recent);
         return generated;
     }

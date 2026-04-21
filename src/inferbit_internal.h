@@ -144,6 +144,12 @@ struct inferbit_model {
     inferbit_model* draft_model;
     int             draft_tokens;
 
+    /* Prompt-lookup speculation: draft k tokens by n-gram match over the
+     * running history. Enabled when lookup_ngram > 0. Mutually exclusive with
+     * external-draft spec decoding. */
+    int             lookup_ngram;      /* size of suffix to match (e.g. 3) */
+    int             lookup_k;          /* draft length (e.g. 6) */
+
     /* Threading */
     int num_threads;
     struct ib_thread_pool* thread_pool;
@@ -230,6 +236,16 @@ typedef struct {
 extern ib_kernels ib_kern;
 
 void ib_init_kernels(ib_simd_level level);
+
+/* ── Prompt-lookup speculation helper ───────────────────────── */
+
+/* Search `history[0..hist_len-1]` for the earliest occurrence of its own
+ * final `ngram` tokens (the "suffix"). On hit, copies up to `k` tokens that
+ * follow the match into `out_candidates` and returns the count. On miss,
+ * returns 0. A match whose position `i` leaves fewer than one follower token
+ * before overlapping the suffix is skipped. */
+int ib_prompt_lookup_search(const int32_t* history, int hist_len,
+                            int ngram, int k, int32_t* out_candidates);
 
 /* ── Safetensors parser ─────────────────────────────────────── */
 

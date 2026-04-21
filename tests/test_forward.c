@@ -533,6 +533,84 @@ void test_forward_deterministic(void) {
     unlink(TINY_IBF);
 }
 
+/* Unit test for the prompt-lookup n-gram search. Pure logic; no model. */
+int ib_prompt_lookup_search(const int32_t* history, int hist_len,
+                            int ngram, int k, int32_t* out_candidates);
+
+void test_prompt_lookup_search(void) {
+    int32_t cands[32];
+
+    /* Basic hit: suffix {5,6} appears earlier at index 3; followers {7,8,9}. */
+    int32_t h1[] = {1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 5, 6};
+    int n1 = ib_prompt_lookup_search(h1, 12, 2, 3, cands);
+    if (n1 != 3 || cands[0] != 7 || cands[1] != 8 || cands[2] != 9) {
+        fprintf(stderr, "basic hit failed: n=%d cands=%d,%d,%d\n",
+                n1, cands[0], cands[1], cands[2]);
+        exit(1);
+    }
+
+    /* Miss: suffix never appeared. */
+    int32_t h2[] = {1, 2, 3, 4, 5};
+    int n2 = ib_prompt_lookup_search(h2, 5, 2, 3, cands);
+    if (n2 != 0) { fprintf(stderr, "miss returned %d\n", n2); exit(1); }
+
+    /* Earliest match wins: {1,2} appears at 0 and 4; followers should be
+     * history[2..] starting with 3. */
+    int32_t h3[] = {1, 2, 3, 4, 1, 2};
+    int n3 = ib_prompt_lookup_search(h3, 6, 2, 2, cands);
+    if (n3 != 2 || cands[0] != 3 || cands[1] != 4) {
+        fprintf(stderr, "earliest-match failed: n=%d cands=%d,%d\n",
+                n3, cands[0], cands[1]);
+        exit(1);
+    }
+
+    /* k capped by available followers: only 1 follower between match and
+     * suffix region. */
+    int32_t h4[] = {9, 9, 1, 2};
+    int n4 = ib_prompt_lookup_search(h4, 4, 1, 4, cands);
+    /* suffix = {2}; earliest match of {2} at index 2 but no followers before
+     * suffix. No earlier {2} exists. So miss. */
+    if (n4 != 0) { fprintf(stderr, "h4 should miss, got n=%d\n", n4); exit(1); }
+
+    /* Degenerate inputs: ngram=0, k=0, hist_len < ngram+1. */
+    if (ib_prompt_lookup_search(h1, 12, 0, 3, cands) != 0) exit(1);
+    if (ib_prompt_lookup_search(h1, 12, 2, 0, cands) != 0) exit(1);
+    if (ib_prompt_lookup_search(h1, 1, 2, 3, cands)  != 0) exit(1);
+    if (ib_prompt_lookup_search(NULL, 12, 2, 3, cands) != 0) exit(1);
+}
+
+/* End-to-end prompt-lookup exercise on the tiny synthetic model. Sets
+ * lookup_ngram/k and runs greedy generate. Smoke test — verifies the
+ * control flow runs, produces valid tokens, and doesn't crash. */
+void test_prompt_lookup_generate(void) {
+    write_tiny_ibf();
+    inferbit_config* cfg = inferbit_config_create();
+    inferbit_model* model = inferbit_load(TINY_IBF, cfg);
+    if (!model) { fprintf(stderr, "load failed\n"); exit(1); }
+
+    inferbit_set_prompt_lookup(model, 2, 4);
+
+    int32_t input[] = {3, 5, 7, 3, 5, 7, 3, 5, 7, 11};
+    int32_t out[16];
+    inferbit_sample_params p = inferbit_default_sample_params();
+    p.temperature = 0.0f;
+    p.seed = 7;
+    p.max_tokens = 12;
+
+    int n = inferbit_generate(model, input, 10, out, 12, p);
+    if (n <= 0) { fprintf(stderr, "lookup generate returned %d\n", n); exit(1); }
+    for (int i = 0; i < n; i++) {
+        if (out[i] < 0 || out[i] >= VOCAB) {
+            fprintf(stderr, "bad token at %d: %d\n", i, out[i]);
+            exit(1);
+        }
+    }
+
+    inferbit_free(model);
+    inferbit_config_free(cfg);
+    unlink(TINY_IBF);
+}
+
 /* End-to-end speculative-decoding exercise on the tiny synthetic model.
  *
  * Two copies of the same .ibf are loaded — one as main, one as draft. This
@@ -608,6 +686,8 @@ int main(void) {
     TEST(test_kv_clear_and_reuse);
     TEST(test_forward_deterministic);
     TEST(test_spec_decoding_tiny);
+    TEST(test_prompt_lookup_search);
+    TEST(test_prompt_lookup_generate);
 
     printf("─────────────────────────────────────────────\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);
