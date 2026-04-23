@@ -184,6 +184,67 @@ static void tensor_matmul(
     }
 }
 
+/* Batched variant of tensor_matmul.
+ *
+ *   out    [B * M]  row-major, out[b*M + i]
+ *   input  [B * N]  row-major, input[b*N + j]
+ *   scale_buf: caller-provided, at least M floats (weight scales).
+ *   q_scratch: only used for INT4+W4A8 path — B * N int8 bytes for quantized
+ *              activations, plus B * ceil(N/IB_W4A8_GROUP) floats for scales.
+ *              Caller supplies both to avoid malloc in the hot loop. Pass
+ *              NULL for paths that don't need them (INT8, FP16).
+ *
+ * Same dispatch policy as tensor_matmul: INT4 routes through W4A8 batched
+ * kernel when enabled; INT8 uses matmul_int8_batch; FP16 falls back to the
+ * sequential FP16 path because we don't have a batched FP16 kernel. */
+static void tensor_matmul_batch(
+    const inferbit_model* m, const ib_tensor_meta* t,
+    float* out, const float* input, int M, int N, int B,
+    float* scale_buf, int8_t* q_scratch, float* sa_scratch
+) {
+    const void* weights = tensor_data(m, t);
+    const void* scales_raw = tensor_scales_raw(m, t);
+
+    if (scales_raw) {
+        scales_to_fp32(scale_buf, scales_raw, M);
+    } else {
+        for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
+    }
+
+    if (t->bits == 4 && w4a8_enabled() && ib_kern.matmul_w4a8_batch && q_scratch && sa_scratch) {
+        int n_groups = (N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
+        for (int b = 0; b < B; b++) {
+            ib_quantize_input_int8_g128(input + (size_t)b * N,
+                                        q_scratch + (size_t)b * N,
+                                        sa_scratch + (size_t)b * n_groups, N);
+        }
+        ib_parallel_matmul_w4a8_batch(m->thread_pool, out, weights, scale_buf,
+                                      q_scratch, sa_scratch, M, N, B);
+    } else if (t->bits == 8 && ib_kern.matmul_int8_batch) {
+        ib_parallel_matmul_int8_batch(m->thread_pool, out, weights, scale_buf,
+                                      input, M, N, B);
+    } else {
+        /* Fallback: per-position sequential. */
+        for (int b = 0; b < B; b++) {
+            float* out_b = out + (size_t)b * M;
+            const float* in_b = input + (size_t)b * N;
+            if (t->bits == 2 || t->bits == 4 || t->bits == 8) {
+                ib_parallel_matmul(m->thread_pool, out_b, weights, scale_buf,
+                                   in_b, M, N, t->bits);
+            } else if (t->bits == 16) {
+                const uint16_t* w = (const uint16_t*)weights;
+                for (int i = 0; i < M; i++) {
+                    float sum = 0.0f;
+                    for (int j = 0; j < N; j++) {
+                        sum += fp16_to_fp32(w[(size_t)i * N + j]) * in_b[j];
+                    }
+                    out_b[i] = sum;
+                }
+            }
+        }
+    }
+}
+
 /*
  * Sparse matmul: same as tensor_matmul but skips rows where mask[row] == 0.
  * Outputs zero for skipped rows. mask is a byte array of length M.
@@ -444,7 +505,19 @@ static void ib_attn_head_task(void* arg, int tid, int start, int end) {
 
 /* ── Single-token forward pass ──────────────────────────────── */
 
-static int forward_single_ex(inferbit_model* m, int token_id, int pos, float* logits, int compute_logits) {
+/* Extended single-token forward.
+ *
+ * compute_logits:
+ *   0 — skip the final RMSNorm and LM head (prefill path, advances KV only)
+ *   1 — compute logits via the LM head (default decode path)
+ *
+ * hidden_out: if non-NULL, writes the post-final-RMSNorm hidden state into
+ *   hidden_out[hidden_size]. Used by the batched verify path to stack B
+ *   positions' hidden states before a single batched LM head matmul. When
+ *   hidden_out is supplied the final RMSNorm runs regardless of compute_logits. */
+static int forward_single_ex(inferbit_model* m, int token_id, int pos,
+                             float* logits, int compute_logits,
+                             float* hidden_out) {
     int hidden   = m->header.hidden_size;
     int n_layers = m->header.num_layers;
     int n_heads  = m->header.num_heads;
@@ -573,20 +646,223 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos, float* lo
         }
     }
 
-    if (compute_logits) {
+    if (compute_logits || hidden_out) {
         /* Final RMSNorm */
         rmsnorm_fp16(x, x, tensor_data(m, &m->output_norm),
                      eps, hidden, scale_buf);
 
-        /* Output head: logits = head @ x */
-        tensor_matmul(m, &m->output_head, logits, x, vocab, hidden, scale_buf);
+        if (hidden_out) {
+            memcpy(hidden_out, x, (size_t)hidden * sizeof(float));
+        }
+        if (compute_logits) {
+            /* Output head: logits = head @ x */
+            tensor_matmul(m, &m->output_head, logits, x, vocab, hidden, scale_buf);
+        }
     }
 
     return INFERBIT_OK;
 }
 
 static int forward_single(inferbit_model* m, int token_id, int pos, float* logits) {
-    return forward_single_ex(m, token_id, pos, logits, 1);
+    return forward_single_ex(m, token_id, pos, logits, 1, NULL);
+}
+
+/* ── Batched forward pass ───────────────────────────────────── */
+
+/* Process B tokens (at contiguous positions positions[0..B-1]) through the
+ * transformer, using batched matmul for projections, MLP, and LM head. Each
+ * position's attention runs sequentially (each attends to its own prefix of
+ * the KV cache, so there's no matmul-shape win from batching attention).
+ *
+ * If out_logits is non-NULL, writes per-position logits [B * vocab] row-major.
+ *
+ * Invariant: positions[b] = inferbit_kv_length(m) + b on entry (each position
+ * gets appended to the KV cache as processed). Caller is responsible for
+ * ensuring that's true. */
+static int forward_batch(inferbit_model* m, const int32_t* tokens,
+                         const int* positions, int B, float* out_logits) {
+    int hidden   = m->header.hidden_size;
+    int n_layers = m->header.num_layers;
+    int n_heads  = m->header.num_heads;
+    int n_kv     = m->header.num_kv_heads;
+    int head_dim = m->header.head_dim;
+    int inter    = m->header.intermediate_size;
+    int vocab    = m->header.vocab_size;
+    float eps    = m->header.norm_epsilon;
+    float theta  = m->header.rope_theta;
+    int kv_dim   = n_kv * head_dim;
+    int heads_per_kv = n_heads / n_kv;
+
+    /* Per-batch activations. Layout: outer index = batch, inner = hidden/etc. */
+    size_t x_sz   = (size_t)B * hidden;
+    size_t kv_sz  = (size_t)B * kv_dim;
+    size_t inter_sz = (size_t)B * inter;
+
+    float* x   = (float*)malloc(x_sz   * sizeof(float));
+    float* xb  = (float*)malloc(x_sz   * sizeof(float));
+    float* xb2 = (float*)malloc(x_sz   * sizeof(float));
+    float* q   = (float*)malloc(x_sz   * sizeof(float));
+    float* k   = (float*)malloc(kv_sz  * sizeof(float));
+    float* v   = (float*)malloc(kv_sz  * sizeof(float));
+    float* hb  = (float*)malloc(inter_sz * sizeof(float));
+    float* hb2 = (float*)malloc(inter_sz * sizeof(float));
+
+    int scale_sz = hidden;
+    if (inter > scale_sz) scale_sz = inter;
+    if (vocab > scale_sz) scale_sz = vocab;
+    float* scale_buf = (float*)malloc((size_t)scale_sz * sizeof(float));
+
+    /* Attention scratch (per-position) */
+    int max_pos = 0;
+    for (int b = 0; b < B; b++) if (positions[b] > max_pos) max_pos = positions[b];
+    size_t att_sz = (size_t)n_heads * (max_pos + 1);
+    float* att = (float*)malloc(att_sz * sizeof(float));
+
+    /* Batched-matmul scratch: for W4A8 path we quantize B activations of
+     * length up to max(hidden, inter). Allocate max size. */
+    int n_max = hidden > inter ? hidden : inter;
+    int groups_max = (n_max + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
+    int8_t* q_scratch = (int8_t*)malloc((size_t)B * n_max * sizeof(int8_t));
+    float*  sa_scratch = (float*)malloc((size_t)B * groups_max * sizeof(float));
+
+    if (!x || !xb || !xb2 || !q || !k || !v || !hb || !hb2 ||
+        !scale_buf || !att || !q_scratch || !sa_scratch) {
+        free(x); free(xb); free(xb2); free(q); free(k); free(v);
+        free(hb); free(hb2); free(scale_buf); free(att);
+        free(q_scratch); free(sa_scratch);
+        ib_set_error("forward_batch oom");
+        return INFERBIT_ERROR_PARAM;
+    }
+
+    /* Embed each token (cheap, per-position). */
+    for (int b = 0; b < B; b++) {
+        embedding_lookup(m, tokens[b], x + (size_t)b * hidden);
+    }
+
+    for (int l = 0; l < n_layers; l++) {
+        ib_layer_meta* layer = &m->layers[l];
+        ib_kv_cache* kv = &m->kv_caches[l];
+
+        /* RMSNorm per position. Uses rmsnorm_fp16 to handle FP16 weights. */
+        for (int b = 0; b < B; b++) {
+            rmsnorm_fp16(xb + (size_t)b * hidden, x + (size_t)b * hidden,
+                         tensor_data(m, &layer->input_norm),
+                         eps, hidden, scale_buf);
+        }
+
+        /* Q/K/V projections — batched. */
+        tensor_matmul_batch(m, &layer->q_proj, q, xb, hidden, hidden, B,
+                            scale_buf, q_scratch, sa_scratch);
+        tensor_matmul_batch(m, &layer->k_proj, k, xb, kv_dim, hidden, B,
+                            scale_buf, q_scratch, sa_scratch);
+        tensor_matmul_batch(m, &layer->v_proj, v, xb, kv_dim, hidden, B,
+                            scale_buf, q_scratch, sa_scratch);
+
+        /* Per-position: RoPE, KV-cache write, attention, O-proj-input
+         * (accumulated per-position into xb2[b]). */
+        for (int b = 0; b < B; b++) {
+            int pos = positions[b];
+            float* qb = q + (size_t)b * hidden;
+            float* kb = k + (size_t)b * kv_dim;
+            float* vb = v + (size_t)b * kv_dim;
+
+            /* RoPE: same pattern as forward_single_ex. */
+            for (int h = 0; h < n_heads; h++) {
+                int kv_h = h / heads_per_kv;
+                int is_first = (h % heads_per_kv == 0);
+                if (is_first) {
+                    ib_kern.rope(qb + h * head_dim, kb + kv_h * head_dim,
+                                 head_dim, pos, theta);
+                } else {
+                    float k_scratch[256];
+                    memcpy(k_scratch, kb + kv_h * head_dim, head_dim * sizeof(float));
+                    ib_kern.rope(qb + h * head_dim, k_scratch, head_dim, pos, theta);
+                }
+            }
+
+            kv_cache_write(kv, pos, kb, vb, kv_dim, n_kv, head_dim, m->header.kv_bits);
+            kv->length = pos + 1;
+
+            float attn_scale = 1.0f / sqrtf((float)head_dim);
+            ib_attn_ctx ctx = {
+                .q = qb, .att = att, .xb2 = xb2 + (size_t)b * hidden,
+                .kv = kv,
+                .head_dim = head_dim, .kv_dim = kv_dim,
+                .n_kv_heads = n_kv,
+                .heads_per_kv = heads_per_kv,
+                .pos = pos,
+                .kv_bits = m->header.kv_bits,
+                .scale = attn_scale,
+            };
+            if (m->thread_pool && n_heads >= 4) {
+                ib_pool_run(m->thread_pool, ib_attn_head_task, &ctx, n_heads, 0);
+            } else {
+                ib_attn_head_task(&ctx, 0, 0, n_heads);
+            }
+        }
+
+        /* O projection — batched. */
+        tensor_matmul_batch(m, &layer->o_proj, xb, xb2, hidden, hidden, B,
+                            scale_buf, q_scratch, sa_scratch);
+
+        /* Residual add per position. */
+        for (size_t i = 0; i < x_sz; i++) x[i] += xb[i];
+
+        /* RMSNorm before MLP, per position. */
+        for (int b = 0; b < B; b++) {
+            rmsnorm_fp16(xb + (size_t)b * hidden, x + (size_t)b * hidden,
+                         tensor_data(m, &layer->post_attn_norm),
+                         eps, hidden, scale_buf);
+        }
+
+        /* MLP — batched gate/up/down. Sparsity is not applied here; if a
+         * layer has sparsity we fall back to the single-position path per
+         * batch via tensor_matmul_sparse (rare for Llama, so OK). */
+        if (layer->sparsity_mask_size > 0) {
+            const uint8_t* sp_mask = (const uint8_t*)m->weight_data + layer->sparsity_mask_offset;
+            for (int b = 0; b < B; b++) {
+                float* xb_b = xb + (size_t)b * hidden;
+                float* hb_b = hb + (size_t)b * inter;
+                float* hb2_b = hb2 + (size_t)b * inter;
+                float* xb_out = xb + (size_t)b * hidden;  /* overwrite xb[b] with down output */
+                tensor_matmul_sparse(m, &layer->gate_proj, hb_b, xb_b, inter, hidden, scale_buf, sp_mask);
+                tensor_matmul_sparse(m, &layer->up_proj, hb2_b, xb_b, inter, hidden, scale_buf, sp_mask);
+                ib_kern.silu_mul(hb_b, hb_b, hb2_b, inter);
+                tensor_matmul(m, &layer->down_proj, xb_out, hb_b, hidden, inter, scale_buf);
+            }
+        } else {
+            tensor_matmul_batch(m, &layer->gate_proj, hb, xb, inter, hidden, B,
+                                scale_buf, q_scratch, sa_scratch);
+            tensor_matmul_batch(m, &layer->up_proj, hb2, xb, inter, hidden, B,
+                                scale_buf, q_scratch, sa_scratch);
+            for (int b = 0; b < B; b++) {
+                ib_kern.silu_mul(hb + (size_t)b * inter,
+                                 hb + (size_t)b * inter,
+                                 hb2 + (size_t)b * inter, inter);
+            }
+            tensor_matmul_batch(m, &layer->down_proj, xb, hb, hidden, inter, B,
+                                scale_buf, q_scratch, sa_scratch);
+        }
+
+        /* Residual add per position. */
+        for (size_t i = 0; i < x_sz; i++) x[i] += xb[i];
+    }
+
+    /* Final RMSNorm + LM head. */
+    if (out_logits) {
+        for (int b = 0; b < B; b++) {
+            rmsnorm_fp16(x + (size_t)b * hidden, x + (size_t)b * hidden,
+                         tensor_data(m, &m->output_norm),
+                         eps, hidden, scale_buf);
+        }
+        tensor_matmul_batch(m, &m->output_head, out_logits, x, vocab, hidden, B,
+                            scale_buf, q_scratch, sa_scratch);
+    }
+
+    free(x); free(xb); free(xb2); free(q); free(k); free(v);
+    free(hb); free(hb2); free(scale_buf); free(att);
+    free(q_scratch); free(sa_scratch);
+    return INFERBIT_OK;
 }
 
 /* ── Public: forward pass ───────────────────────────────────── */
@@ -637,10 +913,45 @@ int ib_forward(inferbit_model* model, const int32_t* tokens, int num_tokens, flo
      */
     for (int i = 0; i < num_tokens - 1; i++) {
         int pos = kv_pos + i;
-        int rc = forward_single_ex(model, tokens[i], pos, out_logits, 0);
+        int rc = forward_single_ex(model, tokens[i], pos, out_logits, 0, NULL);
         if (rc != INFERBIT_OK) return rc;
     }
 
     /* Last token — full forward with logits */
-    return forward_single_ex(model, tokens[num_tokens - 1], kv_pos + num_tokens - 1, out_logits, 1);
+    return forward_single_ex(model, tokens[num_tokens - 1], kv_pos + num_tokens - 1, out_logits, 1, NULL);
+}
+
+int ib_forward_positions(inferbit_model* model, const int32_t* tokens,
+                         int num_tokens, float* out_logits) {
+    if (!model || !tokens || !out_logits || num_tokens <= 0) {
+        ib_set_error("invalid arguments to ib_forward_positions");
+        return INFERBIT_ERROR_PARAM;
+    }
+
+    int kv_pos = inferbit_kv_length(model);
+    int max_ctx = model->header.max_context_length;
+    int vocab   = model->header.vocab_size;
+
+    if (kv_pos + num_tokens > max_ctx) {
+        ib_set_error("context length exceeded: %d + %d > %d",
+                     kv_pos, num_tokens, max_ctx);
+        return INFERBIT_ERROR_CONTEXT;
+    }
+    for (int i = 0; i < num_tokens; i++) {
+        if (tokens[i] < 0 || tokens[i] >= vocab) {
+            ib_set_error("token ID out of range: %d (vocab_size=%d)",
+                         tokens[i], vocab);
+            return INFERBIT_ERROR_PARAM;
+        }
+    }
+
+    /* Build absolute positions for forward_batch (each token is appended to
+     * the KV cache in sequence starting at kv_pos). */
+    int* positions = (int*)malloc((size_t)num_tokens * sizeof(int));
+    if (!positions) { ib_set_error("oom"); return INFERBIT_ERROR_PARAM; }
+    for (int i = 0; i < num_tokens; i++) positions[i] = kv_pos + i;
+
+    int rc = forward_batch(model, tokens, positions, num_tokens, out_logits);
+    free(positions);
+    return rc;
 }

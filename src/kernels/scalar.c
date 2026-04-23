@@ -67,6 +67,62 @@ static void scalar_matmul_w4a8(
     }
 }
 
+static void scalar_matmul_int8_batch(
+    float* out, const void* weights, const float* scales_w,
+    const float* input, int M, int N, int B
+) {
+    const int8_t* w = (const int8_t*)weights;
+    for (int i = 0; i < M; i++) {
+        const int8_t* row = w + (size_t)i * N;
+        for (int b = 0; b < B; b++) {
+            const float* arow = input + (size_t)b * N;
+            float sum = 0.0f;
+            for (int j = 0; j < N; j++) sum += (float)row[j] * arow[j];
+            out[(size_t)b * M + i] = sum * scales_w[i];
+        }
+    }
+}
+
+static void scalar_matmul_w4a8_batch(
+    float* out, const void* weights, const float* scales_w,
+    const int8_t* input, const float* scales_a,
+    int M, int N, int B
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    const int G = IB_W4A8_GROUP;
+    const int groups = (N + G - 1) / G;
+
+    for (int i = 0; i < M; i++) {
+        /* Accumulate per-batch row totals in fp32. Small stack array (B ≤ 32
+         * in practice; if B is absurd we'd need heap, caller avoids that). */
+        float row_acc[32] = {0};
+        int use_B = B < 32 ? B : 32;
+        (void)use_B;  /* Index check only. */
+
+        int j = 0, g = 0;
+        while (j < N) {
+            int end = j + G; if (end > N) end = N;
+            int32_t sum[32] = {0};
+            for (int jj = j; jj < end; jj += 2) {
+                uint8_t byte = w[i * (N / 2) + jj / 2];
+                int8_t v0 = (int8_t)(byte & 0x0F) - 8;
+                int8_t v1 = (int8_t)((byte >> 4) & 0x0F) - 8;
+                for (int b = 0; b < B; b++) {
+                    const int8_t* arow = input + (size_t)b * N;
+                    sum[b] += (int32_t)v0 * (int32_t)arow[jj];
+                    if (jj + 1 < end) sum[b] += (int32_t)v1 * (int32_t)arow[jj + 1];
+                }
+            }
+            for (int b = 0; b < B; b++) {
+                row_acc[b] += (float)sum[b] * scales_a[(size_t)b * groups + g];
+            }
+            j = end; g++;
+        }
+        float sw = scales_w[i];
+        for (int b = 0; b < B; b++) out[(size_t)b * M + i] = row_acc[b] * sw;
+    }
+}
+
 static void scalar_rmsnorm(
     float* out, const float* input, const float* weight,
     float eps, int N
@@ -138,6 +194,8 @@ void ib_init_kernels(ib_simd_level level) {
     ib_kern.matmul_int4 = scalar_matmul_int4;
     ib_kern.matmul_int8 = scalar_matmul_int8;
     ib_kern.matmul_w4a8 = scalar_matmul_w4a8;
+    ib_kern.matmul_w4a8_batch = scalar_matmul_w4a8_batch;
+    ib_kern.matmul_int8_batch = scalar_matmul_int8_batch;
     ib_kern.matmul_int2 = NULL;  /* Set by ib_init_kernels_int2 */
     ib_kern.rmsnorm     = scalar_rmsnorm;
     ib_kern.rope        = scalar_rope;

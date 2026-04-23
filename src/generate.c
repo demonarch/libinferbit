@@ -311,7 +311,12 @@ int inferbit_generate(
 
         int ngram      = model->lookup_ngram;
         int lookup_k   = model->lookup_k;
+        if (lookup_k > 32) lookup_k = 32;
         int32_t candidates[32];
+
+        /* Batched verify scratch: room for k per-position logit vectors. */
+        float* logits_batch = (float*)malloc((size_t)lookup_k * (size_t)vocab * sizeof(float));
+        if (!logits_batch) { free(history); ib_set_error("alloc logits_batch"); return INFERBIT_ERROR_MEMORY; }
 
         const char* spec_log_env = getenv("IB_SPEC_LOG");
         int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
@@ -328,26 +333,30 @@ int inferbit_generate(
                 history[hist_n++] = t;
                 if (t == eos) goto lookup_done;
                 rc = ib_forward(model, &t, 1, logits);
-                if (rc != INFERBIT_OK) { free(history); return rc; }
+                if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
                 continue;
             }
 
+            /* Batched verify: one forward over all k candidates, producing k
+             * per-position logit vectors. Position 0 is verified against the
+             * pre-round `logits` (unchanged); position i (1..k-1) against
+             * logits_batch[(i-1)*vocab]. */
+            int base_main_len = inferbit_kv_length(model);
+            rc = ib_forward_positions(model, candidates, k, logits_batch);
+            if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+
             int accepted = 0, mismatch = 0;
             int32_t mismatch_tok = -1;
+            int match_eos = 0;
             for (int i = 0; i < k && generated < max_out_tokens; i++) {
-                int32_t mtok = sample_argmax(logits, vocab);
+                const float* cur = (i == 0) ? logits
+                                            : (logits_batch + (size_t)(i - 1) * (size_t)vocab);
+                int32_t mtok = sample_argmax(cur, vocab);
                 if (mtok == candidates[i]) {
                     out_tokens[generated++] = mtok;
                     history[hist_n++] = mtok;
-                    if (mtok == eos) {
-                        if (spec_log) {
-                            stat_drafted += k; stat_accepted += accepted + 1; stat_rounds++;
-                        }
-                        goto lookup_done;
-                    }
                     accepted++;
-                    rc = ib_forward(model, &mtok, 1, logits);
-                    if (rc != INFERBIT_OK) { free(history); return rc; }
+                    if (mtok == eos) { match_eos = 1; break; }
                 } else {
                     mismatch = 1;
                     mismatch_tok = mtok;
@@ -355,32 +364,41 @@ int inferbit_generate(
                 }
             }
 
-            if (spec_log && !mismatch) {
-                stat_drafted += k; stat_accepted += accepted; stat_rounds++;
+            if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+
+            /* Roll back main KV if not all k got committed. */
+            if (accepted < k) inferbit_kv_truncate(model, base_main_len + accepted);
+
+            if (match_eos) {
+                /* Accepted mtok that is EOS — we're done. */
+                goto lookup_done;
             }
 
             if (mismatch) {
-                if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
                 out_tokens[generated++] = mismatch_tok;
                 history[hist_n++] = mismatch_tok;
                 if (mismatch_tok == eos) goto lookup_done;
                 rc = ib_forward(model, &mismatch_tok, 1, logits);
-                if (rc != INFERBIT_OK) { free(history); return rc; }
+                if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
                 continue;
             }
 
             if (generated >= max_out_tokens) break;
 
-            /* All k accepted — emit the bonus token from main. */
-            int32_t extra = sample_argmax(logits, vocab);
+            /* All k accepted. The "next-step" logits are the k-th position's
+             * output from the batched forward. Sample the bonus token from
+             * there, emit it, then advance main by 1 to refresh `logits`. */
+            const float* last = logits_batch + (size_t)(k - 1) * (size_t)vocab;
+            int32_t extra = sample_argmax(last, vocab);
             out_tokens[generated++] = extra;
             history[hist_n++] = extra;
             if (extra == eos) goto lookup_done;
             rc = ib_forward(model, &extra, 1, logits);
-            if (rc != INFERBIT_OK) { free(history); return rc; }
+            if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
         }
 
     lookup_done:
+        free(logits_batch);
         if (spec_log) {
             fprintf(stderr, "[ib-spec-lookup] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
                     stat_rounds, stat_drafted, stat_accepted,
@@ -396,9 +414,10 @@ int inferbit_generate(
     if (draft_k > 32) draft_k = 32;
     int32_t candidates[32];
 
-    /* Optional accept-rate telemetry — off unless IB_SPEC_LOG is set. Counts
-     * candidates drafted vs accepted across the generation. Prints a single
-     * summary line at the end. Has no effect on the generated output. */
+    float* logits_batch = (float*)malloc((size_t)draft_k * (size_t)vocab * sizeof(float));
+    if (!logits_batch) { ib_set_error("alloc logits_batch"); return INFERBIT_ERROR_MEMORY; }
+
+    /* Optional accept-rate telemetry — off unless IB_SPEC_LOG is set. */
     const char* spec_log_env = getenv("IB_SPEC_LOG");
     int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
     long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
@@ -413,30 +432,29 @@ int inferbit_generate(
         for (int i = 0; i < k; i++) {
             candidates[i] = dtok;
             rc = ib_forward(draft, &dtok, 1, dlogits);
-            if (rc != INFERBIT_OK) return rc;
+            if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
             dtok = sample_argmax(dlogits, vocab);
         }
 
+        /* Batched verify over main: one forward producing k per-position logits.
+         * Position 0 checks against pre-round `logits`; 1..k-1 against logits_batch. */
+        int base_main_len = inferbit_kv_length(model);
+        rc = ib_forward_positions(model, candidates, k, logits_batch);
+        if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
+
         int accepted = 0;
         int mismatch = 0;
+        int match_eos = 0;
         int32_t mismatch_tok = -1;
 
         for (int i = 0; i < k && generated < max_out_tokens; i++) {
-            int32_t mtok = sample_argmax(logits, vocab);
+            const float* cur = (i == 0) ? logits
+                                        : (logits_batch + (size_t)(i - 1) * (size_t)vocab);
+            int32_t mtok = sample_argmax(cur, vocab);
             if (mtok == candidates[i]) {
                 out_tokens[generated++] = mtok;
-                if (mtok == eos) {
-                    if (spec_log) {
-                        stat_drafted += k; stat_accepted += accepted + 1; stat_rounds++;
-                        fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
-                                stat_rounds, stat_drafted, stat_accepted,
-                                stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
-                    }
-                    return generated;
-                }
                 accepted++;
-                rc = ib_forward(model, &mtok, 1, logits);
-                if (rc != INFERBIT_OK) return rc;
+                if (mtok == eos) { match_eos = 1; break; }
             } else {
                 mismatch = 1;
                 mismatch_tok = mtok;
@@ -446,6 +464,19 @@ int inferbit_generate(
 
         if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
 
+        /* Roll back main KV if we did not commit all k positions. */
+        if (accepted < k) inferbit_kv_truncate(model, base_main_len + accepted);
+
+        if (match_eos) {
+            if (spec_log) {
+                fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
+                        stat_rounds, stat_drafted, stat_accepted,
+                        stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
+            }
+            free(logits_batch);
+            return generated;
+        }
+
         if (mismatch) {
             out_tokens[generated++] = mismatch_tok;
             if (mismatch_tok == eos) {
@@ -454,20 +485,23 @@ int inferbit_generate(
                             stat_rounds, stat_drafted, stat_accepted,
                             stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
                 }
+                free(logits_batch);
                 return generated;
             }
             rc = ib_forward(model, &mismatch_tok, 1, logits);
-            if (rc != INFERBIT_OK) return rc;
+            if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
 
             inferbit_kv_truncate(draft, base_draft_len + accepted);
             rc = ib_forward(draft, &mismatch_tok, 1, dlogits);
-            if (rc != INFERBIT_OK) return rc;
+            if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
             continue;
         }
 
         if (generated >= max_out_tokens) break;
 
-        int32_t extra = sample_argmax(logits, vocab);
+        /* All k accepted — emit the bonus token, then advance main and draft. */
+        const float* last = logits_batch + (size_t)(k - 1) * (size_t)vocab;
+        int32_t extra = sample_argmax(last, vocab);
         out_tokens[generated++] = extra;
         if (extra == eos) {
             if (spec_log) {
@@ -475,13 +509,14 @@ int inferbit_generate(
                         stat_rounds, stat_drafted, stat_accepted,
                         stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
             }
+            free(logits_batch);
             return generated;
         }
 
         rc = ib_forward(model, &extra, 1, logits);
-        if (rc != INFERBIT_OK) return rc;
+        if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
         rc = ib_forward(draft, &extra, 1, dlogits);
-        if (rc != INFERBIT_OK) return rc;
+        if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
     }
 
     if (spec_log) {
@@ -489,6 +524,7 @@ int inferbit_generate(
                 stat_rounds, stat_drafted, stat_accepted,
                 stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
     }
+    free(logits_batch);
     return generated;
 }
 
@@ -578,11 +614,16 @@ int inferbit_generate_stream(
     }
 
     if (use_lookup) {
-        /* Prompt-lookup streaming path: draft from history n-gram match. */
+        /* Prompt-lookup streaming path: draft from history n-gram match,
+         * verify batched with ib_forward_positions. */
         int ngram    = model->lookup_ngram;
         int lookup_k = model->lookup_k;
+        if (lookup_k > 32) lookup_k = 32;
         int32_t candidates[32];
         int stopped = 0;
+
+        float* logits_batch = (float*)malloc((size_t)lookup_k * (size_t)vocab * sizeof(float));
+        if (!logits_batch) { free(recent); ib_set_error("alloc logits_batch"); return INFERBIT_ERROR_MEMORY; }
 
         const char* spec_log_env = getenv("IB_SPEC_LOG");
         int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
@@ -597,40 +638,57 @@ int inferbit_generate_stream(
                 recent[recent_len++] = t; generated++;
                 if (t == eos || callback(t, ctx) == 0) { stopped = 1; break; }
                 rc = ib_forward(model, &t, 1, logits);
-                if (rc != INFERBIT_OK) { free(recent); return rc; }
+                if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
                 continue;
             }
 
+            int base_main_len = inferbit_kv_length(model);
+            rc = ib_forward_positions(model, candidates, k, logits_batch);
+            if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+
             int accepted = 0, mismatch = 0;
+            int32_t mismatch_tok = -1;
+            int match_eos_or_stop = 0;
             for (int i = 0; i < k && generated < params.max_tokens; i++) {
-                int32_t mtok = sample_argmax(logits, vocab);
+                const float* cur = (i == 0) ? logits
+                                            : (logits_batch + (size_t)(i - 1) * (size_t)vocab);
+                int32_t mtok = sample_argmax(cur, vocab);
                 if (mtok == candidates[i]) {
                     recent[recent_len++] = mtok; generated++;
-                    if (mtok == eos || callback(mtok, ctx) == 0) { stopped = 1; break; }
                     accepted++;
-                    rc = ib_forward(model, &mtok, 1, logits);
-                    if (rc != INFERBIT_OK) { free(recent); return rc; }
+                    if (mtok == eos || callback(mtok, ctx) == 0) {
+                        stopped = 1; match_eos_or_stop = 1; break;
+                    }
                 } else {
                     mismatch = 1;
-                    recent[recent_len++] = mtok; generated++;
-                    if (mtok == eos || callback(mtok, ctx) == 0) { stopped = 1; break; }
-                    rc = ib_forward(model, &mtok, 1, logits);
-                    if (rc != INFERBIT_OK) { free(recent); return rc; }
+                    mismatch_tok = mtok;
                     break;
                 }
             }
 
             if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
 
-            if (stopped || mismatch) continue;
+            if (accepted < k) inferbit_kv_truncate(model, base_main_len + accepted);
 
-            /* All k accepted — bonus token. */
+            if (match_eos_or_stop) continue;   /* loop exits via stopped */
+
+            if (mismatch) {
+                recent[recent_len++] = mismatch_tok; generated++;
+                if (mismatch_tok == eos || callback(mismatch_tok, ctx) == 0) { stopped = 1; continue; }
+                rc = ib_forward(model, &mismatch_tok, 1, logits);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                continue;
+            }
+
             if (generated >= params.max_tokens) break;
-            int32_t extra = sample_argmax(logits, vocab);
+
+            /* All k accepted — bonus token from last batched position. */
+            const float* last = logits_batch + (size_t)(k - 1) * (size_t)vocab;
+            int32_t extra = sample_argmax(last, vocab);
             recent[recent_len++] = extra; generated++;
             if (extra == eos || callback(extra, ctx) == 0) { stopped = 1; break; }
             rc = ib_forward(model, &extra, 1, logits);
-            if (rc != INFERBIT_OK) { free(recent); return rc; }
+            if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
         }
 
         if (spec_log) {
@@ -638,11 +696,12 @@ int inferbit_generate_stream(
                     stat_rounds, stat_drafted, stat_accepted,
                     stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
         }
+        free(logits_batch);
         free(recent);
         return generated;
     }
 
-    /* Speculative streaming path */
+    /* Speculative streaming path (external draft, batched verify). */
     inferbit_model* draft = model->draft_model;
     float* dlogits = draft->buf_logits;
     int draft_k = model->draft_tokens > 0 ? model->draft_tokens : 4;
@@ -650,58 +709,76 @@ int inferbit_generate_stream(
     int32_t candidates[32];
     int stopped = 0;
 
+    float* logits_batch = (float*)malloc((size_t)draft_k * (size_t)vocab * sizeof(float));
+    if (!logits_batch) { free(recent); ib_set_error("alloc logits_batch"); return INFERBIT_ERROR_MEMORY; }
+
     while (generated < params.max_tokens && !stopped) {
         int base_draft_len = inferbit_kv_length(draft);
+        int base_main_len  = inferbit_kv_length(model);
 
         int k = draft_k;
         if (k > (params.max_tokens - generated)) k = params.max_tokens - generated;
 
-        /* Draft generates k candidates */
         int32_t dtok = sample_argmax(dlogits, vocab);
         for (int i = 0; i < k; i++) {
             candidates[i] = dtok;
             rc = ib_forward(draft, &dtok, 1, dlogits);
-            if (rc != INFERBIT_OK) { free(recent); return rc; }
+            if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
             dtok = sample_argmax(dlogits, vocab);
         }
 
-        /* Verify and stream accepted tokens */
+        /* Batched verify over main: one forward producing k per-position logits. */
+        rc = ib_forward_positions(model, candidates, k, logits_batch);
+        if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+
         int accepted = 0;
+        int mismatch = 0;
+        int32_t mismatch_tok = -1;
+        int match_eos_or_stop = 0;
         for (int i = 0; i < k && generated < params.max_tokens; i++) {
-            int32_t mtok = sample_argmax(logits, vocab);
+            const float* cur = (i == 0) ? logits
+                                        : (logits_batch + (size_t)(i - 1) * (size_t)vocab);
+            int32_t mtok = sample_argmax(cur, vocab);
             if (mtok == candidates[i]) {
                 generated++;
-                if (mtok == eos || callback(mtok, ctx) == 0) { stopped = 1; break; }
                 accepted++;
-                rc = ib_forward(model, &mtok, 1, logits);
-                if (rc != INFERBIT_OK) { free(recent); return rc; }
+                if (mtok == eos || callback(mtok, ctx) == 0) {
+                    stopped = 1; match_eos_or_stop = 1; break;
+                }
             } else {
-                /* Mismatch: emit the main model's token */
-                generated++;
-                if (mtok == eos || callback(mtok, ctx) == 0) { stopped = 1; break; }
-                rc = ib_forward(model, &mtok, 1, logits);
-                if (rc != INFERBIT_OK) { free(recent); return rc; }
-                /* Rollback draft KV cache */
-                inferbit_kv_truncate(draft, base_draft_len + accepted);
-                rc = ib_forward(draft, &mtok, 1, dlogits);
-                if (rc != INFERBIT_OK) { free(recent); return rc; }
+                mismatch = 1;
+                mismatch_tok = mtok;
                 break;
             }
         }
 
-        /* If all k accepted, emit one more from main model */
-        if (!stopped && accepted == k && generated < params.max_tokens) {
-            int32_t extra = sample_argmax(logits, vocab);
+        if (accepted < k) inferbit_kv_truncate(model, base_main_len + accepted);
+
+        if (match_eos_or_stop) continue;   /* loop exits via stopped */
+
+        if (mismatch) {
             generated++;
-            if (extra == eos || callback(extra, ctx) == 0) { stopped = 1; }
-            else {
-                rc = ib_forward(model, &extra, 1, logits);
-                if (rc != INFERBIT_OK) { free(recent); return rc; }
-                rc = ib_forward(draft, &extra, 1, dlogits);
-                if (rc != INFERBIT_OK) { free(recent); return rc; }
-            }
+            if (mismatch_tok == eos || callback(mismatch_tok, ctx) == 0) { stopped = 1; continue; }
+            rc = ib_forward(model, &mismatch_tok, 1, logits);
+            if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+            inferbit_kv_truncate(draft, base_draft_len + accepted);
+            rc = ib_forward(draft, &mismatch_tok, 1, dlogits);
+            if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+            continue;
         }
+
+        /* All k accepted — bonus token from last batched position. */
+        if (generated >= params.max_tokens) break;
+        const float* last = logits_batch + (size_t)(k - 1) * (size_t)vocab;
+        int32_t extra = sample_argmax(last, vocab);
+        generated++;
+        if (extra == eos || callback(extra, ctx) == 0) { stopped = 1; break; }
+        rc = ib_forward(model, &extra, 1, logits);
+        if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+        rc = ib_forward(draft, &extra, 1, dlogits);
+        if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
     }
+    free(logits_batch);
 
     free(recent);
     return generated;

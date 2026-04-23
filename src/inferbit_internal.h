@@ -226,6 +226,32 @@ typedef struct {
         float* out, const void* weights, const float* scales_w,
         const int8_t* input, const float* scales_a, int M, int N
     );
+
+    /* W4A8 batched matmul: same as above, but amortizes weight loads across
+     * B independent activation vectors.
+     *
+     *   out      [B * M]  row-major, out[b*M + i]
+     *   weights  [M * N/2] INT4 packed (shared across batch)
+     *   scales_w [M]                     (shared across batch)
+     *   input    [B * N]  INT8 row-major, input[b*N + j]
+     *   scales_a [B * (N/IB_W4A8_GROUP)] FP32, one scale per (batch, group)
+     *
+     * Caller guarantees N % IB_W4A8_GROUP == 0. Typical B is 2-8 (spec
+     * decoding verify width). Large B is valid but not optimized — the
+     * kernel keeps B accumulators in registers. */
+    void (*matmul_w4a8_batch)(
+        float* out, const void* weights, const float* scales_w,
+        const int8_t* input, const float* scales_a,
+        int M, int N, int B
+    );
+
+    /* INT8 weight × FP32 activation batched matmul. Same layout contract as
+     * matmul_w4a8_batch for output and input (out[b*M + i], input[b*N + j]).
+     * Scales are per-row FP32 (shared across batch). */
+    void (*matmul_int8_batch)(
+        float* out, const void* weights, const float* scales_w,
+        const float* input, int M, int N, int B
+    );
 } ib_kernels;
 
 /* Activation quantization group size for W4A8. Chosen to fit all transformer
@@ -355,6 +381,18 @@ void ib_copy_norm_fp16(uint16_t* out, const void* src, const char* dtype, int si
 
 int ib_forward(inferbit_model* model, const int32_t* tokens, int num_tokens, float* out_logits);
 
+/* Multi-position forward. Processes num_tokens tokens advancing the KV cache,
+ * and writes per-position logits into out_logits[num_tokens * vocab_size].
+ *
+ * Unlike ib_forward (which only returns the last position's logits as a
+ * prefill optimization), this variant costs one LM head matmul per position.
+ * Needed for speculative-decoding verify passes, where we need logits at
+ * every candidate position to check whether the main model agrees with the
+ * draft. Do not use this for long prompt prefill — it's per-token more
+ * expensive than ib_forward by one LM head per token. */
+int ib_forward_positions(inferbit_model* model, const int32_t* tokens,
+                         int num_tokens, float* out_logits);
+
 /* ── Threading ──────────────────────────────────────────────── */
 
 typedef struct ib_thread_pool ib_thread_pool;
@@ -371,6 +409,17 @@ void            ib_parallel_matmul_w4a8(ib_thread_pool* tp, float* out,
                                         const void* weights, const float* scales_w,
                                         const int8_t* input, const float* scales_a,
                                         int M, int N);
+void            ib_parallel_matmul_w4a8_batch(ib_thread_pool* tp, float* out,
+                                               const void* weights,
+                                               const float* scales_w,
+                                               const int8_t* input,
+                                               const float* scales_a,
+                                               int M, int N, int B);
+void            ib_parallel_matmul_int8_batch(ib_thread_pool* tp, float* out,
+                                               const void* weights,
+                                               const float* scales_w,
+                                               const float* input,
+                                               int M, int N, int B);
 /* Per-group symmetric INT8 quantization. Writes N INT8 values and
  * ceil(N/IB_W4A8_GROUP) FP32 scales. Returns the number of groups written. */
 int             ib_quantize_input_int8_g128(const float* input, int8_t* out_q,
