@@ -140,6 +140,24 @@ struct inferbit_model {
     float* buf_logits;           /* [vocab_size] */
     float* buf_qkv;              /* Scratch for Q, K, V projections */
 
+    /* Batched-forward scratch (forward_batch, ib_forward_positions).
+     * Sized for up to IB_BATCH_MAX parallel positions. Preallocated at
+     * model load; reused every batched call to avoid malloc/free in the
+     * hot spec-verify loop. NULL when IB_BATCH_MAX == 0. */
+    float*  bb_x;                /* [B_MAX * hidden] */
+    float*  bb_xb;               /* [B_MAX * hidden] */
+    float*  bb_xb2;              /* [B_MAX * hidden] */
+    float*  bb_q;                /* [B_MAX * hidden] */
+    float*  bb_k;                /* [B_MAX * kv_dim] */
+    float*  bb_v;                /* [B_MAX * kv_dim] */
+    float*  bb_hb;               /* [B_MAX * intermediate] */
+    float*  bb_hb2;              /* [B_MAX * intermediate] */
+    float*  bb_scale;            /* [max(hidden,intermediate,vocab)] */
+    float*  bb_att;              /* [num_heads * max_ctx] (per-position scratch, reused) */
+    int8_t* bb_qscratch;         /* [B_MAX * max(hidden,intermediate)] */
+    float*  bb_sa;               /* [B_MAX * groups_max] */
+    int*    bb_positions;        /* [B_MAX] */
+
     /* Speculative decoding */
     inferbit_model* draft_model;
     int             draft_tokens;
@@ -257,6 +275,12 @@ typedef struct {
 /* Activation quantization group size for W4A8. Chosen to fit all transformer
  * hidden dims used in practice (multiples of 128). */
 #define IB_W4A8_GROUP 128
+
+/* Max parallel positions handled by forward_batch without falling back to
+ * malloc. Matches the candidates[32] cap in spec verify. Lowering this
+ * shrinks per-model preallocated scratch; raising it is only useful for
+ * wider speculation schemes. */
+#define IB_BATCH_MAX 32
 
 /* Global kernel dispatch table */
 extern ib_kernels ib_kern;

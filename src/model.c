@@ -85,6 +85,21 @@ void inferbit_free(inferbit_model* model) {
     free(model->buf_logits);
     free(model->buf_qkv);
 
+    /* Free batched-forward scratch */
+    free(model->bb_x);
+    free(model->bb_xb);
+    free(model->bb_xb2);
+    free(model->bb_q);
+    free(model->bb_k);
+    free(model->bb_v);
+    free(model->bb_hb);
+    free(model->bb_hb2);
+    free(model->bb_scale);
+    free(model->bb_att);
+    free(model->bb_qscratch);
+    free(model->bb_sa);
+    free(model->bb_positions);
+
     /* Free layer metadata */
     free(model->layers);
 

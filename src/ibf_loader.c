@@ -314,6 +314,35 @@ static int alloc_buffers(inferbit_model* model) {
         return -1;
     }
 
+    /* Batched-forward scratch (IB_BATCH_MAX positions). Allocated once so
+     * the spec-verify loop doesn't malloc/free ~1 MB per round. */
+    int B = IB_BATCH_MAX;
+    int n_max = h > inter ? h : inter;
+    int groups_max = (n_max + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
+    int scale_sz_b = h > inter ? h : inter;
+    if (vocab > scale_sz_b) scale_sz_b = vocab;
+
+    model->bb_x         = calloc((size_t)B * h,       sizeof(float));
+    model->bb_xb        = calloc((size_t)B * h,       sizeof(float));
+    model->bb_xb2       = calloc((size_t)B * h,       sizeof(float));
+    model->bb_q         = calloc((size_t)B * h,       sizeof(float));
+    model->bb_k         = calloc((size_t)B * kv_dim,  sizeof(float));
+    model->bb_v         = calloc((size_t)B * kv_dim,  sizeof(float));
+    model->bb_hb        = calloc((size_t)B * inter,   sizeof(float));
+    model->bb_hb2       = calloc((size_t)B * inter,   sizeof(float));
+    model->bb_scale     = calloc((size_t)scale_sz_b,  sizeof(float));
+    model->bb_att       = calloc((size_t)num_heads * max_ctx, sizeof(float));
+    model->bb_qscratch  = calloc((size_t)B * n_max,   sizeof(int8_t));
+    model->bb_sa        = calloc((size_t)B * groups_max, sizeof(float));
+    model->bb_positions = calloc((size_t)B,           sizeof(int));
+
+    if (!model->bb_x || !model->bb_xb || !model->bb_xb2 || !model->bb_q ||
+        !model->bb_k || !model->bb_v || !model->bb_hb || !model->bb_hb2 ||
+        !model->bb_scale || !model->bb_att || !model->bb_qscratch ||
+        !model->bb_sa || !model->bb_positions) {
+        return -1;
+    }
+
     return 0;
 }
 

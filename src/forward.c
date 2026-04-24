@@ -693,46 +693,28 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
     int kv_dim   = n_kv * head_dim;
     int heads_per_kv = n_heads / n_kv;
 
-    /* Per-batch activations. Layout: outer index = batch, inner = hidden/etc. */
-    size_t x_sz   = (size_t)B * hidden;
-    size_t kv_sz  = (size_t)B * kv_dim;
-    size_t inter_sz = (size_t)B * inter;
-
-    float* x   = (float*)malloc(x_sz   * sizeof(float));
-    float* xb  = (float*)malloc(x_sz   * sizeof(float));
-    float* xb2 = (float*)malloc(x_sz   * sizeof(float));
-    float* q   = (float*)malloc(x_sz   * sizeof(float));
-    float* k   = (float*)malloc(kv_sz  * sizeof(float));
-    float* v   = (float*)malloc(kv_sz  * sizeof(float));
-    float* hb  = (float*)malloc(inter_sz * sizeof(float));
-    float* hb2 = (float*)malloc(inter_sz * sizeof(float));
-
-    int scale_sz = hidden;
-    if (inter > scale_sz) scale_sz = inter;
-    if (vocab > scale_sz) scale_sz = vocab;
-    float* scale_buf = (float*)malloc((size_t)scale_sz * sizeof(float));
-
-    /* Attention scratch (per-position) */
-    int max_pos = 0;
-    for (int b = 0; b < B; b++) if (positions[b] > max_pos) max_pos = positions[b];
-    size_t att_sz = (size_t)n_heads * (max_pos + 1);
-    float* att = (float*)malloc(att_sz * sizeof(float));
-
-    /* Batched-matmul scratch: for W4A8 path we quantize B activations of
-     * length up to max(hidden, inter). Allocate max size. */
-    int n_max = hidden > inter ? hidden : inter;
-    int groups_max = (n_max + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
-    int8_t* q_scratch = (int8_t*)malloc((size_t)B * n_max * sizeof(int8_t));
-    float*  sa_scratch = (float*)malloc((size_t)B * groups_max * sizeof(float));
-
-    if (!x || !xb || !xb2 || !q || !k || !v || !hb || !hb2 ||
-        !scale_buf || !att || !q_scratch || !sa_scratch) {
-        free(x); free(xb); free(xb2); free(q); free(k); free(v);
-        free(hb); free(hb2); free(scale_buf); free(att);
-        free(q_scratch); free(sa_scratch);
-        ib_set_error("forward_batch oom");
+    if (B > IB_BATCH_MAX) {
+        ib_set_error("forward_batch B=%d exceeds IB_BATCH_MAX=%d", B, IB_BATCH_MAX);
         return INFERBIT_ERROR_PARAM;
     }
+
+    /* Reuse model-lifetime preallocated scratch. Avoids ~1 MB malloc/free
+     * per call in the spec-verify hot loop. Buffers are sized for
+     * IB_BATCH_MAX positions; we only touch the first B slots. */
+    float*  x          = m->bb_x;
+    float*  xb         = m->bb_xb;
+    float*  xb2        = m->bb_xb2;
+    float*  q          = m->bb_q;
+    float*  k          = m->bb_k;
+    float*  v          = m->bb_v;
+    float*  hb         = m->bb_hb;
+    float*  hb2        = m->bb_hb2;
+    float*  scale_buf  = m->bb_scale;
+    float*  att        = m->bb_att;
+    int8_t* q_scratch  = m->bb_qscratch;
+    float*  sa_scratch = m->bb_sa;
+
+    size_t x_sz = (size_t)B * hidden;
 
     /* Embed each token (cheap, per-position). */
     for (int b = 0; b < B; b++) {
@@ -859,9 +841,7 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
                             scale_buf, q_scratch, sa_scratch);
     }
 
-    free(x); free(xb); free(xb2); free(q); free(k); free(v);
-    free(hb); free(hb2); free(scale_buf); free(att);
-    free(q_scratch); free(sa_scratch);
+    /* Scratch buffers are model-lifetime; no free here. */
     return INFERBIT_OK;
 }
 
@@ -945,13 +925,15 @@ int ib_forward_positions(inferbit_model* model, const int32_t* tokens,
         }
     }
 
-    /* Build absolute positions for forward_batch (each token is appended to
-     * the KV cache in sequence starting at kv_pos). */
-    int* positions = (int*)malloc((size_t)num_tokens * sizeof(int));
-    if (!positions) { ib_set_error("oom"); return INFERBIT_ERROR_PARAM; }
+    if (num_tokens > IB_BATCH_MAX) {
+        ib_set_error("forward_positions num_tokens=%d exceeds IB_BATCH_MAX=%d",
+                     num_tokens, IB_BATCH_MAX);
+        return INFERBIT_ERROR_PARAM;
+    }
+
+    /* Fill absolute positions in the preallocated scratch buffer. */
+    int* positions = model->bb_positions;
     for (int i = 0; i < num_tokens; i++) positions[i] = kv_pos + i;
 
-    int rc = forward_batch(model, tokens, positions, num_tokens, out_logits);
-    free(positions);
-    return rc;
+    return forward_batch(model, tokens, positions, num_tokens, out_logits);
 }
