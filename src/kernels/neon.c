@@ -360,7 +360,7 @@ __attribute__((target("dotprod"),noinline))
 #endif
 static void neon_matmul_w4a8_batch_b4(
     float* out, const uint8_t* w, const float* scales_w,
-    const int8_t* input, const float* scales_a, int M, int N
+    const int8_t* input, const float* scales_a, int M, int N, int M_stride
 ) {
     const int G = IB_W4A8_GROUP;
     const int groups = N / G;
@@ -402,10 +402,10 @@ static void neon_matmul_w4a8_batch_b4(
         }
 
         float sw = scales_w[i];
-        out[0 * M + i] = r0 * sw;
-        out[1 * M + i] = r1 * sw;
-        out[2 * M + i] = r2 * sw;
-        out[3 * M + i] = r3 * sw;
+        out[0 * (size_t)M_stride + i] = r0 * sw;
+        out[1 * (size_t)M_stride + i] = r1 * sw;
+        out[2 * (size_t)M_stride + i] = r2 * sw;
+        out[3 * (size_t)M_stride + i] = r3 * sw;
     }
 }
 
@@ -414,7 +414,7 @@ __attribute__((target("dotprod"),noinline))
 #endif
 static void neon_matmul_w4a8_batch_b2(
     float* out, const uint8_t* w, const float* scales_w,
-    const int8_t* input, const float* scales_a, int M, int N
+    const int8_t* input, const float* scales_a, int M, int N, int M_stride
 ) {
     const int G = IB_W4A8_GROUP;
     const int groups = N / G;
@@ -446,8 +446,8 @@ static void neon_matmul_w4a8_batch_b2(
         }
 
         float sw = scales_w[i];
-        out[0 * M + i] = r0 * sw;
-        out[1 * M + i] = r1 * sw;
+        out[0 * (size_t)M_stride + i] = r0 * sw;
+        out[1 * (size_t)M_stride + i] = r1 * sw;
     }
 }
 
@@ -458,7 +458,7 @@ __attribute__((target("dotprod"),noinline))
 #endif
 static void neon_matmul_w4a8_batch_generic(
     float* out, const uint8_t* w, const float* scales_w,
-    const int8_t* input, const float* scales_a, int M, int N, int B
+    const int8_t* input, const float* scales_a, int M, int N, int B, int M_stride
 ) {
     const int G = IB_W4A8_GROUP;
     const int groups = N / G;
@@ -491,14 +491,14 @@ static void neon_matmul_w4a8_batch_generic(
             }
         }
         float sw = scales_w[i];
-        for (int b = 0; b < B; b++) out[(size_t)b * M + i] = row_acc[b] * sw;
+        for (int b = 0; b < B; b++) out[(size_t)b * M_stride + i] = row_acc[b] * sw;
     }
 }
 
 static void neon_matmul_w4a8_batch(
     float* out, const void* weights, const float* scales_w,
     const int8_t* input, const float* scales_a,
-    int M, int N, int B
+    int M, int N, int B, int M_stride
 ) {
     const uint8_t* w = (const uint8_t*)weights;
     const int groups = N / IB_W4A8_GROUP;
@@ -508,11 +508,11 @@ static void neon_matmul_w4a8_batch(
         return;
     }
     if (B == 2) {
-        neon_matmul_w4a8_batch_b2(out, w, scales_w, input, scales_a, M, N);
+        neon_matmul_w4a8_batch_b2(out, w, scales_w, input, scales_a, M, N, M_stride);
         return;
     }
     if (B == 4) {
-        neon_matmul_w4a8_batch_b4(out, w, scales_w, input, scales_a, M, N);
+        neon_matmul_w4a8_batch_b4(out, w, scales_w, input, scales_a, M, N, M_stride);
         return;
     }
     /* For 3 ≤ B ≤ 8 and larger, decompose into chunks of 4, 2, 1 using
@@ -524,12 +524,12 @@ static void neon_matmul_w4a8_batch(
         int rem = B - done;
         const int8_t* in_chunk  = input    + (size_t)done * N;
         const float*  sa_chunk  = scales_a + (size_t)done * groups;
-        float*        out_chunk = out      + (size_t)done * M;
+        float*        out_chunk = out      + (size_t)done * M_stride;
         if (rem >= 4) {
-            neon_matmul_w4a8_batch_b4(out_chunk, w, scales_w, in_chunk, sa_chunk, M, N);
+            neon_matmul_w4a8_batch_b4(out_chunk, w, scales_w, in_chunk, sa_chunk, M, N, M_stride);
             done += 4;
         } else if (rem == 2 || rem == 3) {
-            neon_matmul_w4a8_batch_b2(out_chunk, w, scales_w, in_chunk, sa_chunk, M, N);
+            neon_matmul_w4a8_batch_b2(out_chunk, w, scales_w, in_chunk, sa_chunk, M, N, M_stride);
             done += 2;
         } else { /* rem == 1 */
             neon_matmul_w4a8(out_chunk, weights, scales_w, in_chunk, sa_chunk, M, N);
@@ -549,7 +549,7 @@ static void neon_matmul_w4a8_batch(
 __attribute__((noinline))
 static void neon_matmul_int8_batch_b4(
     float* out, const int8_t* w, const float* scales_w,
-    const float* input, int M, int N
+    const float* input, int M, int N, int M_stride
 ) {
     const float* in0 = input + 0 * N;
     const float* in1 = input + 1 * N;
@@ -585,17 +585,17 @@ static void neon_matmul_int8_batch_b4(
             s2 += wv * in2[j]; s3 += wv * in3[j];
         }
         float sw = scales_w[i];
-        out[0 * M + i] = s0 * sw;
-        out[1 * M + i] = s1 * sw;
-        out[2 * M + i] = s2 * sw;
-        out[3 * M + i] = s3 * sw;
+        out[0 * (size_t)M_stride + i] = s0 * sw;
+        out[1 * (size_t)M_stride + i] = s1 * sw;
+        out[2 * (size_t)M_stride + i] = s2 * sw;
+        out[3 * (size_t)M_stride + i] = s3 * sw;
     }
 }
 
 __attribute__((noinline))
 static void neon_matmul_int8_batch_b2(
     float* out, const int8_t* w, const float* scales_w,
-    const float* input, int M, int N
+    const float* input, int M, int N, int M_stride
 ) {
     const float* in0 = input + 0 * N;
     const float* in1 = input + 1 * N;
@@ -620,26 +620,26 @@ static void neon_matmul_int8_batch_b2(
             s0 += wv * in0[j]; s1 += wv * in1[j];
         }
         float sw = scales_w[i];
-        out[0 * M + i] = s0 * sw;
-        out[1 * M + i] = s1 * sw;
+        out[0 * (size_t)M_stride + i] = s0 * sw;
+        out[1 * (size_t)M_stride + i] = s1 * sw;
     }
 }
 
 static void neon_matmul_int8_batch(
     float* out, const void* weights, const float* scales_w,
-    const float* input, int M, int N, int B
+    const float* input, int M, int N, int B, int M_stride
 ) {
     const int8_t* w = (const int8_t*)weights;
     int done = 0;
     while (done < B) {
         int rem = B - done;
         const float* in_chunk = input + (size_t)done * N;
-        float*       out_chunk = out  + (size_t)done * M;
+        float*       out_chunk = out  + (size_t)done * M_stride;
         if (rem >= 4) {
-            neon_matmul_int8_batch_b4(out_chunk, w, scales_w, in_chunk, M, N);
+            neon_matmul_int8_batch_b4(out_chunk, w, scales_w, in_chunk, M, N, M_stride);
             done += 4;
         } else if (rem >= 2) {
-            neon_matmul_int8_batch_b2(out_chunk, w, scales_w, in_chunk, M, N);
+            neon_matmul_int8_batch_b2(out_chunk, w, scales_w, in_chunk, M, N, M_stride);
             done += 2;
         } else {
             neon_matmul_int8(out_chunk, w, scales_w, in_chunk, M, N);

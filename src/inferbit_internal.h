@@ -248,27 +248,31 @@ typedef struct {
     /* W4A8 batched matmul: same as above, but amortizes weight loads across
      * B independent activation vectors.
      *
-     *   out      [B * M]  row-major, out[b*M + i]
-     *   weights  [M * N/2] INT4 packed (shared across batch)
-     *   scales_w [M]                     (shared across batch)
-     *   input    [B * N]  INT8 row-major, input[b*N + j]
-     *   scales_a [B * (N/IB_W4A8_GROUP)] FP32, one scale per (batch, group)
+     *   out         [B * M_stride]  row-major, out[b*M_stride + i]
+     *   weights     [M * N/2] INT4 packed (shared across batch). M rows
+     *               processed; rows physically span the first M*(N/2) bytes.
+     *   scales_w    [M]                     (shared across batch)
+     *   input       [B * N]  INT8 row-major, input[b*N + j]
+     *   scales_a    [B * (N/IB_W4A8_GROUP)] FP32 (one scale per batch×group)
+     *   M_stride    Output column stride. Pass M_stride==M for a contiguous
+     *               B-by-M output. The thread-parallel wrapper passes the
+     *               global M (so per-thread row slices write into their
+     *               correct positions in the shared output), with weights
+     *               + scales_w pre-offset to the slice's first row.
      *
      * Caller guarantees N % IB_W4A8_GROUP == 0. Typical B is 2-8 (spec
-     * decoding verify width). Large B is valid but not optimized — the
-     * kernel keeps B accumulators in registers. */
+     * decoding verify width). */
     void (*matmul_w4a8_batch)(
         float* out, const void* weights, const float* scales_w,
         const int8_t* input, const float* scales_a,
-        int M, int N, int B
+        int M, int N, int B, int M_stride
     );
 
     /* INT8 weight × FP32 activation batched matmul. Same layout contract as
-     * matmul_w4a8_batch for output and input (out[b*M + i], input[b*N + j]).
-     * Scales are per-row FP32 (shared across batch). */
+     * matmul_w4a8_batch (output strided by M_stride). */
     void (*matmul_int8_batch)(
         float* out, const void* weights, const float* scales_w,
-        const float* input, int M, int N, int B
+        const float* input, int M, int N, int B, int M_stride
     );
 } ib_kernels;
 

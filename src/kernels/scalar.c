@@ -69,7 +69,7 @@ static void scalar_matmul_w4a8(
 
 static void scalar_matmul_int8_batch(
     float* out, const void* weights, const float* scales_w,
-    const float* input, int M, int N, int B
+    const float* input, int M, int N, int B, int M_stride
 ) {
     const int8_t* w = (const int8_t*)weights;
     for (int i = 0; i < M; i++) {
@@ -78,7 +78,7 @@ static void scalar_matmul_int8_batch(
             const float* arow = input + (size_t)b * N;
             float sum = 0.0f;
             for (int j = 0; j < N; j++) sum += (float)row[j] * arow[j];
-            out[(size_t)b * M + i] = sum * scales_w[i];
+            out[(size_t)b * M_stride + i] = sum * scales_w[i];
         }
     }
 }
@@ -86,7 +86,7 @@ static void scalar_matmul_int8_batch(
 static void scalar_matmul_w4a8_batch(
     float* out, const void* weights, const float* scales_w,
     const int8_t* input, const float* scales_a,
-    int M, int N, int B
+    int M, int N, int B, int M_stride
 ) {
     const uint8_t* w = (const uint8_t*)weights;
     const int G = IB_W4A8_GROUP;
@@ -119,7 +119,7 @@ static void scalar_matmul_w4a8_batch(
             j = end; g++;
         }
         float sw = scales_w[i];
-        for (int b = 0; b < B; b++) out[(size_t)b * M + i] = row_acc[b] * sw;
+        for (int b = 0; b < B; b++) out[(size_t)b * M_stride + i] = row_acc[b] * sw;
     }
 }
 

@@ -318,14 +318,18 @@ static void parallel_w4a8_batch_task(void* arg, int thread_id, int start, int en
     int rows = end - start;
     const uint8_t* w = (const uint8_t*)a->weights;
     const uint8_t* row_start = w + (size_t)start * (a->N / 2);
-    int groups = a->N / IB_W4A8_GROUP;
-    for (int b = 0; b < a->B; b++) {
-        float* out_slice = a->out + (size_t)b * a->M + start;
-        const int8_t* in = a->input + (size_t)b * a->N;
-        const float* sa = a->scales_a + (size_t)b * groups;
-        ib_kern.matmul_w4a8(out_slice, row_start, a->scales_w + start,
-                            in, sa, rows, a->N);
-    }
+    /* Call the BATCHED kernel on this thread's row slice. M_stride==a->M
+     * so per-batch outputs land in their correct positions in the global
+     * out[b * M_global + i] layout. */
+    ib_kern.matmul_w4a8_batch(a->out + start,
+                              row_start,
+                              a->scales_w + start,
+                              a->input,
+                              a->scales_a,
+                              rows,
+                              a->N,
+                              a->B,
+                              a->M);
 }
 
 void ib_parallel_matmul_w4a8_batch(ib_thread_pool* tp, float* out,
@@ -333,7 +337,7 @@ void ib_parallel_matmul_w4a8_batch(ib_thread_pool* tp, float* out,
                                    const int8_t* input, const float* scales_a,
                                    int M, int N, int B) {
     if (!tp || M < 64) {
-        ib_kern.matmul_w4a8_batch(out, weights, scales_w, input, scales_a, M, N, B);
+        ib_kern.matmul_w4a8_batch(out, weights, scales_w, input, scales_a, M, N, B, M);
         return;
     }
     ib_w4a8_batch_arg arg = { out, weights, scales_w, input, scales_a, M, N, B };
@@ -364,24 +368,23 @@ static void parallel_int8_batch_task(void* arg, int thread_id, int start, int en
     int rows = end - start;
     const int8_t* w = (const int8_t*)a->weights;
     const int8_t* row_start = w + (size_t)start * a->N;
-    /* Per-batch lane dispatch into row slice. The kernel uses M for row
-     * stride in the output, but we're only writing rows [start..end). To
-     * match the global out[b*M + i] layout we place each batch's partial
-     * output at out + b*M + start and run a single-row-dense kernel over
-     * `rows` rows. */
-    for (int b = 0; b < a->B; b++) {
-        float* out_slice = a->out + (size_t)b * a->M + start;
-        const float* in = a->input + (size_t)b * a->N;
-        ib_kern.matmul_int8(out_slice, row_start, a->scales_w + start,
-                            in, rows, a->N);
-    }
+    /* Call the batched kernel on this thread's row slice. M_stride==a->M
+     * so each batch's partial output lands at out[b * M_global + start]. */
+    ib_kern.matmul_int8_batch(a->out + start,
+                              row_start,
+                              a->scales_w + start,
+                              a->input,
+                              rows,
+                              a->N,
+                              a->B,
+                              a->M);
 }
 
 void ib_parallel_matmul_int8_batch(ib_thread_pool* tp, float* out,
                                    const void* weights, const float* scales_w,
                                    const float* input, int M, int N, int B) {
     if (!tp || M < 64) {
-        ib_kern.matmul_int8_batch(out, weights, scales_w, input, M, N, B);
+        ib_kern.matmul_int8_batch(out, weights, scales_w, input, M, N, B, M);
         return;
     }
     ib_int8_batch_arg arg = { out, weights, scales_w, input, M, N, B };
