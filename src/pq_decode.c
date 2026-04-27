@@ -132,58 +132,20 @@ void ib_pq_free(ib_pq_tensor* t) {
     memset(t, 0, sizeof(*t));
 }
 
-int ib_pq_load_single(const char* path, ib_pq_tensor* out) {
-    if (!out || !path) return -1;
+/* Parse one tensor's metadata + load its blocks. The file handle is
+ * positioned arbitrarily afterwards. Returns 0 on success. */
+static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
+                            size_t file_sz, ib_pq_tensor* out) {
     memset(out, 0, sizeof(*out));
 
-    FILE* f = fopen(path, "rb");
-    if (!f) return -1;
-
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
-    long file_sz_l = ftell(f);
-    if (file_sz_l < (long)IBF_PREAMBLE) { fclose(f); return -1; }
-    size_t file_sz = (size_t)file_sz_l;
-    rewind(f);
-
-    uint8_t preamble[IBF_PREAMBLE];
-    if (fread(preamble, 1, IBF_PREAMBLE, f) != IBF_PREAMBLE) { fclose(f); return -1; }
-
-    if (memcmp(preamble, IBF_MAGIC, IBF_MAGIC_SIZE) != 0) { fclose(f); return -1; }
-
-    uint32_t version, json_reserve;
-    memcpy(&version, preamble + 8, 4);
-    memcpy(&json_reserve, preamble + 12, 4);
-    if (version != IBF_VERSION_V5) { fclose(f); return -1; }
-
-    char* json_buf = (char*)malloc(json_reserve + 1);
-    if (!json_buf) { fclose(f); return -1; }
-    if (fread(json_buf, 1, json_reserve, f) != json_reserve) {
-        free(json_buf); fclose(f); return -1;
-    }
-    json_buf[json_reserve] = '\0';
-
-    cJSON* root = cJSON_Parse(json_buf);
-    free(json_buf);
-    if (!root) { fclose(f); return -1; }
-
-    size_t weight_data_start = (size_t)json_int_field(root, "weight_data_start", 0);
-    cJSON* tensors = cJSON_GetObjectItemCaseSensitive(root, "tensors");
-    if (!cJSON_IsObject(tensors)) { cJSON_Delete(root); fclose(f); return -1; }
-
-    cJSON* tm = tensors->child;  /* first tensor */
-    if (!tm) { cJSON_Delete(root); fclose(f); return -1; }
-
-    /* Parse meta */
     const char* fmt_str = "";
     cJSON* fit = cJSON_GetObjectItemCaseSensitive(tm, "format");
     if (cJSON_IsString(fit)) fmt_str = fit->valuestring;
-    out->format   = parse_format(fmt_str);
-    if (out->format == IB_PQ_FMT_NONE) { cJSON_Delete(root); fclose(f); return -1; }
+    out->format = parse_format(fmt_str);
+    if (out->format == IB_PQ_FMT_NONE) return -1;
 
     cJSON* shape = cJSON_GetObjectItemCaseSensitive(tm, "shape");
-    if (!cJSON_IsArray(shape) || cJSON_GetArraySize(shape) != 2) {
-        cJSON_Delete(root); fclose(f); return -1;
-    }
+    if (!cJSON_IsArray(shape) || cJSON_GetArraySize(shape) != 2) return -1;
     out->M = (int)cJSON_GetArrayItem(shape, 0)->valuedouble;
     out->N = (int)cJSON_GetArrayItem(shape, 1)->valuedouble;
     out->G = (int)json_int_field(tm, "G", 0);
@@ -198,13 +160,10 @@ int ib_pq_load_single(const char* path, ib_pq_tensor* out) {
 
     int M = out->M, N = out->N, G = out->G, K = out->K;
     int n_inner = N - out->n_outlier;
-    if (G <= 0 || K <= 0 || (G & 1) || n_inner % G != 0) {
-        cJSON_Delete(root); fclose(f); return -1;
-    }
+    if (G <= 0 || K <= 0 || (G & 1) || n_inner % G != 0) return -1;
     out->C = n_inner / G;
     int C = out->C;
 
-    /* Block sizes (canonical) */
     size_t cb_sz   = (size_t)K * (G / 2) * sizeof(uint16_t);
     size_t idx_sz  = (size_t)M * (size_t)C * sizeof(uint8_t);
     size_t rs_sz   = (size_t)M * sizeof(uint16_t);
@@ -212,13 +171,12 @@ int ib_pq_load_single(const char* path, ib_pq_tensor* out) {
     size_t osc_sz  = (size_t)M * (size_t)out->n_outlier * sizeof(int8_t);
     size_t oscl_sz = (size_t)out->n_outlier * sizeof(uint16_t);
 
-    /* Total arena */
     size_t total = 2*cb_sz + 2*idx_sz + rs_sz;
     if (out->n_levels == 2) total += 2*cb_sz + 2*idx_sz;
     if (out->n_outlier > 0) total += oc_sz + osc_sz + oscl_sz;
 
     out->_arena = malloc(total ? total : 1);
-    if (!out->_arena) { cJSON_Delete(root); fclose(f); return -1; }
+    if (!out->_arena) return -1;
     out->_arena_size = total;
     uint8_t* arena = (uint8_t*)out->_arena;
     size_t cur = 0;
@@ -242,7 +200,6 @@ int ib_pq_load_single(const char* path, ib_pq_tensor* out) {
     }
     #undef SLICE
 
-    /* Load each block from file at (weight_data_start + offset). */
     #define LOAD_BLOCK(key, dst_ptr, expected_sz) do {                    \
         size_t off, sz;                                                   \
         if (read_block(tm, (key), &off, &sz) != 0) goto err;              \
@@ -270,16 +227,139 @@ int ib_pq_load_single(const char* path, ib_pq_tensor* out) {
         LOAD_BLOCK("outlier_scale",   out->outlier_scale,   oscl_sz);
     }
     #undef LOAD_BLOCK
+    return 0;
+
+err:
+    ib_pq_free(out);
+    return -1;
+}
+
+/* Open the file, parse preamble + JSON header. On success, returns a
+ * still-open FILE* and the parsed cJSON root + sizes via outparams.
+ * On failure returns NULL and zeroes outparams. */
+static FILE* open_and_parse_header(const char* path, cJSON** out_root,
+                                    size_t* out_weight_data_start,
+                                    size_t* out_file_sz) {
+    *out_root = NULL;
+    *out_weight_data_start = 0;
+    *out_file_sz = 0;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long file_sz_l = ftell(f);
+    if (file_sz_l < (long)IBF_PREAMBLE) { fclose(f); return NULL; }
+    *out_file_sz = (size_t)file_sz_l;
+    rewind(f);
+
+    uint8_t preamble[IBF_PREAMBLE];
+    if (fread(preamble, 1, IBF_PREAMBLE, f) != IBF_PREAMBLE) { fclose(f); return NULL; }
+    if (memcmp(preamble, IBF_MAGIC, IBF_MAGIC_SIZE) != 0) { fclose(f); return NULL; }
+
+    uint32_t version, json_reserve;
+    memcpy(&version, preamble + 8, 4);
+    memcpy(&json_reserve, preamble + 12, 4);
+    if (version != IBF_VERSION_V5) { fclose(f); return NULL; }
+
+    char* json_buf = (char*)malloc(json_reserve + 1);
+    if (!json_buf) { fclose(f); return NULL; }
+    if (fread(json_buf, 1, json_reserve, f) != json_reserve) {
+        free(json_buf); fclose(f); return NULL;
+    }
+    json_buf[json_reserve] = '\0';
+
+    cJSON* root = cJSON_Parse(json_buf);
+    free(json_buf);
+    if (!root) { fclose(f); return NULL; }
+
+    *out_root = root;
+    *out_weight_data_start = (size_t)json_int_field(root, "weight_data_start", 0);
+    return f;
+}
+
+int ib_pq_load_single(const char* path, ib_pq_tensor* out) {
+    if (!out || !path) return -1;
+    memset(out, 0, sizeof(*out));
+
+    cJSON* root = NULL;
+    size_t weight_data_start = 0, file_sz = 0;
+    FILE* f = open_and_parse_header(path, &root, &weight_data_start, &file_sz);
+    if (!f) return -1;
+
+    cJSON* tensors = cJSON_GetObjectItemCaseSensitive(root, "tensors");
+    if (!cJSON_IsObject(tensors)) { cJSON_Delete(root); fclose(f); return -1; }
+    cJSON* tm = tensors->child;
+    if (!tm) { cJSON_Delete(root); fclose(f); return -1; }
+
+    int rc = load_one_tensor(f, tm, weight_data_start, file_sz, out);
+    cJSON_Delete(root);
+    fclose(f);
+    return rc;
+}
+
+int ib_pq_load_multi(const char* path, ib_pq_multi* out) {
+    if (!out || !path) return -1;
+    memset(out, 0, sizeof(*out));
+
+    cJSON* root = NULL;
+    size_t weight_data_start = 0, file_sz = 0;
+    FILE* f = open_and_parse_header(path, &root, &weight_data_start, &file_sz);
+    if (!f) return -1;
+
+    cJSON* tensors = cJSON_GetObjectItemCaseSensitive(root, "tensors");
+    if (!cJSON_IsObject(tensors)) { cJSON_Delete(root); fclose(f); return -1; }
+
+    int n = 0;
+    for (cJSON* it = tensors->child; it; it = it->next) n++;
+    if (n <= 0) { cJSON_Delete(root); fclose(f); return -1; }
+
+    out->n = n;
+    out->names = (char**)calloc((size_t)n, sizeof(char*));
+    out->tensors = (ib_pq_tensor*)calloc((size_t)n, sizeof(ib_pq_tensor));
+    if (!out->names || !out->tensors) {
+        cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+    }
+
+    int i = 0;
+    for (cJSON* it = tensors->child; it; it = it->next, i++) {
+        size_t name_len = it->string ? strlen(it->string) : 0;
+        out->names[i] = (char*)malloc(name_len + 1);
+        if (!out->names[i]) {
+            cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+        }
+        memcpy(out->names[i], it->string ? it->string : "", name_len);
+        out->names[i][name_len] = '\0';
+
+        if (load_one_tensor(f, it, weight_data_start, file_sz, &out->tensors[i]) != 0) {
+            cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+        }
+    }
 
     cJSON_Delete(root);
     fclose(f);
     return 0;
+}
 
-err:
-    cJSON_Delete(root);
-    fclose(f);
-    ib_pq_free(out);
-    return -1;
+void ib_pq_multi_free(ib_pq_multi* m) {
+    if (!m) return;
+    if (m->names) {
+        for (int i = 0; i < m->n; i++) free(m->names[i]);
+        free(m->names);
+    }
+    if (m->tensors) {
+        for (int i = 0; i < m->n; i++) ib_pq_free(&m->tensors[i]);
+        free(m->tensors);
+    }
+    memset(m, 0, sizeof(*m));
+}
+
+const ib_pq_tensor* ib_pq_multi_find(const ib_pq_multi* m, const char* name) {
+    if (!m || !name) return NULL;
+    for (int i = 0; i < m->n; i++) {
+        if (m->names[i] && strcmp(m->names[i], name) == 0) return &m->tensors[i];
+    }
+    return NULL;
 }
 
 /* ── Materialize ──────────────────────────────────────────────── */
@@ -378,30 +458,35 @@ int ib_pq_reconstruct_fp16(const ib_pq_tensor* t, uint16_t* out) {
     return rc;
 }
 
-/* ── Fused matmul (vector path) ───────────────────────────────── */
+/* ── Fused matmul (LUT path) ──────────────────────────────────── */
 /*
- * out[r] = sum_j W[r,j] * x[j]
+ * out = W * x in FP32, computed without materializing W.
  *
- * For each row r and chunk c:
- *   out[r] += scale_r * (
- *       sum_{k<half} (cb1l[idx_l[c]][k] (+ cb2l[idx2l[c]][k] if l2)) *
- *                    x[ inner_cols[c*G + k] ]
- *     + sum_{k<half} (cb1r[idx_r[c]][k] (+ cb2r[idx2r[c]][k] if l2)) *
- *                    x[ inner_cols[c*G + half + k] ]
- *   )
- * + outlier contribution (sparse).
+ * Standard PQ-MATMUL-LUT optimisation:
+ *   For each chunk c (column block of size G/2 each on L and R sides),
+ *   precompute partial dot products against x for every codebook entry:
+ *     T_L1[k, c] = sum_{i<half} cb1l[k,i] * x[inner_cols[c*G + i]]
+ *     T_R1[k, c] = sum_{i<half} cb1r[k,i] * x[inner_cols[c*G + half + i]]
+ *   Then per row r:
+ *     out[r] = scale[r] * sum_c (T_L1[idx_l[r,c], c] + T_R1[idx_r[r,c], c])
+ *           (+ same with L2 tables if n_levels == 2)
+ *           + outlier contribution.
  *
- * The "table-of-partial-products" optimisation that wins on cache lookup
- * is NOT applied here yet — this is the scalar reference. Bench S3.6 will
- * compare this against the materialize-then-FP32-matmul path.
+ * Cost: O(K * N) for the tables, plus O(M * C) cheap lookups per row.
+ * Old per-row implementation was O(M * N) with the same constants.
+ *
+ * Numerical contract: the materialize path round-trips each weight value
+ * through fp16 once. The LUT path keeps the codebook entries in fp32
+ * throughout and only does fp32 fma; this matches "ib_pq_matmul_fp32 may
+ * differ from materialize+fp32_matmul by FMA reassociation" from doc 26.
  */
 int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
     if (!t || !x || !out) return -1;
-    int M = t->M, N = t->N, G = t->G, C = t->C;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
     int half = G / 2;
 
-    /* Pre-decode codebooks to FP32 */
-    int cb_entries = t->K * half;
+    /* Codebook tables decoded to fp32 once. */
+    int cb_entries = K * half;
     float* cb1l = (float*)malloc((size_t)cb_entries * sizeof(float));
     float* cb1r = (float*)malloc((size_t)cb_entries * sizeof(float));
     float* cb2l = NULL, *cb2r = NULL;
@@ -413,6 +498,7 @@ int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
     if (t->n_levels == 2) {
         cb2l = (float*)malloc((size_t)cb_entries * sizeof(float));
         cb2r = (float*)malloc((size_t)cb_entries * sizeof(float));
+        if (!cb2l || !cb2r) { free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1; }
         for (int i = 0; i < cb_entries; i++) {
             cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
             cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
@@ -425,53 +511,93 @@ int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
     {
         uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
         for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
-        int k = 0;
-        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        int kk = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[kk++] = j;
         free(mask);
     }
 
+    /* Pre-multiplied tables. Layout: T_*[c * K + k] (chunk-major so the
+     * per-row inner loop steps the chunk index by 1 contiguously per c). */
+    size_t table_sz = (size_t)C * K;
+    float* TL1 = (float*)malloc(table_sz * sizeof(float));
+    float* TR1 = (float*)malloc(table_sz * sizeof(float));
+    float* TL2 = NULL, *TR2 = NULL;
+    if (!TL1 || !TR1) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(TL1); free(TR1); return -1;
+    }
+    if (cb2l) {
+        TL2 = (float*)malloc(table_sz * sizeof(float));
+        TR2 = (float*)malloc(table_sz * sizeof(float));
+        if (!TL2 || !TR2) { /* leak-and-fail; matmul must abort */
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            free(TL1); free(TR1); free(TL2); free(TR2); return -1;
+        }
+    }
+
+    /* Build the partial-dot tables. For each chunk c and codebook
+     * entry k: T_L*[c*K + k] = sum_{i<half} cb*l[k,i] * x[inner_cols[c*G+i]]. */
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        /* Cache the two x slices for this chunk. */
+        float xL[16], xR[16];   /* half ≤ 16 in any sane config */
+        for (int i = 0; i < half; i++) xL[i] = x[inner_cols[base + i]];
+        for (int i = 0; i < half; i++) xR[i] = x[inner_cols[base + half + i]];
+        for (int k = 0; k < K; k++) {
+            float sl = 0.0f, sr = 0.0f;
+            const float* lv = &cb1l[(size_t)k * half];
+            const float* rv = &cb1r[(size_t)k * half];
+            for (int i = 0; i < half; i++) sl += lv[i] * xL[i];
+            for (int i = 0; i < half; i++) sr += rv[i] * xR[i];
+            TL1[(size_t)c * K + k] = sl;
+            TR1[(size_t)c * K + k] = sr;
+            if (cb2l) {
+                float sl2 = 0.0f, sr2 = 0.0f;
+                const float* lv2 = &cb2l[(size_t)k * half];
+                const float* rv2 = &cb2r[(size_t)k * half];
+                for (int i = 0; i < half; i++) sl2 += lv2[i] * xL[i];
+                for (int i = 0; i < half; i++) sr2 += rv2[i] * xR[i];
+                TL2[(size_t)c * K + k] = sl2;
+                TR2[(size_t)c * K + k] = sr2;
+            }
+        }
+    }
+
+    /* Per-row gather. */
     for (int r = 0; r < M; r++) {
         float scale = ib_fp16_to_fp32(t->row_scale[r]);
         const uint8_t* il_l = t->indices_l1_l + (size_t)r * C;
         const uint8_t* il_r = t->indices_l1_r + (size_t)r * C;
-        const uint8_t* il2l = cb2l ? t->indices_l2_l + (size_t)r * C : NULL;
-        const uint8_t* il2r = cb2r ? t->indices_l2_r + (size_t)r * C : NULL;
+        const uint8_t* il2l = TL2 ? t->indices_l2_l + (size_t)r * C : NULL;
+        const uint8_t* il2r = TR2 ? t->indices_l2_r + (size_t)r * C : NULL;
         float acc = 0.0f;
-        for (int c = 0; c < C; c++) {
-            int base = c * G;
-            const float* lv = &cb1l[(size_t)il_l[c] * half];
-            const float* rv = &cb1r[(size_t)il_r[c] * half];
-            const float* lv2 = il2l ? &cb2l[(size_t)il2l[c] * half] : NULL;
-            const float* rv2 = il2r ? &cb2r[(size_t)il2r[c] * half] : NULL;
-            for (int k = 0; k < half; k++) {
-                float w = lv[k];
-                if (lv2) w += lv2[k];
-                /* scale and round-trip through fp16 to match the materialize
-                 * path numerically. */
-                w = ib_fp16_to_fp32(ib_fp32_to_fp16(w * scale));
-                acc += w * x[inner_cols[base + k]];
+        if (TL2) {
+            for (int c = 0; c < C; c++) {
+                size_t base = (size_t)c * K;
+                acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
+                acc += TL2[base + il2l[c]] + TR2[base + il2r[c]];
             }
-            for (int k = 0; k < half; k++) {
-                float w = rv[k];
-                if (rv2) w += rv2[k];
-                w = ib_fp16_to_fp32(ib_fp32_to_fp16(w * scale));
-                acc += w * x[inner_cols[base + half + k]];
+        } else {
+            for (int c = 0; c < C; c++) {
+                size_t base = (size_t)c * K;
+                acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
             }
         }
-        out[r] = acc;
+        out[r] = acc * scale;
     }
 
-    /* Outliers */
+    /* Outliers — small (n_outlier ≪ N), kept as scalar fp32 fma. */
     for (int j = 0; j < t->n_outlier; j++) {
         int col = t->outlier_cols[j];
         float os = ib_fp16_to_fp32(t->outlier_scale[j]);
+        float xj = x[col];
         for (int r = 0; r < M; r++) {
             float w = (float)t->outlier_sidecar[(size_t)r * t->n_outlier + j] * os;
-            w = ib_fp16_to_fp32(ib_fp32_to_fp16(w));
-            out[r] += w * x[col];
+            out[r] += w * xj;
         }
     }
 
-    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r);
+    free(inner_cols); free(TL1); free(TR1); free(TL2); free(TR2);
     return 0;
 }

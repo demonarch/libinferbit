@@ -74,6 +74,18 @@ typedef struct {
 int  ib_pq_load_single(const char* path, ib_pq_tensor* out);
 void ib_pq_free(ib_pq_tensor* t);
 
+/* Multi-tensor IBF v5 loader. Returns an array of tensors and their
+ * names. Caller must free both via ib_pq_multi_free. */
+typedef struct {
+    int n;
+    char** names;          /* heap-allocated strings */
+    ib_pq_tensor* tensors; /* parallel array */
+} ib_pq_multi;
+
+int  ib_pq_load_multi(const char* path, ib_pq_multi* out);
+void ib_pq_multi_free(ib_pq_multi* m);
+const ib_pq_tensor* ib_pq_multi_find(const ib_pq_multi* m, const char* name);
+
 /* Materialize: write M*N FP16 values into out_fp16.
  * out_fp16 must have space for M*N uint16_t. */
 int ib_pq_reconstruct_fp16(const ib_pq_tensor* t, uint16_t* out_fp16);

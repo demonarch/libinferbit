@@ -124,6 +124,10 @@ add_executable(bench_pq_decode tests/bench_pq_decode.c)
 target_link_libraries(bench_pq_decode inferbit_static ${PLATFORM_LIBS})
 target_include_directories(bench_pq_decode PRIVATE include src)
 
+add_executable(bench_pq_ffn tests/bench_pq_ffn.c)
+target_link_libraries(bench_pq_ffn inferbit_static ${PLATFORM_LIBS})
+target_include_directories(bench_pq_ffn PRIVATE include src)
+
 enable_testing()
 add_test(NAME basic COMMAND test_inferbit)
 add_test(NAME ibf_loader COMMAND test_ibf_loader)
