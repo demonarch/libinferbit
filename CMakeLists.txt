@@ -55,6 +55,7 @@ set(INFERBIT_SOURCES
     src/eval.c
     src/calibrate.c
     src/cJSON.c
+    src/pq_decode.c
 )
 
 # Determine target architecture
@@ -114,6 +115,14 @@ target_include_directories(test_forward PRIVATE include)
 add_executable(test_convert tests/test_convert.c)
 target_link_libraries(test_convert inferbit_static ${PLATFORM_LIBS})
 target_include_directories(test_convert PRIVATE include)
+
+add_executable(test_pq_decode tests/test_pq_decode.c)
+target_link_libraries(test_pq_decode inferbit_static ${PLATFORM_LIBS})
+target_include_directories(test_pq_decode PRIVATE include src)
+
+add_executable(bench_pq_decode tests/bench_pq_decode.c)
+target_link_libraries(bench_pq_decode inferbit_static ${PLATFORM_LIBS})
+target_include_directories(bench_pq_decode PRIVATE include src)
 
 enable_testing()
 add_test(NAME basic COMMAND test_inferbit)
