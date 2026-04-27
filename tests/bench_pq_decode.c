@@ -15,6 +15,7 @@
  */
 
 #include "pq_decode.h"
+#include "inferbit_internal.h"  /* ib_thread_pool */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
     fprintf(stdout, "  materialize+FP32 matmul:       %7.3f ms  %6.2f GFLOP/s\n",
             t_ref_min * 1e3, ref_GFLOPs);
 
-    /* Fused PQ matmul */
+    /* Fused PQ matmul (single-threaded) */
     double t_fus_min = 1e9;
     for (int r = 0; r < repeats; r++) {
         double s = now_s();
@@ -103,8 +104,27 @@ int main(int argc, char** argv) {
         if (d < t_fus_min) t_fus_min = d;
     }
     double fus_GFLOPs = 2.0 * (double)MN / 1e9 / t_fus_min;
-    fprintf(stdout, "  fused PQ-matmul (scalar):      %7.3f ms  %6.2f GFLOP/s\n",
+    fprintf(stdout, "  fused PQ-matmul (1 thread):    %7.3f ms  %6.2f GFLOP/s\n",
             t_fus_min * 1e3, fus_GFLOPs);
+
+    /* Threaded fused (P=4, P=8 if available) */
+    int n_thread_configs[] = {4, 8};
+    for (int p_idx = 0; p_idx < 2; p_idx++) {
+        int P = n_thread_configs[p_idx];
+        ib_thread_pool* pool = ib_pool_create(P);
+        if (!pool) continue;
+        double t_th_min = 1e9;
+        for (int r = 0; r < repeats; r++) {
+            double s = now_s();
+            if (ib_pq_matmul_fp32_threaded(&t, x, y_fused, pool) != 0) return 1;
+            double d = now_s() - s;
+            if (d < t_th_min) t_th_min = d;
+        }
+        double th_GFLOPs = 2.0 * (double)MN / 1e9 / t_th_min;
+        fprintf(stdout, "  fused PQ-matmul (%d threads):   %7.3f ms  %6.2f GFLOP/s  (%.2fx vs 1t)\n",
+                P, t_th_min * 1e3, th_GFLOPs, t_fus_min / t_th_min);
+        ib_pool_destroy(pool);
+    }
 
     fprintf(stdout, "  speedup fused vs materialize+matmul: %.2fx\n",
             t_ref_min / t_fus_min);

@@ -5,6 +5,7 @@
 
 #include "pq_decode.h"
 #include "cJSON.h"
+#include "inferbit_internal.h"  /* ib_thread_pool, ib_pool_run */
 
 #include <errno.h>
 #include <stdio.h>
@@ -480,7 +481,57 @@ int ib_pq_reconstruct_fp16(const ib_pq_tensor* t, uint16_t* out) {
  * throughout and only does fp32 fma; this matches "ib_pq_matmul_fp32 may
  * differ from materialize+fp32_matmul by FMA reassociation" from doc 26.
  */
-int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
+/* Per-row gather context — populated by the matmul setup, consumed by
+ * the gather task (single-threaded or threaded). */
+typedef struct {
+    const ib_pq_tensor* t;
+    const float* TL1;
+    const float* TR1;
+    const float* TL2;   /* may be NULL */
+    const float* TR2;   /* may be NULL */
+    int K, C;
+    float* out;
+} pq_gather_ctx;
+
+static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
+    const ib_pq_tensor* t = g->t;
+    int C = g->C, K = g->K;
+    const float* TL1 = g->TL1;
+    const float* TR1 = g->TR1;
+    const float* TL2 = g->TL2;
+    const float* TR2 = g->TR2;
+    float* out = g->out;
+    for (int r = r0; r < r1; r++) {
+        float scale = ib_fp16_to_fp32(t->row_scale[r]);
+        const uint8_t* il_l = t->indices_l1_l + (size_t)r * C;
+        const uint8_t* il_r = t->indices_l1_r + (size_t)r * C;
+        const uint8_t* il2l = TL2 ? t->indices_l2_l + (size_t)r * C : NULL;
+        const uint8_t* il2r = TR2 ? t->indices_l2_r + (size_t)r * C : NULL;
+        float acc = 0.0f;
+        if (TL2) {
+            for (int c = 0; c < C; c++) {
+                size_t base = (size_t)c * K;
+                acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
+                acc += TL2[base + il2l[c]] + TR2[base + il2r[c]];
+            }
+        } else {
+            for (int c = 0; c < C; c++) {
+                size_t base = (size_t)c * K;
+                acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
+            }
+        }
+        out[r] = acc * scale;
+    }
+}
+
+static void pq_gather_task(void* arg, int thread_id, int start, int end) {
+    (void)thread_id;
+    pq_gather_rows((pq_gather_ctx*)arg, start, end);
+}
+
+/* Set up tables, run gather (optionally threaded), apply outliers. */
+static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
+                       ib_thread_pool* pool) {
     if (!t || !x || !out) return -1;
     int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
     int half = G / 2;
@@ -563,27 +614,18 @@ int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
         }
     }
 
-    /* Per-row gather. */
-    for (int r = 0; r < M; r++) {
-        float scale = ib_fp16_to_fp32(t->row_scale[r]);
-        const uint8_t* il_l = t->indices_l1_l + (size_t)r * C;
-        const uint8_t* il_r = t->indices_l1_r + (size_t)r * C;
-        const uint8_t* il2l = TL2 ? t->indices_l2_l + (size_t)r * C : NULL;
-        const uint8_t* il2r = TR2 ? t->indices_l2_r + (size_t)r * C : NULL;
-        float acc = 0.0f;
-        if (TL2) {
-            for (int c = 0; c < C; c++) {
-                size_t base = (size_t)c * K;
-                acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
-                acc += TL2[base + il2l[c]] + TR2[base + il2r[c]];
-            }
-        } else {
-            for (int c = 0; c < C; c++) {
-                size_t base = (size_t)c * K;
-                acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
-            }
-        }
-        out[r] = acc * scale;
+    /* Per-row gather. Single-threaded path uses a register accumulator
+     * (NEON 4-row blocks regressed by ~10% on M1; chunk-outer regressed
+     * by 4-8x due to out[] R-M-W). Threaded path splits the row range
+     * across the pool's workers. */
+    pq_gather_ctx ctx = {
+        .t = t, .TL1 = TL1, .TR1 = TR1, .TL2 = TL2, .TR2 = TR2,
+        .K = K, .C = C, .out = out,
+    };
+    if (pool) {
+        ib_pool_run(pool, pq_gather_task, &ctx, M, 0);
+    } else {
+        pq_gather_rows(&ctx, 0, M);
     }
 
     /* Outliers — small (n_outlier ≪ N), kept as scalar fp32 fma. */
@@ -600,4 +642,13 @@ int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
     free(cb1l); free(cb1r); free(cb2l); free(cb2r);
     free(inner_cols); free(TL1); free(TR1); free(TL2); free(TR2);
     return 0;
+}
+
+int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
+    return matmul_impl(t, x, out, NULL);
+}
+
+int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
+                                float* out, void* pool) {
+    return matmul_impl(t, x, out, (ib_thread_pool*)pool);
 }

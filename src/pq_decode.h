@@ -98,6 +98,13 @@ int ib_pq_reconstruct_fp32(const ib_pq_tensor* t, float* out_fp32);
  * runtime the rotation merges into the prior projection). */
 int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out);
 
+/* Threaded variant. `pool` is an opaque ib_thread_pool* (defined in
+ * inferbit_internal.h). If pool is NULL, falls back to single-threaded.
+ * The per-row gather is split across worker threads; LUT-table build
+ * and outlier sidecar both run on the calling thread. */
+int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
+                                float* out, void* pool);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);
