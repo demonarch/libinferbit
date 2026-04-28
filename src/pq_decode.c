@@ -23,6 +23,14 @@
 #define IB_PQ_HAVE_MMAP 1
 #endif
 
+/* NEON intrinsics. M-series (and newer ARM cores with +dotprod) get
+ * the int8 dot-product path used by the outlier kernel; portable
+ * scalar fallback otherwise. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#include <arm_neon.h>
+#define IB_PQ_HAVE_NEON_DOTPROD 1
+#endif
+
 #define IBF_MAGIC      "INFERBIT"
 #define IBF_MAGIC_SIZE 8
 #define IBF_PREAMBLE   32
@@ -740,6 +748,123 @@ int ib_pq_reconstruct_fp16(const ib_pq_tensor* t, uint16_t* out) {
  * throughout and only does fp32 fma; this matches "ib_pq_matmul_fp32 may
  * differ from materialize+fp32_matmul by FMA reassociation" from doc 26.
  */
+/* ── Outlier sidecar kernel ───────────────────────────────────── */
+/*
+ * For each row r:
+ *   out[r] += sum_j sidecar[r, j] * outlier_scale[j] * x[outlier_cols[j]]
+ *
+ * Naive scalar: O(M * n_outlier) fp32 muls — disproportionately
+ * expensive given n_outlier is small (~84 for s2_gate, ~288 for
+ * s2_down at Llama-8B). Smart trick (item #5 in docs/27): pre-multiply
+ * x×scale once, quantise to int8 with a single fp32 meta-scale, then
+ * per-row `vdotq_s32` over 16 outliers at a time.
+ *
+ * Numerical: introduces ~1/127 relative error per outlier term. Sum of
+ * 84 such terms: bounded by sqrt(84) × 0.4% × |xq|_typical ≈ 4%
+ * relative on the outlier-only contribution. Outliers are ~5-10% of
+ * total output magnitude → final per-element error ≤ 0.4%. Within
+ * fp16 weight precision; well under doc-26 frob-rel spec.
+ */
+
+#ifdef IB_PQ_HAVE_NEON_DOTPROD
+/* NEON int8 dot product. Returns 0 on success, < 0 on alloc failure. */
+static int apply_outliers_neon(const ib_pq_tensor* t, const float* x,
+                                float* out) {
+    int no = t->n_outlier;
+    if (no <= 0) return 0;
+    int M = t->M;
+
+    /* 1) xq[j] = x[col[j]] * scale[j] in fp32 + max-abs scan */
+    float* xq = (float*)malloc((size_t)no * sizeof(float));
+    if (!xq) return -1;
+    float maxabs = 0.0f;
+    for (int j = 0; j < no; j++) {
+        float v = x[t->outlier_cols[j]] * ib_fp16_to_fp32(t->outlier_scale[j]);
+        xq[j] = v;
+        float a = v < 0 ? -v : v;
+        if (a > maxabs) maxabs = a;
+    }
+
+    /* 2) Quantise xq to int8 with one fp32 meta-scale. Pad to multiple
+     * of 16 with zeros so the SIMD inner loop has no tail. */
+    int no_pad = (no + 15) & ~15;
+    int8_t* xq_q = (int8_t*)calloc((size_t)no_pad, 1);
+    if (!xq_q) { free(xq); return -1; }
+    float xq_meta = (maxabs > 0.0f) ? (maxabs / 127.0f) : 1.0f;
+    float xq_inv  = 1.0f / xq_meta;
+    for (int j = 0; j < no; j++) {
+        float scaled = xq[j] * xq_inv;
+        int qi = (int)(scaled >= 0 ? scaled + 0.5f : scaled - 0.5f);
+        if (qi >  127) qi =  127;
+        if (qi < -128) qi = -128;
+        xq_q[j] = (int8_t)qi;
+    }
+    free(xq);
+
+    /* 3) Per-row vdotq_s32. The sidecar is M × n_outlier int8, so for
+     * fixed r, sidecar[r * no .. r * no + no - 1] is contiguous —
+     * perfect for vld1q_s8. We may read up to 15 bytes BEYOND the
+     * row's outliers; for rows < M-1 those bytes belong to the NEXT
+     * row of sidecar (still in-bounds). The xq_q tail is zero-padded
+     * so those out-of-row reads multiply by zero and contribute
+     * nothing. The LAST row would read past the buffer; fall back to
+     * scalar for that row when (no & 15) != 0. */
+    int safe_rows = (no & 15) ? (M - 1) : M;
+    if (safe_rows < 0) safe_rows = 0;
+
+    for (int r = 0; r < safe_rows; r++) {
+        const int8_t* row_sc = t->outlier_sidecar + (size_t)r * no;
+        int32x4_t acc = vdupq_n_s32(0);
+        for (int j = 0; j < no_pad; j += 16) {
+            int8x16_t a = vld1q_s8(row_sc + j);
+            int8x16_t b = vld1q_s8(xq_q + j);
+            acc = vdotq_s32(acc, a, b);
+        }
+        int32_t sum = vaddvq_s32(acc);
+        out[r] += (float)sum * xq_meta;
+    }
+    /* Scalar tail row (at most one when no & 15 != 0) */
+    for (int r = safe_rows; r < M; r++) {
+        const int8_t* row_sc = t->outlier_sidecar + (size_t)r * no;
+        int32_t sum = 0;
+        for (int j = 0; j < no; j++) sum += (int32_t)row_sc[j] * (int32_t)xq_q[j];
+        out[r] += (float)sum * xq_meta;
+    }
+
+    free(xq_q);
+    return 0;
+}
+#endif
+
+/* Scalar reference. Always available; used when NEON dotprod absent
+ * or for very small n_outlier where the SIMD setup cost dominates. */
+static void apply_outliers_scalar(const ib_pq_tensor* t, const float* x,
+                                   float* out) {
+    int no = t->n_outlier;
+    if (no <= 0) return;
+    int M = t->M;
+    for (int j = 0; j < no; j++) {
+        int col = t->outlier_cols[j];
+        float os = ib_fp16_to_fp32(t->outlier_scale[j]);
+        float xj = x[col];
+        for (int r = 0; r < M; r++) {
+            float w = (float)t->outlier_sidecar[(size_t)r * no + j] * os;
+            out[r] += w * xj;
+        }
+    }
+}
+
+static void apply_outliers(const ib_pq_tensor* t, const float* x, float* out) {
+#ifdef IB_PQ_HAVE_NEON_DOTPROD
+    /* SIMD setup ~50µs (alloc + quantise loop). Below ~32 outliers
+     * the scalar path wins. */
+    if (t->n_outlier >= 32) {
+        if (apply_outliers_neon(t, x, out) == 0) return;
+    }
+#endif
+    apply_outliers_scalar(t, x, out);
+}
+
 /* Per-row gather context — populated by the matmul setup, consumed by
  * the gather task (single-threaded or threaded). */
 typedef struct {
@@ -986,16 +1111,8 @@ static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
         pq_gather_rows(&ctx, 0, M);
     }
 
-    /* Outliers — small (n_outlier ≪ N), kept as scalar fp32 fma. */
-    for (int j = 0; j < t->n_outlier; j++) {
-        int col = t->outlier_cols[j];
-        float os = ib_fp16_to_fp32(t->outlier_scale[j]);
-        float xj = x[col];
-        for (int r = 0; r < M; r++) {
-            float w = (float)t->outlier_sidecar[(size_t)r * t->n_outlier + j] * os;
-            out[r] += w * xj;
-        }
-    }
+    /* Outliers — see apply_outliers (item #5: NEON int8 dot for n>=32). */
+    apply_outliers(t, x, out);
 
     free(cb1l); free(cb1r); free(cb2l); free(cb2r);
     free(inner_cols); free(TL1); free(TR1); free(TL2); free(TR2);
@@ -1232,16 +1349,8 @@ int ib_pq_matmul_fp32_q8lut(const ib_pq_tensor* t, const float* x,
     if (pool) ib_pool_run(pool, pq_q8_task, &ctx, t->M, 0);
     else      pq_q8_gather_rows(&ctx, 0, t->M);
 
-    /* Outliers (same as fp32 path) */
-    for (int j = 0; j < t->n_outlier; j++) {
-        int col = t->outlier_cols[j];
-        float os = ib_fp16_to_fp32(t->outlier_scale[j]);
-        float xj = x[col];
-        for (int r = 0; r < t->M; r++) {
-            float w = (float)t->outlier_sidecar[(size_t)r * t->n_outlier + j] * os;
-            out[r] += w * xj;
-        }
-    }
+    /* Outliers (same NEON int8 dot path as fp32 LUT). */
+    apply_outliers(t, x, out);
 
     free(cb1l); free(cb1r); free(cb2l); free(cb2r);
     free(inner_cols); free(T1q); free(T1s); free(T2q); free(T2s);
