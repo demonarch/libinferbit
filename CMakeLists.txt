@@ -56,6 +56,7 @@ set(INFERBIT_SOURCES
     src/calibrate.c
     src/cJSON.c
     src/pq_decode.c
+    src/pq_kmeans.c
 )
 
 # Determine target architecture
@@ -82,6 +83,9 @@ if(TARGET_ARCH MATCHES "x86_64|AMD64")
             COMPILE_FLAGS "-mavx2 -mfma"
         )
         set_source_files_properties(src/pq_decode.c PROPERTIES
+            COMPILE_FLAGS "-mavx2 -mfma"
+        )
+        set_source_files_properties(src/pq_kmeans.c PROPERTIES
             COMPILE_FLAGS "-mavx2 -mfma"
         )
     endif()
