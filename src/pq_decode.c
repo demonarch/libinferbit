@@ -23,12 +23,17 @@
 #define IB_PQ_HAVE_MMAP 1
 #endif
 
-/* NEON intrinsics. M-series (and newer ARM cores with +dotprod) get
- * the int8 dot-product path used by the outlier kernel; portable
- * scalar fallback otherwise. */
+/* SIMD-accelerated outlier dot kernels.
+ *   - ARM with +dotprod: vdotq_s32 (16x int8 dot per cycle)
+ *   - x86_64 with AVX2: pmaddubsw / madd_epi16 cascade (16x int8 per call)
+ *   - else: scalar fallback in apply_outliers_scalar */
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 #include <arm_neon.h>
 #define IB_PQ_HAVE_NEON_DOTPROD 1
+#endif
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define IB_PQ_HAVE_AVX2 1
 #endif
 
 #define IBF_MAGIC      "INFERBIT"
@@ -876,6 +881,77 @@ static int apply_outliers_neon(const ib_pq_tensor* t, const float* x,
 }
 #endif
 
+#ifdef IB_PQ_HAVE_AVX2
+/* AVX2 int8 dot product. Mirrors apply_outliers_neon: pre-quantises
+ * x×scale to int8, then per-row reads 16 sidecar bytes + 16 xq bytes,
+ * sign-extends to int16, uses _mm256_madd_epi16 to compute 8-wide
+ * int32 sums, accumulates, horizontal-sums at row end.
+ *
+ * Per chunk of 16 outliers: 1 madd_epi16 ~= 1 vdotq_s32 throughput. */
+static int apply_outliers_avx2(const ib_pq_tensor* t, const float* x,
+                                float* out) {
+    int no = t->n_outlier;
+    if (no <= 0) return 0;
+    int M = t->M;
+
+    float* xq = (float*)malloc((size_t)no * sizeof(float));
+    if (!xq) return -1;
+    float maxabs = 0.0f;
+    for (int j = 0; j < no; j++) {
+        float v = x[t->outlier_cols[j]] * ib_fp16_to_fp32(t->outlier_scale[j]);
+        xq[j] = v;
+        float a = v < 0 ? -v : v;
+        if (a > maxabs) maxabs = a;
+    }
+    int no_pad = (no + 15) & ~15;
+    int8_t* xq_q = (int8_t*)calloc((size_t)no_pad, 1);
+    if (!xq_q) { free(xq); return -1; }
+    float xq_meta = (maxabs > 0.0f) ? (maxabs / 127.0f) : 1.0f;
+    float xq_inv  = 1.0f / xq_meta;
+    for (int j = 0; j < no; j++) {
+        float scaled = xq[j] * xq_inv;
+        int qi = (int)(scaled >= 0 ? scaled + 0.5f : scaled - 0.5f);
+        if (qi >  127) qi =  127;
+        if (qi < -128) qi = -128;
+        xq_q[j] = (int8_t)qi;
+    }
+    free(xq);
+
+    int safe_rows = (no & 15) ? (M - 1) : M;
+    if (safe_rows < 0) safe_rows = 0;
+
+    for (int r = 0; r < safe_rows; r++) {
+        const int8_t* row_sc = t->outlier_sidecar + (size_t)r * no;
+        __m256i acc = _mm256_setzero_si256();
+        for (int j = 0; j < no_pad; j += 16) {
+            __m128i a = _mm_loadu_si128((const __m128i*)(row_sc + j));
+            __m128i b = _mm_loadu_si128((const __m128i*)(xq_q + j));
+            __m256i a16 = _mm256_cvtepi8_epi16(a);
+            __m256i b16 = _mm256_cvtepi8_epi16(b);
+            __m256i prod = _mm256_madd_epi16(a16, b16);
+            acc = _mm256_add_epi32(acc, prod);
+        }
+        /* horizontal sum of 8 int32 lanes */
+        __m128i lo128 = _mm256_castsi256_si128(acc);
+        __m128i hi128 = _mm256_extracti128_si256(acc, 1);
+        __m128i s = _mm_add_epi32(lo128, hi128);
+        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));
+        s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));
+        int32_t sum = _mm_cvtsi128_si32(s);
+        out[r] += (float)sum * xq_meta;
+    }
+    for (int r = safe_rows; r < M; r++) {
+        const int8_t* row_sc = t->outlier_sidecar + (size_t)r * no;
+        int32_t sum = 0;
+        for (int j = 0; j < no; j++) sum += (int32_t)row_sc[j] * (int32_t)xq_q[j];
+        out[r] += (float)sum * xq_meta;
+    }
+
+    free(xq_q);
+    return 0;
+}
+#endif
+
 /* Scalar reference. Always available; used when NEON dotprod absent
  * or for very small n_outlier where the SIMD setup cost dominates. */
 static void apply_outliers_scalar(const ib_pq_tensor* t, const float* x,
@@ -895,13 +971,15 @@ static void apply_outliers_scalar(const ib_pq_tensor* t, const float* x,
 }
 
 static void apply_outliers(const ib_pq_tensor* t, const float* x, float* out) {
-#ifdef IB_PQ_HAVE_NEON_DOTPROD
-    /* SIMD setup ~50µs (alloc + quantise loop). Below ~32 outliers
+    /* SIMD setup cost ~50µs (alloc + quantise loop); below ~32 outliers
      * the scalar path wins. */
     if (t->n_outlier >= 32) {
+#ifdef IB_PQ_HAVE_NEON_DOTPROD
         if (apply_outliers_neon(t, x, out) == 0) return;
-    }
+#elif defined(IB_PQ_HAVE_AVX2)
+        if (apply_outliers_avx2(t, x, out) == 0) return;
 #endif
+    }
     apply_outliers_scalar(t, x, out);
 }
 
