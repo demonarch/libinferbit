@@ -71,8 +71,17 @@ if(TARGET_ARCH MATCHES "x86_64|AMD64")
         set_source_files_properties(src/kernels/avx2.c PROPERTIES
             COMPILE_FLAGS "/arch:AVX2"
         )
+        # Let pq_decode use AVX2 via the auto-vectoriser. The PQ matmul
+        # is gather-bound but the LUT-table build and the per-row scale
+        # multiply both auto-vec cleanly.
+        set_source_files_properties(src/pq_decode.c PROPERTIES
+            COMPILE_FLAGS "/arch:AVX2"
+        )
     else()
         set_source_files_properties(src/kernels/avx2.c PROPERTIES
+            COMPILE_FLAGS "-mavx2 -mfma"
+        )
+        set_source_files_properties(src/pq_decode.c PROPERTIES
             COMPILE_FLAGS "-mavx2 -mfma"
         )
     endif()
