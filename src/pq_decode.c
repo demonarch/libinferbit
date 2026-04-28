@@ -192,10 +192,8 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     out->C = n_inner / G;
     int C = out->C;
     int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
-    /* Stage D guard: matmul kernel doesn't yet handle K_l2 != K
-     * (variable-K_l2 #7 v2 in flight). Reject loads of files using a
-     * different L2 codebook size to avoid silent corruption. */
-    if (out->n_levels == 2 && K_l2_eff != K) return -1;
+    /* Per docs/26: K_l2 must be in {16, 64, K} (with K typically 256). */
+    if (out->n_levels == 2 && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
     size_t l2_idx_per_row = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
 
@@ -305,7 +303,10 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
     if (G <= 0 || K <= 0 || (G & 1) || n_inner % G != 0) return -1;
     out->C = n_inner / G;
     int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
-    if (out->n_levels == 2 && K_l2_eff != K) return -1;  /* stage D guard */
+    /* Stage D guard removed: matmul_impl + ib_pq_reconstruct_fp32 now
+     * handle K_l2 ∈ {16, 64, 256} including 4-bit packed indices for
+     * K_l2 == 16. */
+    if (out->n_levels == 2 && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
     size_t l2_idx_per_row = l2_packed ? (size_t)((out->C + 1) / 2) : (size_t)out->C;
 
@@ -647,6 +648,21 @@ void ib_pq_advise_dontneed_n(const ib_pq_tensor* const* tensors, int n) {
 }
 #endif
 
+/* ── L2 index unpack helper ───────────────────────────────────── */
+/* When K_l2 == 16, indices_l2_* arrays store 4-bit indices packed
+ * 2-per-byte (low nibble = even chunk, high nibble = odd chunk). */
+static inline uint8_t pq_l2_idx_at(const uint8_t* il2, int c, int packed) {
+    if (packed) {
+        uint8_t b = il2[c >> 1];
+        return (c & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
+    }
+    return il2[c];
+}
+
+static inline int pq_K_l2_eff(const ib_pq_tensor* t) {
+    return t->K_l2 > 0 ? t->K_l2 : t->K;
+}
+
 /* ── Materialize ──────────────────────────────────────────────── */
 
 int ib_pq_reconstruct_fp32(const ib_pq_tensor* t, float* out) {
@@ -654,22 +670,26 @@ int ib_pq_reconstruct_fp32(const ib_pq_tensor* t, float* out) {
     int M = t->M, N = t->N, G = t->G, C = t->C;
     int half = G / 2;
 
-    /* Pre-decode codebooks to FP32 once */
-    int cb_entries = t->K * half;
-    float* cb1l = (float*)malloc((size_t)cb_entries * sizeof(float));
-    float* cb1r = (float*)malloc((size_t)cb_entries * sizeof(float));
+    /* Pre-decode codebooks to FP32 once. L1 has K entries; L2 has
+     * K_l2 entries (defaults to K when not set). */
+    int cb1_entries = t->K * half;
+    int K_l2 = pq_K_l2_eff(t);
+    int cb2_entries = K_l2 * half;
+    int l2_packed = (K_l2 == 16);
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
     float* cb2l = NULL;
     float* cb2r = NULL;
     if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
-    for (int i = 0; i < cb_entries; i++) {
+    for (int i = 0; i < cb1_entries; i++) {
         cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
         cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
     }
     if (t->n_levels == 2) {
-        cb2l = (float*)malloc((size_t)cb_entries * sizeof(float));
-        cb2r = (float*)malloc((size_t)cb_entries * sizeof(float));
+        cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
         if (!cb2l || !cb2r) { free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1; }
-        for (int i = 0; i < cb_entries; i++) {
+        for (int i = 0; i < cb2_entries; i++) {
             cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
             cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
         }
@@ -689,27 +709,30 @@ int ib_pq_reconstruct_fp32(const ib_pq_tensor* t, float* out) {
     /* Fill output: zero first so any uninitialized columns are deterministic */
     memset(out, 0, (size_t)M * (size_t)N * sizeof(float));
 
+    /* L2 indices array stride: bytes per row. Packed (K_l2=16): ceil(C/2). */
+    size_t l2_stride = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
+
     for (int r = 0; r < M; r++) {
         float scale = ib_fp16_to_fp32(t->row_scale[r]);
         const uint8_t* il_l = t->indices_l1_l + (size_t)r * C;
         const uint8_t* il_r = t->indices_l1_r + (size_t)r * C;
-        const uint8_t* il2l = t->indices_l2_l ? t->indices_l2_l + (size_t)r * C : NULL;
-        const uint8_t* il2r = t->indices_l2_r ? t->indices_l2_r + (size_t)r * C : NULL;
+        const uint8_t* il2l = t->indices_l2_l ? t->indices_l2_l + (size_t)r * l2_stride : NULL;
+        const uint8_t* il2r = t->indices_l2_r ? t->indices_l2_r + (size_t)r * l2_stride : NULL;
         for (int c = 0; c < C; c++) {
             int base = c * G;
             const float* lvec = &cb1l[(size_t)il_l[c] * half];
             const float* rvec = &cb1r[(size_t)il_r[c] * half];
+            uint8_t i2l = il2l ? pq_l2_idx_at(il2l, c, l2_packed) : 0;
+            uint8_t i2r = il2r ? pq_l2_idx_at(il2r, c, l2_packed) : 0;
             for (int k = 0; k < half; k++) {
                 float v = lvec[k];
-                if (cb2l) v += cb2l[(size_t)il2l[c] * half + k];
+                if (cb2l) v += cb2l[(size_t)i2l * half + k];
                 int col = inner_cols[base + k];
-                /* Match Python: chunk *= row_scale, then cast to fp16,
-                 * so we go fp32 -> fp16 -> fp32 to be bit-identical. */
                 out[(size_t)r * N + col] = ib_fp16_to_fp32(ib_fp32_to_fp16(v * scale));
             }
             for (int k = 0; k < half; k++) {
                 float v = rvec[k];
-                if (cb2r) v += cb2r[(size_t)il2r[c] * half + k];
+                if (cb2r) v += cb2r[(size_t)i2r * half + k];
                 int col = inner_cols[base + half + k];
                 out[(size_t)r * N + col] = ib_fp16_to_fp32(ib_fp32_to_fp16(v * scale));
             }
@@ -890,7 +913,9 @@ typedef struct {
     const float* TR1;
     const float* TL2;   /* may be NULL */
     const float* TR2;   /* may be NULL */
-    int K, C;
+    int K, K_l2, C;
+    int l2_packed;       /* 1 when K_l2 == 16 (4-bit packed indices) */
+    size_t l2_idx_stride; /* bytes per row for indices_l2_* */
     /* DejaVu sparsity: when active_list is non-NULL the gather walks
      * only those chunks. NULL means walk all C chunks (dense path). */
     const int32_t* active_list;
@@ -900,7 +925,9 @@ typedef struct {
 
 static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
     const ib_pq_tensor* t = g->t;
-    int C = g->C, K = g->K;
+    int C = g->C, K = g->K, K_l2 = g->K_l2;
+    int l2_packed = g->l2_packed;
+    size_t l2_stride = g->l2_idx_stride;
     const float* TL1 = g->TL1;
     const float* TR1 = g->TR1;
     const float* TL2 = g->TL2;
@@ -912,16 +939,18 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
         float scale = ib_fp16_to_fp32(t->row_scale[r]);
         const uint8_t* il_l = t->indices_l1_l + (size_t)r * C;
         const uint8_t* il_r = t->indices_l1_r + (size_t)r * C;
-        const uint8_t* il2l = TL2 ? t->indices_l2_l + (size_t)r * C : NULL;
-        const uint8_t* il2r = TR2 ? t->indices_l2_r + (size_t)r * C : NULL;
+        const uint8_t* il2l = TL2 ? t->indices_l2_l + (size_t)r * l2_stride : NULL;
+        const uint8_t* il2r = TR2 ? t->indices_l2_r + (size_t)r * l2_stride : NULL;
         float acc = 0.0f;
         if (active) {
             if (TL2) {
                 for (int aii = 0; aii < n_active; aii++) {
                     int c = active[aii];
-                    size_t base = (size_t)c * K;
-                    acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
-                    acc += TL2[base + il2l[c]] + TR2[base + il2r[c]];
+                    size_t base1 = (size_t)c * K;
+                    size_t base2 = (size_t)c * K_l2;
+                    acc += TL1[base1 + il_l[c]] + TR1[base1 + il_r[c]];
+                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed)]
+                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed)];
                 }
             } else {
                 for (int aii = 0; aii < n_active; aii++) {
@@ -933,9 +962,11 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
         } else {
             if (TL2) {
                 for (int c = 0; c < C; c++) {
-                    size_t base = (size_t)c * K;
-                    acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
-                    acc += TL2[base + il2l[c]] + TR2[base + il2r[c]];
+                    size_t base1 = (size_t)c * K;
+                    size_t base2 = (size_t)c * K_l2;
+                    acc += TL1[base1 + il_l[c]] + TR1[base1 + il_r[c]];
+                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed)]
+                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed)];
                 }
             } else {
                 for (int c = 0; c < C; c++) {
@@ -959,22 +990,26 @@ static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
     if (!t || !x || !out) return -1;
     int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
     int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int l2_packed = (K_l2 == 16);
+    size_t l2_idx_stride = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
 
-    /* Codebook tables decoded to fp32 once. */
-    int cb_entries = K * half;
-    float* cb1l = (float*)malloc((size_t)cb_entries * sizeof(float));
-    float* cb1r = (float*)malloc((size_t)cb_entries * sizeof(float));
+    /* Codebook tables decoded to fp32 once. L1: K entries; L2: K_l2 entries. */
+    int cb1_entries = K * half;
+    int cb2_entries = K_l2 * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
     float* cb2l = NULL, *cb2r = NULL;
     if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
-    for (int i = 0; i < cb_entries; i++) {
+    for (int i = 0; i < cb1_entries; i++) {
         cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
         cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
     }
     if (t->n_levels == 2) {
-        cb2l = (float*)malloc((size_t)cb_entries * sizeof(float));
-        cb2r = (float*)malloc((size_t)cb_entries * sizeof(float));
+        cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
         if (!cb2l || !cb2r) { free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1; }
-        for (int i = 0; i < cb_entries; i++) {
+        for (int i = 0; i < cb2_entries; i++) {
             cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
             cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
         }
@@ -991,20 +1026,22 @@ static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
         free(mask);
     }
 
-    /* Pre-multiplied tables. Layout: T_*[c * K + k] (chunk-major so the
-     * per-row inner loop steps the chunk index by 1 contiguously per c). */
-    size_t table_sz = (size_t)C * K;
-    float* TL1 = (float*)malloc(table_sz * sizeof(float));
-    float* TR1 = (float*)malloc(table_sz * sizeof(float));
+    /* Pre-multiplied tables. Layout: TL1/TR1 use T[c * K + k]; TL2/TR2
+     * use T[c * K_l2 + k]. Per-row inner loop steps the chunk index
+     * by 1 within each table contiguously. */
+    size_t table1_sz = (size_t)C * K;
+    size_t table2_sz = (size_t)C * K_l2;
+    float* TL1 = (float*)malloc(table1_sz * sizeof(float));
+    float* TR1 = (float*)malloc(table1_sz * sizeof(float));
     float* TL2 = NULL, *TR2 = NULL;
     if (!TL1 || !TR1) {
         free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
         free(TL1); free(TR1); return -1;
     }
     if (cb2l) {
-        TL2 = (float*)malloc(table_sz * sizeof(float));
-        TR2 = (float*)malloc(table_sz * sizeof(float));
-        if (!TL2 || !TR2) { /* leak-and-fail; matmul must abort */
+        TL2 = (float*)malloc(table2_sz * sizeof(float));
+        TR2 = (float*)malloc(table2_sz * sizeof(float));
+        if (!TL2 || !TR2) {
             free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
             free(TL1); free(TR1); free(TL2); free(TR2); return -1;
         }
@@ -1059,66 +1096,54 @@ static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
         }
     }
 
-    /* Build the partial-dot tables. Only for active chunks when sparse. */
+    /* Build the partial-dot tables. L1 uses K entries per chunk; L2
+     * uses K_l2 entries per chunk (which may differ from K, e.g.
+     * K_l2=16 for the 6-bpw S1 variant). */
+    #define BUILD_LUT_FOR_CHUNK(c) do {                                      \
+        int base = (c) * G;                                                  \
+        float xL[16], xR[16];                                                \
+        for (int i = 0; i < half; i++) xL[i] = x[inner_cols[base + i]];      \
+        for (int i = 0; i < half; i++) xR[i] = x[inner_cols[base + half + i]]; \
+        /* L1: K entries */                                                  \
+        for (int k = 0; k < K; k++) {                                        \
+            float sl = 0.0f, sr = 0.0f;                                      \
+            const float* lv = &cb1l[(size_t)k * half];                       \
+            const float* rv = &cb1r[(size_t)k * half];                       \
+            for (int i = 0; i < half; i++) sl += lv[i] * xL[i];              \
+            for (int i = 0; i < half; i++) sr += rv[i] * xR[i];              \
+            TL1[(size_t)(c) * K + k] = sl;                                   \
+            TR1[(size_t)(c) * K + k] = sr;                                   \
+        }                                                                    \
+        /* L2: K_l2 entries (may be != K) */                                 \
+        if (cb2l) {                                                          \
+            for (int k = 0; k < K_l2; k++) {                                 \
+                float sl2 = 0.0f, sr2 = 0.0f;                                \
+                const float* lv2 = &cb2l[(size_t)k * half];                  \
+                const float* rv2 = &cb2r[(size_t)k * half];                  \
+                for (int i = 0; i < half; i++) sl2 += lv2[i] * xL[i];        \
+                for (int i = 0; i < half; i++) sr2 += rv2[i] * xR[i];        \
+                TL2[(size_t)(c) * K_l2 + k] = sl2;                           \
+                TR2[(size_t)(c) * K_l2 + k] = sr2;                           \
+            }                                                                \
+        }                                                                    \
+    } while (0)
     if (active_list) {
-        /* Inactive entries' tables are never read by the gather, so we
-         * leave them uninitialised. */
         for (int aii = 0; aii < n_active; aii++) {
             int c = active_list[aii];
-            int base = c * G;
-            float xL[16], xR[16];
-            for (int i = 0; i < half; i++) xL[i] = x[inner_cols[base + i]];
-            for (int i = 0; i < half; i++) xR[i] = x[inner_cols[base + half + i]];
-            for (int k = 0; k < K; k++) {
-                float sl = 0.0f, sr = 0.0f;
-                const float* lv = &cb1l[(size_t)k * half];
-                const float* rv = &cb1r[(size_t)k * half];
-                for (int i = 0; i < half; i++) sl += lv[i] * xL[i];
-                for (int i = 0; i < half; i++) sr += rv[i] * xR[i];
-                TL1[(size_t)c * K + k] = sl;
-                TR1[(size_t)c * K + k] = sr;
-                if (cb2l) {
-                    float sl2 = 0.0f, sr2 = 0.0f;
-                    const float* lv2 = &cb2l[(size_t)k * half];
-                    const float* rv2 = &cb2r[(size_t)k * half];
-                    for (int i = 0; i < half; i++) sl2 += lv2[i] * xL[i];
-                    for (int i = 0; i < half; i++) sr2 += rv2[i] * xR[i];
-                    TL2[(size_t)c * K + k] = sl2;
-                    TR2[(size_t)c * K + k] = sr2;
-                }
-            }
+            BUILD_LUT_FOR_CHUNK(c);
         }
     } else {
         for (int c = 0; c < C; c++) {
-            int base = c * G;
-            float xL[16], xR[16];
-            for (int i = 0; i < half; i++) xL[i] = x[inner_cols[base + i]];
-            for (int i = 0; i < half; i++) xR[i] = x[inner_cols[base + half + i]];
-            for (int k = 0; k < K; k++) {
-                float sl = 0.0f, sr = 0.0f;
-                const float* lv = &cb1l[(size_t)k * half];
-                const float* rv = &cb1r[(size_t)k * half];
-                for (int i = 0; i < half; i++) sl += lv[i] * xL[i];
-                for (int i = 0; i < half; i++) sr += rv[i] * xR[i];
-                TL1[(size_t)c * K + k] = sl;
-                TR1[(size_t)c * K + k] = sr;
-                if (cb2l) {
-                    float sl2 = 0.0f, sr2 = 0.0f;
-                    const float* lv2 = &cb2l[(size_t)k * half];
-                    const float* rv2 = &cb2r[(size_t)k * half];
-                    for (int i = 0; i < half; i++) sl2 += lv2[i] * xL[i];
-                    for (int i = 0; i < half; i++) sr2 += rv2[i] * xR[i];
-                    TL2[(size_t)c * K + k] = sl2;
-                    TR2[(size_t)c * K + k] = sr2;
-                }
-            }
+            BUILD_LUT_FOR_CHUNK(c);
         }
     }
+    #undef BUILD_LUT_FOR_CHUNK
 
     /* Per-row gather. Sparse path walks active_list when present. */
     pq_gather_ctx ctx = {
         .t = t, .TL1 = TL1, .TR1 = TR1, .TL2 = TL2, .TR2 = TR2,
-        .K = K, .C = C,
+        .K = K, .K_l2 = K_l2, .C = C,
+        .l2_packed = l2_packed, .l2_idx_stride = l2_idx_stride,
         .active_list = active_list, .n_active = n_active,
         .out = out,
     };
