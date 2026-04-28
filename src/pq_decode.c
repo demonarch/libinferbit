@@ -184,22 +184,32 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     out->n_outlier = cJSON_IsObject(outlier)
                      ? (int)json_int_field(outlier, "n_cols", 0)
                      : 0;
+    out->K_l2 = (int)json_int_field(tm, "K_l2", 0);   /* 0 = inherit K */
 
     int M = out->M, N = out->N, G = out->G, K = out->K;
     int n_inner = N - out->n_outlier;
     if (G <= 0 || K <= 0 || (G & 1) || n_inner % G != 0) return -1;
     out->C = n_inner / G;
     int C = out->C;
+    int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
+    /* Stage D guard: matmul kernel doesn't yet handle K_l2 != K
+     * (variable-K_l2 #7 v2 in flight). Reject loads of files using a
+     * different L2 codebook size to avoid silent corruption. */
+    if (out->n_levels == 2 && K_l2_eff != K) return -1;
+    int l2_packed = (K_l2_eff == 16);
+    size_t l2_idx_per_row = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
 
-    size_t cb_sz   = (size_t)K * (G / 2) * sizeof(uint16_t);
-    size_t idx_sz  = (size_t)M * (size_t)C * sizeof(uint8_t);
-    size_t rs_sz   = (size_t)M * sizeof(uint16_t);
-    size_t oc_sz   = (size_t)out->n_outlier * sizeof(int32_t);
-    size_t osc_sz  = (size_t)M * (size_t)out->n_outlier * sizeof(int8_t);
-    size_t oscl_sz = (size_t)out->n_outlier * sizeof(uint16_t);
+    size_t cb_sz       = (size_t)K * (G / 2) * sizeof(uint16_t);
+    size_t cb_l2_sz    = (size_t)K_l2_eff * (G / 2) * sizeof(uint16_t);
+    size_t idx_sz      = (size_t)M * (size_t)C * sizeof(uint8_t);
+    size_t idx_l2_sz   = (size_t)M * l2_idx_per_row;
+    size_t rs_sz       = (size_t)M * sizeof(uint16_t);
+    size_t oc_sz       = (size_t)out->n_outlier * sizeof(int32_t);
+    size_t osc_sz      = (size_t)M * (size_t)out->n_outlier * sizeof(int8_t);
+    size_t oscl_sz     = (size_t)out->n_outlier * sizeof(uint16_t);
 
     size_t total = 2*cb_sz + 2*idx_sz + rs_sz;
-    if (out->n_levels == 2) total += 2*cb_sz + 2*idx_sz;
+    if (out->n_levels == 2) total += 2*cb_l2_sz + 2*idx_l2_sz;
     if (out->n_outlier > 0) total += oc_sz + osc_sz + oscl_sz;
 
     out->_arena = malloc(total ? total : 1);
@@ -215,10 +225,10 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     SLICE(out->indices_l1_r,  uint8_t,  idx_sz);
     SLICE(out->row_scale,     uint16_t, rs_sz);
     if (out->n_levels == 2) {
-        SLICE(out->codebook_l2_l, uint16_t, cb_sz);
-        SLICE(out->codebook_l2_r, uint16_t, cb_sz);
-        SLICE(out->indices_l2_l,  uint8_t,  idx_sz);
-        SLICE(out->indices_l2_r,  uint8_t,  idx_sz);
+        SLICE(out->codebook_l2_l, uint16_t, cb_l2_sz);
+        SLICE(out->codebook_l2_r, uint16_t, cb_l2_sz);
+        SLICE(out->indices_l2_l,  uint8_t,  idx_l2_sz);
+        SLICE(out->indices_l2_r,  uint8_t,  idx_l2_sz);
     }
     if (out->n_outlier > 0) {
         SLICE(out->outlier_cols,    int32_t,  oc_sz);
@@ -243,10 +253,10 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     LOAD_BLOCK("indices_l1_r",  out->indices_l1_r,  idx_sz);
     LOAD_BLOCK("row_scale",     out->row_scale,     rs_sz);
     if (out->n_levels == 2) {
-        LOAD_BLOCK("codebook_l2_l", out->codebook_l2_l, cb_sz);
-        LOAD_BLOCK("codebook_l2_r", out->codebook_l2_r, cb_sz);
-        LOAD_BLOCK("indices_l2_l",  out->indices_l2_l,  idx_sz);
-        LOAD_BLOCK("indices_l2_r",  out->indices_l2_r,  idx_sz);
+        LOAD_BLOCK("codebook_l2_l", out->codebook_l2_l, cb_l2_sz);
+        LOAD_BLOCK("codebook_l2_r", out->codebook_l2_r, cb_l2_sz);
+        LOAD_BLOCK("indices_l2_l",  out->indices_l2_l,  idx_l2_sz);
+        LOAD_BLOCK("indices_l2_r",  out->indices_l2_r,  idx_l2_sz);
     }
     if (out->n_outlier > 0) {
         LOAD_BLOCK("outlier_cols",    out->outlier_cols,    oc_sz);
@@ -288,18 +298,25 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
     out->n_outlier = cJSON_IsObject(outlier)
                      ? (int)json_int_field(outlier, "n_cols", 0)
                      : 0;
+    out->K_l2 = (int)json_int_field(tm, "K_l2", 0);
 
     int M = out->M, N = out->N, G = out->G, K = out->K;
     int n_inner = N - out->n_outlier;
     if (G <= 0 || K <= 0 || (G & 1) || n_inner % G != 0) return -1;
     out->C = n_inner / G;
+    int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
+    if (out->n_levels == 2 && K_l2_eff != K) return -1;  /* stage D guard */
+    int l2_packed = (K_l2_eff == 16);
+    size_t l2_idx_per_row = l2_packed ? (size_t)((out->C + 1) / 2) : (size_t)out->C;
 
-    size_t cb_sz   = (size_t)K * (G / 2) * sizeof(uint16_t);
-    size_t idx_sz  = (size_t)M * (size_t)out->C * sizeof(uint8_t);
-    size_t rs_sz   = (size_t)M * sizeof(uint16_t);
-    size_t oc_sz   = (size_t)out->n_outlier * sizeof(int32_t);
-    size_t osc_sz  = (size_t)M * (size_t)out->n_outlier * sizeof(int8_t);
-    size_t oscl_sz = (size_t)out->n_outlier * sizeof(uint16_t);
+    size_t cb_sz       = (size_t)K * (G / 2) * sizeof(uint16_t);
+    size_t cb_l2_sz    = (size_t)K_l2_eff * (G / 2) * sizeof(uint16_t);
+    size_t idx_sz      = (size_t)M * (size_t)out->C * sizeof(uint8_t);
+    size_t idx_l2_sz   = (size_t)M * l2_idx_per_row;
+    size_t rs_sz       = (size_t)M * sizeof(uint16_t);
+    size_t oc_sz       = (size_t)out->n_outlier * sizeof(int32_t);
+    size_t osc_sz      = (size_t)M * (size_t)out->n_outlier * sizeof(int8_t);
+    size_t oscl_sz     = (size_t)out->n_outlier * sizeof(uint16_t);
 
     #define VIEW_BLOCK(key, dst_ptr, dst_type, expected_sz) do {              \
         size_t off, sz;                                                       \
@@ -316,10 +333,10 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
     VIEW_BLOCK("indices_l1_r",  out->indices_l1_r,  uint8_t,  idx_sz);
     VIEW_BLOCK("row_scale",     out->row_scale,     uint16_t, rs_sz);
     if (out->n_levels == 2) {
-        VIEW_BLOCK("codebook_l2_l", out->codebook_l2_l, uint16_t, cb_sz);
-        VIEW_BLOCK("codebook_l2_r", out->codebook_l2_r, uint16_t, cb_sz);
-        VIEW_BLOCK("indices_l2_l",  out->indices_l2_l,  uint8_t,  idx_sz);
-        VIEW_BLOCK("indices_l2_r",  out->indices_l2_r,  uint8_t,  idx_sz);
+        VIEW_BLOCK("codebook_l2_l", out->codebook_l2_l, uint16_t, cb_l2_sz);
+        VIEW_BLOCK("codebook_l2_r", out->codebook_l2_r, uint16_t, cb_l2_sz);
+        VIEW_BLOCK("indices_l2_l",  out->indices_l2_l,  uint8_t,  idx_l2_sz);
+        VIEW_BLOCK("indices_l2_r",  out->indices_l2_r,  uint8_t,  idx_l2_sz);
     }
     if (out->n_outlier > 0) {
         VIEW_BLOCK("outlier_cols",    out->outlier_cols,    int32_t,  oc_sz);

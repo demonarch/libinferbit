@@ -36,6 +36,7 @@ typedef struct {
     int N;
     int G;
     int K;
+    int K_l2;        /* L2 codebook size; 0 = same as K (for n_levels==1) */
     int n_levels;
     int rotate;
     int n_outlier;
