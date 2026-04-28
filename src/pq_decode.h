@@ -130,6 +130,18 @@ int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out);
 int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
                                 float* out, void* pool);
 
+/* Byte-quantised-LUT variant. Same math, but the per-chunk partial-
+ * products tables are quantised to int8 with one fp32 scale per
+ * chunk-side. Reduces L2 cache traffic per row by ~32x at the cost of
+ * 1 fp32 multiply per chunk and ~1 fp16 ULP precision per chunk-side
+ * (bounded; signed errors largely cancel across chunks).
+ *
+ * Numerical contract: output is allowed to differ from the fp32-LUT
+ * path by up to ~1e-3 frobenius-relative on typical model shapes. Use
+ * for inference; use ib_pq_matmul_fp32 for verification. */
+int ib_pq_matmul_fp32_q8lut(const ib_pq_tensor* t, const float* x,
+                             float* out, void* pool);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

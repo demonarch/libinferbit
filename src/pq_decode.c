@@ -896,3 +896,245 @@ int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
                                 float* out, void* pool) {
     return matmul_impl(t, x, out, (ib_thread_pool*)pool);
 }
+
+/* ── Byte-quantised LUT path ───────────────────────────────────── */
+/*
+ * Same math as matmul_impl but the per-chunk partial-products tables
+ * are stored as int8 + per-(chunk,side) fp32 scale. Per-row inner
+ * loop reads 2 bytes per chunk (vs 8 bytes fp32), then a single
+ * fp32 fma per chunk to apply the chunk scales.
+ *
+ * Key trade-off:
+ *   - 4x less per-chunk table size (2 bytes/k vs 8 bytes/k)
+ *   - 32x less per-row L2 traffic on cache-line basis
+ *   - +1 fp32 multiply per chunk in the inner loop
+ *   - quantisation error: ~1 fp16-ULP per chunk-side (bounded)
+ */
+
+typedef struct {
+    const int8_t* T1q;       /* M x C x K x 2 int8 (L,R interleaved per index) */
+    const float*  T1s;       /* C x 2 fp32 (L scale, R scale) per chunk */
+    const int8_t* T2q;       /* may be NULL */
+    const float*  T2s;
+    const ib_pq_tensor* t;
+    int K, C;
+    float* out;
+} pq_q8_ctx;
+
+static void pq_q8_gather_rows(pq_q8_ctx* g, int r0, int r1) {
+    const ib_pq_tensor* t = g->t;
+    int C = g->C, K = g->K;
+    const int8_t* T1q = g->T1q;
+    const float*  T1s = g->T1s;
+    const int8_t* T2q = g->T2q;
+    const float*  T2s = g->T2s;
+    float* out = g->out;
+    for (int r = r0; r < r1; r++) {
+        float scale = ib_fp16_to_fp32(t->row_scale[r]);
+        const uint8_t* il_l = t->indices_l1_l + (size_t)r * C;
+        const uint8_t* il_r = t->indices_l1_r + (size_t)r * C;
+        const uint8_t* il2l = T2q ? t->indices_l2_l + (size_t)r * C : NULL;
+        const uint8_t* il2r = T2q ? t->indices_l2_r + (size_t)r * C : NULL;
+        float acc = 0.0f;
+        if (T2q) {
+            for (int c = 0; c < C; c++) {
+                size_t base = (size_t)c * (size_t)K * 2;
+                const float* sc1 = T1s + (size_t)c * 2;
+                const float* sc2 = T2s + (size_t)c * 2;
+                acc += T1q[base + (size_t)il_l[c] * 2 + 0] * sc1[0]
+                     + T1q[base + (size_t)il_r[c] * 2 + 1] * sc1[1];
+                acc += T2q[base + (size_t)il2l[c] * 2 + 0] * sc2[0]
+                     + T2q[base + (size_t)il2r[c] * 2 + 1] * sc2[1];
+            }
+        } else {
+            for (int c = 0; c < C; c++) {
+                size_t base = (size_t)c * (size_t)K * 2;
+                const float* sc = T1s + (size_t)c * 2;
+                acc += T1q[base + (size_t)il_l[c] * 2 + 0] * sc[0]
+                     + T1q[base + (size_t)il_r[c] * 2 + 1] * sc[1];
+            }
+        }
+        out[r] = acc * scale;
+    }
+}
+
+static void pq_q8_task(void* arg, int thread_id, int start, int end) {
+    (void)thread_id;
+    pq_q8_gather_rows((pq_q8_ctx*)arg, start, end);
+}
+
+/* Build the int8 LUT and per-chunk scales from x and the codebook for
+ * one side. side_off picks which half of each chunk's columns to dot
+ * against (0 = first half, `half` = second half). */
+static int build_q8_lut(int C, int K, int half, int G,
+                         const float* cb,
+                         const int* inner_cols, const float* x,
+                         int side_off,
+                         int8_t** out_q, float** out_s) {
+    size_t fp_sz = (size_t)C * K;
+    float* tmp = (float*)malloc(fp_sz * sizeof(float));
+    if (!tmp) return -1;
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xs[16];
+        for (int i = 0; i < half; i++) xs[i] = x[inner_cols[base + side_off + i]];
+        for (int k = 0; k < K; k++) {
+            float s = 0.0f;
+            const float* cv = &cb[(size_t)k * half];
+            for (int i = 0; i < half; i++) s += cv[i] * xs[i];
+            tmp[(size_t)c * K + k] = s;
+        }
+    }
+
+    int8_t* q = (int8_t*)malloc(fp_sz);
+    float*  s = (float*)malloc((size_t)C * sizeof(float));
+    if (!q || !s) { free(tmp); free(q); free(s); return -1; }
+
+    for (int c = 0; c < C; c++) {
+        const float* row = tmp + (size_t)c * K;
+        float maxabs = 0.0f;
+        for (int k = 0; k < K; k++) {
+            float v = row[k];
+            float av = v < 0 ? -v : v;
+            if (av > maxabs) maxabs = av;
+        }
+        float sc = (maxabs > 0.0f) ? (maxabs / 127.0f) : 1.0f;
+        float inv = 1.0f / sc;
+        s[c] = sc;
+        for (int k = 0; k < K; k++) {
+            float scaled = row[k] * inv;
+            int qi = (int)(scaled >= 0 ? scaled + 0.5f : scaled - 0.5f);
+            if (qi >  127) qi =  127;
+            if (qi < -128) qi = -128;
+            q[(size_t)c * K + k] = (int8_t)qi;
+        }
+    }
+    free(tmp);
+    *out_q = q;
+    *out_s = s;
+    return 0;
+}
+
+int ib_pq_matmul_fp32_q8lut(const ib_pq_tensor* t, const float* x,
+                             float* out, void* pool_v) {
+    if (!t || !x || !out) return -1;
+    ib_thread_pool* pool = (ib_thread_pool*)pool_v;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+    (void)M;
+
+    /* Decode codebooks to fp32 once. */
+    int cb_entries = K * half;
+    float* cb1l = (float*)malloc((size_t)cb_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb_entries * sizeof(float));
+    float* cb2l = NULL, *cb2r = NULL;
+    if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
+    for (int i = 0; i < cb_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    if (t->n_levels == 2) {
+        cb2l = (float*)malloc((size_t)cb_entries * sizeof(float));
+        cb2r = (float*)malloc((size_t)cb_entries * sizeof(float));
+        if (!cb2l || !cb2r) { free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1; }
+        for (int i = 0; i < cb_entries; i++) {
+            cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+            cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+        }
+    }
+
+    /* Inner-cols list */
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) { free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1; }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int kk = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[kk++] = j;
+        free(mask);
+    }
+
+    /* Build per-side LUTs in q8 form, then interleave into the
+     * inner-loop layout T1q[c*K*2 + k*2 + side]. */
+    int8_t* qL = NULL; float* sL = NULL;
+    int8_t* qR = NULL; float* sR = NULL;
+    int8_t* qL2 = NULL; float* sL2 = NULL;
+    int8_t* qR2 = NULL; float* sR2 = NULL;
+    if (build_q8_lut(C, K, half, G, cb1l, inner_cols, x, 0,    &qL, &sL) != 0
+        || build_q8_lut(C, K, half, G, cb1r, inner_cols, x, half, &qR, &sR) != 0) {
+        goto fail;
+    }
+    if (cb2l) {
+        if (build_q8_lut(C, K, half, G, cb2l, inner_cols, x, 0,    &qL2, &sL2) != 0
+            || build_q8_lut(C, K, half, G, cb2r, inner_cols, x, half, &qR2, &sR2) != 0) {
+            goto fail;
+        }
+    }
+
+    size_t T_sz = (size_t)C * K * 2;
+    int8_t* T1q = (int8_t*)malloc(T_sz);
+    float*  T1s = (float*)malloc((size_t)C * 2 * sizeof(float));
+    int8_t* T2q = NULL; float* T2s = NULL;
+    if (!T1q || !T1s) { free(T1q); free(T1s); goto fail; }
+    if (cb2l) {
+        T2q = (int8_t*)malloc(T_sz);
+        T2s = (float*)malloc((size_t)C * 2 * sizeof(float));
+        if (!T2q || !T2s) { free(T1q); free(T1s); free(T2q); free(T2s); goto fail; }
+    }
+
+    for (int c = 0; c < C; c++) {
+        T1s[c*2 + 0] = sL[c];
+        T1s[c*2 + 1] = sR[c];
+        const int8_t* lq = qL + (size_t)c * K;
+        const int8_t* rq = qR + (size_t)c * K;
+        int8_t* dst = T1q + (size_t)c * K * 2;
+        for (int k = 0; k < K; k++) {
+            dst[k*2 + 0] = lq[k];
+            dst[k*2 + 1] = rq[k];
+        }
+        if (cb2l) {
+            T2s[c*2 + 0] = sL2[c];
+            T2s[c*2 + 1] = sR2[c];
+            const int8_t* l2q = qL2 + (size_t)c * K;
+            const int8_t* r2q = qR2 + (size_t)c * K;
+            int8_t* d2 = T2q + (size_t)c * K * 2;
+            for (int k = 0; k < K; k++) {
+                d2[k*2 + 0] = l2q[k];
+                d2[k*2 + 1] = r2q[k];
+            }
+        }
+    }
+    free(qL); free(sL); free(qR); free(sR);
+    free(qL2); free(sL2); free(qR2); free(sR2);
+    qL = qR = qL2 = qR2 = NULL;
+    sL = sR = sL2 = sR2 = NULL;
+
+    /* Zero output: outlier path adds in-place. */
+    pq_q8_ctx ctx = {
+        .T1q = T1q, .T1s = T1s, .T2q = T2q, .T2s = T2s,
+        .t = t, .K = K, .C = C, .out = out,
+    };
+    if (pool) ib_pool_run(pool, pq_q8_task, &ctx, t->M, 0);
+    else      pq_q8_gather_rows(&ctx, 0, t->M);
+
+    /* Outliers (same as fp32 path) */
+    for (int j = 0; j < t->n_outlier; j++) {
+        int col = t->outlier_cols[j];
+        float os = ib_fp16_to_fp32(t->outlier_scale[j]);
+        float xj = x[col];
+        for (int r = 0; r < t->M; r++) {
+            float w = (float)t->outlier_sidecar[(size_t)r * t->n_outlier + j] * os;
+            out[r] += w * xj;
+        }
+    }
+
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r);
+    free(inner_cols); free(T1q); free(T1s); free(T2q); free(T2s);
+    return 0;
+
+fail:
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    free(qL); free(sL); free(qR); free(sR);
+    free(qL2); free(sL2); free(qR2); free(sR2);
+    return -1;
+}
