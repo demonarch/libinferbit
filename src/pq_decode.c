@@ -12,6 +12,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* mmap support — POSIX. On Windows we fall back to fread-style loaders
+ * (the existing ib_pq_load_single/multi paths) because Win32 file
+ * mapping has a different API; that's a follow-up. */
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#define IB_PQ_HAVE_MMAP 1
+#endif
+
 #define IBF_MAGIC      "INFERBIT"
 #define IBF_MAGIC_SIZE 8
 #define IBF_PREAMBLE   32
@@ -129,7 +140,14 @@ static ib_pq_format parse_format(const char* s) {
 
 void ib_pq_free(ib_pq_tensor* t) {
     if (!t) return;
-    free(t->_arena);
+    if (t->_arena) {
+        free(t->_arena);
+    }
+#ifdef IB_PQ_HAVE_MMAP
+    if (t->_owns_mmap && t->_mmap_base && t->_mmap_size) {
+        munmap(t->_mmap_base, t->_mmap_size);
+    }
+#endif
     memset(t, 0, sizeof(*t));
 }
 
@@ -234,6 +252,76 @@ err:
     ib_pq_free(out);
     return -1;
 }
+
+#ifdef IB_PQ_HAVE_MMAP
+/* Same shape as load_one_tensor but tensor pointers are offsets into
+ * the mmap'd region. No fread, no heap arena copy. */
+static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
+                            const cJSON* tm, size_t weight_data_start,
+                            ib_pq_tensor* out) {
+    memset(out, 0, sizeof(*out));
+
+    const char* fmt_str = "";
+    cJSON* fit = cJSON_GetObjectItemCaseSensitive(tm, "format");
+    if (cJSON_IsString(fit)) fmt_str = fit->valuestring;
+    out->format = parse_format(fmt_str);
+    if (out->format == IB_PQ_FMT_NONE) return -1;
+
+    cJSON* shape = cJSON_GetObjectItemCaseSensitive(tm, "shape");
+    if (!cJSON_IsArray(shape) || cJSON_GetArraySize(shape) != 2) return -1;
+    out->M = (int)cJSON_GetArrayItem(shape, 0)->valuedouble;
+    out->N = (int)cJSON_GetArrayItem(shape, 1)->valuedouble;
+    out->G = (int)json_int_field(tm, "G", 0);
+    out->K = (int)json_int_field(tm, "K", 0);
+    out->n_levels = (int)json_int_field(tm, "n_levels", 0);
+    out->rotate   = json_bool_field(tm, "rotate", 0);
+
+    cJSON* outlier = cJSON_GetObjectItemCaseSensitive(tm, "outlier");
+    out->n_outlier = cJSON_IsObject(outlier)
+                     ? (int)json_int_field(outlier, "n_cols", 0)
+                     : 0;
+
+    int M = out->M, N = out->N, G = out->G, K = out->K;
+    int n_inner = N - out->n_outlier;
+    if (G <= 0 || K <= 0 || (G & 1) || n_inner % G != 0) return -1;
+    out->C = n_inner / G;
+
+    size_t cb_sz   = (size_t)K * (G / 2) * sizeof(uint16_t);
+    size_t idx_sz  = (size_t)M * (size_t)out->C * sizeof(uint8_t);
+    size_t rs_sz   = (size_t)M * sizeof(uint16_t);
+    size_t oc_sz   = (size_t)out->n_outlier * sizeof(int32_t);
+    size_t osc_sz  = (size_t)M * (size_t)out->n_outlier * sizeof(int8_t);
+    size_t oscl_sz = (size_t)out->n_outlier * sizeof(uint16_t);
+
+    #define VIEW_BLOCK(key, dst_ptr, dst_type, expected_sz) do {              \
+        size_t off, sz;                                                       \
+        if (read_block(tm, (key), &off, &sz) != 0) return -1;                 \
+        if (sz != (expected_sz)) return -1;                                   \
+        size_t abs = weight_data_start + off;                                 \
+        if (abs + sz > file_sz) return -1;                                    \
+        (dst_ptr) = (dst_type*)(mmap_base + abs);                             \
+    } while (0)
+
+    VIEW_BLOCK("codebook_l1_l", out->codebook_l1_l, uint16_t, cb_sz);
+    VIEW_BLOCK("codebook_l1_r", out->codebook_l1_r, uint16_t, cb_sz);
+    VIEW_BLOCK("indices_l1_l",  out->indices_l1_l,  uint8_t,  idx_sz);
+    VIEW_BLOCK("indices_l1_r",  out->indices_l1_r,  uint8_t,  idx_sz);
+    VIEW_BLOCK("row_scale",     out->row_scale,     uint16_t, rs_sz);
+    if (out->n_levels == 2) {
+        VIEW_BLOCK("codebook_l2_l", out->codebook_l2_l, uint16_t, cb_sz);
+        VIEW_BLOCK("codebook_l2_r", out->codebook_l2_r, uint16_t, cb_sz);
+        VIEW_BLOCK("indices_l2_l",  out->indices_l2_l,  uint8_t,  idx_sz);
+        VIEW_BLOCK("indices_l2_r",  out->indices_l2_r,  uint8_t,  idx_sz);
+    }
+    if (out->n_outlier > 0) {
+        VIEW_BLOCK("outlier_cols",    out->outlier_cols,    int32_t,  oc_sz);
+        VIEW_BLOCK("outlier_sidecar", out->outlier_sidecar, int8_t,   osc_sz);
+        VIEW_BLOCK("outlier_scale",   out->outlier_scale,   uint16_t, oscl_sz);
+    }
+    #undef VIEW_BLOCK
+    return 0;
+}
+#endif  /* IB_PQ_HAVE_MMAP */
 
 /* Open the file, parse preamble + JSON header. On success, returns a
  * still-open FILE* and the parsed cJSON root + sizes via outparams.
@@ -349,9 +437,24 @@ void ib_pq_multi_free(ib_pq_multi* m) {
         free(m->names);
     }
     if (m->tensors) {
+        /* Tensors loaded via ib_pq_open_mmap share one mmap owned by
+         * the multi struct; clear their pointers before per-tensor free
+         * so we don't double-munmap. */
+        if (m->_mmap_base) {
+            for (int i = 0; i < m->n; i++) {
+                m->tensors[i]._mmap_base = NULL;
+                m->tensors[i]._mmap_size = 0;
+                m->tensors[i]._owns_mmap = 0;
+            }
+        }
         for (int i = 0; i < m->n; i++) ib_pq_free(&m->tensors[i]);
         free(m->tensors);
     }
+#ifdef IB_PQ_HAVE_MMAP
+    if (m->_mmap_base && m->_mmap_size) {
+        munmap(m->_mmap_base, m->_mmap_size);
+    }
+#endif
     memset(m, 0, sizeof(*m));
 }
 
@@ -362,6 +465,147 @@ const ib_pq_tensor* ib_pq_multi_find(const ib_pq_multi* m, const char* name) {
     }
     return NULL;
 }
+
+#ifdef IB_PQ_HAVE_MMAP
+int ib_pq_open_mmap(const char* path, ib_pq_multi* out) {
+    if (!path || !out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    size_t file_sz = (size_t)st.st_size;
+    if (file_sz < IBF_PREAMBLE) { close(fd); return -1; }
+
+    void* mmap_base = mmap(NULL, file_sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);  /* mmap holds its own reference */
+    if (mmap_base == MAP_FAILED) return -1;
+
+    /* By default the OS reads pages on demand. Hint that we'll touch
+     * the metadata + headers immediately. */
+    (void)madvise(mmap_base, file_sz, MADV_RANDOM);
+
+    const uint8_t* base = (const uint8_t*)mmap_base;
+    if (memcmp(base, IBF_MAGIC, IBF_MAGIC_SIZE) != 0) {
+        munmap(mmap_base, file_sz); return -1;
+    }
+    uint32_t version, json_reserve;
+    memcpy(&version, base + 8, 4);
+    memcpy(&json_reserve, base + 12, 4);
+    if (version != IBF_VERSION_V5) { munmap(mmap_base, file_sz); return -1; }
+    if (IBF_PREAMBLE + json_reserve > file_sz) {
+        munmap(mmap_base, file_sz); return -1;
+    }
+
+    /* Parse JSON header. We have to copy out the header bytes because
+     * cJSON_Parse expects a NUL-terminated string and our mmap is
+     * read-only / not NUL-terminated at the right boundary. */
+    char* json_buf = (char*)malloc(json_reserve + 1);
+    if (!json_buf) { munmap(mmap_base, file_sz); return -1; }
+    memcpy(json_buf, base + IBF_PREAMBLE, json_reserve);
+    json_buf[json_reserve] = '\0';
+    cJSON* root = cJSON_Parse(json_buf);
+    free(json_buf);
+    if (!root) { munmap(mmap_base, file_sz); return -1; }
+
+    size_t weight_data_start = (size_t)json_int_field(root, "weight_data_start", 0);
+    cJSON* tensors = cJSON_GetObjectItemCaseSensitive(root, "tensors");
+    if (!cJSON_IsObject(tensors)) {
+        cJSON_Delete(root); munmap(mmap_base, file_sz); return -1;
+    }
+
+    int n = 0;
+    for (cJSON* it = tensors->child; it; it = it->next) n++;
+    if (n <= 0) { cJSON_Delete(root); munmap(mmap_base, file_sz); return -1; }
+
+    out->n = n;
+    out->names = (char**)calloc((size_t)n, sizeof(char*));
+    out->tensors = (ib_pq_tensor*)calloc((size_t)n, sizeof(ib_pq_tensor));
+    out->_mmap_base = mmap_base;
+    out->_mmap_size = file_sz;
+    if (!out->names || !out->tensors) {
+        cJSON_Delete(root); ib_pq_multi_free(out); return -1;
+    }
+
+    int i = 0;
+    for (cJSON* it = tensors->child; it; it = it->next, i++) {
+        size_t name_len = it->string ? strlen(it->string) : 0;
+        out->names[i] = (char*)malloc(name_len + 1);
+        if (!out->names[i]) {
+            cJSON_Delete(root); ib_pq_multi_free(out); return -1;
+        }
+        memcpy(out->names[i], it->string ? it->string : "", name_len);
+        out->names[i][name_len] = '\0';
+
+        if (view_one_tensor(base, file_sz, it, weight_data_start, &out->tensors[i]) != 0) {
+            cJSON_Delete(root); ib_pq_multi_free(out); return -1;
+        }
+        /* Tensors share the multi's mmap; only the multi struct frees it. */
+        out->tensors[i]._mmap_base = mmap_base;
+        out->tensors[i]._mmap_size = file_sz;
+        out->tensors[i]._owns_mmap = 0;
+    }
+
+    cJSON_Delete(root);
+    return 0;
+}
+
+/* Compute the byte range of a tensor's blocks within the mmap and
+ * issue an madvise. We use the codebook_l1_l offset as the lower
+ * bound; the blocks are not strictly contiguous, but advising over
+ * the whole tensor's "footprint" is a fine approximation. */
+static void pq_advise_tensor(const ib_pq_tensor* t, int advice) {
+    if (!t || !t->_mmap_base) return;
+    /* Find earliest and latest pointer among the tensor's blocks. */
+    const uint8_t* lo = (const uint8_t*)t->codebook_l1_l;
+    const uint8_t* hi = lo;
+
+    #define ADJUST(p, sz) do {                                                \
+        if ((p)) {                                                            \
+            const uint8_t* a = (const uint8_t*)(p);                           \
+            const uint8_t* b = a + (sz);                                      \
+            if (a < lo) lo = a;                                               \
+            if (b > hi) hi = b;                                               \
+        }                                                                     \
+    } while (0)
+
+    int K = t->K, M = t->M, half = t->G / 2, C = t->C, no = t->n_outlier;
+    size_t cb_sz   = (size_t)K * (size_t)half * sizeof(uint16_t);
+    size_t idx_sz  = (size_t)M * (size_t)C * sizeof(uint8_t);
+    size_t rs_sz   = (size_t)M * sizeof(uint16_t);
+
+    ADJUST(t->codebook_l1_l, cb_sz);
+    ADJUST(t->codebook_l1_r, cb_sz);
+    ADJUST(t->indices_l1_l,  idx_sz);
+    ADJUST(t->indices_l1_r,  idx_sz);
+    ADJUST(t->row_scale,     rs_sz);
+    if (t->codebook_l2_l) ADJUST(t->codebook_l2_l, cb_sz);
+    if (t->codebook_l2_r) ADJUST(t->codebook_l2_r, cb_sz);
+    if (t->indices_l2_l)  ADJUST(t->indices_l2_l,  idx_sz);
+    if (t->indices_l2_r)  ADJUST(t->indices_l2_r,  idx_sz);
+    if (no > 0) {
+        ADJUST(t->outlier_cols,    (size_t)no * sizeof(int32_t));
+        ADJUST(t->outlier_sidecar, (size_t)M * (size_t)no);
+        ADJUST(t->outlier_scale,   (size_t)no * sizeof(uint16_t));
+    }
+    #undef ADJUST
+
+    /* Round to page boundaries. madvise rejects unaligned start. */
+    long pagesize = sysconf(_SC_PAGESIZE);
+    if (pagesize <= 0) pagesize = 4096;
+    uintptr_t lo_a = (uintptr_t)lo & ~(uintptr_t)(pagesize - 1);
+    uintptr_t hi_a = ((uintptr_t)hi + pagesize - 1) & ~(uintptr_t)(pagesize - 1);
+    (void)madvise((void*)lo_a, (size_t)(hi_a - lo_a), advice);
+}
+
+void ib_pq_advise_willneed(const ib_pq_tensor* t) { pq_advise_tensor(t, MADV_WILLNEED); }
+void ib_pq_advise_dontneed(const ib_pq_tensor* t) { pq_advise_tensor(t, MADV_DONTNEED); }
+#else
+int ib_pq_open_mmap(const char* path, ib_pq_multi* out) { (void)path; (void)out; return -1; }
+void ib_pq_advise_willneed(const ib_pq_tensor* t) { (void)t; }
+void ib_pq_advise_dontneed(const ib_pq_tensor* t) { (void)t; }
+#endif
 
 /* ── Materialize ──────────────────────────────────────────────── */
 

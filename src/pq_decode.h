@@ -63,9 +63,14 @@ typedef struct {
     int8_t*   outlier_sidecar; /* M × n_outlier int8 */
     uint16_t* outlier_scale;   /* n_outlier FP16 per-col scales */
 
-    /* Scratch buffer used for FP16 conversion (owned by struct) */
-    void* _arena;              /* internal: contiguous allocation backing all pointers */
+    /* Backing storage. Exactly one of these is non-NULL:
+     *   _arena: contiguous heap allocation (fread loaders)
+     *   _mmap_base: mmap'd file region (Path D loaders) */
+    void* _arena;
     size_t _arena_size;
+    void* _mmap_base;          /* set on the FIRST tensor of an mmap'd file; */
+    size_t _mmap_size;         /* others share, only owner munmaps */
+    int   _owns_mmap;          /* 1 = munmap on free, 0 = shared reference */
 } ib_pq_tensor;
 
 /* Load a single-tensor IBF v5 file (matches the Python writer in
@@ -80,11 +85,31 @@ typedef struct {
     int n;
     char** names;          /* heap-allocated strings */
     ib_pq_tensor* tensors; /* parallel array */
+    void* _mmap_base;      /* non-NULL when mmap-backed (Path D) */
+    size_t _mmap_size;
 } ib_pq_multi;
 
 int  ib_pq_load_multi(const char* path, ib_pq_multi* out);
 void ib_pq_multi_free(ib_pq_multi* m);
 const ib_pq_tensor* ib_pq_multi_find(const ib_pq_multi* m, const char* name);
+
+/* Path D: mmap the file once and view tensors as zero-copy pointers
+ * into the OS page cache. Compared to ib_pq_load_multi:
+ *   - load wall is constant regardless of file size (no fread copy)
+ *   - working-set RAM is OS-paged, not preloaded
+ *   - eviction & prefetch can be advised explicitly (see below)
+ *
+ * On success returns 0 and fills *out. The mmap is owned by the
+ * ib_pq_multi struct; ib_pq_multi_free will munmap it. */
+int ib_pq_open_mmap(const char* path, ib_pq_multi* out);
+
+/* Tell the OS we plan to use a tensor's bytes soon — issues
+ * MADV_WILLNEED so pages are read in ahead. Cheap. */
+void ib_pq_advise_willneed(const ib_pq_tensor* t);
+
+/* Tell the OS we are done with a tensor and the pages can be
+ * dropped — MADV_DONTNEED. Frees physical RAM under pressure. */
+void ib_pq_advise_dontneed(const ib_pq_tensor* t);
 
 /* Materialize: write M*N FP16 values into out_fp16.
  * out_fp16 must have space for M*N uint16_t. */

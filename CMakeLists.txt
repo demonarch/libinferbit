@@ -149,6 +149,10 @@ add_executable(bench_pq_real_model tests/bench_pq_real_model.c)
 target_link_libraries(bench_pq_real_model inferbit_static ${PLATFORM_LIBS})
 target_include_directories(bench_pq_real_model PRIVATE include src)
 
+add_executable(bench_pq_pathd tests/bench_pq_pathd.c)
+target_link_libraries(bench_pq_pathd inferbit_static ${PLATFORM_LIBS})
+target_include_directories(bench_pq_pathd PRIVATE include src)
+
 enable_testing()
 add_test(NAME basic COMMAND test_inferbit)
 add_test(NAME ibf_loader COMMAND test_ibf_loader)
