@@ -749,6 +749,10 @@ typedef struct {
     const float* TL2;   /* may be NULL */
     const float* TR2;   /* may be NULL */
     int K, C;
+    /* DejaVu sparsity: when active_list is non-NULL the gather walks
+     * only those chunks. NULL means walk all C chunks (dense path). */
+    const int32_t* active_list;
+    int n_active;
     float* out;
 } pq_gather_ctx;
 
@@ -759,6 +763,8 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
     const float* TR1 = g->TR1;
     const float* TL2 = g->TL2;
     const float* TR2 = g->TR2;
+    const int32_t* active = g->active_list;
+    int n_active = g->n_active;
     float* out = g->out;
     for (int r = r0; r < r1; r++) {
         float scale = ib_fp16_to_fp32(t->row_scale[r]);
@@ -767,16 +773,33 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
         const uint8_t* il2l = TL2 ? t->indices_l2_l + (size_t)r * C : NULL;
         const uint8_t* il2r = TR2 ? t->indices_l2_r + (size_t)r * C : NULL;
         float acc = 0.0f;
-        if (TL2) {
-            for (int c = 0; c < C; c++) {
-                size_t base = (size_t)c * K;
-                acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
-                acc += TL2[base + il2l[c]] + TR2[base + il2r[c]];
+        if (active) {
+            if (TL2) {
+                for (int aii = 0; aii < n_active; aii++) {
+                    int c = active[aii];
+                    size_t base = (size_t)c * K;
+                    acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
+                    acc += TL2[base + il2l[c]] + TR2[base + il2r[c]];
+                }
+            } else {
+                for (int aii = 0; aii < n_active; aii++) {
+                    int c = active[aii];
+                    size_t base = (size_t)c * K;
+                    acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
+                }
             }
         } else {
-            for (int c = 0; c < C; c++) {
-                size_t base = (size_t)c * K;
-                acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
+            if (TL2) {
+                for (int c = 0; c < C; c++) {
+                    size_t base = (size_t)c * K;
+                    acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
+                    acc += TL2[base + il2l[c]] + TR2[base + il2r[c]];
+                }
+            } else {
+                for (int c = 0; c < C; c++) {
+                    size_t base = (size_t)c * K;
+                    acc += TL1[base + il_l[c]] + TR1[base + il_r[c]];
+                }
             }
         }
         out[r] = acc * scale;
@@ -845,41 +868,117 @@ static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
         }
     }
 
-    /* Build the partial-dot tables. For each chunk c and codebook
-     * entry k: T_L*[c*K + k] = sum_{i<half} cb*l[k,i] * x[inner_cols[c*G+i]]. */
-    for (int c = 0; c < C; c++) {
-        int base = c * G;
-        /* Cache the two x slices for this chunk. */
-        float xL[16], xR[16];   /* half ≤ 16 in any sane config */
-        for (int i = 0; i < half; i++) xL[i] = x[inner_cols[base + i]];
-        for (int i = 0; i < half; i++) xR[i] = x[inner_cols[base + half + i]];
-        for (int k = 0; k < K; k++) {
-            float sl = 0.0f, sr = 0.0f;
-            const float* lv = &cb1l[(size_t)k * half];
-            const float* rv = &cb1r[(size_t)k * half];
-            for (int i = 0; i < half; i++) sl += lv[i] * xL[i];
-            for (int i = 0; i < half; i++) sr += rv[i] * xR[i];
-            TL1[(size_t)c * K + k] = sl;
-            TR1[(size_t)c * K + k] = sr;
-            if (cb2l) {
-                float sl2 = 0.0f, sr2 = 0.0f;
-                const float* lv2 = &cb2l[(size_t)k * half];
-                const float* rv2 = &cb2r[(size_t)k * half];
-                for (int i = 0; i < half; i++) sl2 += lv2[i] * xL[i];
-                for (int i = 0; i < half; i++) sr2 += rv2[i] * xR[i];
-                TL2[(size_t)c * K + k] = sl2;
-                TR2[(size_t)c * K + k] = sr2;
+    /* DejaVu sparsity auto-detect.
+     *
+     * When x has many near-zero entries (post-SiLU FFN intermediate is
+     * the canonical case), entire chunks contribute nothing. We scan
+     * x once, build a list of active chunks, skip the rest in both
+     * LUT build and per-row gather. Threshold: 1% of max-abs. Below
+     * that, contribution to the output is bounded by
+     *     max_abs * 0.01 * codebook_max * C
+     * which is well below fp16 noise on typical inputs.
+     *
+     * If no chunks fall below threshold, active_list stays NULL and
+     * the kernel runs the dense path (no overhead).
+     */
+    float maxabs = 0.0f;
+    int n_inner = N - t->n_outlier;
+    for (int j = 0; j < n_inner; j++) {
+        float v = x[inner_cols[j]];
+        if (v < 0) v = -v;
+        if (v > maxabs) maxabs = v;
+    }
+    int32_t* active_list = NULL;
+    int n_active = 0;
+    if (maxabs > 0.0f) {
+        float thresh = maxabs * 0.01f;
+        active_list = (int32_t*)malloc((size_t)C * sizeof(int32_t));
+        if (!active_list) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            free(TL1); free(TR1); free(TL2); free(TR2); return -1;
+        }
+        for (int c = 0; c < C; c++) {
+            int base = c * G;
+            float chunk_maxabs = 0.0f;
+            for (int i = 0; i < G; i++) {
+                float v = x[inner_cols[base + i]];
+                if (v < 0) v = -v;
+                if (v > chunk_maxabs) chunk_maxabs = v;
+            }
+            if (chunk_maxabs >= thresh) {
+                active_list[n_active++] = c;
+            }
+        }
+        /* If everything is active, dense path is just as fast and the
+         * gather inner loop is one fewer indirection. */
+        if (n_active == C) {
+            free(active_list);
+            active_list = NULL;
+        }
+    }
+
+    /* Build the partial-dot tables. Only for active chunks when sparse. */
+    if (active_list) {
+        /* Inactive entries' tables are never read by the gather, so we
+         * leave them uninitialised. */
+        for (int aii = 0; aii < n_active; aii++) {
+            int c = active_list[aii];
+            int base = c * G;
+            float xL[16], xR[16];
+            for (int i = 0; i < half; i++) xL[i] = x[inner_cols[base + i]];
+            for (int i = 0; i < half; i++) xR[i] = x[inner_cols[base + half + i]];
+            for (int k = 0; k < K; k++) {
+                float sl = 0.0f, sr = 0.0f;
+                const float* lv = &cb1l[(size_t)k * half];
+                const float* rv = &cb1r[(size_t)k * half];
+                for (int i = 0; i < half; i++) sl += lv[i] * xL[i];
+                for (int i = 0; i < half; i++) sr += rv[i] * xR[i];
+                TL1[(size_t)c * K + k] = sl;
+                TR1[(size_t)c * K + k] = sr;
+                if (cb2l) {
+                    float sl2 = 0.0f, sr2 = 0.0f;
+                    const float* lv2 = &cb2l[(size_t)k * half];
+                    const float* rv2 = &cb2r[(size_t)k * half];
+                    for (int i = 0; i < half; i++) sl2 += lv2[i] * xL[i];
+                    for (int i = 0; i < half; i++) sr2 += rv2[i] * xR[i];
+                    TL2[(size_t)c * K + k] = sl2;
+                    TR2[(size_t)c * K + k] = sr2;
+                }
+            }
+        }
+    } else {
+        for (int c = 0; c < C; c++) {
+            int base = c * G;
+            float xL[16], xR[16];
+            for (int i = 0; i < half; i++) xL[i] = x[inner_cols[base + i]];
+            for (int i = 0; i < half; i++) xR[i] = x[inner_cols[base + half + i]];
+            for (int k = 0; k < K; k++) {
+                float sl = 0.0f, sr = 0.0f;
+                const float* lv = &cb1l[(size_t)k * half];
+                const float* rv = &cb1r[(size_t)k * half];
+                for (int i = 0; i < half; i++) sl += lv[i] * xL[i];
+                for (int i = 0; i < half; i++) sr += rv[i] * xR[i];
+                TL1[(size_t)c * K + k] = sl;
+                TR1[(size_t)c * K + k] = sr;
+                if (cb2l) {
+                    float sl2 = 0.0f, sr2 = 0.0f;
+                    const float* lv2 = &cb2l[(size_t)k * half];
+                    const float* rv2 = &cb2r[(size_t)k * half];
+                    for (int i = 0; i < half; i++) sl2 += lv2[i] * xL[i];
+                    for (int i = 0; i < half; i++) sr2 += rv2[i] * xR[i];
+                    TL2[(size_t)c * K + k] = sl2;
+                    TR2[(size_t)c * K + k] = sr2;
+                }
             }
         }
     }
 
-    /* Per-row gather. Single-threaded path uses a register accumulator
-     * (NEON 4-row blocks regressed by ~10% on M1; chunk-outer regressed
-     * by 4-8x due to out[] R-M-W). Threaded path splits the row range
-     * across the pool's workers. */
+    /* Per-row gather. Sparse path walks active_list when present. */
     pq_gather_ctx ctx = {
         .t = t, .TL1 = TL1, .TR1 = TR1, .TL2 = TL2, .TR2 = TR2,
-        .K = K, .C = C, .out = out,
+        .K = K, .C = C,
+        .active_list = active_list, .n_active = n_active,
+        .out = out,
     };
     if (pool) {
         ib_pool_run(pool, pq_gather_task, &ctx, M, 0);
@@ -900,6 +999,7 @@ static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
 
     free(cb1l); free(cb1r); free(cb2l); free(cb2r);
     free(inner_cols); free(TL1); free(TR1); free(TL2); free(TR2);
+    free(active_list);
     return 0;
 }
 

@@ -161,6 +161,10 @@ add_executable(bench_pq_streaming tests/bench_pq_streaming.c)
 target_link_libraries(bench_pq_streaming inferbit_static ${PLATFORM_LIBS})
 target_include_directories(bench_pq_streaming PRIVATE include src)
 
+add_executable(bench_pq_dejavu tests/bench_pq_dejavu.c)
+target_link_libraries(bench_pq_dejavu inferbit_static ${PLATFORM_LIBS})
+target_include_directories(bench_pq_dejavu PRIVATE include src)
+
 enable_testing()
 add_test(NAME basic COMMAND test_inferbit)
 add_test(NAME ibf_loader COMMAND test_ibf_loader)
