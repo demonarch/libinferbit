@@ -165,6 +165,10 @@ add_executable(bench_pq_dejavu tests/bench_pq_dejavu.c)
 target_link_libraries(bench_pq_dejavu inferbit_static ${PLATFORM_LIBS})
 target_include_directories(bench_pq_dejavu PRIVATE include src)
 
+add_executable(bench_pq_bounded tests/bench_pq_bounded.c)
+target_link_libraries(bench_pq_bounded inferbit_static ${PLATFORM_LIBS})
+target_include_directories(bench_pq_bounded PRIVATE include src)
+
 enable_testing()
 add_test(NAME basic COMMAND test_inferbit)
 add_test(NAME ibf_loader COMMAND test_ibf_loader)
