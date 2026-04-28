@@ -111,6 +111,30 @@ void ib_pq_advise_willneed(const ib_pq_tensor* t);
  * dropped — MADV_DONTNEED. Frees physical RAM under pressure. */
 void ib_pq_advise_dontneed(const ib_pq_tensor* t);
 
+/* Streaming-inference scheduler primitives.
+ *
+ * Typical use during a forward pass over a multi-layer model:
+ *   for L in 0..n_layers:
+ *       if L+1 < n_layers:
+ *           ib_pq_advise_willneed_n(&next_layer_tensors, k);
+ *       run_layer(L);
+ *       ib_pq_advise_dontneed_n(&this_layer_tensors, k);
+ *
+ * The willneed hint lets the OS overlap layer L+1's page-in with
+ * layer L's compute. The dontneed lets the OS reclaim layer L's
+ * pages when it needs to. Both are advisory — no-ops on already-
+ * resident pages.
+ *
+ * Quantitative wins:
+ *   - Cold start (pages not yet faulted): willneed overlaps fault
+ *     with compute, materially cuts time-to-first-token.
+ *   - Memory-pressured (model > RAM): dontneed lets the OS evict
+ *     finished layers so the next layer fits.
+ *   - Warm + abundant RAM: both calls are no-ops; same throughput.
+ */
+void ib_pq_advise_willneed_n(const ib_pq_tensor* const* tensors, int n);
+void ib_pq_advise_dontneed_n(const ib_pq_tensor* const* tensors, int n);
+
 /* Materialize: write M*N FP16 values into out_fp16.
  * out_fp16 must have space for M*N uint16_t. */
 int ib_pq_reconstruct_fp16(const ib_pq_tensor* t, uint16_t* out_fp16);

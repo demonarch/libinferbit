@@ -601,10 +601,25 @@ static void pq_advise_tensor(const ib_pq_tensor* t, int advice) {
 
 void ib_pq_advise_willneed(const ib_pq_tensor* t) { pq_advise_tensor(t, MADV_WILLNEED); }
 void ib_pq_advise_dontneed(const ib_pq_tensor* t) { pq_advise_tensor(t, MADV_DONTNEED); }
+
+void ib_pq_advise_willneed_n(const ib_pq_tensor* const* tensors, int n) {
+    if (!tensors) return;
+    for (int i = 0; i < n; i++) pq_advise_tensor(tensors[i], MADV_WILLNEED);
+}
+void ib_pq_advise_dontneed_n(const ib_pq_tensor* const* tensors, int n) {
+    if (!tensors) return;
+    for (int i = 0; i < n; i++) pq_advise_tensor(tensors[i], MADV_DONTNEED);
+}
 #else
 int ib_pq_open_mmap(const char* path, ib_pq_multi* out) { (void)path; (void)out; return -1; }
 void ib_pq_advise_willneed(const ib_pq_tensor* t) { (void)t; }
 void ib_pq_advise_dontneed(const ib_pq_tensor* t) { (void)t; }
+void ib_pq_advise_willneed_n(const ib_pq_tensor* const* tensors, int n) {
+    (void)tensors; (void)n;
+}
+void ib_pq_advise_dontneed_n(const ib_pq_tensor* const* tensors, int n) {
+    (void)tensors; (void)n;
+}
 #endif
 
 /* ── Materialize ──────────────────────────────────────────────── */
