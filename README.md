@@ -1,6 +1,6 @@
 # libinferbit
 
-C shared library for quantized LLM inference. The core engine behind [InferBit](https://github.com/demonarch/inferbit-py).
+**v0.2.0** — C shared library for quantized LLM inference. The core engine behind [InferBit](https://github.com/demonarch/inferbit-py).
 
 Loads INT4/INT8 quantized models and runs transformer inference with SIMD-optimized kernels on CPU. Designed to be called via FFI from Python, Node.js, or any language that can load a shared library.
 
