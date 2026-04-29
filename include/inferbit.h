@@ -30,8 +30,8 @@ extern "C" {
 
 #define INFERBIT_VERSION_MAJOR 0
 #define INFERBIT_VERSION_MINOR 2
-#define INFERBIT_VERSION_PATCH 0
-#define INFERBIT_VERSION_STRING "0.2.0"
+#define INFERBIT_VERSION_PATCH 3
+#define INFERBIT_VERSION_STRING "0.2.3"
 
 IB_API const char* inferbit_version(void);
 IB_API int         inferbit_version_major(void);
