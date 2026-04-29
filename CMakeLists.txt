@@ -121,59 +121,37 @@ add_executable(test_ibf_loader tests/test_ibf_loader.c)
 target_link_libraries(test_ibf_loader inferbit_static ${PLATFORM_LIBS})
 target_include_directories(test_ibf_loader PRIVATE include)
 
-add_executable(test_forward tests/test_forward.c)
-target_link_libraries(test_forward inferbit_static ${PLATFORM_LIBS})
-target_include_directories(test_forward PRIVATE include)
-
 add_executable(test_convert tests/test_convert.c)
 target_link_libraries(test_convert inferbit_static ${PLATFORM_LIBS})
 target_include_directories(test_convert PRIVATE include)
 
-add_executable(test_pq_decode tests/test_pq_decode.c)
-target_link_libraries(test_pq_decode inferbit_static ${PLATFORM_LIBS})
-target_include_directories(test_pq_decode PRIVATE include src)
+# POSIX-only tests/benches: clock_gettime(CLOCK_MONOTONIC),
+# sys/resource.h, and some internal-symbol linkage. Skipped on Windows.
+if(NOT WIN32)
+    add_executable(test_forward tests/test_forward.c)
+    target_link_libraries(test_forward inferbit_static ${PLATFORM_LIBS})
+    target_include_directories(test_forward PRIVATE include)
 
-add_executable(bench_pq_decode tests/bench_pq_decode.c)
-target_link_libraries(bench_pq_decode inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_decode PRIVATE include src)
+    add_executable(test_pq_decode tests/test_pq_decode.c)
+    target_link_libraries(test_pq_decode inferbit_static ${PLATFORM_LIBS})
+    target_include_directories(test_pq_decode PRIVATE include src)
 
-add_executable(bench_pq_ffn tests/bench_pq_ffn.c)
-target_link_libraries(bench_pq_ffn inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_ffn PRIVATE include src)
-
-add_executable(bench_pq_model_mlp tests/bench_pq_model_mlp.c)
-target_link_libraries(bench_pq_model_mlp inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_model_mlp PRIVATE include src)
-
-add_executable(bench_pq_real_model tests/bench_pq_real_model.c)
-target_link_libraries(bench_pq_real_model inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_real_model PRIVATE include src)
-
-add_executable(bench_pq_pathd tests/bench_pq_pathd.c)
-target_link_libraries(bench_pq_pathd inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_pathd PRIVATE include src)
-
-add_executable(bench_pq_q8lut tests/bench_pq_q8lut.c)
-target_link_libraries(bench_pq_q8lut inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_q8lut PRIVATE include src)
-
-add_executable(bench_pq_streaming tests/bench_pq_streaming.c)
-target_link_libraries(bench_pq_streaming inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_streaming PRIVATE include src)
-
-add_executable(bench_pq_dejavu tests/bench_pq_dejavu.c)
-target_link_libraries(bench_pq_dejavu inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_dejavu PRIVATE include src)
-
-add_executable(bench_pq_bounded tests/bench_pq_bounded.c)
-target_link_libraries(bench_pq_bounded inferbit_static ${PLATFORM_LIBS})
-target_include_directories(bench_pq_bounded PRIVATE include src)
+    foreach(b bench_pq_decode bench_pq_ffn bench_pq_model_mlp
+              bench_pq_real_model bench_pq_pathd bench_pq_q8lut
+              bench_pq_streaming bench_pq_dejavu bench_pq_bounded)
+        add_executable(${b} tests/${b}.c)
+        target_link_libraries(${b} inferbit_static ${PLATFORM_LIBS})
+        target_include_directories(${b} PRIVATE include src)
+    endforeach()
+endif()
 
 enable_testing()
 add_test(NAME basic COMMAND test_inferbit)
 add_test(NAME ibf_loader COMMAND test_ibf_loader)
-add_test(NAME forward COMMAND test_forward)
 add_test(NAME convert COMMAND test_convert)
+if(NOT WIN32)
+    add_test(NAME forward COMMAND test_forward)
+endif()
 
 # Install
 install(TARGETS inferbit
