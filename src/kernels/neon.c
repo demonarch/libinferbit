@@ -11,6 +11,15 @@
 #include <math.h>
 #include <string.h>
 
+/* MSVC ARM64 doesn't grok GCC __attribute__ syntax. */
+#if defined(_MSC_VER)
+#define IB_NOINLINE __declspec(noinline)
+#define IB_DOTPROD_NOINLINE __declspec(noinline)
+#else
+#define IB_NOINLINE __attribute__((noinline))
+#define IB_DOTPROD_NOINLINE __attribute__((target("dotprod"),noinline))
+#endif
+
 /* ── INT8 matmul ────────────────────────────────────────────── */
 
 static void neon_matmul_int8(
@@ -244,7 +253,7 @@ static void neon_rope(
 #endif
 
 #if IB_HAS_DOTPROD
-__attribute__((target("dotprod"),noinline))
+IB_DOTPROD_NOINLINE
 #endif
 static void neon_matmul_w4a8(
     float* out, const void* weights, const float* scales_w,
@@ -356,7 +365,7 @@ static void neon_matmul_w4a8(
 #endif
 
 #if IB_HAS_DOTPROD
-__attribute__((target("dotprod"),noinline))
+IB_DOTPROD_NOINLINE
 #endif
 static void neon_matmul_w4a8_batch_b4(
     float* out, const uint8_t* w, const float* scales_w,
@@ -410,7 +419,7 @@ static void neon_matmul_w4a8_batch_b4(
 }
 
 #if IB_HAS_DOTPROD
-__attribute__((target("dotprod"),noinline))
+IB_DOTPROD_NOINLINE
 #endif
 static void neon_matmul_w4a8_batch_b2(
     float* out, const uint8_t* w, const float* scales_w,
@@ -454,7 +463,7 @@ static void neon_matmul_w4a8_batch_b2(
 /* Generic fallback — correct but slower than specialized variants because
  * the compiler spills per-batch accumulators to stack. */
 #if IB_HAS_DOTPROD
-__attribute__((target("dotprod"),noinline))
+IB_DOTPROD_NOINLINE
 #endif
 static void neon_matmul_w4a8_batch_generic(
     float* out, const uint8_t* w, const float* scales_w,
@@ -546,7 +555,7 @@ static void neon_matmul_w4a8_batch(
  * against B activation vectors. Used by the LM head during spec-decoding
  * verify, where we want B positions' logits from a single pass over the
  * vocab×hidden weight matrix. */
-__attribute__((noinline))
+IB_NOINLINE
 static void neon_matmul_int8_batch_b4(
     float* out, const int8_t* w, const float* scales_w,
     const float* input, int M, int N, int M_stride
@@ -592,7 +601,7 @@ static void neon_matmul_int8_batch_b4(
     }
 }
 
-__attribute__((noinline))
+IB_NOINLINE
 static void neon_matmul_int8_batch_b2(
     float* out, const int8_t* w, const float* scales_w,
     const float* input, int M, int N, int M_stride
