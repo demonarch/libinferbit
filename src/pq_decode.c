@@ -3551,9 +3551,18 @@ struct ib_pq_kv_cache {
     int max_seq;
     int kv_dim;        /* num_kv_heads * head_dim */
     int length;
-    /* Layout: [layer][pos][kv_dim] fp32 — separate K and V. */
-    float* k;          /* size = n_layers * max_seq * kv_dim */
-    float* v;
+    /* Storage layout: [layer][pos][kv_dim].
+     * F1.d: storage_fp16 selects between fp32 and fp16 backing. fp16
+     * halves the bytes streamed from RAM in the attention dot loop —
+     * a meaningful win at long context (pos × n_layers × kv_dim reads
+     * per token) where bandwidth dominates the software fp16 cvt cost.
+     * Set IB_PQ_KV_FP16=1 to enable. Default fp32 keeps short-context
+     * latency low. */
+    int storage_fp16;
+    float*    k_f32;
+    float*    v_f32;
+    uint16_t* k_f16;
+    uint16_t* v_f16;
 };
 
 static int session_config_int(const char* json, const char* key, int def) {
@@ -3592,11 +3601,21 @@ int ib_pq_kv_cache_create(const ib_pq_session* s, int max_seq_len,
     ib_pq_kv_cache* kv = (ib_pq_kv_cache*)calloc(1, sizeof(*kv));
     if (!kv) return -1;
     kv->n_layers = n_layers; kv->max_seq = max_seq_len; kv->kv_dim = kv_dim;
-    size_t bytes = (size_t)n_layers * max_seq_len * kv_dim * sizeof(float);
-    kv->k = (float*)malloc(bytes);
-    kv->v = (float*)malloc(bytes);
-    if (!kv->k || !kv->v) {
-        free(kv->k); free(kv->v); free(kv); return -1;
+    const char* fp16_env = getenv("IB_PQ_KV_FP16");
+    kv->storage_fp16 = (fp16_env && atoi(fp16_env) > 0) ? 1 : 0;
+    size_t n_elem = (size_t)n_layers * max_seq_len * kv_dim;
+    if (kv->storage_fp16) {
+        kv->k_f16 = (uint16_t*)malloc(n_elem * sizeof(uint16_t));
+        kv->v_f16 = (uint16_t*)malloc(n_elem * sizeof(uint16_t));
+        if (!kv->k_f16 || !kv->v_f16) {
+            free(kv->k_f16); free(kv->v_f16); free(kv); return -1;
+        }
+    } else {
+        kv->k_f32 = (float*)malloc(n_elem * sizeof(float));
+        kv->v_f32 = (float*)malloc(n_elem * sizeof(float));
+        if (!kv->k_f32 || !kv->v_f32) {
+            free(kv->k_f32); free(kv->v_f32); free(kv); return -1;
+        }
     }
     *out_p = kv;
     return 0;
@@ -3604,7 +3623,9 @@ int ib_pq_kv_cache_create(const ib_pq_session* s, int max_seq_len,
 
 void ib_pq_kv_cache_free(ib_pq_kv_cache* kv) {
     if (!kv) return;
-    free(kv->k); free(kv->v); free(kv);
+    free(kv->k_f32); free(kv->v_f32);
+    free(kv->k_f16); free(kv->v_f16);
+    free(kv);
 }
 
 void ib_pq_kv_cache_clear(ib_pq_kv_cache* kv) { if (kv) kv->length = 0; }
@@ -3698,34 +3719,101 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
         ib_rope_f32(q,     n_heads, head_dim, pos, theta);
         ib_rope_f32(k_now, n_kv,    head_dim, pos, theta);
 
-        /* Write into kv cache. */
+        /* Write into kv cache. fp32 path: memcpy. fp16 path: convert. */
         if (kv) {
-            float* k_slot = kv->k + ((size_t)L * kv->max_seq + pos) * kv_dim;
-            float* v_slot = kv->v + ((size_t)L * kv->max_seq + pos) * kv_dim;
-            memcpy(k_slot, k_now, (size_t)kv_dim * sizeof(float));
-            memcpy(v_slot, v_now, (size_t)kv_dim * sizeof(float));
+            size_t kv_offset = ((size_t)L * kv->max_seq + pos) * kv_dim;
+            if (kv->storage_fp16) {
+                uint16_t* k_slot = kv->k_f16 + kv_offset;
+                uint16_t* v_slot = kv->v_f16 + kv_offset;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+                int d = 0;
+                for (; d + 4 <= kv_dim; d += 4) {
+                    float16x4_t kh = vcvt_f16_f32(vld1q_f32(k_now + d));
+                    float16x4_t vh = vcvt_f16_f32(vld1q_f32(v_now + d));
+                    vst1_u16(k_slot + d, vreinterpret_u16_f16(kh));
+                    vst1_u16(v_slot + d, vreinterpret_u16_f16(vh));
+                }
+                for (; d < kv_dim; d++) {
+                    k_slot[d] = ib_fp32_to_fp16(k_now[d]);
+                    v_slot[d] = ib_fp32_to_fp16(v_now[d]);
+                }
+#else
+                for (int d = 0; d < kv_dim; d++) {
+                    k_slot[d] = ib_fp32_to_fp16(k_now[d]);
+                    v_slot[d] = ib_fp32_to_fp16(v_now[d]);
+                }
+#endif
+            } else {
+                float* k_slot = kv->k_f32 + kv_offset;
+                float* v_slot = kv->v_f32 + kv_offset;
+                memcpy(k_slot, k_now, (size_t)kv_dim * sizeof(float));
+                memcpy(v_slot, v_now, (size_t)kv_dim * sizeof(float));
+            }
         }
 
         /* Multi-head attention with grouped-query (each query head h
          * attends to the kv head h / (n_heads / n_kv)). */
         int q_per_kv = n_heads / n_kv;
         float inv_sqrt = 1.0f / sqrtf((float)head_dim);
+        /* For fp16-backed KV, dequant the slice for this layer + head into
+         * stack scratch once per (t, h) so the dot loop reads contiguous fp32
+         * (and SIMD on it). head_dim ≤ 256 in practice. */
+        float k_scratch[256];
+        float v_scratch[256];
         for (int h = 0; h < n_heads; h++) {
             int kv_h = h / q_per_kv;
             const float* qh = q + (size_t)h * head_dim;
             for (int t = 0; t <= pos; t++) {
-                const float* k_t = kv
-                    ? (kv->k + ((size_t)L * kv->max_seq + t) * kv_dim + (size_t)kv_h * head_dim)
-                    : (k_now + (size_t)kv_h * head_dim);
+                const float* k_t;
+                if (kv && kv->storage_fp16) {
+                    const uint16_t* k_src = kv->k_f16
+                        + ((size_t)L * kv->max_seq + t) * kv_dim
+                        + (size_t)kv_h * head_dim;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+                    int d = 0;
+                    for (; d + 4 <= head_dim; d += 4) {
+                        float16x4_t hv = vreinterpret_f16_u16(vld1_u16(k_src + d));
+                        vst1q_f32(k_scratch + d, vcvt_f32_f16(hv));
+                    }
+                    for (; d < head_dim; d++) k_scratch[d] = ib_fp16_to_fp32(k_src[d]);
+#else
+                    for (int d = 0; d < head_dim; d++) k_scratch[d] = ib_fp16_to_fp32(k_src[d]);
+#endif
+                    k_t = k_scratch;
+                } else if (kv) {
+                    k_t = kv->k_f32 + ((size_t)L * kv->max_seq + t) * kv_dim
+                                    + (size_t)kv_h * head_dim;
+                } else {
+                    k_t = k_now + (size_t)kv_h * head_dim;
+                }
                 scores[t] = pq_dot_f32(qh, k_t, head_dim) * inv_sqrt;
             }
             ib_softmax_f32(scores, pos + 1);
             float* outh = xb2 + (size_t)h * head_dim;
             memset(outh, 0, (size_t)head_dim * sizeof(float));
             for (int t = 0; t <= pos; t++) {
-                const float* v_t = kv
-                    ? (kv->v + ((size_t)L * kv->max_seq + t) * kv_dim + (size_t)kv_h * head_dim)
-                    : (v_now + (size_t)kv_h * head_dim);
+                const float* v_t;
+                if (kv && kv->storage_fp16) {
+                    const uint16_t* v_src = kv->v_f16
+                        + ((size_t)L * kv->max_seq + t) * kv_dim
+                        + (size_t)kv_h * head_dim;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+                    int d = 0;
+                    for (; d + 4 <= head_dim; d += 4) {
+                        float16x4_t hv = vreinterpret_f16_u16(vld1_u16(v_src + d));
+                        vst1q_f32(v_scratch + d, vcvt_f32_f16(hv));
+                    }
+                    for (; d < head_dim; d++) v_scratch[d] = ib_fp16_to_fp32(v_src[d]);
+#else
+                    for (int d = 0; d < head_dim; d++) v_scratch[d] = ib_fp16_to_fp32(v_src[d]);
+#endif
+                    v_t = v_scratch;
+                } else if (kv) {
+                    v_t = kv->v_f32 + ((size_t)L * kv->max_seq + t) * kv_dim
+                                    + (size_t)kv_h * head_dim;
+                } else {
+                    v_t = v_now + (size_t)kv_h * head_dim;
+                }
                 pq_accum_scaled_f32(outh, v_t, scores[t], head_dim);
             }
         }
