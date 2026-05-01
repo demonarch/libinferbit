@@ -6,6 +6,8 @@
 #include "pq_decode.h"
 #include "cJSON.h"
 #include "inferbit_internal.h"  /* ib_thread_pool, ib_pool_run */
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include <errno.h>
 #include <math.h>
@@ -2946,6 +2948,45 @@ static void pq_streaming_cached_row_task(void* arg, int tid, int r0, int r1) {
     }
 }
 
+/* Forward declarations for spin-pool (defined below). */
+typedef struct pq_spin_pool pq_spin_pool;
+typedef void (*pq_spin_fn)(void* arg, int tid, int s, int e);
+static void pq_spin_pool_run(pq_spin_pool* p, pq_spin_fn fn, void* arg,
+                              int total, int chunk_size);
+
+static int ib_pq_matmul_fp32_streaming_cached_spin(const ib_pq_tensor* t,
+                                                     const ib_pq_lut_cache* cache,
+                                                     const float* x, float* out,
+                                                     pq_spin_pool* sp, int n_threads,
+                                                     float* scratch, size_t per_thread) {
+    if (!sp || n_threads <= 1) return -1;
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int has_l2 = (cache->n_levels == 2);
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    pq_streaming_cached_threaded_args args = {
+        .t = t, .cache = cache, .x = x, .out = out,
+        .M = M, .G = G, .C = C, .K = K, .K_l2 = K_l2, .half = half,
+        .has_l2 = has_l2,
+        .n_threads = n_threads,
+        .scratch_base = scratch,
+        .scratch_per_thread = per_thread,
+    };
+
+    int chunk = (M + n_threads - 1) / n_threads;
+    if (chunk < 1) chunk = 1;
+    pq_spin_pool_run(sp, pq_streaming_cached_row_task, &args, M, chunk);
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+    return 0;
+}
+
 static int ib_pq_matmul_fp32_streaming_cached_threaded(const ib_pq_tensor* t,
                                                          const ib_pq_lut_cache* cache,
                                                          const float* x, float* out,
@@ -3120,13 +3161,112 @@ int ib_pq_multi_caches_quantize_all_int8(ib_pq_multi_caches* mc) {
 
 /* ── Session: IBF + cache fleet + per-tensor policy ── */
 
+/* F1.b: minimal spin pool — workers busy-wait on a generation counter
+ * instead of cond_wait. Sync latency drops from O(50–200 µs) to O(<1 µs)
+ * which is what makes per-call threading viable in a 154-call/token loop. */
+
+struct pq_spin_pool {
+    int n_threads;
+    pthread_t* threads;
+    _Atomic int generation;
+    _Atomic int next_chunk;
+    _Atomic int n_done;
+    _Atomic int shutdown;
+    pq_spin_fn fn;
+    void* arg;
+    int total;
+    int chunk_size;
+    /* per-thread tid (passed to worker thread). */
+    int* tids;
+};
+
+static inline void pq_cpu_pause(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause");
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+static void* pq_spin_worker(void* raw) {
+    int tid_box = *(int*)raw;
+    pq_spin_pool* p = *(pq_spin_pool**)((char*)raw + sizeof(int));
+    int my_gen = 0;
+    while (1) {
+        while (atomic_load_explicit(&p->generation, memory_order_acquire) == my_gen) {
+            if (atomic_load_explicit(&p->shutdown, memory_order_acquire)) return NULL;
+            pq_cpu_pause();
+        }
+        my_gen = atomic_load_explicit(&p->generation, memory_order_acquire);
+        if (atomic_load_explicit(&p->shutdown, memory_order_acquire)) return NULL;
+        pq_spin_fn fn = p->fn;
+        void* arg = p->arg;
+        int total = p->total;
+        int chunk = p->chunk_size;
+        while (1) {
+            int s = atomic_fetch_add_explicit(&p->next_chunk, chunk, memory_order_relaxed);
+            if (s >= total) break;
+            int e = s + chunk; if (e > total) e = total;
+            fn(arg, tid_box, s, e);
+        }
+        atomic_fetch_add_explicit(&p->n_done, 1, memory_order_release);
+    }
+}
+
+static pq_spin_pool* pq_spin_pool_create(int n_threads) {
+    if (n_threads <= 1) return NULL;
+    pq_spin_pool* p = (pq_spin_pool*)calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->n_threads = n_threads;
+    p->threads = (pthread_t*)calloc((size_t)n_threads, sizeof(pthread_t));
+    p->tids = (int*)calloc((size_t)n_threads,
+                              sizeof(int) + sizeof(pq_spin_pool*));
+    if (!p->threads || !p->tids) { free(p->threads); free(p->tids); free(p); return NULL; }
+    atomic_store(&p->generation, 0);
+    atomic_store(&p->shutdown, 0);
+    for (int i = 0; i < n_threads; i++) {
+        char* slot = (char*)p->tids + (size_t)i * (sizeof(int) + sizeof(pq_spin_pool*));
+        *(int*)slot = i;
+        *(pq_spin_pool**)(slot + sizeof(int)) = p;
+        pthread_create(&p->threads[i], NULL, pq_spin_worker, slot);
+    }
+    return p;
+}
+
+static void pq_spin_pool_destroy(pq_spin_pool* p) {
+    if (!p) return;
+    atomic_store_explicit(&p->shutdown, 1, memory_order_release);
+    /* Bump generation to wake spinners that are waiting. */
+    atomic_fetch_add_explicit(&p->generation, 1, memory_order_release);
+    for (int i = 0; i < p->n_threads; i++) pthread_join(p->threads[i], NULL);
+    free(p->threads); free(p->tids); free(p);
+}
+
+static void pq_spin_pool_run(pq_spin_pool* p, pq_spin_fn fn, void* arg,
+                              int total, int chunk_size) {
+    if (!p || total <= 0) {
+        if (fn && total > 0) fn(arg, 0, 0, total);
+        return;
+    }
+    if (chunk_size <= 0) chunk_size = (total + p->n_threads - 1) / p->n_threads;
+    if (chunk_size < 1) chunk_size = 1;
+    p->fn = fn; p->arg = arg; p->total = total; p->chunk_size = chunk_size;
+    atomic_store_explicit(&p->next_chunk, 0, memory_order_relaxed);
+    atomic_store_explicit(&p->n_done, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&p->generation, 1, memory_order_release);
+    while (atomic_load_explicit(&p->n_done, memory_order_acquire) < p->n_threads) {
+        pq_cpu_pause();
+    }
+}
+
 struct ib_pq_session {
     ib_pq_multi multi;            /* owned */
     ib_pq_multi_caches* mc;       /* owned */
     ib_pq_policy default_policy;
     ib_pq_policy* policies;       /* parallel to multi.tensors[i]; NULL => default */
     int int8_quantized;
-    ib_thread_pool* pool;         /* shared, owned (NULL = sequential) */
+    ib_thread_pool* pool;         /* legacy cond_wait pool (kept for compat) */
+    pq_spin_pool* spin;           /* F1.b: hot-loop spin pool used by matmul */
     int n_threads;
     /* F1.a: preallocated LUT scratch sized to max(K), max(K_l2) across the
      * fleet. One block, four buffers laid out contiguously. */
@@ -3136,6 +3276,9 @@ struct ib_pq_session {
     float* scratch_C2R;
     int scratch_K;
     int scratch_K_l2;
+    /* F1.b: per-thread scratch for spin-pool matmul (4 LUTs per thread). */
+    float* thread_scratch;
+    size_t thread_scratch_per;
 };
 
 static int session_find_index(const ib_pq_session* s, const char* name) {
@@ -3195,7 +3338,15 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
     const char* env = getenv("IB_PQ_THREADS");
     if (env && *env) { int v = atoi(env); if (v > 0) n_threads = v; }
     s->n_threads = n_threads;
-    if (n_threads > 1) s->pool = ib_pool_create(n_threads);
+    if (n_threads > 1) {
+        s->pool = ib_pool_create(n_threads);
+        s->spin = pq_spin_pool_create(n_threads);
+        size_t per_thread = (size_t)(2 * max_K + 2 * max_Kl2);
+        if (per_thread > 0) {
+            s->thread_scratch = (float*)malloc(per_thread * (size_t)n_threads * sizeof(float));
+            s->thread_scratch_per = per_thread;
+        }
+    }
 
     *out_p = s;
     return 0;
@@ -3203,9 +3354,11 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
 
 void ib_pq_session_close(ib_pq_session* s) {
     if (!s) return;
+    if (s->spin) pq_spin_pool_destroy(s->spin);
     if (s->pool) ib_pool_destroy(s->pool);
     free(s->scratch_C1L); free(s->scratch_C1R);
     free(s->scratch_C2L); free(s->scratch_C2R);
+    free(s->thread_scratch);
     ib_pq_multi_caches_free(s->mc);
     ib_pq_multi_free(&s->multi);
     free(s->policies);
@@ -3252,15 +3405,11 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
         return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x, out);
     case IB_PQ_VARIANT_STREAMING:
     default:
-        /* Threading only helps when row work dominates pool sync (~50μs).
-         * M*C > 1e6 corresponds to gate/up/down/o_proj/q_proj/lm_head;
-         * k_proj/v_proj at M=256 fall back to sequential. */
-        if (s->pool && s->n_threads > 1
-         && (size_t)t->M * (size_t)t->C >= 1000000) {
-            return ib_pq_matmul_fp32_streaming_cached_threaded(t, c, x, out,
-                                                                  s->pool, s->n_threads);
-        }
-        /* F1.a: zero-malloc fast path using session scratch. */
+        /* F1.a: zero-malloc fast path using session scratch. Threading
+         * via spin pool (F1.b) regresses on this workload because spin
+         * workers burn cycles during main's serial work between matmul
+         * calls; the cond_wait pool wins via opt-in IB_PQ_THREADS but
+         * not by default. Leaving plain sequential as default. */
         return streaming_cached_kernel(t, c, x, out,
                                           s->scratch_C1L, s->scratch_C1R,
                                           s->scratch_C2L, s->scratch_C2R);
