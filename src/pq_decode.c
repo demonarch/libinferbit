@@ -37,6 +37,63 @@
 #define IB_PQ_HAVE_AVX2 1
 #endif
 
+/* F1.e: SIMD-accelerated fp32 dot + scaled accumulator (for attention). */
+static inline float pq_dot_f32(const float* a, const float* b, int n) {
+#if defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+    }
+    float s = vaddvq_f32(acc);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                              _mm256_loadu_ps(b + i), acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float total = _mm_cvtss_f32(s);
+    for (; i < n; i++) total += a[i] * b[i];
+    return total;
+#else
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+#endif
+}
+
+static inline void pq_accum_scaled_f32(float* out, const float* v, float w, int n) {
+#if defined(__ARM_NEON)
+    float32x4_t wv = vdupq_n_f32(w);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t o = vld1q_f32(out + i);
+        o = vfmaq_f32(o, vld1q_f32(v + i), wv);
+        vst1q_f32(out + i, o);
+    }
+    for (; i < n; i++) out[i] += w * v[i];
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 wv = _mm256_set1_ps(w);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 o = _mm256_loadu_ps(out + i);
+        o = _mm256_fmadd_ps(_mm256_loadu_ps(v + i), wv, o);
+        _mm256_storeu_ps(out + i, o);
+    }
+    for (; i < n; i++) out[i] += w * v[i];
+#else
+    for (int i = 0; i < n; i++) out[i] += w * v[i];
+#endif
+}
+
 /* Per-chunk codebook ↔ x dot table.
  * For each k in [0, K): out[k] = sum_{j in [0, half)} cb[k*half + j] * x[j].
  * Specialized for half ∈ {8, 16} on NEON / AVX2; scalar otherwise. */
@@ -3498,33 +3555,20 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
         for (int h = 0; h < n_heads; h++) {
             int kv_h = h / q_per_kv;
             const float* qh = q + (size_t)h * head_dim;
-            /* scores[t] = qh · k[t][kv_h] / sqrt(d) */
             for (int t = 0; t <= pos; t++) {
-                const float* k_t;
-                if (kv) {
-                    k_t = kv->k + ((size_t)L * kv->max_seq + t) * kv_dim
-                                + (size_t)kv_h * head_dim;
-                } else {
-                    /* Without kv cache, only pos==0 supported; use k_now. */
-                    k_t = k_now + (size_t)kv_h * head_dim;
-                }
-                float dot = 0.0f;
-                for (int d = 0; d < head_dim; d++) dot += qh[d] * k_t[d];
-                scores[t] = dot * inv_sqrt;
+                const float* k_t = kv
+                    ? (kv->k + ((size_t)L * kv->max_seq + t) * kv_dim + (size_t)kv_h * head_dim)
+                    : (k_now + (size_t)kv_h * head_dim);
+                scores[t] = pq_dot_f32(qh, k_t, head_dim) * inv_sqrt;
             }
             ib_softmax_f32(scores, pos + 1);
             float* outh = xb2 + (size_t)h * head_dim;
             memset(outh, 0, (size_t)head_dim * sizeof(float));
             for (int t = 0; t <= pos; t++) {
-                const float* v_t;
-                if (kv) {
-                    v_t = kv->v + ((size_t)L * kv->max_seq + t) * kv_dim
-                                + (size_t)kv_h * head_dim;
-                } else {
-                    v_t = v_now + (size_t)kv_h * head_dim;
-                }
-                float w = scores[t];
-                for (int d = 0; d < head_dim; d++) outh[d] += w * v_t[d];
+                const float* v_t = kv
+                    ? (kv->v + ((size_t)L * kv->max_seq + t) * kv_dim + (size_t)kv_h * head_dim)
+                    : (v_now + (size_t)kv_h * head_dim);
+                pq_accum_scaled_f32(outh, v_t, scores[t], head_dim);
             }
         }
 
