@@ -378,6 +378,34 @@ int  ib_pq_session_raw_get(const ib_pq_session* s, const char* name,
 /* Phase 9: free-form JSON config string (NUL-terminated). NULL if absent. */
 const char* ib_pq_session_config_json(const ib_pq_session* s);
 
+/* ── Phase 9: forward-pass primitives (no PQ inside) ──
+ * Used to assemble inferbit_pq_forward: matmuls go through the session,
+ * everything else (norm, rotary, activation, residual, attention) uses
+ * these. Pure C, scalar-then-SIMD where it matters.
+ */
+
+/* RMSNorm: out[i] = x[i] * weight[i] / sqrt(mean(x*x) + eps).
+ * Layer-by-layer in float; weight is fp32. */
+void ib_rmsnorm_f32(float* out, const float* x, const float* weight,
+                     int hidden, float eps);
+
+/* SwiGLU activation in place (or to out): out[i] = silu(gate[i]) * up[i]
+ *   silu(x) = x / (1 + exp(-x))
+ */
+void ib_silu_gate_f32(float* out, const float* gate, const float* up, int n);
+
+/* Residual add: x[i] += delta[i]. */
+void ib_residual_add_f32(float* x, const float* delta, int n);
+
+/* RoPE (rotary positional embedding). Rotates x in pairs (x[2i], x[2i+1])
+ * by angle pos * theta^(-2i/head_dim). x is shaped [n_heads * head_dim],
+ * head_dim must be even. theta is the rope base (typically 10000.0).
+ * For a single position. For batched / cached positions call once per pos. */
+void ib_rope_f32(float* x, int n_heads, int head_dim, int pos, float theta);
+
+/* Softmax in place over n elements. Numerically stable (subtracts max). */
+void ib_softmax_f32(float* x, int n);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

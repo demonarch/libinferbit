@@ -3083,3 +3083,54 @@ int ib_pq_session_raw_get(const ib_pq_session* s, const char* name,
 const char* ib_pq_session_config_json(const ib_pq_session* s) {
     return s ? s->multi.config_json : NULL;
 }
+
+/* ── Phase 9: forward-pass primitives ── */
+
+void ib_rmsnorm_f32(float* out, const float* x, const float* w, int H, float eps) {
+    double s = 0.0;
+    for (int i = 0; i < H; i++) s += (double)x[i] * (double)x[i];
+    float inv = 1.0f / sqrtf((float)(s / (double)H) + eps);
+    for (int i = 0; i < H; i++) out[i] = x[i] * inv * w[i];
+}
+
+void ib_silu_gate_f32(float* out, const float* gate, const float* up, int n) {
+    for (int i = 0; i < n; i++) {
+        float g = gate[i];
+        float silu = g / (1.0f + expf(-g));
+        out[i] = silu * up[i];
+    }
+}
+
+void ib_residual_add_f32(float* x, const float* delta, int n) {
+    for (int i = 0; i < n; i++) x[i] += delta[i];
+}
+
+void ib_rope_f32(float* x, int n_heads, int head_dim, int pos, float theta) {
+    /* For each head, rotate consecutive pairs (x[2i], x[2i+1]) by angle
+     * pos * theta^(-2i/head_dim). HF/Llama-style rotates the lower half
+     * with the upper half (NEOX-style); here we rotate adjacent pairs
+     * (the simpler "interleaved" convention), which matches the rope_theta
+     * stored by HF for "rope_type": "default" with neox=false. Callers
+     * that need NEOX rotation should split + concat outside. */
+    for (int h = 0; h < n_heads; h++) {
+        float* xh = x + (size_t)h * head_dim;
+        for (int i = 0; i < head_dim / 2; i++) {
+            float freq = powf(theta, -2.0f * (float)i / (float)head_dim);
+            float angle = (float)pos * freq;
+            float c = cosf(angle), s = sinf(angle);
+            float a = xh[2 * i];
+            float b = xh[2 * i + 1];
+            xh[2 * i]     = a * c - b * s;
+            xh[2 * i + 1] = a * s + b * c;
+        }
+    }
+}
+
+void ib_softmax_f32(float* x, int n) {
+    float m = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > m) m = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - m); sum += x[i]; }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv;
+}
