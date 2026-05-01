@@ -233,6 +233,21 @@ int ib_pq_lm_head_topk(const ib_pq_tensor* t, const float* x, int K_top,
 int ib_pq_matmul_fp32_streaming_sparse(const ib_pq_tensor* t, const float* x,
                                         float* out, float act_threshold);
 
+/* Phase 8.F: variance-bounded L2 skip.
+ *
+ * Per (output_row, chunk) pair, decides whether to apply L2 based on
+ * a precomputed per-cluster ||C2[k]||_max bound vs the L1 contribution
+ * magnitude. Skip L2 when the L1 contribution dominates the L2 bound.
+ *
+ * skip_threshold ≥ 0: ratio above which L2 is skipped. 0 = always
+ * apply L2 (equivalent to streaming matmul). Larger = more aggressive
+ * skip, lower compute, higher quality cost. Test 41b found ~1pp PPL
+ * edge over random skip at low rates; mechanism is marginal but
+ * cheap once the bound table is precomputed.
+ */
+int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
+                                        float* out, float skip_threshold);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

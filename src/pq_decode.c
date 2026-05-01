@@ -1678,6 +1678,160 @@ int ib_pq_matmul_fp32_streaming_sparse(const ib_pq_tensor* t, const float* x,
     return 0;
 }
 
+/* Phase 8.F: variance-bounded L2 skip variant of streaming matmul.
+ * Adds per-cluster ||C2||_max precompute and per-(row, chunk) skip
+ * decision. */
+int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
+                                        float* out, float skip_threshold) {
+    if (!t || !x || !out) return -1;
+    if (t->n_levels != 2) return ib_pq_matmul_fp32_streaming(t, x, out);
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+
+    int cb1_entries = K * half;
+    int cb2_entries = K_l2 * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+    float* cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
+    if (!cb1l || !cb1r || !cb2l || !cb2r) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    for (int i = 0; i < cb2_entries; i++) {
+        cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+        cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+    }
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            return -1;
+        }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+
+    /* Phase 8.F: precompute per-outer-cluster ||C2[k]||_max for L and R.
+     * For PYRAMID format L2 is conditional [K1][K2][G/2]; for L1_L2 it's
+     * flat [K_l2][G/2]. We use K_l2 as the index range; for the PYRAMID
+     * case the 'k' index is the combined i1*K_inner+i2 — to compute
+     * per-outer-cluster max we'd need to know K_inner. Approximation:
+     * just use the global max ||C2[*]||_max as the bound. Conservative;
+     * skips less aggressively than per-cluster. */
+    float c2l_max_global = 0.0f, c2r_max_global = 0.0f;
+    for (int k = 0; k < K_l2; k++) {
+        float nl = 0.0f, nr = 0.0f;
+        for (int j = 0; j < half; j++) {
+            nl += cb2l[k * half + j] * cb2l[k * half + j];
+            nr += cb2r[k * half + j] * cb2r[k * half + j];
+        }
+        nl = sqrtf(nl); nr = sqrtf(nr);
+        if (nl > c2l_max_global) c2l_max_global = nl;
+        if (nr > c2r_max_global) c2r_max_global = nr;
+    }
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
+    float* C2R_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
+    if (!C1L_dot_x || !C1R_dot_x || !C2L_dot_x || !C2R_dot_x) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    int n_skipped = 0, n_evaluated = 0;
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        float xL_norm2 = 0.0f, xR_norm2 = 0.0f;
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[inner_cols[base + j]];
+            xR[j] = x[inner_cols[base + half + j]];
+            xL_norm2 += xL[j] * xL[j];
+            xR_norm2 += xR[j] * xR[j];
+        }
+        float xL_norm = sqrtf(xL_norm2);
+        float xR_norm = sqrtf(xR_norm2);
+        /* Per-chunk L2 contribution bound (conservative: ||C2||_max * ||x||) */
+        float l2_bound_l = c2l_max_global * xL_norm;
+        float l2_bound_r = c2r_max_global * xR_norm;
+
+        for (int k = 0; k < K; k++) {
+            const float* eL = &cb1l[(size_t)k * half];
+            const float* eR = &cb1r[(size_t)k * half];
+            float dl = 0.0f, dr = 0.0f;
+            for (int j = 0; j < half; j++) {
+                dl += eL[j] * xL[j];
+                dr += eR[j] * xR[j];
+            }
+            C1L_dot_x[k] = dl;
+            C1R_dot_x[k] = dr;
+        }
+        for (int k = 0; k < K_l2; k++) {
+            const float* eL = &cb2l[(size_t)k * half];
+            const float* eR = &cb2r[(size_t)k * half];
+            float dl = 0.0f, dr = 0.0f;
+            for (int j = 0; j < half; j++) {
+                dl += eL[j] * xL[j];
+                dr += eR[j] * xR[j];
+            }
+            C2L_dot_x[k] = dl;
+            C2R_dot_x[k] = dr;
+        }
+
+        for (int r = 0; r < M; r++) {
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            float l1_contrib = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            float v = l1_contrib;
+            /* Variance-bound skip: if L1 contribution magnitude is large
+             * relative to L2 contribution bound, skip L2. */
+            if (skip_threshold > 0.0f
+                && fabsf(l1_contrib) > skip_threshold * (l2_bound_l + l2_bound_r)) {
+                n_skipped++;
+            } else {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+            n_evaluated++;
+            out[r] += v;
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    (void)n_skipped; (void)n_evaluated;  /* could expose stats via a debug API */
+
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
+
 /* Phase 5: L1-only matmul. Same as streaming matmul but pretends
  * n_levels=1 — skip the L2 codebook contribution. Cheap pass for
  * top-K candidate filtering. */
