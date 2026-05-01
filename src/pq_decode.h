@@ -179,6 +179,20 @@ int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
 int ib_pq_matmul_fp32_q8lut(const ib_pq_tensor* t, const float* x,
                              float* out, void* pool);
 
+/* Phase 2: cache-resident streaming-precompute matmul.
+ *
+ * Same math as ib_pq_matmul_fp32 but restructured so codebook ↔ activation
+ * dot-product tables are computed PER CHUNK and stay in L1/L2 cache for
+ * the whole-row accumulation pass over that chunk. Replaces the existing
+ * "all-chunks-at-once" precompute that blows cache on big-K tensors.
+ *
+ * Per-chunk working set: (K + K_l2) × 2 floats ≈ a few KB; fits in L1
+ * even on Raspberry Pi (64 KB L1). Index streams are sequential reads.
+ *
+ * Numerically equivalent to ib_pq_matmul_fp32 (FP32 throughout). Use
+ * for performance; the existing entry point remains for verification. */
+int ib_pq_matmul_fp32_streaming(const ib_pq_tensor* t, const float* x, float* out);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

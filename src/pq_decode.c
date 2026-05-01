@@ -1398,6 +1398,144 @@ int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
     return matmul_impl(t, x, out, NULL);
 }
 
+/* Phase 2: streaming-precompute matmul. Per-chunk codebook dots stay
+ * in cache for the row accumulation pass over that chunk. Scalar
+ * implementation; SIMD variants in 2.x. */
+int ib_pq_matmul_fp32_streaming(const ib_pq_tensor* t, const float* x, float* out) {
+    if (!t || !x || !out) return -1;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    int has_l2 = (t->n_levels == 2);
+
+    /* Decode codebooks to fp32 once. */
+    int cb1_entries = K * half;
+    int cb2_entries = K_l2 * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    float* cb2l = NULL;
+    float* cb2r = NULL;
+    if (has_l2) {
+        cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        if (!cb2l || !cb2r) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+        }
+        for (int i = 0; i < cb2_entries; i++) {
+            cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+            cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+        }
+    }
+
+    /* Build inner-column index list (skip outlier columns). */
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            return -1;
+        }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+
+    /* Per-chunk lookup tables (stay in cache). */
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    /* Stream chunks. For each chunk position c, build the per-chunk lookup
+     * tables, then accumulate across all M output rows. Tables stay in L1. */
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        /* Extract the activation half-chunks for this chunk's columns. */
+        float xL[16];  /* G/2 ≤ 16 in any sane config; G is small */
+        float xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[inner_cols[base + j]];
+            xR[j] = x[inner_cols[base + half + j]];
+        }
+        /* Precompute K codebook ↔ x_chunk dots for L. */
+        for (int k = 0; k < K; k++) {
+            const float* eL = &cb1l[(size_t)k * half];
+            const float* eR = &cb1r[(size_t)k * half];
+            float dl = 0.0f, dr = 0.0f;
+            for (int j = 0; j < half; j++) {
+                dl += eL[j] * xL[j];
+                dr += eR[j] * xR[j];
+            }
+            C1L_dot_x[k] = dl;
+            C1R_dot_x[k] = dr;
+        }
+        if (has_l2) {
+            for (int k = 0; k < K_l2; k++) {
+                const float* eL = &cb2l[(size_t)k * half];
+                const float* eR = &cb2r[(size_t)k * half];
+                float dl = 0.0f, dr = 0.0f;
+                for (int j = 0; j < half; j++) {
+                    dl += eL[j] * xL[j];
+                    dr += eR[j] * xR[j];
+                }
+                C2L_dot_x[k] = dl;
+                C2R_dot_x[k] = dr;
+            }
+        }
+
+        /* Walk all output rows; accumulate from cache-resident tables. */
+        const uint8_t* il_l_col = t->indices_l1_l;
+        const uint8_t* il_r_col = t->indices_l1_r;
+        for (int r = 0; r < M; r++) {
+            int i1l = il_l_col[(size_t)r * C + c];
+            int i1r = il_r_col[(size_t)r * C + c];
+            float v = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            if (has_l2) {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+            out[r] += v;
+        }
+    }
+
+    /* Apply per-row scale. */
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+
+    /* Add outlier sidecar contribution (existing helper). */
+    apply_outliers(t, x, out);
+
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
+
 int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
                                 float* out, void* pool) {
     return matmul_impl(t, x, out, (ib_thread_pool*)pool);
