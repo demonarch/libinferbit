@@ -219,6 +219,20 @@ int ib_pq_matmul_fp32_subset(const ib_pq_tensor* t, const float* x,
 int ib_pq_lm_head_topk(const ib_pq_tensor* t, const float* x, int K_top,
                         float* out_logits, int32_t* out_token_ids);
 
+/* Phase 4: activation-sparse streaming matmul.
+ *
+ * Skips chunks whose input activation values (in x) are all below
+ * `act_threshold` in absolute value. Designed for the down_proj
+ * matmul whose input (post-SwiGLU intermediate) is ~50% near-zero
+ * per token (test 33). Skipping zero-contributing chunks delivers
+ * ~2× MLP compute reduction with no quality loss.
+ *
+ * act_threshold ≤ 0 disables the sparsity check (equivalent to
+ * ib_pq_matmul_fp32_streaming).
+ */
+int ib_pq_matmul_fp32_streaming_sparse(const ib_pq_tensor* t, const float* x,
+                                        float* out, float act_threshold);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);
