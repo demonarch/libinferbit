@@ -2374,6 +2374,15 @@ struct ib_pq_lut_cache {
     int is_pyramid;
     int n_outer;
     int K_inner;
+    /* Phase 3: optional int8 quantized codebooks (NULL until quantize_int8). */
+    int8_t* cb1l_q8;
+    int8_t* cb1r_q8;
+    int8_t* cb2l_q8;
+    int8_t* cb2r_q8;
+    float* cb1l_scale;  /* [K] */
+    float* cb1r_scale;
+    float* cb2l_scale;  /* [K_l2] */
+    float* cb2r_scale;
 };
 
 int ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out_p) {
@@ -2458,7 +2467,178 @@ void ib_pq_lut_cache_free(ib_pq_lut_cache* c) {
     free(c->cb2l_fp32); free(c->cb2r_fp32);
     free(c->inner_cols);
     free(c->c2l_max_per_cluster); free(c->c2r_max_per_cluster);
+    free(c->cb1l_q8); free(c->cb1r_q8);
+    free(c->cb2l_q8); free(c->cb2r_q8);
+    free(c->cb1l_scale); free(c->cb1r_scale);
+    free(c->cb2l_scale); free(c->cb2r_scale);
     free(c);
+}
+
+/* Quantize a [K, half] fp32 codebook to int8 with per-row scale.
+ * scale[k] = max|cb[k]|/127; q[k][j] = round(cb[k][j] / scale[k]) clamped to [-127, 127].
+ */
+static int pq_quantize_codebook_int8(const float* cb_fp32, int K, int half,
+                                       int8_t** out_q, float** out_scale) {
+    int8_t* q = (int8_t*)malloc((size_t)K * half);
+    float* s = (float*)malloc((size_t)K * sizeof(float));
+    if (!q || !s) { free(q); free(s); return -1; }
+    for (int k = 0; k < K; k++) {
+        const float* row = cb_fp32 + (size_t)k * half;
+        float m = 0.0f;
+        for (int j = 0; j < half; j++) {
+            float a = fabsf(row[j]);
+            if (a > m) m = a;
+        }
+        float scale = (m > 0.0f) ? (m / 127.0f) : 1.0f;
+        float inv = 1.0f / scale;
+        for (int j = 0; j < half; j++) {
+            float v = row[j] * inv;
+            int qi = (int)(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
+            if (qi >  127) qi =  127;
+            if (qi < -127) qi = -127;
+            q[(size_t)k * half + j] = (int8_t)qi;
+        }
+        s[k] = scale;
+    }
+    *out_q = q; *out_scale = s;
+    return 0;
+}
+
+int ib_pq_lut_cache_quantize_int8(ib_pq_lut_cache* c) {
+    if (!c) return -1;
+    if (c->cb1l_q8 != NULL) return 0;  /* idempotent */
+    int K = c->K, K_l2 = c->K_l2, half = c->half;
+    int has_l2 = (c->n_levels == 2);
+
+    if (pq_quantize_codebook_int8(c->cb1l_fp32, K, half,
+                                    &c->cb1l_q8, &c->cb1l_scale) != 0) return -1;
+    if (pq_quantize_codebook_int8(c->cb1r_fp32, K, half,
+                                    &c->cb1r_q8, &c->cb1r_scale) != 0) return -1;
+    if (has_l2) {
+        if (pq_quantize_codebook_int8(c->cb2l_fp32, K_l2, half,
+                                        &c->cb2l_q8, &c->cb2l_scale) != 0) return -1;
+        if (pq_quantize_codebook_int8(c->cb2r_fp32, K_l2, half,
+                                        &c->cb2r_q8, &c->cb2r_scale) != 0) return -1;
+    }
+    return 0;
+}
+
+/* INT8 chunk dot table: int_dot[k] = sum_j q_cb[k][j] * q_x[j];
+ * out[k] = int_dot[k] * cb_scale[k] * x_scale.
+ * Specialized for half ∈ {8, 16}; NEON dotprod path when available. */
+static inline void pq_chunk_dot_table_int8(const int8_t* cb_q, const float* cb_scale,
+                                             const int8_t* xq, float x_scale,
+                                             int half, int K, float* out) {
+#if defined(IB_PQ_HAVE_NEON_DOTPROD)
+    if (half == 16) {
+        int8x16_t xv = vld1q_s8(xq);
+        for (int k = 0; k < K; k++) {
+            int8x16_t ev = vld1q_s8(cb_q + (size_t)k * 16);
+            int32x4_t acc = vdupq_n_s32(0);
+            acc = vdotq_s32(acc, ev, xv);
+            int32_t s = vaddvq_s32(acc);
+            out[k] = (float)s * cb_scale[k] * x_scale;
+        }
+        return;
+    }
+#endif
+    for (int k = 0; k < K; k++) {
+        const int8_t* e = cb_q + (size_t)k * half;
+        int32_t s = 0;
+        for (int j = 0; j < half; j++) s += (int32_t)e[j] * (int32_t)xq[j];
+        out[k] = (float)s * cb_scale[k] * x_scale;
+    }
+}
+
+/* Quantize a small fp32 chunk (length half) to int8 with single scale. */
+static inline float pq_quantize_chunk_int8(const float* x, int half, int8_t* xq) {
+    float m = 0.0f;
+    for (int j = 0; j < half; j++) {
+        float a = fabsf(x[j]);
+        if (a > m) m = a;
+    }
+    float scale = (m > 0.0f) ? (m / 127.0f) : 1.0f;
+    float inv = 1.0f / scale;
+    for (int j = 0; j < half; j++) {
+        float v = x[j] * inv;
+        int qi = (int)(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
+        if (qi >  127) qi =  127;
+        if (qi < -127) qi = -127;
+        xq[j] = (int8_t)qi;
+    }
+    return scale;
+}
+
+int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
+                                              const ib_pq_lut_cache* cache,
+                                              const float* x, float* out) {
+    if (!t || !cache || !x || !out) return -1;
+    if (!cache->cb1l_q8) return -1;  /* must call quantize_int8 first */
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    int has_l2 = (cache->n_levels == 2);
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        int8_t xLq[16], xRq[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[cache->inner_cols[base + j]];
+            xR[j] = x[cache->inner_cols[base + half + j]];
+        }
+        float xL_scale = pq_quantize_chunk_int8(xL, half, xLq);
+        float xR_scale = pq_quantize_chunk_int8(xR, half, xRq);
+
+        pq_chunk_dot_table_int8(cache->cb1l_q8, cache->cb1l_scale,
+                                xLq, xL_scale, half, K, C1L_dot_x);
+        pq_chunk_dot_table_int8(cache->cb1r_q8, cache->cb1r_scale,
+                                xRq, xR_scale, half, K, C1R_dot_x);
+        if (has_l2) {
+            pq_chunk_dot_table_int8(cache->cb2l_q8, cache->cb2l_scale,
+                                    xLq, xL_scale, half, K_l2, C2L_dot_x);
+            pq_chunk_dot_table_int8(cache->cb2r_q8, cache->cb2r_scale,
+                                    xRq, xR_scale, half, K_l2, C2R_dot_x);
+        }
+
+        for (int r = 0; r < M; r++) {
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            float v = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            if (has_l2) {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+            out[r] += v;
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
 }
 
 int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,

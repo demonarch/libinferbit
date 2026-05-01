@@ -268,6 +268,20 @@ int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
                                                 const float* x, float* out,
                                                 float skip_threshold);
 
+/* Phase 3: INT8 activations on top of cache.
+ *
+ * Quantizes the cached fp32 codebooks to int8 per-row scales and exposes
+ * a streaming matmul that quantizes x_chunk to int8 per chunk and uses
+ * NEON dotprod (ARM_FEATURE_DOTPROD) / AVX2 cascade for the inner dot.
+ * Accuracy budget: ~10-12 effective bits per product after scaling.
+ *
+ * Call once on an existing cache before using the int8 matmul; idempotent.
+ */
+int ib_pq_lut_cache_quantize_int8(ib_pq_lut_cache* cache);
+int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
+                                              const ib_pq_lut_cache* cache,
+                                              const float* x, float* out);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);
