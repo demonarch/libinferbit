@@ -636,6 +636,66 @@ int ib_pq_load_multi(const char* path, ib_pq_multi* out) {
         }
     }
 
+    /* Phase 9: optional raw tensors + config (additive header fields). */
+    cJSON* raws = cJSON_GetObjectItemCaseSensitive(root, "raw_tensors");
+    if (cJSON_IsObject(raws)) {
+        int rn = 0;
+        for (cJSON* it = raws->child; it; it = it->next) rn++;
+        if (rn > 0) {
+            out->n_raw = rn;
+            out->raw_tensors = (ib_pq_raw_tensor*)calloc((size_t)rn, sizeof(ib_pq_raw_tensor));
+            if (!out->raw_tensors) {
+                cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+            }
+            int ri = 0;
+            for (cJSON* it = raws->child; it; it = it->next, ri++) {
+                ib_pq_raw_tensor* rt = &out->raw_tensors[ri];
+                size_t nl = it->string ? strlen(it->string) : 0;
+                rt->name = (char*)malloc(nl + 1);
+                if (!rt->name) { cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1; }
+                memcpy(rt->name, it->string ? it->string : "", nl); rt->name[nl] = '\0';
+
+                cJSON* dtit = cJSON_GetObjectItemCaseSensitive(it, "dtype");
+                const char* dt = cJSON_IsString(dtit) ? dtit->valuestring : "float32";
+                if      (!strcmp(dt, "float32")) rt->dtype = IB_RAW_F32;
+                else if (!strcmp(dt, "float16")) rt->dtype = IB_RAW_F16;
+                else if (!strcmp(dt, "int32"))   rt->dtype = IB_RAW_I32;
+                else if (!strcmp(dt, "int16"))   rt->dtype = IB_RAW_I16;
+                else if (!strcmp(dt, "int8"))    rt->dtype = IB_RAW_I8;
+                else if (!strcmp(dt, "uint8"))   rt->dtype = IB_RAW_U8;
+                else { cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1; }
+
+                cJSON* shape = cJSON_GetObjectItemCaseSensitive(it, "shape");
+                rt->ndim = cJSON_IsArray(shape) ? cJSON_GetArraySize(shape) : 0;
+                if (rt->ndim > 4) rt->ndim = 4;
+                for (int d = 0; d < rt->ndim; d++) {
+                    rt->shape[d] = (int)cJSON_GetArrayItem(shape, d)->valuedouble;
+                }
+
+                cJSON* oit = cJSON_GetObjectItemCaseSensitive(it, "offset");
+                cJSON* sit = cJSON_GetObjectItemCaseSensitive(it, "size");
+                if (!cJSON_IsNumber(oit) || !cJSON_IsNumber(sit)) {
+                    cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+                }
+                size_t off = (size_t)oit->valuedouble;
+                size_t sz  = (size_t)sit->valuedouble;
+                rt->size_bytes = sz;
+                rt->data = malloc(sz);
+                if (!rt->data) { cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1; }
+                rt->_owns_data = 1;
+                if (fseek(f, (long)(weight_data_start + off), SEEK_SET) != 0
+                 || fread(rt->data, 1, sz, f) != sz) {
+                    cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+                }
+            }
+        }
+    }
+    cJSON* cfg = cJSON_GetObjectItemCaseSensitive(root, "config");
+    if (cJSON_IsObject(cfg)) {
+        char* s = cJSON_PrintUnformatted(cfg);
+        if (s) out->config_json = s;
+    }
+
     cJSON_Delete(root);
     fclose(f);
     return 0;
@@ -661,6 +721,14 @@ void ib_pq_multi_free(ib_pq_multi* m) {
         for (int i = 0; i < m->n; i++) ib_pq_free(&m->tensors[i]);
         free(m->tensors);
     }
+    if (m->raw_tensors) {
+        for (int i = 0; i < m->n_raw; i++) {
+            free(m->raw_tensors[i].name);
+            if (m->raw_tensors[i]._owns_data) free(m->raw_tensors[i].data);
+        }
+        free(m->raw_tensors);
+    }
+    free(m->config_json);
 #ifdef IB_PQ_HAVE_MMAP
     if (m->_mmap_base && m->_mmap_size) {
         munmap(m->_mmap_base, m->_mmap_size);
@@ -2984,4 +3052,34 @@ int ib_pq_session_tensor_count(const ib_pq_session* s) {
 const char* ib_pq_session_tensor_name(const ib_pq_session* s, int i) {
     if (!s || i < 0 || i >= s->multi.n) return NULL;
     return s->multi.names[i];
+}
+
+int ib_pq_session_raw_count(const ib_pq_session* s) {
+    return s ? s->multi.n_raw : 0;
+}
+
+const char* ib_pq_session_raw_name(const ib_pq_session* s, int i) {
+    if (!s || i < 0 || i >= s->multi.n_raw) return NULL;
+    return s->multi.raw_tensors[i].name;
+}
+
+int ib_pq_session_raw_get(const ib_pq_session* s, const char* name,
+                           const void** out_data, int* out_dtype,
+                           int* out_shape, int* out_ndim) {
+    if (!s || !name) return -1;
+    for (int i = 0; i < s->multi.n_raw; i++) {
+        ib_pq_raw_tensor* rt = &s->multi.raw_tensors[i];
+        if (rt->name && strcmp(rt->name, name) == 0) {
+            if (out_data)  *out_data  = rt->data;
+            if (out_dtype) *out_dtype = rt->dtype;
+            if (out_ndim)  *out_ndim  = rt->ndim;
+            if (out_shape) for (int d = 0; d < rt->ndim; d++) out_shape[d] = rt->shape[d];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+const char* ib_pq_session_config_json(const ib_pq_session* s) {
+    return s ? s->multi.config_json : NULL;
 }

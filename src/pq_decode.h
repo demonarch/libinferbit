@@ -92,6 +92,28 @@ typedef struct {
 int  ib_pq_load_single(const char* path, ib_pq_tensor* out);
 void ib_pq_free(ib_pq_tensor* t);
 
+/* Raw (non-PQ) tensor stored alongside PQ tensors in the IBF v5
+ * file. Used for token embeddings, RMSNorm weights, and any other
+ * model state needed by inferbit_pq_forward that isn't PQ-quantized. */
+typedef enum {
+    IB_RAW_F32 = 0,
+    IB_RAW_F16 = 1,
+    IB_RAW_I32 = 2,
+    IB_RAW_I16 = 3,
+    IB_RAW_I8  = 4,
+    IB_RAW_U8  = 5,
+} ib_raw_dtype;
+
+typedef struct {
+    char*  name;          /* heap-allocated */
+    void*  data;          /* heap-allocated copy (or mmap pointer) */
+    int    dtype;         /* ib_raw_dtype */
+    int    ndim;
+    int    shape[4];
+    size_t size_bytes;
+    int    _owns_data;    /* 1 if heap-allocated and we should free it */
+} ib_pq_raw_tensor;
+
 /* Multi-tensor IBF v5 loader. Returns an array of tensors and their
  * names. Caller must free both via ib_pq_multi_free. */
 typedef struct {
@@ -100,6 +122,11 @@ typedef struct {
     ib_pq_tensor* tensors; /* parallel array */
     void* _mmap_base;      /* non-NULL when mmap-backed (Path D) */
     size_t _mmap_size;
+    /* Phase 9: raw tensors + free-form JSON config. NULL/0/n_raw=0 if
+     * the file was written without them (backward compatible). */
+    int    n_raw;
+    ib_pq_raw_tensor* raw_tensors;
+    char*  config_json;    /* heap-allocated NUL-terminated, NULL if absent */
 } ib_pq_multi;
 
 int  ib_pq_load_multi(const char* path, ib_pq_multi* out);
@@ -339,6 +366,17 @@ int  ib_pq_session_tensor_shape(const ib_pq_session* s, const char* name,
                                  int* out_M, int* out_N);
 int  ib_pq_session_tensor_count(const ib_pq_session* s);
 const char* ib_pq_session_tensor_name(const ib_pq_session* s, int i);
+
+/* Phase 9: raw (non-PQ) tensor access. Returns 0 on success.
+ * out_data borrows from the session — do not free. */
+int  ib_pq_session_raw_count(const ib_pq_session* s);
+const char* ib_pq_session_raw_name(const ib_pq_session* s, int i);
+int  ib_pq_session_raw_get(const ib_pq_session* s, const char* name,
+                            const void** out_data, int* out_dtype,
+                            int* out_shape, int* out_ndim);
+
+/* Phase 9: free-form JSON config string (NUL-terminated). NULL if absent. */
+const char* ib_pq_session_config_json(const ib_pq_session* s);
 
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
