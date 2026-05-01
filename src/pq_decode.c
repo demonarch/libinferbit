@@ -379,17 +379,26 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
         && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
     out->l2_idx_bytes = (out->format == IB_PQ_FMT_PYRAMID && K_l2_eff > 256) ? 2 : 1;
-    size_t l2_idx_per_row;
+    out->l2_packed_bits = (int)json_int_field(tm, "l2_packed_bits", 0);
+    size_t l2_idx_per_row, l2_idx_disk_per_row;
     if (l2_packed) {
         l2_idx_per_row = (size_t)((out->C + 1) / 2);
+        l2_idx_disk_per_row = l2_idx_per_row;
     } else {
         l2_idx_per_row = (size_t)out->C * (size_t)out->l2_idx_bytes;
+        if (out->l2_packed_bits > 0) {
+            l2_idx_disk_per_row =
+                ((size_t)out->C * (size_t)out->l2_packed_bits + 7) >> 3;
+        } else {
+            l2_idx_disk_per_row = l2_idx_per_row;
+        }
     }
 
     size_t cb_sz       = (size_t)K * (G / 2) * sizeof(uint16_t);
     size_t cb_l2_sz    = (size_t)K_l2_eff * (G / 2) * sizeof(uint16_t);
     size_t idx_sz      = (size_t)M * (size_t)out->C * sizeof(uint8_t);
     size_t idx_l2_sz   = (size_t)M * l2_idx_per_row;
+    size_t idx_l2_disk_sz = (size_t)M * l2_idx_disk_per_row;
     size_t rs_sz       = (size_t)M * sizeof(uint16_t);
     size_t oc_sz       = (size_t)out->n_outlier * sizeof(int32_t);
     size_t osc_sz      = (size_t)M * (size_t)out->n_outlier * sizeof(int8_t);
@@ -412,8 +421,36 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
     if (out->n_levels == 2) {
         VIEW_BLOCK("codebook_l2_l", out->codebook_l2_l, uint16_t, cb_l2_sz);
         VIEW_BLOCK("codebook_l2_r", out->codebook_l2_r, uint16_t, cb_l2_sz);
-        VIEW_BLOCK("indices_l2_l",  out->indices_l2_l,  uint8_t,  idx_l2_sz);
-        VIEW_BLOCK("indices_l2_r",  out->indices_l2_r,  uint8_t,  idx_l2_sz);
+        if (out->l2_packed_bits > 0 && !l2_packed) {
+            /* Packed-on-disk indices: view the packed bytes via mmap, then
+             * unpack into a heap-allocated uint16 buffer (stored in _arena
+             * for cleanup). Decode path reads uint16 from heap, not mmap. */
+            uint8_t* packed_l;
+            uint8_t* packed_r;
+            VIEW_BLOCK("indices_l2_l", packed_l, uint8_t, idx_l2_disk_sz);
+            VIEW_BLOCK("indices_l2_r", packed_r, uint8_t, idx_l2_disk_sz);
+            /* Allocate uint16 for L and R indices (2 × idx_l2_sz bytes). */
+            size_t total = 2 * idx_l2_sz + 4;  /* +4 pad for safe over-read */
+            uint8_t* buf = (uint8_t*)malloc(total);
+            if (!buf) return -1;
+            out->_arena = buf;
+            out->_arena_size = total;
+            uint16_t* unp_l = (uint16_t*)buf;
+            uint16_t* unp_r = (uint16_t*)(buf + idx_l2_sz);
+            for (int r = 0; r < M; r++) {
+                pq_unpack_bits_to_u16(packed_l + (size_t)r * l2_idx_disk_per_row,
+                                       unp_l + (size_t)r * out->C,
+                                       (size_t)out->C, out->l2_packed_bits);
+                pq_unpack_bits_to_u16(packed_r + (size_t)r * l2_idx_disk_per_row,
+                                       unp_r + (size_t)r * out->C,
+                                       (size_t)out->C, out->l2_packed_bits);
+            }
+            out->indices_l2_l = (uint8_t*)unp_l;
+            out->indices_l2_r = (uint8_t*)unp_r;
+        } else {
+            VIEW_BLOCK("indices_l2_l", out->indices_l2_l, uint8_t, idx_l2_sz);
+            VIEW_BLOCK("indices_l2_r", out->indices_l2_r, uint8_t, idx_l2_sz);
+        }
     }
     if (out->n_outlier > 0) {
         VIEW_BLOCK("outlier_cols",    out->outlier_cols,    int32_t,  oc_sz);
