@@ -150,6 +150,10 @@ static ib_pq_format parse_format(const char* s) {
     return IB_PQ_FMT_NONE;
 }
 
+/* Forward declaration: defined later near the L2 index helpers. */
+static void pq_unpack_bits_to_u16(const uint8_t* src, uint16_t* dst,
+                                   size_t n_total, int n_bits);
+
 /* ── Loader ────────────────────────────────────────────────────── */
 
 void ib_pq_free(ib_pq_tensor* t) {
@@ -207,12 +211,24 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     /* L2 index byte-width: PYRAMID with K_l2>256 uses uint16 (2 bytes).
      * Otherwise uint8 (1 byte). Packed 4-bit (K_l2==16) is 1 byte/2 indices. */
     out->l2_idx_bytes = (out->format == IB_PQ_FMT_PYRAMID && K_l2_eff > 256) ? 2 : 1;
-    size_t l2_idx_per_row;
+    /* Phase 1.5: Bit-packed L2 indices on disk (PYRAMID only). At load we
+     * unpack to uint16 in the arena. l2_packed_bits = 0 = no packing. */
+    out->l2_packed_bits = (int)json_int_field(tm, "l2_packed_bits", 0);
+    size_t l2_idx_per_row, l2_idx_disk_per_row;
     if (l2_packed) {
         l2_idx_per_row = (size_t)((C + 1) / 2);
+        l2_idx_disk_per_row = l2_idx_per_row;
     } else {
         l2_idx_per_row = (size_t)C * (size_t)out->l2_idx_bytes;
+        if (out->l2_packed_bits > 0) {
+            /* Disk: ceil(C * bits / 8). RAM: still uint16 (l2_idx_per_row). */
+            l2_idx_disk_per_row =
+                ((size_t)C * (size_t)out->l2_packed_bits + 7) >> 3;
+        } else {
+            l2_idx_disk_per_row = l2_idx_per_row;
+        }
     }
+    (void)l2_idx_disk_per_row;  /* used in LOAD_BLOCK below */
 
     size_t cb_sz       = (size_t)K * (G / 2) * sizeof(uint16_t);
     size_t cb_l2_sz    = (size_t)K_l2_eff * (G / 2) * sizeof(uint16_t);
@@ -270,8 +286,43 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     if (out->n_levels == 2) {
         LOAD_BLOCK("codebook_l2_l", out->codebook_l2_l, cb_l2_sz);
         LOAD_BLOCK("codebook_l2_r", out->codebook_l2_r, cb_l2_sz);
-        LOAD_BLOCK("indices_l2_l",  out->indices_l2_l,  idx_l2_sz);
-        LOAD_BLOCK("indices_l2_r",  out->indices_l2_r,  idx_l2_sz);
+        if (out->l2_packed_bits > 0 && !l2_packed) {
+            /* Read packed bytes from disk, unpack into arena uint16 buffer. */
+            size_t disk_per_row =
+                ((size_t)C * (size_t)out->l2_packed_bits + 7) >> 3;
+            size_t disk_total = (size_t)M * disk_per_row;
+            uint8_t* tmp = (uint8_t*)malloc(disk_total + 4);  /* +4 pad for safe overread */
+            if (!tmp) goto err;
+            size_t off, sz;
+            if (read_block(tm, "indices_l2_l", &off, &sz) != 0
+                || sz != disk_total
+                || weight_data_start + off + sz > file_sz
+                || fseek(f, (long)(weight_data_start + off), SEEK_SET) != 0
+                || fread(tmp, 1, sz, f) != sz) {
+                free(tmp); goto err;
+            }
+            for (int r = 0; r < M; r++) {
+                pq_unpack_bits_to_u16(tmp + (size_t)r * disk_per_row,
+                                      ((uint16_t*)out->indices_l2_l) + (size_t)r * C,
+                                      (size_t)C, out->l2_packed_bits);
+            }
+            if (read_block(tm, "indices_l2_r", &off, &sz) != 0
+                || sz != disk_total
+                || weight_data_start + off + sz > file_sz
+                || fseek(f, (long)(weight_data_start + off), SEEK_SET) != 0
+                || fread(tmp, 1, sz, f) != sz) {
+                free(tmp); goto err;
+            }
+            for (int r = 0; r < M; r++) {
+                pq_unpack_bits_to_u16(tmp + (size_t)r * disk_per_row,
+                                      ((uint16_t*)out->indices_l2_r) + (size_t)r * C,
+                                      (size_t)C, out->l2_packed_bits);
+            }
+            free(tmp);
+        } else {
+            LOAD_BLOCK("indices_l2_l", out->indices_l2_l, idx_l2_sz);
+            LOAD_BLOCK("indices_l2_r", out->indices_l2_r, idx_l2_sz);
+        }
     }
     if (out->n_outlier > 0) {
         LOAD_BLOCK("outlier_cols",    out->outlier_cols,    oc_sz);
@@ -696,6 +747,27 @@ static inline int pq_l2_idx_at(const uint8_t* il2, int c, int packed, int bytes)
         return (int)il2_u16[c];
     }
     return (int)il2[c];
+}
+
+/* Bit-unpack N-bit indices (LSB-first) into a uint16 array.
+ * src: packed byte stream; dst: uint16 buffer with n_total slots; n_bits in [1, 16]. */
+static void pq_unpack_bits_to_u16(const uint8_t* src, uint16_t* dst,
+                                   size_t n_total, int n_bits) {
+    if (n_bits <= 0 || n_bits > 16) return;
+    uint32_t mask = (n_bits == 16) ? 0xFFFFu : ((1u << n_bits) - 1u);
+    size_t bit_pos = 0;
+    for (size_t i = 0; i < n_total; i++) {
+        size_t byte_off = bit_pos >> 3;
+        int bit_off = (int)(bit_pos & 7);
+        /* Read up to 4 bytes to cover any 16-bit value crossing byte boundaries. */
+        uint32_t word = (uint32_t)src[byte_off];
+        word |= (uint32_t)src[byte_off + 1] << 8;
+        if (bit_off + n_bits > 16) {
+            word |= (uint32_t)src[byte_off + 2] << 16;
+        }
+        dst[i] = (uint16_t)((word >> bit_off) & mask);
+        bit_pos += (size_t)n_bits;
+    }
 }
 
 static inline int pq_K_l2_eff(const ib_pq_tensor* t) {

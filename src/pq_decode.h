@@ -65,6 +65,8 @@ typedef struct {
     uint8_t* indices_l2_r;     /* NULL if n_levels == 1; raw bytes — cast per l2_idx_bytes */
     int C;                     /* chunks per row */
     int l2_idx_bytes;          /* 1 = uint8 (default); 2 = uint16 (PYRAMID K_l2>256) */
+    int l2_packed_bits;        /* 0 = unpacked (default); >0 = N-bit packed on
+                                * disk, unpacked to uint16 in RAM at load. */
 
     /* Per-row scale */
     uint16_t* row_scale;       /* M FP16 entries */
