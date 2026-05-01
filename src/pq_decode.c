@@ -2746,23 +2746,16 @@ int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
     return 0;
 }
 
-int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
-                                        const ib_pq_lut_cache* cache,
-                                        const float* x, float* out) {
-    if (!t || !cache || !x || !out) return -1;
+/* F1.a: shared kernel with caller-supplied scratch. */
+static int streaming_cached_kernel(const ib_pq_tensor* t,
+                                    const ib_pq_lut_cache* cache,
+                                    const float* x, float* out,
+                                    float* C1L_dot_x, float* C1R_dot_x,
+                                    float* C2L_dot_x, float* C2R_dot_x) {
     int M = t->M, G = t->G, C = t->C, K = t->K;
     int half = cache->half;
     int K_l2 = cache->K_l2;
     int has_l2 = (cache->n_levels == 2);
-
-    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
-    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
-    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
-    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
-    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
-        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
-        return -1;
-    }
 
     memset(out, 0, (size_t)M * sizeof(float));
 
@@ -2800,9 +2793,30 @@ int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
         out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
     }
     apply_outliers(t, x, out);
-
-    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
     return 0;
+}
+
+int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
+                                        const ib_pq_lut_cache* cache,
+                                        const float* x, float* out) {
+    if (!t || !cache || !x || !out) return -1;
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int has_l2 = (cache->n_levels == 2);
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+    int rc = streaming_cached_kernel(t, cache, x, out,
+                                       C1L_dot_x, C1R_dot_x, C2L_dot_x, C2R_dot_x);
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return rc;
 }
 
 /* Threaded streaming_cached: each thread processes a row slice across
@@ -3048,6 +3062,14 @@ struct ib_pq_session {
     int int8_quantized;
     ib_thread_pool* pool;         /* shared, owned (NULL = sequential) */
     int n_threads;
+    /* F1.a: preallocated LUT scratch sized to max(K), max(K_l2) across the
+     * fleet. One block, four buffers laid out contiguously. */
+    float* scratch_C1L;
+    float* scratch_C1R;
+    float* scratch_C2L;  /* may be NULL if no L2 in fleet */
+    float* scratch_C2R;
+    int scratch_K;
+    int scratch_K_l2;
 };
 
 static int session_find_index(const ib_pq_session* s, const char* name) {
@@ -3081,6 +3103,24 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
     /* Sentinel: variant=-1 means "use default". */
     for (int i = 0; i < s->multi.n; i++) s->policies[i].variant = -1;
 
+    /* F1.a: preallocate scratch sized to fleet max. */
+    int max_K = 0, max_Kl2 = 0;
+    for (int i = 0; i < s->multi.n; i++) {
+        const ib_pq_lut_cache* c = s->mc->caches[i];
+        if (c->K > max_K) max_K = c->K;
+        if (c->n_levels == 2 && c->K_l2 > max_Kl2) max_Kl2 = c->K_l2;
+    }
+    s->scratch_K = max_K;
+    s->scratch_K_l2 = max_Kl2;
+    if (max_K > 0) {
+        s->scratch_C1L = (float*)malloc((size_t)max_K * sizeof(float));
+        s->scratch_C1R = (float*)malloc((size_t)max_K * sizeof(float));
+    }
+    if (max_Kl2 > 0) {
+        s->scratch_C2L = (float*)malloc((size_t)max_Kl2 * sizeof(float));
+        s->scratch_C2R = (float*)malloc((size_t)max_Kl2 * sizeof(float));
+    }
+
     /* Thread pool. Off by default — pool sync overhead exceeds the
      * row-work win for typical Llama-1B matmuls under the cached path.
      * Set IB_PQ_THREADS > 1 to enable; only matmuls with M*C above the
@@ -3098,6 +3138,8 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
 void ib_pq_session_close(ib_pq_session* s) {
     if (!s) return;
     if (s->pool) ib_pool_destroy(s->pool);
+    free(s->scratch_C1L); free(s->scratch_C1R);
+    free(s->scratch_C2L); free(s->scratch_C2R);
     ib_pq_multi_caches_free(s->mc);
     ib_pq_multi_free(&s->multi);
     free(s->policies);
@@ -3152,7 +3194,10 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
             return ib_pq_matmul_fp32_streaming_cached_threaded(t, c, x, out,
                                                                   s->pool, s->n_threads);
         }
-        return ib_pq_matmul_fp32_streaming_cached(t, c, x, out);
+        /* F1.a: zero-malloc fast path using session scratch. */
+        return streaming_cached_kernel(t, c, x, out,
+                                          s->scratch_C1L, s->scratch_C1R,
+                                          s->scratch_C2L, s->scratch_C2R);
     }
 }
 
