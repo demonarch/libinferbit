@@ -143,9 +143,10 @@ static int read_block(const cJSON* parent, const char* key, size_t* off, size_t*
 
 static ib_pq_format parse_format(const char* s) {
     if (!s) return IB_PQ_FMT_NONE;
-    if (strcmp(s, "pq2d_v1_l1")    == 0) return IB_PQ_FMT_L1;
-    if (strcmp(s, "pq2d_v1_l2")    == 0) return IB_PQ_FMT_L2;
-    if (strcmp(s, "pq2d_v1_l1_l2") == 0) return IB_PQ_FMT_L1_L2;
+    if (strcmp(s, "pq2d_v1_l1")      == 0) return IB_PQ_FMT_L1;
+    if (strcmp(s, "pq2d_v1_l2")      == 0) return IB_PQ_FMT_L2;
+    if (strcmp(s, "pq2d_v1_l1_l2")   == 0) return IB_PQ_FMT_L1_L2;
+    if (strcmp(s, "pq2d_v1_pyramid") == 0) return IB_PQ_FMT_PYRAMID;
     return IB_PQ_FMT_NONE;
 }
 
@@ -197,8 +198,11 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     out->C = n_inner / G;
     int C = out->C;
     int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
-    /* Per docs/26: K_l2 must be in {16, 64, K} (with K typically 256). */
-    if (out->n_levels == 2 && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
+    /* Per docs/26: K_l2 must be in {16, 64, K} for L1_L2 format (with K
+     * typically 256). The PYRAMID format relaxes this — K_l2 = K_outer *
+     * K_inner where K_inner can be arbitrary. */
+    if (out->n_levels == 2 && out->format != IB_PQ_FMT_PYRAMID
+        && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
     size_t l2_idx_per_row = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
 
@@ -310,8 +314,10 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
     int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
     /* Stage D guard removed: matmul_impl + ib_pq_reconstruct_fp32 now
      * handle K_l2 ∈ {16, 64, 256} including 4-bit packed indices for
-     * K_l2 == 16. */
-    if (out->n_levels == 2 && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
+     * K_l2 == 16. The PYRAMID format relaxes the {16,64,K} restriction
+     * (K_l2 = K_outer × K_inner, arbitrary). */
+    if (out->n_levels == 2 && out->format != IB_PQ_FMT_PYRAMID
+        && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
     size_t l2_idx_per_row = l2_packed ? (size_t)((out->C + 1) / 2) : (size_t)out->C;
 

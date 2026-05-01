@@ -28,6 +28,12 @@ typedef enum {
     IB_PQ_FMT_L1,        /* "pq2d_v1_l1"     — 1 level, optional outlier */
     IB_PQ_FMT_L2,        /* "pq2d_v1_l2"     — 2 level residual, no outlier */
     IB_PQ_FMT_L1_L2,     /* "pq2d_v1_l1_l2"  — 2 level + outlier */
+    IB_PQ_FMT_PYRAMID,   /* "pq2d_v1_pyramid" — conditional pyramid:
+                          * L2 codebook flattened as [K_outer * K_inner, G/2];
+                          * indices i2 are combined as i1*K_inner + i2_local.
+                          * K_l2 unrestricted (vs L1_L2 which requires {16,64,K}).
+                          * Reconstruct path is identical to L1_L2 — only the
+                          * validation differs. */
 } ib_pq_format;
 
 typedef struct {
