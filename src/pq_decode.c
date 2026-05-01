@@ -3588,17 +3588,22 @@ struct ib_pq_kv_cache {
     int kv_dim;        /* num_kv_heads * head_dim */
     int length;
     /* Storage layout: [layer][pos][kv_dim].
-     * F1.d: storage_fp16 selects between fp32 and fp16 backing. fp16
-     * halves the bytes streamed from RAM in the attention dot loop —
-     * a meaningful win at long context (pos × n_layers × kv_dim reads
-     * per token) where bandwidth dominates the software fp16 cvt cost.
-     * Set IB_PQ_KV_FP16=1 to enable. Default fp32 keeps short-context
-     * latency low. */
+     * F1.d / Phase 7: storage selects fp32 (default), fp16, or int8.
+     *   IB_PQ_KV_FP16=1 → fp16 backing (half bandwidth, neutral cvt cost
+     *                      with vcvt_f32_f16 on ARM)
+     *   IB_PQ_KV_INT8=1 → int8 backing + per-token scale (4× vs fp16,
+     *                      8× vs fp32; ~0.1-0.2% PPL hit typical)
+     */
     int storage_fp16;
+    int storage_int8;
     float*    k_f32;
     float*    v_f32;
     uint16_t* k_f16;
     uint16_t* v_f16;
+    int8_t*   k_q8;     /* [n_layers][max_seq][kv_dim] */
+    int8_t*   v_q8;
+    float*    k_q8_scale;  /* [n_layers][max_seq] one scale per slot */
+    float*    v_q8_scale;
 };
 
 static int session_config_int(const char* json, const char* key, int def) {
@@ -3638,9 +3643,22 @@ int ib_pq_kv_cache_create(const ib_pq_session* s, int max_seq_len,
     if (!kv) return -1;
     kv->n_layers = n_layers; kv->max_seq = max_seq_len; kv->kv_dim = kv_dim;
     const char* fp16_env = getenv("IB_PQ_KV_FP16");
-    kv->storage_fp16 = (fp16_env && atoi(fp16_env) > 0) ? 1 : 0;
+    const char* int8_env = getenv("IB_PQ_KV_INT8");
+    kv->storage_int8 = (int8_env && atoi(int8_env) > 0) ? 1 : 0;
+    kv->storage_fp16 = (!kv->storage_int8 && fp16_env && atoi(fp16_env) > 0) ? 1 : 0;
     size_t n_elem = (size_t)n_layers * max_seq_len * kv_dim;
-    if (kv->storage_fp16) {
+    size_t n_slots = (size_t)n_layers * max_seq_len;
+    if (kv->storage_int8) {
+        kv->k_q8 = (int8_t*)malloc(n_elem);
+        kv->v_q8 = (int8_t*)malloc(n_elem);
+        kv->k_q8_scale = (float*)malloc(n_slots * sizeof(float));
+        kv->v_q8_scale = (float*)malloc(n_slots * sizeof(float));
+        if (!kv->k_q8 || !kv->v_q8 || !kv->k_q8_scale || !kv->v_q8_scale) {
+            free(kv->k_q8); free(kv->v_q8);
+            free(kv->k_q8_scale); free(kv->v_q8_scale);
+            free(kv); return -1;
+        }
+    } else if (kv->storage_fp16) {
         kv->k_f16 = (uint16_t*)malloc(n_elem * sizeof(uint16_t));
         kv->v_f16 = (uint16_t*)malloc(n_elem * sizeof(uint16_t));
         if (!kv->k_f16 || !kv->v_f16) {
@@ -3661,6 +3679,8 @@ void ib_pq_kv_cache_free(ib_pq_kv_cache* kv) {
     if (!kv) return;
     free(kv->k_f32); free(kv->v_f32);
     free(kv->k_f16); free(kv->v_f16);
+    free(kv->k_q8); free(kv->v_q8);
+    free(kv->k_q8_scale); free(kv->v_q8_scale);
     free(kv);
 }
 
@@ -3755,10 +3775,36 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
         ib_rope_f32(q,     n_heads, head_dim, pos, theta);
         ib_rope_f32(k_now, n_kv,    head_dim, pos, theta);
 
-        /* Write into kv cache. fp32 path: memcpy. fp16 path: convert. */
+        /* Write into kv cache. fp32 path: memcpy. fp16 path: convert.
+         * int8 path: per-vector scale + round. */
         if (kv) {
             size_t kv_offset = ((size_t)L * kv->max_seq + pos) * kv_dim;
-            if (kv->storage_fp16) {
+            size_t slot = (size_t)L * kv->max_seq + pos;
+            if (kv->storage_int8) {
+                int8_t* k_slot = kv->k_q8 + kv_offset;
+                int8_t* v_slot = kv->v_q8 + kv_offset;
+                float k_max = 1e-12f, v_max = 1e-12f;
+                for (int d = 0; d < kv_dim; d++) {
+                    float ak = fabsf(k_now[d]); if (ak > k_max) k_max = ak;
+                    float av = fabsf(v_now[d]); if (av > v_max) v_max = av;
+                }
+                float k_s = k_max / 127.0f, v_s = v_max / 127.0f;
+                float k_inv = 1.0f / k_s, v_inv = 1.0f / v_s;
+                kv->k_q8_scale[slot] = k_s;
+                kv->v_q8_scale[slot] = v_s;
+                for (int d = 0; d < kv_dim; d++) {
+                    float kq = k_now[d] * k_inv;
+                    float vq = v_now[d] * v_inv;
+                    int kqi = (int)(kq >= 0 ? kq + 0.5f : kq - 0.5f);
+                    int vqi = (int)(vq >= 0 ? vq + 0.5f : vq - 0.5f);
+                    if (kqi >  127) kqi =  127;
+                    if (kqi < -127) kqi = -127;
+                    if (vqi >  127) vqi =  127;
+                    if (vqi < -127) vqi = -127;
+                    k_slot[d] = (int8_t)kqi;
+                    v_slot[d] = (int8_t)vqi;
+                }
+            } else if (kv->storage_fp16) {
                 uint16_t* k_slot = kv->k_f16 + kv_offset;
                 uint16_t* v_slot = kv->v_f16 + kv_offset;
 #if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
@@ -3801,7 +3847,14 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
             const float* qh = q + (size_t)h * head_dim;
             for (int t = 0; t <= pos; t++) {
                 const float* k_t;
-                if (kv && kv->storage_fp16) {
+                if (kv && kv->storage_int8) {
+                    size_t base = ((size_t)L * kv->max_seq + t) * kv_dim
+                                + (size_t)kv_h * head_dim;
+                    const int8_t* k_src = kv->k_q8 + base;
+                    float k_s = kv->k_q8_scale[(size_t)L * kv->max_seq + t];
+                    for (int d = 0; d < head_dim; d++) k_scratch[d] = (float)k_src[d] * k_s;
+                    k_t = k_scratch;
+                } else if (kv && kv->storage_fp16) {
                     const uint16_t* k_src = kv->k_f16
                         + ((size_t)L * kv->max_seq + t) * kv_dim
                         + (size_t)kv_h * head_dim;
@@ -3829,7 +3882,14 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
             memset(outh, 0, (size_t)head_dim * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 const float* v_t;
-                if (kv && kv->storage_fp16) {
+                if (kv && kv->storage_int8) {
+                    size_t base = ((size_t)L * kv->max_seq + t) * kv_dim
+                                + (size_t)kv_h * head_dim;
+                    const int8_t* v_src = kv->v_q8 + base;
+                    float v_s = kv->v_q8_scale[(size_t)L * kv->max_seq + t];
+                    for (int d = 0; d < head_dim; d++) v_scratch[d] = (float)v_src[d] * v_s;
+                    v_t = v_scratch;
+                } else if (kv && kv->storage_fp16) {
                     const uint16_t* v_src = kv->v_f16
                         + ((size_t)L * kv->max_seq + t) * kv_dim
                         + (size_t)kv_h * head_dim;
