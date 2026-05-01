@@ -102,6 +102,25 @@ static inline void pq_accum_scaled_f32(float* out, const float* v, float w, int 
 static inline void pq_chunk_dot_table_f32(const float* cb, const float* x,
                                             int half, int K, float* out) {
 #if defined(__ARM_NEON)
+    if (half == 2) {
+        /* G=4 case: 2 floats per codebook entry. Pack 4 entries (8 floats)
+         * into 2 NEON regs, multiply by [x0,x1,x0,x1,x0,x1,x0,x1], use
+         * vpaddq_f32 to get the 4 paired-sum dots in one vector. */
+        float32x4_t xx = {x[0], x[1], x[0], x[1]};
+        int k = 0;
+        for (; k + 4 <= K; k += 4) {
+            float32x4_t e0 = vld1q_f32(cb + (size_t)k * 2);
+            float32x4_t e1 = vld1q_f32(cb + (size_t)k * 2 + 4);
+            float32x4_t p0 = vmulq_f32(e0, xx);
+            float32x4_t p1 = vmulq_f32(e1, xx);
+            vst1q_f32(out + k, vpaddq_f32(p0, p1));
+        }
+        for (; k < K; k++) {
+            const float* e = cb + (size_t)k * 2;
+            out[k] = e[0] * x[0] + e[1] * x[1];
+        }
+        return;
+    }
     if (half == 16) {
         float32x4_t xv0 = vld1q_f32(x + 0);
         float32x4_t xv1 = vld1q_f32(x + 4);
