@@ -248,6 +248,26 @@ int ib_pq_matmul_fp32_streaming_sparse(const ib_pq_tensor* t, const float* x,
 int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
                                         float* out, float skip_threshold);
 
+/* Phase 6: persistent decode cache for cross-token reuse.
+ *
+ * The fp16→fp32 codebook decode and inner_cols build happen once on
+ * cache creation; cached matmul variants skip that prelude on every
+ * call. Intended use: build one cache per (tensor) at model load,
+ * reuse across all token forward passes.
+ */
+typedef struct ib_pq_lut_cache ib_pq_lut_cache;
+
+int  ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out);
+void ib_pq_lut_cache_free(ib_pq_lut_cache* c);
+
+int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
+                                        const ib_pq_lut_cache* cache,
+                                        const float* x, float* out);
+int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
+                                                const ib_pq_lut_cache* cache,
+                                                const float* x, float* out,
+                                                float skip_threshold);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

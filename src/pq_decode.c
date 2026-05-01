@@ -2358,3 +2358,244 @@ fail:
     free(qL2); free(sL2); free(qR2); free(sR2);
     return -1;
 }
+
+/* ── Phase 6: persistent codebook + inner_cols + per-cluster bound cache ── */
+
+struct ib_pq_lut_cache {
+    float* cb1l_fp32;
+    float* cb1r_fp32;
+    float* cb2l_fp32;
+    float* cb2r_fp32;
+    int*   inner_cols;
+    float* c2l_max_per_cluster;
+    float* c2r_max_per_cluster;
+    int M, N, G, K, K_l2, half, n_levels;
+    int n_inner;
+    int is_pyramid;
+    int n_outer;
+    int K_inner;
+};
+
+int ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out_p) {
+    if (!t || !out_p) return -1;
+    *out_p = NULL;
+    int M = t->M, N = t->N, G = t->G, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int has_l2 = (t->n_levels == 2);
+
+    ib_pq_lut_cache* c = (ib_pq_lut_cache*)calloc(1, sizeof(*c));
+    if (!c) return -1;
+    c->M = M; c->N = N; c->G = G; c->K = K; c->K_l2 = K_l2;
+    c->half = half; c->n_levels = t->n_levels;
+    c->is_pyramid = (t->format == IB_PQ_FMT_PYRAMID);
+    c->n_outer = (c->is_pyramid && K > 0) ? K : 1;
+    c->K_inner = (c->is_pyramid && K > 0) ? (K_l2 / K) : K_l2;
+    c->n_inner = N - t->n_outlier;
+
+    int cb1_entries = K * half;
+    c->cb1l_fp32 = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    c->cb1r_fp32 = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!c->cb1l_fp32 || !c->cb1r_fp32) goto fail;
+    for (int i = 0; i < cb1_entries; i++) {
+        c->cb1l_fp32[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        c->cb1r_fp32[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    if (has_l2) {
+        int cb2_entries = K_l2 * half;
+        c->cb2l_fp32 = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        c->cb2r_fp32 = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        if (!c->cb2l_fp32 || !c->cb2r_fp32) goto fail;
+        for (int i = 0; i < cb2_entries; i++) {
+            c->cb2l_fp32[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+            c->cb2r_fp32[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+        }
+
+        c->c2l_max_per_cluster = (float*)calloc((size_t)c->n_outer, sizeof(float));
+        c->c2r_max_per_cluster = (float*)calloc((size_t)c->n_outer, sizeof(float));
+        if (!c->c2l_max_per_cluster || !c->c2r_max_per_cluster) goto fail;
+        for (int k1 = 0; k1 < c->n_outer; k1++) {
+            float ml = 0.0f, mr = 0.0f;
+            int k_lo = c->is_pyramid ? k1 * c->K_inner : 0;
+            int k_hi = c->is_pyramid ? (k1 + 1) * c->K_inner : K_l2;
+            for (int k = k_lo; k < k_hi; k++) {
+                float nl = 0.0f, nr = 0.0f;
+                for (int j = 0; j < half; j++) {
+                    nl += c->cb2l_fp32[k * half + j] * c->cb2l_fp32[k * half + j];
+                    nr += c->cb2r_fp32[k * half + j] * c->cb2r_fp32[k * half + j];
+                }
+                nl = sqrtf(nl); nr = sqrtf(nr);
+                if (nl > ml) ml = nl;
+                if (nr > mr) mr = nr;
+            }
+            c->c2l_max_per_cluster[k1] = ml;
+            c->c2r_max_per_cluster[k1] = mr;
+        }
+    }
+
+    c->inner_cols = (int*)malloc((size_t)c->n_inner * sizeof(int));
+    if (!c->inner_cols) goto fail;
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) goto fail;
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) c->inner_cols[k++] = j;
+        free(mask);
+    }
+
+    *out_p = c;
+    return 0;
+
+fail:
+    ib_pq_lut_cache_free(c);
+    return -1;
+}
+
+void ib_pq_lut_cache_free(ib_pq_lut_cache* c) {
+    if (!c) return;
+    free(c->cb1l_fp32); free(c->cb1r_fp32);
+    free(c->cb2l_fp32); free(c->cb2r_fp32);
+    free(c->inner_cols);
+    free(c->c2l_max_per_cluster); free(c->c2r_max_per_cluster);
+    free(c);
+}
+
+int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
+                                        const ib_pq_lut_cache* cache,
+                                        const float* x, float* out) {
+    if (!t || !cache || !x || !out) return -1;
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    int has_l2 = (cache->n_levels == 2);
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[cache->inner_cols[base + j]];
+            xR[j] = x[cache->inner_cols[base + half + j]];
+        }
+        pq_chunk_dot_table_f32(cache->cb1l_fp32, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cache->cb1r_fp32, xR, half, K, C1R_dot_x);
+        if (has_l2) {
+            pq_chunk_dot_table_f32(cache->cb2l_fp32, xL, half, K_l2, C2L_dot_x);
+            pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R_dot_x);
+        }
+        for (int r = 0; r < M; r++) {
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            float v = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            if (has_l2) {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+            out[r] += v;
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
+
+int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
+                                                const ib_pq_lut_cache* cache,
+                                                const float* x, float* out,
+                                                float skip_threshold) {
+    if (!t || !cache || !x || !out) return -1;
+    if (cache->n_levels != 2) return ib_pq_matmul_fp32_streaming_cached(t, cache, x, out);
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    int is_pyramid = cache->is_pyramid;
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
+    float* C2R_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
+    if (!C1L_dot_x || !C1R_dot_x || !C2L_dot_x || !C2R_dot_x) {
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        float xL_n2 = 0.0f, xR_n2 = 0.0f;
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[cache->inner_cols[base + j]];
+            xR[j] = x[cache->inner_cols[base + half + j]];
+            xL_n2 += xL[j] * xL[j];
+            xR_n2 += xR[j] * xR[j];
+        }
+        float xL_norm = sqrtf(xL_n2);
+        float xR_norm = sqrtf(xR_n2);
+
+        pq_chunk_dot_table_f32(cache->cb1l_fp32, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cache->cb1r_fp32, xR, half, K, C1R_dot_x);
+        pq_chunk_dot_table_f32(cache->cb2l_fp32, xL, half, K_l2, C2L_dot_x);
+        pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R_dot_x);
+
+        for (int r = 0; r < M; r++) {
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            float l1_contrib = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            float v = l1_contrib;
+            int oc_l = is_pyramid ? i1l : 0;
+            int oc_r = is_pyramid ? i1r : 0;
+            float l2_bound = skip_threshold
+                * (cache->c2l_max_per_cluster[oc_l] * xL_norm
+                 + cache->c2r_max_per_cluster[oc_r] * xR_norm);
+            if (skip_threshold > 0.0f && fabsf(l1_contrib) > l2_bound) {
+                /* skip L2 */
+            } else {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+            out[r] += v;
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
