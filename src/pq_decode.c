@@ -3279,6 +3279,13 @@ struct ib_pq_session {
     /* F1.b: per-thread scratch for spin-pool matmul (4 LUTs per thread). */
     float* thread_scratch;
     size_t thread_scratch_per;
+    /* Phase 8.E: per-tensor inv_act_scale pointer (NULL if absent),
+     * indexed parallel to multi.tensors[i]. The session scratch
+     * x_scratch is used to materialize x * inv_act_scale once per matmul
+     * call; sized to max(N) across the fleet. */
+    const float** act_scale_inv_per_tensor;
+    float* x_scratch;
+    int x_scratch_n;
 };
 
 static int session_find_index(const ib_pq_session* s, const char* name) {
@@ -3311,6 +3318,29 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
     }
     /* Sentinel: variant=-1 means "use default". */
     for (int i = 0; i < s->multi.n; i++) s->policies[i].variant = -1;
+
+    /* Phase 8.E: precompute per-tensor inv_act_scale pointer (NULL if no
+     * matching raw block) + size x_scratch to max(N). */
+    s->act_scale_inv_per_tensor = (const float**)calloc((size_t)s->multi.n,
+                                                          sizeof(*s->act_scale_inv_per_tensor));
+    int max_N = 0;
+    char buf[256];
+    for (int i = 0; i < s->multi.n; i++) {
+        const ib_pq_tensor* tt = &s->multi.tensors[i];
+        if (tt->N > max_N) max_N = tt->N;
+        const char* name = s->multi.names[i];
+        if (!name || !s->act_scale_inv_per_tensor) continue;
+        snprintf(buf, sizeof(buf), "%s__act_scale", name);
+        const void* data = NULL; int dtype = 0, ndim = 0; int shape[4] = {0};
+        if (ib_pq_session_raw_get(s, buf, &data, &dtype, shape, &ndim) == 0
+         && dtype == IB_RAW_F32 && ndim == 1 && shape[0] == tt->N) {
+            s->act_scale_inv_per_tensor[i] = (const float*)data;
+        }
+    }
+    if (max_N > 0) {
+        s->x_scratch = (float*)malloc((size_t)max_N * sizeof(float));
+        s->x_scratch_n = max_N;
+    }
 
     /* F1.a: preallocate scratch sized to fleet max. */
     int max_K = 0, max_Kl2 = 0;
@@ -3359,6 +3389,8 @@ void ib_pq_session_close(ib_pq_session* s) {
     free(s->scratch_C1L); free(s->scratch_C1R);
     free(s->scratch_C2L); free(s->scratch_C2R);
     free(s->thread_scratch);
+    free(s->act_scale_inv_per_tensor);
+    free(s->x_scratch);
     ib_pq_multi_caches_free(s->mc);
     ib_pq_multi_free(&s->multi);
     free(s->policies);
@@ -3394,23 +3426,27 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
     const ib_pq_lut_cache* c = s->mc->caches[i];
     ib_pq_policy p = (s->policies[i].variant >= 0) ? s->policies[i] : s->default_policy;
 
+    /* Phase 8.E: pre-scale x by inv_act_scale if calibration was used. */
+    const float* x_for_kernel = x;
+    const float* inv_s = (s->act_scale_inv_per_tensor
+                            ? s->act_scale_inv_per_tensor[i] : NULL);
+    if (inv_s && s->x_scratch && t->N <= s->x_scratch_n) {
+        for (int j = 0; j < t->N; j++) s->x_scratch[j] = x[j] * inv_s[j];
+        x_for_kernel = s->x_scratch;
+    }
+
     switch (p.variant) {
     case IB_PQ_VARIANT_L1_ONLY:
-        return ib_pq_matmul_fp32_l1_only(t, x, out);
+        return ib_pq_matmul_fp32_l1_only(t, x_for_kernel, out);
     case IB_PQ_VARIANT_L2SKIP:
-        return ib_pq_matmul_fp32_streaming_l2skip_cached(t, c, x, out, p.skip_threshold);
+        return ib_pq_matmul_fp32_streaming_l2skip_cached(t, c, x_for_kernel, out, p.skip_threshold);
     case IB_PQ_VARIANT_SPARSE:
-        return ib_pq_matmul_fp32_streaming_sparse(t, x, out, p.act_threshold);
+        return ib_pq_matmul_fp32_streaming_sparse(t, x_for_kernel, out, p.act_threshold);
     case IB_PQ_VARIANT_INT8:
-        return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x, out);
+        return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x_for_kernel, out);
     case IB_PQ_VARIANT_STREAMING:
     default:
-        /* F1.a: zero-malloc fast path using session scratch. Threading
-         * via spin pool (F1.b) regresses on this workload because spin
-         * workers burn cycles during main's serial work between matmul
-         * calls; the cond_wait pool wins via opt-in IB_PQ_THREADS but
-         * not by default. Leaving plain sequential as default. */
-        return streaming_cached_kernel(t, c, x, out,
+        return streaming_cached_kernel(t, c, x_for_kernel, out,
                                           s->scratch_C1L, s->scratch_C1R,
                                           s->scratch_C2L, s->scratch_C2R);
     }
