@@ -1541,6 +1541,276 @@ int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
     return matmul_impl(t, x, out, (ib_thread_pool*)pool);
 }
 
+/* Phase 5: L1-only matmul. Same as streaming matmul but pretends
+ * n_levels=1 — skip the L2 codebook contribution. Cheap pass for
+ * top-K candidate filtering. */
+int ib_pq_matmul_fp32_l1_only(const ib_pq_tensor* t, const float* x, float* out) {
+    if (!t || !x || !out) return -1;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+
+    /* Decode L1 codebooks to fp32 once. */
+    int cb1_entries = K * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) { free(cb1l); free(cb1r); return -1; }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) { free(cb1l); free(cb1r); free(inner_cols); return -1; }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    if (!C1L_dot_x || !C1R_dot_x) {
+        free(cb1l); free(cb1r); free(inner_cols); free(C1L_dot_x); free(C1R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[inner_cols[base + j]];
+            xR[j] = x[inner_cols[base + half + j]];
+        }
+        for (int k = 0; k < K; k++) {
+            const float* eL = &cb1l[(size_t)k * half];
+            const float* eR = &cb1r[(size_t)k * half];
+            float dl = 0.0f, dr = 0.0f;
+            for (int j = 0; j < half; j++) {
+                dl += eL[j] * xL[j];
+                dr += eR[j] * xR[j];
+            }
+            C1L_dot_x[k] = dl;
+            C1R_dot_x[k] = dr;
+        }
+        for (int r = 0; r < M; r++) {
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            out[r] += C1L_dot_x[i1l] + C1R_dot_x[i1r];
+        }
+    }
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+    free(cb1l); free(cb1r); free(inner_cols);
+    free(C1L_dot_x); free(C1R_dot_x);
+    return 0;
+}
+
+/* Phase 5: subset matmul. Full pyramid logits for the selected row
+ * indices only. n_rows-element output. Linear in n_rows × C, vs
+ * full matmul which is M × C. For n_rows ≪ M (top-K refinement),
+ * a fraction of the full matmul cost. */
+int ib_pq_matmul_fp32_subset(const ib_pq_tensor* t, const float* x,
+                              const int32_t* row_indices, int n_rows,
+                              float* out) {
+    if (!t || !x || !out || (!row_indices && n_rows > 0)) return -1;
+    if (n_rows <= 0) return 0;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    int has_l2 = (t->n_levels == 2);
+
+    /* Bounds check row indices. */
+    for (int i = 0; i < n_rows; i++) {
+        if (row_indices[i] < 0 || row_indices[i] >= M) return -1;
+    }
+
+    int cb1_entries = K * half;
+    int cb2_entries = K_l2 * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    float* cb2l = NULL;
+    float* cb2r = NULL;
+    if (has_l2) {
+        cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        if (!cb2l || !cb2r) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+        }
+        for (int i = 0; i < cb2_entries; i++) {
+            cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+            cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+        }
+    }
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            return -1;
+        }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    /* For each selected row, walk all chunks and accumulate. Per-chunk
+     * lookup tables are per-row here (we don't share across rows, since
+     * rows are sparse). For small n_rows ≪ M this is still cheaper than
+     * the full matmul which precomputes K dot products M times. */
+    for (int ri = 0; ri < n_rows; ri++) {
+        int r = row_indices[ri];
+        float acc = 0.0f;
+        for (int c = 0; c < C; c++) {
+            int base = c * G;
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            const float* eL = &cb1l[(size_t)i1l * half];
+            const float* eR = &cb1r[(size_t)i1r * half];
+            for (int j = 0; j < half; j++) {
+                acc += eL[j] * x[inner_cols[base + j]];
+                acc += eR[j] * x[inner_cols[base + half + j]];
+            }
+            if (has_l2) {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                const float* eL2 = &cb2l[(size_t)i2l * half];
+                const float* eR2 = &cb2r[(size_t)i2r * half];
+                for (int j = 0; j < half; j++) {
+                    acc += eL2[j] * x[inner_cols[base + j]];
+                    acc += eR2[j] * x[inner_cols[base + half + j]];
+                }
+            }
+        }
+        acc *= ib_fp16_to_fp32(t->row_scale[r]);
+        /* Outlier sidecar contribution for this row. */
+        if (t->n_outlier > 0) {
+            for (int j = 0; j < t->n_outlier; j++) {
+                int col = t->outlier_cols[j];
+                float os = ib_fp16_to_fp32(t->outlier_scale[j]);
+                float w = (float)t->outlier_sidecar[(size_t)r * t->n_outlier + j] * os;
+                acc += w * x[col];
+            }
+        }
+        out[ri] = acc;
+    }
+
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    return 0;
+}
+
+/* Phase 5: top-K orchestrator. Two-stage:
+ *   1. L1-only matmul for full-vocab cheap logits.
+ *   2. Partial sort to extract top-K candidate row indices.
+ *   3. Subset matmul for full-pyramid logits on those K rows.
+ *   4. Sort candidates by refined logit, fill outputs descending.
+ *
+ * Memory: O(M) scratch for stage 1, O(K) for stage 3.
+ */
+int ib_pq_lm_head_topk(const ib_pq_tensor* t, const float* x, int K_top,
+                        float* out_logits, int32_t* out_token_ids) {
+    if (!t || !x || !out_logits || !out_token_ids) return -1;
+    if (K_top <= 0 || K_top > t->M) return -1;
+    int M = t->M;
+
+    /* Stage 1: cheap L1-only logits over full vocab. */
+    float* coarse = (float*)malloc((size_t)M * sizeof(float));
+    if (!coarse) return -1;
+    int rc = ib_pq_matmul_fp32_l1_only(t, x, coarse);
+    if (rc != 0) { free(coarse); return rc; }
+
+    /* Stage 2: extract top-K row indices by coarse logit (partial sort).
+     * Use a simple max-heap-like O(M log K) selection. */
+    int32_t* top_ids = (int32_t*)malloc((size_t)K_top * sizeof(int32_t));
+    float* top_vals = (float*)malloc((size_t)K_top * sizeof(float));
+    if (!top_ids || !top_vals) {
+        free(coarse); free(top_ids); free(top_vals); return -1;
+    }
+    /* Initialize heap with the first K elements (min-heap so we pop the
+     * smallest when a larger candidate arrives). */
+    for (int i = 0; i < K_top; i++) { top_ids[i] = i; top_vals[i] = coarse[i]; }
+    /* Build min-heap (sift-down from middle). */
+    for (int start = K_top / 2 - 1; start >= 0; start--) {
+        int i = start;
+        while (1) {
+            int l = 2 * i + 1, r = 2 * i + 2, smallest = i;
+            if (l < K_top && top_vals[l] < top_vals[smallest]) smallest = l;
+            if (r < K_top && top_vals[r] < top_vals[smallest]) smallest = r;
+            if (smallest == i) break;
+            float tv = top_vals[i]; top_vals[i] = top_vals[smallest]; top_vals[smallest] = tv;
+            int32_t ti = top_ids[i]; top_ids[i] = top_ids[smallest]; top_ids[smallest] = ti;
+            i = smallest;
+        }
+    }
+    /* Stream the rest: if val > heap-min, replace and sift down. */
+    for (int j = K_top; j < M; j++) {
+        if (coarse[j] > top_vals[0]) {
+            top_vals[0] = coarse[j];
+            top_ids[0] = (int32_t)j;
+            /* Sift down. */
+            int i = 0;
+            while (1) {
+                int l = 2 * i + 1, r = 2 * i + 2, smallest = i;
+                if (l < K_top && top_vals[l] < top_vals[smallest]) smallest = l;
+                if (r < K_top && top_vals[r] < top_vals[smallest]) smallest = r;
+                if (smallest == i) break;
+                float tv = top_vals[i]; top_vals[i] = top_vals[smallest]; top_vals[smallest] = tv;
+                int32_t ti = top_ids[i]; top_ids[i] = top_ids[smallest]; top_ids[smallest] = ti;
+                i = smallest;
+            }
+        }
+    }
+    free(coarse);
+
+    /* Stage 3: full-pyramid refinement on top-K. */
+    float* refined = (float*)malloc((size_t)K_top * sizeof(float));
+    if (!refined) { free(top_ids); free(top_vals); return -1; }
+    rc = ib_pq_matmul_fp32_subset(t, x, top_ids, K_top, refined);
+    if (rc != 0) { free(top_ids); free(top_vals); free(refined); return rc; }
+
+    /* Stage 4: sort by refined logit descending. Insertion sort for K small. */
+    /* Build pairs (refined, id) and sort. */
+    for (int i = 1; i < K_top; i++) {
+        float v = refined[i];
+        int32_t id = top_ids[i];
+        int j = i - 1;
+        while (j >= 0 && refined[j] < v) {
+            refined[j + 1] = refined[j];
+            top_ids[j + 1] = top_ids[j];
+            j--;
+        }
+        refined[j + 1] = v;
+        top_ids[j + 1] = id;
+    }
+
+    for (int i = 0; i < K_top; i++) {
+        out_logits[i] = refined[i];
+        out_token_ids[i] = top_ids[i];
+    }
+    free(top_ids); free(top_vals); free(refined);
+    return 0;
+}
+
 /* ── Byte-quantised LUT path ───────────────────────────────────── */
 /*
  * Same math as matmul_impl but the per-chunk partial-products tables

@@ -193,6 +193,32 @@ int ib_pq_matmul_fp32_q8lut(const ib_pq_tensor* t, const float* x,
  * for performance; the existing entry point remains for verification. */
 int ib_pq_matmul_fp32_streaming(const ib_pq_tensor* t, const float* x, float* out);
 
+/* Phase 5 helpers — top-K lm_head two-stage.
+ *
+ * L1-only matmul: skips the L2 codebook contribution. Cheap pass over
+ * full M output rows; used as the candidate filter. Output is a coarse
+ * approximation to the full pyramid logits but preserves rank structure
+ * well (validated test 35: 100% argmax coverage at top-32 on 32K vocab).
+ */
+int ib_pq_matmul_fp32_l1_only(const ib_pq_tensor* t, const float* x, float* out);
+
+/* Subset matmul: full-pyramid logits computed only for the selected
+ * row indices. Used as the refinement pass after top-K extraction.
+ * row_indices: array of n_rows int32 row indices; out: float[n_rows]. */
+int ib_pq_matmul_fp32_subset(const ib_pq_tensor* t, const float* x,
+                              const int32_t* row_indices, int n_rows,
+                              float* out);
+
+/* Top-K orchestrator: cheap L1-only pass → top-K extract → full pyramid
+ * on the K candidates → fill out_logits[K] and out_token_ids[K] sorted
+ * descending by refined logit. Caller-allocated buffers must hold K
+ * elements each. K ≤ M. Returns 0 on success.
+ *
+ * For sampling: caller applies temperature/top-P over out_logits[K]
+ * and indexes into out_token_ids[K]. */
+int ib_pq_lm_head_topk(const ib_pq_tensor* t, const float* x, int K_top,
+                        float* out_logits, int32_t* out_token_ids);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);
