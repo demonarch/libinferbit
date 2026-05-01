@@ -37,6 +37,77 @@
 #define IB_PQ_HAVE_AVX2 1
 #endif
 
+/* Per-chunk codebook ↔ x dot table.
+ * For each k in [0, K): out[k] = sum_{j in [0, half)} cb[k*half + j] * x[j].
+ * Specialized for half ∈ {8, 16} on NEON / AVX2; scalar otherwise. */
+static inline void pq_chunk_dot_table_f32(const float* cb, const float* x,
+                                            int half, int K, float* out) {
+#if defined(__ARM_NEON)
+    if (half == 16) {
+        float32x4_t xv0 = vld1q_f32(x + 0);
+        float32x4_t xv1 = vld1q_f32(x + 4);
+        float32x4_t xv2 = vld1q_f32(x + 8);
+        float32x4_t xv3 = vld1q_f32(x + 12);
+        for (int k = 0; k < K; k++) {
+            const float* e = cb + (size_t)k * 16;
+            float32x4_t acc = vmulq_f32(vld1q_f32(e + 0),  xv0);
+            acc = vfmaq_f32(acc, vld1q_f32(e + 4),  xv1);
+            acc = vfmaq_f32(acc, vld1q_f32(e + 8),  xv2);
+            acc = vfmaq_f32(acc, vld1q_f32(e + 12), xv3);
+            out[k] = vaddvq_f32(acc);
+        }
+        return;
+    }
+    if (half == 8) {
+        float32x4_t xv0 = vld1q_f32(x + 0);
+        float32x4_t xv1 = vld1q_f32(x + 4);
+        for (int k = 0; k < K; k++) {
+            const float* e = cb + (size_t)k * 8;
+            float32x4_t acc = vmulq_f32(vld1q_f32(e + 0), xv0);
+            acc = vfmaq_f32(acc, vld1q_f32(e + 4), xv1);
+            out[k] = vaddvq_f32(acc);
+        }
+        return;
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    if (half == 16) {
+        __m256 xv0 = _mm256_loadu_ps(x + 0);
+        __m256 xv1 = _mm256_loadu_ps(x + 8);
+        for (int k = 0; k < K; k++) {
+            const float* e = cb + (size_t)k * 16;
+            __m256 acc = _mm256_mul_ps(_mm256_loadu_ps(e + 0), xv0);
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(e + 8), xv1, acc);
+            __m128 lo = _mm256_castps256_ps128(acc);
+            __m128 hi = _mm256_extractf128_ps(acc, 1);
+            __m128 s = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            out[k] = _mm_cvtss_f32(s);
+        }
+        return;
+    }
+    if (half == 8) {
+        __m256 xv = _mm256_loadu_ps(x);
+        for (int k = 0; k < K; k++) {
+            __m256 acc = _mm256_mul_ps(_mm256_loadu_ps(cb + (size_t)k * 8), xv);
+            __m128 lo = _mm256_castps256_ps128(acc);
+            __m128 hi = _mm256_extractf128_ps(acc, 1);
+            __m128 s = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            out[k] = _mm_cvtss_f32(s);
+        }
+        return;
+    }
+#endif
+    for (int k = 0; k < K; k++) {
+        const float* e = cb + (size_t)k * half;
+        float d = 0.0f;
+        for (int j = 0; j < half; j++) d += e[j] * x[j];
+        out[k] = d;
+    }
+}
+
 #define IBF_MAGIC      "INFERBIT"
 #define IBF_MAGIC_SIZE 8
 #define IBF_PREAMBLE   32
@@ -1480,30 +1551,11 @@ int ib_pq_matmul_fp32_streaming(const ib_pq_tensor* t, const float* x, float* ou
             xL[j] = x[inner_cols[base + j]];
             xR[j] = x[inner_cols[base + half + j]];
         }
-        /* Precompute K codebook ↔ x_chunk dots for L. */
-        for (int k = 0; k < K; k++) {
-            const float* eL = &cb1l[(size_t)k * half];
-            const float* eR = &cb1r[(size_t)k * half];
-            float dl = 0.0f, dr = 0.0f;
-            for (int j = 0; j < half; j++) {
-                dl += eL[j] * xL[j];
-                dr += eR[j] * xR[j];
-            }
-            C1L_dot_x[k] = dl;
-            C1R_dot_x[k] = dr;
-        }
+        pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
         if (has_l2) {
-            for (int k = 0; k < K_l2; k++) {
-                const float* eL = &cb2l[(size_t)k * half];
-                const float* eR = &cb2r[(size_t)k * half];
-                float dl = 0.0f, dr = 0.0f;
-                for (int j = 0; j < half; j++) {
-                    dl += eL[j] * xL[j];
-                    dr += eR[j] * xR[j];
-                }
-                C2L_dot_x[k] = dl;
-                C2R_dot_x[k] = dr;
-            }
+            pq_chunk_dot_table_f32(cb2l, xL, half, K_l2, C2L_dot_x);
+            pq_chunk_dot_table_f32(cb2r, xR, half, K_l2, C2R_dot_x);
         }
 
         /* Walk all output rows; accumulate from cache-resident tables. */
@@ -1628,29 +1680,11 @@ int ib_pq_matmul_fp32_streaming_sparse(const ib_pq_tensor* t, const float* x,
             if (all_small) { n_skipped++; continue; }
         }
 
-        for (int k = 0; k < K; k++) {
-            const float* eL = &cb1l[(size_t)k * half];
-            const float* eR = &cb1r[(size_t)k * half];
-            float dl = 0.0f, dr = 0.0f;
-            for (int j = 0; j < half; j++) {
-                dl += eL[j] * xL[j];
-                dr += eR[j] * xR[j];
-            }
-            C1L_dot_x[k] = dl;
-            C1R_dot_x[k] = dr;
-        }
+        pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
         if (has_l2) {
-            for (int k = 0; k < K_l2; k++) {
-                const float* eL = &cb2l[(size_t)k * half];
-                const float* eR = &cb2r[(size_t)k * half];
-                float dl = 0.0f, dr = 0.0f;
-                for (int j = 0; j < half; j++) {
-                    dl += eL[j] * xL[j];
-                    dr += eR[j] * xR[j];
-                }
-                C2L_dot_x[k] = dl;
-                C2R_dot_x[k] = dr;
-            }
+            pq_chunk_dot_table_f32(cb2l, xL, half, K_l2, C2L_dot_x);
+            pq_chunk_dot_table_f32(cb2r, xR, half, K_l2, C2R_dot_x);
         }
 
         for (int r = 0; r < M; r++) {
@@ -1775,28 +1809,10 @@ int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
         float l2_bound_l = c2l_max_global * xL_norm;
         float l2_bound_r = c2r_max_global * xR_norm;
 
-        for (int k = 0; k < K; k++) {
-            const float* eL = &cb1l[(size_t)k * half];
-            const float* eR = &cb1r[(size_t)k * half];
-            float dl = 0.0f, dr = 0.0f;
-            for (int j = 0; j < half; j++) {
-                dl += eL[j] * xL[j];
-                dr += eR[j] * xR[j];
-            }
-            C1L_dot_x[k] = dl;
-            C1R_dot_x[k] = dr;
-        }
-        for (int k = 0; k < K_l2; k++) {
-            const float* eL = &cb2l[(size_t)k * half];
-            const float* eR = &cb2r[(size_t)k * half];
-            float dl = 0.0f, dr = 0.0f;
-            for (int j = 0; j < half; j++) {
-                dl += eL[j] * xL[j];
-                dr += eR[j] * xR[j];
-            }
-            C2L_dot_x[k] = dl;
-            C2R_dot_x[k] = dr;
-        }
+        pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
+        pq_chunk_dot_table_f32(cb2l, xL, half, K_l2, C2L_dot_x);
+        pq_chunk_dot_table_f32(cb2r, xR, half, K_l2, C2R_dot_x);
 
         for (int r = 0; r < M; r++) {
             int i1l = t->indices_l1_l[(size_t)r * C + c];
@@ -1874,17 +1890,8 @@ int ib_pq_matmul_fp32_l1_only(const ib_pq_tensor* t, const float* x, float* out)
             xL[j] = x[inner_cols[base + j]];
             xR[j] = x[inner_cols[base + half + j]];
         }
-        for (int k = 0; k < K; k++) {
-            const float* eL = &cb1l[(size_t)k * half];
-            const float* eR = &cb1r[(size_t)k * half];
-            float dl = 0.0f, dr = 0.0f;
-            for (int j = 0; j < half; j++) {
-                dl += eL[j] * xL[j];
-                dr += eR[j] * xR[j];
-            }
-            C1L_dot_x[k] = dl;
-            C1R_dot_x[k] = dr;
-        }
+        pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
         for (int r = 0; r < M; r++) {
             int i1l = t->indices_l1_l[(size_t)r * C + c];
             int i1r = t->indices_l1_r[(size_t)r * C + c];
