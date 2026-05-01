@@ -2518,6 +2518,14 @@ struct ib_pq_lut_cache {
     uint16_t* i2l_T;  /* [C][M] uint16, valid when n_levels == 2 */
     uint16_t* i2r_T;
     int has_idx_T;
+    /* F1.h: packed [C][M] uint64 layout for n_levels=2:
+     *   bits  [0..8)  i1l   (uint8)
+     *   bits  [8..16) i1r   (uint8)
+     *   bits  [16..32) i2l  (uint16)
+     *   bits  [32..48) i2r  (uint16)
+     * One sequential 8-byte load per row in the streaming kernel
+     * instead of 4 strided loads from 4 separate streams. */
+    uint64_t* idx_T_packed;
 };
 
 int ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out_p) {
@@ -2619,6 +2627,27 @@ int ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out_p) {
     }
     c->has_idx_T = 1;
 
+    /* F1.h: pack i1l, i1r, i2l, i2r into one [C][M] uint64 stream.
+     * Only when n_levels==2; otherwise the i1l/i1r uint8 path is small
+     * enough on its own. */
+    if (has_l2) {
+        c->idx_T_packed = (uint64_t*)malloc((size_t)C * (size_t)M * sizeof(uint64_t));
+        if (!c->idx_T_packed) goto fail;
+        for (int cc = 0; cc < C; cc++) {
+            const uint8_t*  i1l = c->i1l_T + (size_t)cc * M;
+            const uint8_t*  i1r = c->i1r_T + (size_t)cc * M;
+            const uint16_t* i2l = c->i2l_T + (size_t)cc * M;
+            const uint16_t* i2r = c->i2r_T + (size_t)cc * M;
+            uint64_t* dst = c->idx_T_packed + (size_t)cc * M;
+            for (int r = 0; r < M; r++) {
+                dst[r] = ((uint64_t)i1l[r])
+                       | ((uint64_t)i1r[r]    << 8)
+                       | ((uint64_t)i2l[r]    << 16)
+                       | ((uint64_t)i2r[r]    << 32);
+            }
+        }
+    }
+
     *out_p = c;
     return 0;
 
@@ -2639,6 +2668,7 @@ void ib_pq_lut_cache_free(ib_pq_lut_cache* c) {
     free(c->cb2l_scale); free(c->cb2r_scale);
     free(c->i1l_T); free(c->i1r_T);
     free(c->i2l_T); free(c->i2r_T);
+    free(c->idx_T_packed);
     free(c);
 }
 
@@ -2832,25 +2862,27 @@ static int streaming_cached_kernel(const ib_pq_tensor* t,
             pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R_dot_x);
         }
 
-        const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
-        const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
-        /* Phase 2.z: prefetch next-chunk index rows ahead while we crunch this one. */
-        if (c + 1 < C) {
-            __builtin_prefetch(cache->i1l_T + (size_t)(c + 1) * M, 0, 1);
-            __builtin_prefetch(cache->i1r_T + (size_t)(c + 1) * M, 0, 1);
-        }
-        if (has_l2) {
-            const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
-            const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
-            if (c + 1 < C) {
-                __builtin_prefetch(cache->i2l_T + (size_t)(c + 1) * M, 0, 1);
-                __builtin_prefetch(cache->i2r_T + (size_t)(c + 1) * M, 0, 1);
-            }
+        if (has_l2 && cache->idx_T_packed) {
+            /* F1.h: one sequential u64 load per row, all 4 indices unpacked
+             * with bit ops. ~4× fewer cache lines touched in the hot loop. */
+            const uint64_t* p_row = cache->idx_T_packed + (size_t)c * M;
+            if (c + 1 < C) __builtin_prefetch(p_row + M, 0, 1);
             for (int r = 0; r < M; r++) {
-                out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]]
-                        + C2L_dot_x[i2l_row[r]] + C2R_dot_x[i2r_row[r]];
+                uint64_t p = p_row[r];
+                int i1l = (int)( p        & 0xff);
+                int i1r = (int)((p >>  8) & 0xff);
+                int i2l = (int)((p >> 16) & 0xffff);
+                int i2r = (int)((p >> 32) & 0xffff);
+                out[r] += C1L_dot_x[i1l] + C1R_dot_x[i1r]
+                        + C2L_dot_x[i2l] + C2R_dot_x[i2r];
             }
         } else {
+            const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+            const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+            if (c + 1 < C) {
+                __builtin_prefetch(cache->i1l_T + (size_t)(c + 1) * M, 0, 1);
+                __builtin_prefetch(cache->i1r_T + (size_t)(c + 1) * M, 0, 1);
+            }
             for (int r = 0; r < M; r++) {
                 out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]];
             }
