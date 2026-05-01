@@ -2832,9 +2832,18 @@ static int streaming_cached_kernel(const ib_pq_tensor* t,
 
         const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
         const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+        /* Phase 2.z: prefetch next-chunk index rows ahead while we crunch this one. */
+        if (c + 1 < C) {
+            __builtin_prefetch(cache->i1l_T + (size_t)(c + 1) * M, 0, 1);
+            __builtin_prefetch(cache->i1r_T + (size_t)(c + 1) * M, 0, 1);
+        }
         if (has_l2) {
             const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
             const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
+            if (c + 1 < C) {
+                __builtin_prefetch(cache->i2l_T + (size_t)(c + 1) * M, 0, 1);
+                __builtin_prefetch(cache->i2r_T + (size_t)(c + 1) * M, 0, 1);
+            }
             for (int r = 0; r < M; r++) {
                 out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]]
                         + C2L_dot_x[i2l_row[r]] + C2R_dot_x[i2r_row[r]];
