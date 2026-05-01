@@ -396,6 +396,22 @@ int  ib_pq_kv_cache_length(const ib_pq_kv_cache* kv);
 int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
                         int token_id, int pos, float* logits);
 
+/* Greedy generate: feed prompt_ids[0..n_prompt) into the kv cache,
+ * then greedily emit up to max_new tokens (argmax of logits). Stops
+ * early if eos_token_id is produced. Writes generated tokens into
+ * out_ids[0..*n_out) and *n_out is set on return.
+ *
+ * If callback is non-NULL it is invoked once per emitted token with
+ * (token_id, ctx); returning non-zero from the callback aborts.
+ */
+typedef int (*ib_pq_token_cb)(int token_id, void* ctx);
+
+int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
+                            const int* prompt_ids, int n_prompt,
+                            int max_new, int eos_token_id,
+                            int* out_ids, int* n_out,
+                            ib_pq_token_cb cb, void* cb_ctx);
+
 /* ── Phase 9: forward-pass primitives (no PQ inside) ──
  * Used to assemble inferbit_pq_forward: matmuls go through the session,
  * everything else (norm, rotary, activation, residual, attention) uses

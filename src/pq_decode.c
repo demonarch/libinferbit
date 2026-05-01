@@ -3388,3 +3388,56 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
     free(gate); free(up); free(mlp_out); free(scores);
     return rc;
 }
+
+int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
+                            const int* prompt_ids, int n_prompt,
+                            int max_new, int eos_token_id,
+                            int* out_ids, int* n_out,
+                            ib_pq_token_cb cb, void* cb_ctx) {
+    if (!s || !kv || !prompt_ids || n_prompt <= 0 || max_new < 0
+     || !out_ids || !n_out) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int vocab = session_config_int(cfg, "vocab_size", 0);
+    if (vocab <= 0) return -1;
+    float* logits = (float*)malloc((size_t)vocab * sizeof(float));
+    if (!logits) return -1;
+
+    int pos = 0;
+    int last_token = -1;
+    /* Feed prompt: forward each token, record logits; only the last
+     * one's argmax matters for greedy decode. */
+    for (int i = 0; i < n_prompt; i++) {
+        int tid = prompt_ids[i];
+        if (ib_pq_forward_step(s, kv, tid, pos, logits) != 0) {
+            free(logits); return -1;
+        }
+        last_token = tid;
+        pos++;
+    }
+
+    int written = 0;
+    for (int g = 0; g < max_new; g++) {
+        /* Greedy: argmax of last logits. */
+        int best = 0;
+        float bv = logits[0];
+        for (int v = 1; v < vocab; v++) {
+            if (logits[v] > bv) { bv = logits[v]; best = v; }
+        }
+        out_ids[written++] = best;
+        if (cb && cb(best, cb_ctx) != 0) break;
+        if (eos_token_id >= 0 && best == eos_token_id) break;
+        if (pos >= kv->max_seq) break;
+
+        /* Feed best back in. */
+        if (ib_pq_forward_step(s, kv, best, pos, logits) != 0) {
+            free(logits); *n_out = written; return -1;
+        }
+        last_token = best;
+        pos++;
+    }
+
+    *n_out = written;
+    (void)last_token;
+    free(logits);
+    return 0;
+}
