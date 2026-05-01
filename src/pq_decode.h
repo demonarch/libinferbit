@@ -412,6 +412,27 @@ int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
                             int* out_ids, int* n_out,
                             ib_pq_token_cb cb, void* cb_ctx);
 
+/* Sampling generate: top-K filtered, optional top-P nucleus, with
+ * temperature. seed=0 picks a non-zero from time().
+ *
+ *   temperature  — divides logits before softmax. T<=0 falls back to argmax.
+ *   top_k        — keep only the top-K candidates (<=0 = full vocab).
+ *   top_p        — keep smallest set whose cumulative prob >= p (<=0 disables).
+ */
+typedef struct {
+    float temperature;
+    int   top_k;
+    float top_p;
+    uint32_t seed;
+} ib_pq_sample_params;
+
+int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
+                            const int* prompt_ids, int n_prompt,
+                            int max_new, int eos_token_id,
+                            ib_pq_sample_params params,
+                            int* out_ids, int* n_out,
+                            ib_pq_token_cb cb, void* cb_ctx);
+
 /* ── Phase 9: forward-pass primitives (no PQ inside) ──
  * Used to assemble inferbit_pq_forward: matmuls go through the session,
  * everything else (norm, rotary, activation, residual, attention) uses

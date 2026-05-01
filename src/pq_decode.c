@@ -2805,6 +2805,113 @@ int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
     return 0;
 }
 
+/* Threaded streaming_cached: each thread processes a row slice across
+ * all chunks. LUT scratch is allocated per-call (thread-local on stack
+ * or one shared malloc partitioned by tid). */
+typedef struct {
+    const ib_pq_tensor* t;
+    const ib_pq_lut_cache* cache;
+    const float* x;
+    float* out;
+    int M, G, C, K, K_l2, half;
+    int has_l2;
+    int n_threads;
+    /* Per-thread scratch: 4 buffers each [K + K_l2] floats. Allocated
+     * by the caller as one contiguous block. */
+    float* scratch_base;
+    size_t scratch_per_thread;
+} pq_streaming_cached_threaded_args;
+
+static void pq_streaming_cached_row_task(void* arg, int tid, int r0, int r1) {
+    pq_streaming_cached_threaded_args* a = (pq_streaming_cached_threaded_args*)arg;
+    const ib_pq_lut_cache* cache = a->cache;
+    int M = a->M, G = a->G, C = a->C, K = a->K, K_l2 = a->K_l2, half = a->half;
+    int has_l2 = a->has_l2;
+
+    /* Per-thread LUT scratch slice. */
+    float* base = a->scratch_base + (size_t)tid * a->scratch_per_thread;
+    float* C1L = base;
+    float* C1R = base + K;
+    float* C2L = has_l2 ? (base + 2 * K) : NULL;
+    float* C2R = has_l2 ? (base + 2 * K + K_l2) : NULL;
+
+    for (int c = 0; c < C; c++) {
+        int bs = c * G;
+        float xL[16], xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = a->x[cache->inner_cols[bs + j]];
+            xR[j] = a->x[cache->inner_cols[bs + half + j]];
+        }
+        pq_chunk_dot_table_f32(cache->cb1l_fp32, xL, half, K, C1L);
+        pq_chunk_dot_table_f32(cache->cb1r_fp32, xR, half, K, C1R);
+        if (has_l2) {
+            pq_chunk_dot_table_f32(cache->cb2l_fp32, xL, half, K_l2, C2L);
+            pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R);
+        }
+
+        const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+        const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+        if (has_l2) {
+            const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
+            const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
+            for (int r = r0; r < r1; r++) {
+                a->out[r] += C1L[i1l_row[r]] + C1R[i1r_row[r]]
+                            + C2L[i2l_row[r]] + C2R[i2r_row[r]];
+            }
+        } else {
+            for (int r = r0; r < r1; r++) {
+                a->out[r] += C1L[i1l_row[r]] + C1R[i1r_row[r]];
+            }
+        }
+    }
+}
+
+static int ib_pq_matmul_fp32_streaming_cached_threaded(const ib_pq_tensor* t,
+                                                         const ib_pq_lut_cache* cache,
+                                                         const float* x, float* out,
+                                                         ib_thread_pool* pool, int n_threads) {
+    if (!pool || n_threads <= 1) {
+        return ib_pq_matmul_fp32_streaming_cached(t, cache, x, out);
+    }
+    if (!t || !cache || !x || !out) return -1;
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int has_l2 = (cache->n_levels == 2);
+
+    /* Per-thread scratch: 4 LUT buffers (C1L, C1R, C2L, C2R). */
+    size_t per_thread = (size_t)(2 * K + (has_l2 ? 2 * K_l2 : 0));
+    size_t total = per_thread * (size_t)n_threads;
+    float* scratch = (float*)malloc(total * sizeof(float));
+    if (!scratch) {
+        return ib_pq_matmul_fp32_streaming_cached(t, cache, x, out);
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    pq_streaming_cached_threaded_args args = {
+        .t = t, .cache = cache, .x = x, .out = out,
+        .M = M, .G = G, .C = C, .K = K, .K_l2 = K_l2, .half = half,
+        .has_l2 = has_l2,
+        .n_threads = n_threads,
+        .scratch_base = scratch,
+        .scratch_per_thread = per_thread,
+    };
+
+    /* One row slice per thread. */
+    int chunk = (M + n_threads - 1) / n_threads;
+    if (chunk < 1) chunk = 1;
+    ib_pool_run(pool, pq_streaming_cached_row_task, &args, M, chunk);
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    free(scratch);
+    return 0;
+}
+
 int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
                                                 const ib_pq_lut_cache* cache,
                                                 const float* x, float* out,
@@ -2939,6 +3046,8 @@ struct ib_pq_session {
     ib_pq_policy default_policy;
     ib_pq_policy* policies;       /* parallel to multi.tensors[i]; NULL => default */
     int int8_quantized;
+    ib_thread_pool* pool;         /* shared, owned (NULL = sequential) */
+    int n_threads;
 };
 
 static int session_find_index(const ib_pq_session* s, const char* name) {
@@ -2972,12 +3081,23 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
     /* Sentinel: variant=-1 means "use default". */
     for (int i = 0; i < s->multi.n; i++) s->policies[i].variant = -1;
 
+    /* Thread pool. Off by default — pool sync overhead exceeds the
+     * row-work win for typical Llama-1B matmuls under the cached path.
+     * Set IB_PQ_THREADS > 1 to enable; only matmuls with M*C above the
+     * threshold below dispatch to the pool. */
+    int n_threads = 1;
+    const char* env = getenv("IB_PQ_THREADS");
+    if (env && *env) { int v = atoi(env); if (v > 0) n_threads = v; }
+    s->n_threads = n_threads;
+    if (n_threads > 1) s->pool = ib_pool_create(n_threads);
+
     *out_p = s;
     return 0;
 }
 
 void ib_pq_session_close(ib_pq_session* s) {
     if (!s) return;
+    if (s->pool) ib_pool_destroy(s->pool);
     ib_pq_multi_caches_free(s->mc);
     ib_pq_multi_free(&s->multi);
     free(s->policies);
@@ -3024,6 +3144,14 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
         return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x, out);
     case IB_PQ_VARIANT_STREAMING:
     default:
+        /* Threading only helps when row work dominates pool sync (~50μs).
+         * M*C > 1e6 corresponds to gate/up/down/o_proj/q_proj/lm_head;
+         * k_proj/v_proj at M=256 fall back to sequential. */
+        if (s->pool && s->n_threads > 1
+         && (size_t)t->M * (size_t)t->C >= 1000000) {
+            return ib_pq_matmul_fp32_streaming_cached_threaded(t, c, x, out,
+                                                                  s->pool, s->n_threads);
+        }
         return ib_pq_matmul_fp32_streaming_cached(t, c, x, out);
     }
 }
@@ -3438,6 +3566,139 @@ int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
 
     *n_out = written;
     (void)last_token;
+    free(logits);
+    return 0;
+}
+
+/* ── Sampling helpers ── */
+
+/* Tiny xorshift64 RNG. Deterministic from seed. */
+typedef struct { uint64_t s; } pq_rng;
+static inline uint32_t pq_rng_u32(pq_rng* r) {
+    uint64_t x = r->s; x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    r->s = x;
+    return (uint32_t)x;
+}
+static inline float pq_rng_unit(pq_rng* r) {
+    return (float)(pq_rng_u32(r) >> 8) * (1.0f / (float)(1 << 24));
+}
+
+/* Sample a token from logits given (temperature, top_k, top_p). */
+static int sample_from_logits(const float* logits, int vocab,
+                                ib_pq_sample_params params, pq_rng* rng) {
+    /* Greedy fallback. */
+    if (params.temperature <= 0.0f) {
+        int best = 0; float bv = logits[0];
+        for (int v = 1; v < vocab; v++) if (logits[v] > bv) { bv = logits[v]; best = v; }
+        return best;
+    }
+    /* Build probs with temperature. */
+    float invT = 1.0f / params.temperature;
+    /* Optional top-K: gather top_k indices first. */
+    int k = (params.top_k > 0 && params.top_k < vocab) ? params.top_k : vocab;
+    int* idx = (int*)malloc((size_t)vocab * sizeof(int));
+    float* sc = (float*)malloc((size_t)vocab * sizeof(float));
+    if (!idx || !sc) { free(idx); free(sc); return 0; }
+    for (int v = 0; v < vocab; v++) { idx[v] = v; sc[v] = logits[v]; }
+
+    if (k < vocab) {
+        /* Partial sort: pull top-K to front (descending). Quickselect-ish
+         * via simple selection — fine at K << vocab. */
+        for (int i = 0; i < k; i++) {
+            int max_j = i;
+            for (int j = i + 1; j < vocab; j++) if (sc[j] > sc[max_j]) max_j = j;
+            float tf = sc[i]; sc[i] = sc[max_j]; sc[max_j] = tf;
+            int   ti = idx[i]; idx[i] = idx[max_j]; idx[max_j] = ti;
+        }
+    } else {
+        /* Full vocab — sort descending for top-P. */
+        for (int i = 0; i < vocab; i++) {
+            int max_j = i;
+            for (int j = i + 1; j < vocab; j++) if (sc[j] > sc[max_j]) max_j = j;
+            float tf = sc[i]; sc[i] = sc[max_j]; sc[max_j] = tf;
+            int   ti = idx[i]; idx[i] = idx[max_j]; idx[max_j] = ti;
+        }
+    }
+
+    /* Softmax over the kept top-K (or full sorted vocab) with temperature. */
+    int n_keep = k;
+    float m = sc[0] * invT;
+    float sum = 0.0f;
+    for (int i = 0; i < n_keep; i++) {
+        sc[i] = expf(sc[i] * invT - m);
+        sum += sc[i];
+    }
+    float invs = 1.0f / sum;
+    for (int i = 0; i < n_keep; i++) sc[i] *= invs;
+
+    /* Top-P: keep smallest prefix whose cumprob >= p. */
+    if (params.top_p > 0.0f && params.top_p < 1.0f) {
+        float cum = 0.0f;
+        int trunc = n_keep;
+        for (int i = 0; i < n_keep; i++) {
+            cum += sc[i];
+            if (cum >= params.top_p) { trunc = i + 1; break; }
+        }
+        n_keep = trunc;
+        /* renormalize */
+        float s2 = 0.0f;
+        for (int i = 0; i < n_keep; i++) s2 += sc[i];
+        float inv2 = 1.0f / s2;
+        for (int i = 0; i < n_keep; i++) sc[i] *= inv2;
+    }
+
+    /* Sample by inverse CDF. */
+    float u = pq_rng_unit(rng);
+    float c = 0.0f;
+    int picked = idx[n_keep - 1];
+    for (int i = 0; i < n_keep; i++) {
+        c += sc[i];
+        if (u <= c) { picked = idx[i]; break; }
+    }
+    free(idx); free(sc);
+    return picked;
+}
+
+int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
+                            const int* prompt_ids, int n_prompt,
+                            int max_new, int eos_token_id,
+                            ib_pq_sample_params params,
+                            int* out_ids, int* n_out,
+                            ib_pq_token_cb cb, void* cb_ctx) {
+    if (!s || !kv || !prompt_ids || n_prompt <= 0 || max_new < 0
+     || !out_ids || !n_out) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int vocab = session_config_int(cfg, "vocab_size", 0);
+    if (vocab <= 0) return -1;
+
+    pq_rng rng;
+    rng.s = params.seed ? (uint64_t)params.seed : 0x9E3779B97F4A7C15ULL;
+    /* Mix to avoid weak first samples on small seeds. */
+    rng.s ^= rng.s << 21; rng.s ^= rng.s >> 35; rng.s ^= rng.s << 4;
+
+    float* logits = (float*)malloc((size_t)vocab * sizeof(float));
+    if (!logits) return -1;
+
+    int pos = 0;
+    for (int i = 0; i < n_prompt; i++) {
+        if (ib_pq_forward_step(s, kv, prompt_ids[i], pos, logits) != 0) {
+            free(logits); return -1;
+        }
+        pos++;
+    }
+    int written = 0;
+    for (int g = 0; g < max_new; g++) {
+        int tok = sample_from_logits(logits, vocab, params, &rng);
+        out_ids[written++] = tok;
+        if (cb && cb(tok, cb_ctx) != 0) break;
+        if (eos_token_id >= 0 && tok == eos_token_id) break;
+        if (pos >= kv->max_seq) break;
+        if (ib_pq_forward_step(s, kv, tok, pos, logits) != 0) {
+            free(logits); *n_out = written; return -1;
+        }
+        pos++;
+    }
+    *n_out = written;
     free(logits);
     return 0;
 }
