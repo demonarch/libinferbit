@@ -200,11 +200,19 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
     /* Per docs/26: K_l2 must be in {16, 64, K} for L1_L2 format (with K
      * typically 256). The PYRAMID format relaxes this — K_l2 = K_outer *
-     * K_inner where K_inner can be arbitrary. */
+     * K_inner where K_inner can be arbitrary up to 65535. */
     if (out->n_levels == 2 && out->format != IB_PQ_FMT_PYRAMID
         && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
-    size_t l2_idx_per_row = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
+    /* L2 index byte-width: PYRAMID with K_l2>256 uses uint16 (2 bytes).
+     * Otherwise uint8 (1 byte). Packed 4-bit (K_l2==16) is 1 byte/2 indices. */
+    out->l2_idx_bytes = (out->format == IB_PQ_FMT_PYRAMID && K_l2_eff > 256) ? 2 : 1;
+    size_t l2_idx_per_row;
+    if (l2_packed) {
+        l2_idx_per_row = (size_t)((C + 1) / 2);
+    } else {
+        l2_idx_per_row = (size_t)C * (size_t)out->l2_idx_bytes;
+    }
 
     size_t cb_sz       = (size_t)K * (G / 2) * sizeof(uint16_t);
     size_t cb_l2_sz    = (size_t)K_l2_eff * (G / 2) * sizeof(uint16_t);
@@ -319,7 +327,13 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
     if (out->n_levels == 2 && out->format != IB_PQ_FMT_PYRAMID
         && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
-    size_t l2_idx_per_row = l2_packed ? (size_t)((out->C + 1) / 2) : (size_t)out->C;
+    out->l2_idx_bytes = (out->format == IB_PQ_FMT_PYRAMID && K_l2_eff > 256) ? 2 : 1;
+    size_t l2_idx_per_row;
+    if (l2_packed) {
+        l2_idx_per_row = (size_t)((out->C + 1) / 2);
+    } else {
+        l2_idx_per_row = (size_t)out->C * (size_t)out->l2_idx_bytes;
+    }
 
     size_t cb_sz       = (size_t)K * (G / 2) * sizeof(uint16_t);
     size_t cb_l2_sz    = (size_t)K_l2_eff * (G / 2) * sizeof(uint16_t);
@@ -608,8 +622,15 @@ static void pq_advise_tensor(const ib_pq_tensor* t, int advice) {
     } while (0)
 
     int K = t->K, M = t->M, half = t->G / 2, C = t->C, no = t->n_outlier;
+    int K_l2_eff = t->K_l2 > 0 ? t->K_l2 : K;
+    int l2_packed = (K_l2_eff == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_idx_per_row = l2_packed ? (size_t)((C + 1) / 2)
+                                      : (size_t)C * (size_t)l2_idx_bytes;
     size_t cb_sz   = (size_t)K * (size_t)half * sizeof(uint16_t);
+    size_t cb_l2_sz = (size_t)K_l2_eff * (size_t)half * sizeof(uint16_t);
     size_t idx_sz  = (size_t)M * (size_t)C * sizeof(uint8_t);
+    size_t idx_l2_sz = (size_t)M * l2_idx_per_row;
     size_t rs_sz   = (size_t)M * sizeof(uint16_t);
 
     ADJUST(t->codebook_l1_l, cb_sz);
@@ -617,10 +638,10 @@ static void pq_advise_tensor(const ib_pq_tensor* t, int advice) {
     ADJUST(t->indices_l1_l,  idx_sz);
     ADJUST(t->indices_l1_r,  idx_sz);
     ADJUST(t->row_scale,     rs_sz);
-    if (t->codebook_l2_l) ADJUST(t->codebook_l2_l, cb_sz);
-    if (t->codebook_l2_r) ADJUST(t->codebook_l2_r, cb_sz);
-    if (t->indices_l2_l)  ADJUST(t->indices_l2_l,  idx_sz);
-    if (t->indices_l2_r)  ADJUST(t->indices_l2_r,  idx_sz);
+    if (t->codebook_l2_l) ADJUST(t->codebook_l2_l, cb_l2_sz);
+    if (t->codebook_l2_r) ADJUST(t->codebook_l2_r, cb_l2_sz);
+    if (t->indices_l2_l)  ADJUST(t->indices_l2_l,  idx_l2_sz);
+    if (t->indices_l2_r)  ADJUST(t->indices_l2_r,  idx_l2_sz);
     if (no > 0) {
         ADJUST(t->outlier_cols,    (size_t)no * sizeof(int32_t));
         ADJUST(t->outlier_sidecar, (size_t)M * (size_t)no);
@@ -660,14 +681,21 @@ void ib_pq_advise_dontneed_n(const ib_pq_tensor* const* tensors, int n) {
 #endif
 
 /* ── L2 index unpack helper ───────────────────────────────────── */
-/* When K_l2 == 16, indices_l2_* arrays store 4-bit indices packed
- * 2-per-byte (low nibble = even chunk, high nibble = odd chunk). */
-static inline uint8_t pq_l2_idx_at(const uint8_t* il2, int c, int packed) {
+/* L2 index byte modes:
+ *   packed (K_l2==16): 4-bit indices, 2-per-byte (low nibble = even chunk).
+ *   bytes==1: standard uint8 indices, K_l2 ≤ 256.
+ *   bytes==2: uint16 little-endian indices, K_l2 > 256 (PYRAMID format).
+ * Returns int (not uint8) to fit values up to 65535. */
+static inline int pq_l2_idx_at(const uint8_t* il2, int c, int packed, int bytes) {
     if (packed) {
         uint8_t b = il2[c >> 1];
         return (c & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
     }
-    return il2[c];
+    if (bytes == 2) {
+        const uint16_t* il2_u16 = (const uint16_t*)il2;
+        return (int)il2_u16[c];
+    }
+    return (int)il2[c];
 }
 
 static inline int pq_K_l2_eff(const ib_pq_tensor* t) {
@@ -720,8 +748,15 @@ int ib_pq_reconstruct_fp32(const ib_pq_tensor* t, float* out) {
     /* Fill output: zero first so any uninitialized columns are deterministic */
     memset(out, 0, (size_t)M * (size_t)N * sizeof(float));
 
-    /* L2 indices array stride: bytes per row. Packed (K_l2=16): ceil(C/2). */
-    size_t l2_stride = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
+    /* L2 indices array stride: bytes per row. Packed (K_l2=16): ceil(C/2).
+     * uint8: C bytes. uint16 (PYRAMID K_l2>256): 2*C bytes. */
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_stride;
+    if (l2_packed) {
+        l2_stride = (size_t)((C + 1) / 2);
+    } else {
+        l2_stride = (size_t)C * (size_t)l2_idx_bytes;
+    }
 
     for (int r = 0; r < M; r++) {
         float scale = ib_fp16_to_fp32(t->row_scale[r]);
@@ -733,8 +768,8 @@ int ib_pq_reconstruct_fp32(const ib_pq_tensor* t, float* out) {
             int base = c * G;
             const float* lvec = &cb1l[(size_t)il_l[c] * half];
             const float* rvec = &cb1r[(size_t)il_r[c] * half];
-            uint8_t i2l = il2l ? pq_l2_idx_at(il2l, c, l2_packed) : 0;
-            uint8_t i2r = il2r ? pq_l2_idx_at(il2r, c, l2_packed) : 0;
+            int i2l = il2l ? pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes) : 0;
+            int i2r = il2r ? pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes) : 0;
             for (int k = 0; k < half; k++) {
                 float v = lvec[k];
                 if (cb2l) v += cb2l[(size_t)i2l * half + k];
@@ -1011,6 +1046,7 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
     const ib_pq_tensor* t = g->t;
     int C = g->C, K = g->K, K_l2 = g->K_l2;
     int l2_packed = g->l2_packed;
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
     size_t l2_stride = g->l2_idx_stride;
     const float* TL1 = g->TL1;
     const float* TR1 = g->TR1;
@@ -1033,8 +1069,8 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
                     size_t base1 = (size_t)c * K;
                     size_t base2 = (size_t)c * K_l2;
                     acc += TL1[base1 + il_l[c]] + TR1[base1 + il_r[c]];
-                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed)]
-                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed)];
+                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes)]
+                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes)];
                 }
             } else {
                 for (int aii = 0; aii < n_active; aii++) {
@@ -1049,8 +1085,8 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
                     size_t base1 = (size_t)c * K;
                     size_t base2 = (size_t)c * K_l2;
                     acc += TL1[base1 + il_l[c]] + TR1[base1 + il_r[c]];
-                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed)]
-                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed)];
+                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes)]
+                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes)];
                 }
             } else {
                 for (int c = 0; c < C; c++) {
@@ -1076,7 +1112,10 @@ static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
     int half = G / 2;
     int K_l2 = pq_K_l2_eff(t);
     int l2_packed = (K_l2 == 16);
-    size_t l2_idx_stride = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_idx_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
 
     /* Codebook tables decoded to fp32 once. L1: K entries; L2: K_l2 entries. */
     int cb1_entries = K * half;

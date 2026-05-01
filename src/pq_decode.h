@@ -55,12 +55,16 @@ typedef struct {
     uint16_t* codebook_l2_l;   /* NULL if n_levels == 1 */
     uint16_t* codebook_l2_r;   /* NULL if n_levels == 1 */
 
-    /* Indices: M rows × C columns where C = (N - n_outlier) / G. */
+    /* Indices: M rows × C columns where C = (N - n_outlier) / G.
+     * L2 indices may be 1 byte (K_l2 ≤ 256) or 2 bytes (PYRAMID with
+     * K_l2 > 256). l2_idx_bytes encodes which. Packed 4-bit (K_l2==16)
+     * uses 1 byte per chunk pair regardless. */
     uint8_t* indices_l1_l;
     uint8_t* indices_l1_r;
-    uint8_t* indices_l2_l;     /* NULL if n_levels == 1 */
-    uint8_t* indices_l2_r;     /* NULL if n_levels == 1 */
+    uint8_t* indices_l2_l;     /* NULL if n_levels == 1; raw bytes — cast per l2_idx_bytes */
+    uint8_t* indices_l2_r;     /* NULL if n_levels == 1; raw bytes — cast per l2_idx_bytes */
     int C;                     /* chunks per row */
+    int l2_idx_bytes;          /* 1 = uint8 (default); 2 = uint16 (PYRAMID K_l2>256) */
 
     /* Per-row scale */
     uint16_t* row_scale;       /* M FP16 entries */
