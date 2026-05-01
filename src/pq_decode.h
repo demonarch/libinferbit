@@ -282,6 +282,17 @@ int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
                                               const ib_pq_lut_cache* cache,
                                               const float* x, float* out);
 
+/* Phase 9: per-tensor cache fleet for a multi-tensor IBF.
+ * Builds one ib_pq_lut_cache per tensor; lookup-by-name in O(1).
+ * Owns and frees the underlying caches.
+ */
+typedef struct ib_pq_multi_caches ib_pq_multi_caches;
+
+int  ib_pq_multi_caches_create(const ib_pq_multi* multi, ib_pq_multi_caches** out);
+void ib_pq_multi_caches_free(ib_pq_multi_caches* mc);
+const ib_pq_lut_cache* ib_pq_multi_caches_get(const ib_pq_multi_caches* mc, const char* name);
+int  ib_pq_multi_caches_quantize_all_int8(ib_pq_multi_caches* mc);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

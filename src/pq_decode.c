@@ -2808,3 +2808,57 @@ int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
     free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
     return 0;
 }
+
+/* ── Phase 9: multi-tensor cache fleet ── */
+
+struct ib_pq_multi_caches {
+    int n;
+    ib_pq_lut_cache** caches;
+    char** names;            /* shallow refs to multi->names */
+};
+
+int ib_pq_multi_caches_create(const ib_pq_multi* multi, ib_pq_multi_caches** out_p) {
+    if (!multi || !out_p) return -1;
+    *out_p = NULL;
+    ib_pq_multi_caches* mc = (ib_pq_multi_caches*)calloc(1, sizeof(*mc));
+    if (!mc) return -1;
+    mc->n = multi->n;
+    mc->caches = (ib_pq_lut_cache**)calloc((size_t)multi->n, sizeof(*mc->caches));
+    mc->names  = (char**)calloc((size_t)multi->n, sizeof(*mc->names));
+    if (!mc->caches || !mc->names) { ib_pq_multi_caches_free(mc); return -1; }
+    for (int i = 0; i < multi->n; i++) {
+        mc->names[i] = multi->names[i];
+        if (ib_pq_lut_cache_create(&multi->tensors[i], &mc->caches[i]) != 0) {
+            ib_pq_multi_caches_free(mc);
+            return -1;
+        }
+    }
+    *out_p = mc;
+    return 0;
+}
+
+void ib_pq_multi_caches_free(ib_pq_multi_caches* mc) {
+    if (!mc) return;
+    if (mc->caches) {
+        for (int i = 0; i < mc->n; i++) ib_pq_lut_cache_free(mc->caches[i]);
+        free(mc->caches);
+    }
+    free(mc->names);
+    free(mc);
+}
+
+const ib_pq_lut_cache* ib_pq_multi_caches_get(const ib_pq_multi_caches* mc, const char* name) {
+    if (!mc || !name) return NULL;
+    for (int i = 0; i < mc->n; i++) {
+        if (mc->names[i] && strcmp(mc->names[i], name) == 0) return mc->caches[i];
+    }
+    return NULL;
+}
+
+int ib_pq_multi_caches_quantize_all_int8(ib_pq_multi_caches* mc) {
+    if (!mc) return -1;
+    for (int i = 0; i < mc->n; i++) {
+        if (ib_pq_lut_cache_quantize_int8(mc->caches[i]) != 0) return -1;
+    }
+    return 0;
+}
