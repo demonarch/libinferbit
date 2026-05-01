@@ -293,6 +293,53 @@ void ib_pq_multi_caches_free(ib_pq_multi_caches* mc);
 const ib_pq_lut_cache* ib_pq_multi_caches_get(const ib_pq_multi_caches* mc, const char* name);
 int  ib_pq_multi_caches_quantize_all_int8(ib_pq_multi_caches* mc);
 
+/* ── Session: owns IBF + cache fleet + per-tensor policy. ──
+ *
+ * Design goal: dispatch decisions live in C, not in the language wrapper.
+ * The wrapper opens a session, optionally tunes per-tensor policies, and
+ * issues matmul-by-name calls. The session picks the right kernel.
+ */
+
+typedef enum {
+    IB_PQ_VARIANT_STREAMING = 0,  /* default, full pyramid */
+    IB_PQ_VARIANT_L1_ONLY,        /* skip L2 entirely (cheap, lossy) */
+    IB_PQ_VARIANT_L2SKIP,         /* variance-bounded L2 skip */
+    IB_PQ_VARIANT_SPARSE,         /* skip near-zero activation chunks */
+    IB_PQ_VARIANT_INT8,           /* int8 codebook + activations */
+} ib_pq_variant;
+
+typedef struct {
+    int   variant;            /* ib_pq_variant */
+    float skip_threshold;     /* for L2SKIP */
+    float act_threshold;      /* for SPARSE */
+} ib_pq_policy;
+
+typedef struct ib_pq_session ib_pq_session;
+
+int  ib_pq_session_open(const char* ibf_path, ib_pq_session** out);
+void ib_pq_session_close(ib_pq_session* s);
+
+int  ib_pq_session_set_default_policy(ib_pq_session* s, ib_pq_policy p);
+int  ib_pq_session_set_policy(ib_pq_session* s, const char* name, ib_pq_policy p);
+
+/* Matmul by tensor name. Variant comes from the per-tensor policy
+ * (or the session default if none set). Out is M floats.
+ */
+int  ib_pq_session_matmul(ib_pq_session* s, const char* name,
+                           const float* x, float* out);
+
+/* Top-K lm_head two-stage. K_top values in out_logits + ids, sorted desc. */
+int  ib_pq_session_lm_head_topk(ib_pq_session* s, const char* name,
+                                 const float* x, int K_top,
+                                 float* out_logits, int32_t* out_ids);
+
+/* Read-only metadata for the wrapper (so it doesn't need to redeclare
+ * the IbPqTensor struct just to know shape). */
+int  ib_pq_session_tensor_shape(const ib_pq_session* s, const char* name,
+                                 int* out_M, int* out_N);
+int  ib_pq_session_tensor_count(const ib_pq_session* s);
+const char* ib_pq_session_tensor_name(const ib_pq_session* s, int i);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

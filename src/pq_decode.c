@@ -2862,3 +2862,126 @@ int ib_pq_multi_caches_quantize_all_int8(ib_pq_multi_caches* mc) {
     }
     return 0;
 }
+
+/* ── Session: IBF + cache fleet + per-tensor policy ── */
+
+struct ib_pq_session {
+    ib_pq_multi multi;            /* owned */
+    ib_pq_multi_caches* mc;       /* owned */
+    ib_pq_policy default_policy;
+    ib_pq_policy* policies;       /* parallel to multi.tensors[i]; NULL => default */
+    int int8_quantized;
+};
+
+static int session_find_index(const ib_pq_session* s, const char* name) {
+    if (!s || !name) return -1;
+    for (int i = 0; i < s->multi.n; i++) {
+        if (s->multi.names[i] && strcmp(s->multi.names[i], name) == 0) return i;
+    }
+    return -1;
+}
+
+int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
+    if (!ibf_path || !out_p) return -1;
+    *out_p = NULL;
+    ib_pq_session* s = (ib_pq_session*)calloc(1, sizeof(*s));
+    if (!s) return -1;
+    s->default_policy.variant = IB_PQ_VARIANT_STREAMING;
+    s->default_policy.skip_threshold = 0.0f;
+    s->default_policy.act_threshold = 0.0f;
+
+    if (ib_pq_load_multi(ibf_path, &s->multi) != 0) {
+        free(s); return -1;
+    }
+    if (ib_pq_multi_caches_create(&s->multi, &s->mc) != 0) {
+        ib_pq_multi_free(&s->multi); free(s); return -1;
+    }
+    s->policies = (ib_pq_policy*)calloc((size_t)s->multi.n, sizeof(*s->policies));
+    if (!s->policies) {
+        ib_pq_multi_caches_free(s->mc);
+        ib_pq_multi_free(&s->multi); free(s); return -1;
+    }
+    /* Sentinel: variant=-1 means "use default". */
+    for (int i = 0; i < s->multi.n; i++) s->policies[i].variant = -1;
+
+    *out_p = s;
+    return 0;
+}
+
+void ib_pq_session_close(ib_pq_session* s) {
+    if (!s) return;
+    ib_pq_multi_caches_free(s->mc);
+    ib_pq_multi_free(&s->multi);
+    free(s->policies);
+    free(s);
+}
+
+int ib_pq_session_set_default_policy(ib_pq_session* s, ib_pq_policy p) {
+    if (!s) return -1;
+    s->default_policy = p;
+    if (p.variant == IB_PQ_VARIANT_INT8 && !s->int8_quantized) {
+        if (ib_pq_multi_caches_quantize_all_int8(s->mc) != 0) return -1;
+        s->int8_quantized = 1;
+    }
+    return 0;
+}
+
+int ib_pq_session_set_policy(ib_pq_session* s, const char* name, ib_pq_policy p) {
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    s->policies[i] = p;
+    if (p.variant == IB_PQ_VARIANT_INT8 && !s->int8_quantized) {
+        if (ib_pq_multi_caches_quantize_all_int8(s->mc) != 0) return -1;
+        s->int8_quantized = 1;
+    }
+    return 0;
+}
+
+int ib_pq_session_matmul(ib_pq_session* s, const char* name,
+                          const float* x, float* out) {
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    const ib_pq_tensor* t = &s->multi.tensors[i];
+    const ib_pq_lut_cache* c = s->mc->caches[i];
+    ib_pq_policy p = (s->policies[i].variant >= 0) ? s->policies[i] : s->default_policy;
+
+    switch (p.variant) {
+    case IB_PQ_VARIANT_L1_ONLY:
+        return ib_pq_matmul_fp32_l1_only(t, x, out);
+    case IB_PQ_VARIANT_L2SKIP:
+        return ib_pq_matmul_fp32_streaming_l2skip_cached(t, c, x, out, p.skip_threshold);
+    case IB_PQ_VARIANT_SPARSE:
+        return ib_pq_matmul_fp32_streaming_sparse(t, x, out, p.act_threshold);
+    case IB_PQ_VARIANT_INT8:
+        return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x, out);
+    case IB_PQ_VARIANT_STREAMING:
+    default:
+        return ib_pq_matmul_fp32_streaming_cached(t, c, x, out);
+    }
+}
+
+int ib_pq_session_lm_head_topk(ib_pq_session* s, const char* name,
+                                const float* x, int K_top,
+                                float* out_logits, int32_t* out_ids) {
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    return ib_pq_lm_head_topk(&s->multi.tensors[i], x, K_top, out_logits, out_ids);
+}
+
+int ib_pq_session_tensor_shape(const ib_pq_session* s, const char* name,
+                                int* out_M, int* out_N) {
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    if (out_M) *out_M = s->multi.tensors[i].M;
+    if (out_N) *out_N = s->multi.tensors[i].N;
+    return 0;
+}
+
+int ib_pq_session_tensor_count(const ib_pq_session* s) {
+    return s ? s->multi.n : 0;
+}
+
+const char* ib_pq_session_tensor_name(const ib_pq_session* s, int i) {
+    if (!s || i < 0 || i >= s->multi.n) return NULL;
+    return s->multi.names[i];
+}
