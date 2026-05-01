@@ -3134,3 +3134,236 @@ void ib_softmax_f32(float* x, int n) {
     float inv = 1.0f / sum;
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
+
+/* ── Phase 9: KV cache + single-token forward ── */
+
+struct ib_pq_kv_cache {
+    int n_layers;
+    int max_seq;
+    int kv_dim;        /* num_kv_heads * head_dim */
+    int length;
+    /* Layout: [layer][pos][kv_dim] fp32 — separate K and V. */
+    float* k;          /* size = n_layers * max_seq * kv_dim */
+    float* v;
+};
+
+static int session_config_int(const char* json, const char* key, int def) {
+    /* Tiny JSON int extractor. Looks for "key": <number>. Avoids cJSON
+     * dependency churn here; the strings come from our own writer so the
+     * format is predictable. */
+    if (!json) return def;
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char* p = strstr(json, pat);
+    if (!p) return def;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++;
+    return (int)atol(p);
+}
+
+static float session_config_float(const char* json, const char* key, float def) {
+    if (!json) return def;
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char* p = strstr(json, pat);
+    if (!p) return def;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++;
+    return (float)atof(p);
+}
+
+int ib_pq_kv_cache_create(const ib_pq_session* s, int max_seq_len,
+                           ib_pq_kv_cache** out_p) {
+    if (!s || !out_p || max_seq_len <= 0) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int n_layers = session_config_int(cfg, "num_layers", 0);
+    int n_kv     = session_config_int(cfg, "num_kv_heads", 0);
+    int head_dim = session_config_int(cfg, "head_dim", 0);
+    if (n_layers <= 0 || n_kv <= 0 || head_dim <= 0) return -1;
+    int kv_dim = n_kv * head_dim;
+
+    ib_pq_kv_cache* kv = (ib_pq_kv_cache*)calloc(1, sizeof(*kv));
+    if (!kv) return -1;
+    kv->n_layers = n_layers; kv->max_seq = max_seq_len; kv->kv_dim = kv_dim;
+    size_t bytes = (size_t)n_layers * max_seq_len * kv_dim * sizeof(float);
+    kv->k = (float*)malloc(bytes);
+    kv->v = (float*)malloc(bytes);
+    if (!kv->k || !kv->v) {
+        free(kv->k); free(kv->v); free(kv); return -1;
+    }
+    *out_p = kv;
+    return 0;
+}
+
+void ib_pq_kv_cache_free(ib_pq_kv_cache* kv) {
+    if (!kv) return;
+    free(kv->k); free(kv->v); free(kv);
+}
+
+void ib_pq_kv_cache_clear(ib_pq_kv_cache* kv) { if (kv) kv->length = 0; }
+int  ib_pq_kv_cache_length(const ib_pq_kv_cache* kv) { return kv ? kv->length : 0; }
+
+/* Embedding lookup: out[i] = embed[token_id][i]. Embed is stored fp16. */
+static int embed_lookup(const ib_pq_session* s, int token_id, float* out, int hidden) {
+    const void* data = NULL;
+    int dtype = 0, ndim = 0;
+    int shape[4] = {0};
+    if (ib_pq_session_raw_get(s, "tok_embed", &data, &dtype, shape, &ndim) != 0) return -1;
+    if (ndim != 2 || shape[1] != hidden) return -1;
+    if (token_id < 0 || token_id >= shape[0]) return -1;
+    if (dtype == IB_RAW_F16) {
+        const uint16_t* row = (const uint16_t*)data + (size_t)token_id * hidden;
+        for (int i = 0; i < hidden; i++) out[i] = ib_fp16_to_fp32(row[i]);
+    } else if (dtype == IB_RAW_F32) {
+        const float* row = (const float*)data + (size_t)token_id * hidden;
+        memcpy(out, row, (size_t)hidden * sizeof(float));
+    } else return -1;
+    return 0;
+}
+
+static int load_norm_weight(const ib_pq_session* s, const char* name,
+                              const float** out_w, int hidden) {
+    const void* data = NULL;
+    int dtype = 0, ndim = 0;
+    int shape[4] = {0};
+    if (ib_pq_session_raw_get(s, name, &data, &dtype, shape, &ndim) != 0) return -1;
+    if (ndim != 1 || shape[0] != hidden || dtype != IB_RAW_F32) return -1;
+    *out_w = (const float*)data;
+    return 0;
+}
+
+int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                        int token_id, int pos, float* logits) {
+    if (!s || !logits) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int n_layers = session_config_int(cfg, "num_layers", 0);
+    int hidden   = session_config_int(cfg, "hidden_size", 0);
+    int n_heads  = session_config_int(cfg, "num_heads", 0);
+    int n_kv     = session_config_int(cfg, "num_kv_heads", n_heads);
+    int head_dim = session_config_int(cfg, "head_dim", hidden / n_heads);
+    int inter    = session_config_int(cfg, "intermediate_size", 0);
+    int vocab    = session_config_int(cfg, "vocab_size", 0);
+    float eps    = session_config_float(cfg, "rms_norm_eps", 1e-5f);
+    float theta  = session_config_float(cfg, "rope_theta", 10000.0f);
+    int kv_dim   = n_kv * head_dim;
+    if (n_layers <= 0 || hidden <= 0 || n_heads <= 0 || vocab <= 0) return -1;
+    if (kv && (pos < 0 || pos >= kv->max_seq)) return -1;
+
+    float* x        = (float*)calloc((size_t)hidden, sizeof(float));
+    float* xb       = (float*)calloc((size_t)hidden, sizeof(float));   /* normed */
+    float* xb2      = (float*)calloc((size_t)hidden, sizeof(float));   /* attn out */
+    float* q        = (float*)calloc((size_t)hidden, sizeof(float));   /* full Q */
+    float* k_now    = (float*)calloc((size_t)kv_dim, sizeof(float));
+    float* v_now    = (float*)calloc((size_t)kv_dim, sizeof(float));
+    float* gate     = (float*)calloc((size_t)inter,  sizeof(float));
+    float* up       = (float*)calloc((size_t)inter,  sizeof(float));
+    float* mlp_out  = (float*)calloc((size_t)hidden, sizeof(float));
+    float* scores   = (float*)calloc((size_t)(pos + 1), sizeof(float));
+    if (!x || !xb || !xb2 || !q || !k_now || !v_now || !gate || !up || !mlp_out || !scores) {
+        free(x); free(xb); free(xb2); free(q); free(k_now); free(v_now);
+        free(gate); free(up); free(mlp_out); free(scores); return -1;
+    }
+
+    if (embed_lookup(s, token_id, x, hidden) != 0) {
+        free(x); free(xb); free(xb2); free(q); free(k_now); free(v_now);
+        free(gate); free(up); free(mlp_out); free(scores); return -1;
+    }
+
+    char buf[64];
+    int rc = 0;
+    for (int L = 0; L < n_layers && rc == 0; L++) {
+        const float* w_in = NULL; const float* w_pn = NULL;
+        snprintf(buf, sizeof(buf), "L%d_input_norm", L);
+        if (load_norm_weight(s, buf, &w_in, hidden) != 0) { rc = -1; break; }
+        snprintf(buf, sizeof(buf), "L%d_post_attn_norm", L);
+        if (load_norm_weight(s, buf, &w_pn, hidden) != 0) { rc = -1; break; }
+
+        /* ── Attention block ── */
+        ib_rmsnorm_f32(xb, x, w_in, hidden, eps);
+
+        snprintf(buf, sizeof(buf), "L%d_q_proj", L);
+        if (ib_pq_session_matmul(s, buf, xb, q) != 0) { rc = -1; break; }
+        snprintf(buf, sizeof(buf), "L%d_k_proj", L);
+        if (ib_pq_session_matmul(s, buf, xb, k_now) != 0) { rc = -1; break; }
+        snprintf(buf, sizeof(buf), "L%d_v_proj", L);
+        if (ib_pq_session_matmul(s, buf, xb, v_now) != 0) { rc = -1; break; }
+
+        ib_rope_f32(q,     n_heads, head_dim, pos, theta);
+        ib_rope_f32(k_now, n_kv,    head_dim, pos, theta);
+
+        /* Write into kv cache. */
+        if (kv) {
+            float* k_slot = kv->k + ((size_t)L * kv->max_seq + pos) * kv_dim;
+            float* v_slot = kv->v + ((size_t)L * kv->max_seq + pos) * kv_dim;
+            memcpy(k_slot, k_now, (size_t)kv_dim * sizeof(float));
+            memcpy(v_slot, v_now, (size_t)kv_dim * sizeof(float));
+        }
+
+        /* Multi-head attention with grouped-query (each query head h
+         * attends to the kv head h / (n_heads / n_kv)). */
+        int q_per_kv = n_heads / n_kv;
+        float inv_sqrt = 1.0f / sqrtf((float)head_dim);
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = h / q_per_kv;
+            const float* qh = q + (size_t)h * head_dim;
+            /* scores[t] = qh · k[t][kv_h] / sqrt(d) */
+            for (int t = 0; t <= pos; t++) {
+                const float* k_t;
+                if (kv) {
+                    k_t = kv->k + ((size_t)L * kv->max_seq + t) * kv_dim
+                                + (size_t)kv_h * head_dim;
+                } else {
+                    /* Without kv cache, only pos==0 supported; use k_now. */
+                    k_t = k_now + (size_t)kv_h * head_dim;
+                }
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; d++) dot += qh[d] * k_t[d];
+                scores[t] = dot * inv_sqrt;
+            }
+            ib_softmax_f32(scores, pos + 1);
+            float* outh = xb2 + (size_t)h * head_dim;
+            memset(outh, 0, (size_t)head_dim * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                const float* v_t;
+                if (kv) {
+                    v_t = kv->v + ((size_t)L * kv->max_seq + t) * kv_dim
+                                + (size_t)kv_h * head_dim;
+                } else {
+                    v_t = v_now + (size_t)kv_h * head_dim;
+                }
+                float w = scores[t];
+                for (int d = 0; d < head_dim; d++) outh[d] += w * v_t[d];
+            }
+        }
+
+        /* o_proj + residual */
+        snprintf(buf, sizeof(buf), "L%d_o_proj", L);
+        if (ib_pq_session_matmul(s, buf, xb2, xb) != 0) { rc = -1; break; }
+        ib_residual_add_f32(x, xb, hidden);
+
+        /* ── MLP block ── */
+        ib_rmsnorm_f32(xb, x, w_pn, hidden, eps);
+        snprintf(buf, sizeof(buf), "L%d_gate_proj", L);
+        if (ib_pq_session_matmul(s, buf, xb, gate) != 0) { rc = -1; break; }
+        snprintf(buf, sizeof(buf), "L%d_up_proj", L);
+        if (ib_pq_session_matmul(s, buf, xb, up) != 0) { rc = -1; break; }
+        ib_silu_gate_f32(gate, gate, up, inter);
+        snprintf(buf, sizeof(buf), "L%d_down_proj", L);
+        if (ib_pq_session_matmul(s, buf, gate, mlp_out) != 0) { rc = -1; break; }
+        ib_residual_add_f32(x, mlp_out, hidden);
+    }
+
+    if (rc == 0) {
+        const float* w_final = NULL;
+        if (load_norm_weight(s, "final_norm", &w_final, hidden) != 0) rc = -1;
+        else {
+            ib_rmsnorm_f32(xb, x, w_final, hidden, eps);
+            if (ib_pq_session_matmul(s, "lm_head", xb, logits) != 0) rc = -1;
+            (void)vocab;
+        }
+    }
+
+    if (kv && rc == 0) kv->length = pos + 1;
+
+    free(x); free(xb); free(xb2); free(q); free(k_now); free(v_now);
+    free(gate); free(up); free(mlp_out); free(scores);
+    return rc;
+}

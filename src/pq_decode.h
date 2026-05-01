@@ -378,6 +378,24 @@ int  ib_pq_session_raw_get(const ib_pq_session* s, const char* name,
 /* Phase 9: free-form JSON config string (NUL-terminated). NULL if absent. */
 const char* ib_pq_session_config_json(const ib_pq_session* s);
 
+/* ── Phase 9: KV cache + transformer forward pass ── */
+
+typedef struct ib_pq_kv_cache ib_pq_kv_cache;
+
+int  ib_pq_kv_cache_create(const ib_pq_session* s, int max_seq_len,
+                            ib_pq_kv_cache** out);
+void ib_pq_kv_cache_free(ib_pq_kv_cache* kv);
+void ib_pq_kv_cache_clear(ib_pq_kv_cache* kv);
+int  ib_pq_kv_cache_length(const ib_pq_kv_cache* kv);
+
+/* Single-token forward step. Reads token_id, runs the full transformer
+ * stack using the session for matmuls, writes vocab_size logits.
+ * pos is the absolute position in the sequence (0 for the first token).
+ * Caller is responsible for incrementing pos and using the same kv across calls.
+ */
+int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                        int token_id, int pos, float* logits);
+
 /* ── Phase 9: forward-pass primitives (no PQ inside) ──
  * Used to assemble inferbit_pq_forward: matmuls go through the session,
  * everything else (norm, rotary, activation, residual, attention) uses
