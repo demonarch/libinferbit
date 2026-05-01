@@ -2383,6 +2383,14 @@ struct ib_pq_lut_cache {
     float* cb1r_scale;
     float* cb2l_scale;  /* [K_l2] */
     float* cb2r_scale;
+    /* Phase 8.X: transposed indices [C][M] for sequential reads in row loop.
+     * For L2: stored as flat uint16 to avoid runtime unpacking inside the
+     * hot loop (handles K_l2 in [1, 65535]). */
+    uint8_t*  i1l_T;  /* [C][M] uint8 */
+    uint8_t*  i1r_T;
+    uint16_t* i2l_T;  /* [C][M] uint16, valid when n_levels == 2 */
+    uint16_t* i2r_T;
+    int has_idx_T;
 };
 
 int ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out_p) {
@@ -2453,6 +2461,37 @@ int ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out_p) {
         free(mask);
     }
 
+    /* Phase 8.X: transpose indices to [C][M] for sequential row-loop reads. */
+    int C = t->C;
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+    c->i1l_T = (uint8_t*)malloc((size_t)C * (size_t)M);
+    c->i1r_T = (uint8_t*)malloc((size_t)C * (size_t)M);
+    if (!c->i1l_T || !c->i1r_T) goto fail;
+    for (int r = 0; r < M; r++) {
+        for (int cc = 0; cc < C; cc++) {
+            c->i1l_T[(size_t)cc * M + r] = t->indices_l1_l[(size_t)r * C + cc];
+            c->i1r_T[(size_t)cc * M + r] = t->indices_l1_r[(size_t)r * C + cc];
+        }
+    }
+    if (has_l2) {
+        c->i2l_T = (uint16_t*)malloc((size_t)C * (size_t)M * sizeof(uint16_t));
+        c->i2r_T = (uint16_t*)malloc((size_t)C * (size_t)M * sizeof(uint16_t));
+        if (!c->i2l_T || !c->i2r_T) goto fail;
+        for (int r = 0; r < M; r++) {
+            const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+            const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+            for (int cc = 0; cc < C; cc++) {
+                c->i2l_T[(size_t)cc * M + r] = (uint16_t)pq_l2_idx_at(il2l, cc, l2_packed, l2_idx_bytes);
+                c->i2r_T[(size_t)cc * M + r] = (uint16_t)pq_l2_idx_at(il2r, cc, l2_packed, l2_idx_bytes);
+            }
+        }
+    }
+    c->has_idx_T = 1;
+
     *out_p = c;
     return 0;
 
@@ -2471,6 +2510,8 @@ void ib_pq_lut_cache_free(ib_pq_lut_cache* c) {
     free(c->cb2l_q8); free(c->cb2r_q8);
     free(c->cb1l_scale); free(c->cb1r_scale);
     free(c->cb2l_scale); free(c->cb2r_scale);
+    free(c->i1l_T); free(c->i1r_T);
+    free(c->i2l_T); free(c->i2r_T);
     free(c);
 }
 
@@ -2577,8 +2618,6 @@ int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
     int M = t->M, G = t->G, C = t->C, K = t->K;
     int half = cache->half;
     int K_l2 = cache->K_l2;
-    int l2_packed = (K_l2 == 16);
-    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
     int has_l2 = (cache->n_levels == 2);
 
     float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
@@ -2591,9 +2630,6 @@ int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
     }
 
     memset(out, 0, (size_t)M * sizeof(float));
-    size_t l2_stride = l2_packed
-        ? (size_t)((C + 1) / 2)
-        : (size_t)C * (size_t)l2_idx_bytes;
 
     for (int c = 0; c < C; c++) {
         int base = c * G;
@@ -2617,18 +2653,19 @@ int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
                                     xRq, xR_scale, half, K_l2, C2R_dot_x);
         }
 
-        for (int r = 0; r < M; r++) {
-            int i1l = t->indices_l1_l[(size_t)r * C + c];
-            int i1r = t->indices_l1_r[(size_t)r * C + c];
-            float v = C1L_dot_x[i1l] + C1R_dot_x[i1r];
-            if (has_l2) {
-                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
-                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
-                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
-                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
-                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+        const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+        const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+        if (has_l2) {
+            const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
+            const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
+            for (int r = 0; r < M; r++) {
+                out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]]
+                        + C2L_dot_x[i2l_row[r]] + C2R_dot_x[i2r_row[r]];
             }
-            out[r] += v;
+        } else {
+            for (int r = 0; r < M; r++) {
+                out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]];
+            }
         }
     }
 
@@ -2648,8 +2685,6 @@ int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
     int M = t->M, G = t->G, C = t->C, K = t->K;
     int half = cache->half;
     int K_l2 = cache->K_l2;
-    int l2_packed = (K_l2 == 16);
-    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
     int has_l2 = (cache->n_levels == 2);
 
     float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
@@ -2662,9 +2697,6 @@ int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
     }
 
     memset(out, 0, (size_t)M * sizeof(float));
-    size_t l2_stride = l2_packed
-        ? (size_t)((C + 1) / 2)
-        : (size_t)C * (size_t)l2_idx_bytes;
 
     for (int c = 0; c < C; c++) {
         int base = c * G;
@@ -2679,18 +2711,20 @@ int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
             pq_chunk_dot_table_f32(cache->cb2l_fp32, xL, half, K_l2, C2L_dot_x);
             pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R_dot_x);
         }
-        for (int r = 0; r < M; r++) {
-            int i1l = t->indices_l1_l[(size_t)r * C + c];
-            int i1r = t->indices_l1_r[(size_t)r * C + c];
-            float v = C1L_dot_x[i1l] + C1R_dot_x[i1r];
-            if (has_l2) {
-                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
-                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
-                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
-                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
-                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+
+        const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+        const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+        if (has_l2) {
+            const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
+            const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
+            for (int r = 0; r < M; r++) {
+                out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]]
+                        + C2L_dot_x[i2l_row[r]] + C2R_dot_x[i2r_row[r]];
             }
-            out[r] += v;
+        } else {
+            for (int r = 0; r < M; r++) {
+                out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]];
+            }
         }
     }
 
@@ -2712,8 +2746,6 @@ int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
     int M = t->M, G = t->G, C = t->C, K = t->K;
     int half = cache->half;
     int K_l2 = cache->K_l2;
-    int l2_packed = (K_l2 == 16);
-    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
     int is_pyramid = cache->is_pyramid;
 
     float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
@@ -2726,9 +2758,6 @@ int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
     }
 
     memset(out, 0, (size_t)M * sizeof(float));
-    size_t l2_stride = l2_packed
-        ? (size_t)((C + 1) / 2)
-        : (size_t)C * (size_t)l2_idx_bytes;
 
     for (int c = 0; c < C; c++) {
         int base = c * G;
@@ -2748,9 +2777,13 @@ int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
         pq_chunk_dot_table_f32(cache->cb2l_fp32, xL, half, K_l2, C2L_dot_x);
         pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R_dot_x);
 
+        const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+        const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+        const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
+        const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
         for (int r = 0; r < M; r++) {
-            int i1l = t->indices_l1_l[(size_t)r * C + c];
-            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            int i1l = i1l_row[r];
+            int i1r = i1r_row[r];
             float l1_contrib = C1L_dot_x[i1l] + C1R_dot_x[i1r];
             float v = l1_contrib;
             int oc_l = is_pyramid ? i1l : 0;
@@ -2761,11 +2794,7 @@ int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
             if (skip_threshold > 0.0f && fabsf(l1_contrib) > l2_bound) {
                 /* skip L2 */
             } else {
-                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
-                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
-                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
-                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
-                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+                v += C2L_dot_x[i2l_row[r]] + C2R_dot_x[i2r_row[r]];
             }
             out[r] += v;
         }
