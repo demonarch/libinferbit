@@ -3106,22 +3106,22 @@ void ib_residual_add_f32(float* x, const float* delta, int n) {
 }
 
 void ib_rope_f32(float* x, int n_heads, int head_dim, int pos, float theta) {
-    /* For each head, rotate consecutive pairs (x[2i], x[2i+1]) by angle
-     * pos * theta^(-2i/head_dim). HF/Llama-style rotates the lower half
-     * with the upper half (NEOX-style); here we rotate adjacent pairs
-     * (the simpler "interleaved" convention), which matches the rope_theta
-     * stored by HF for "rope_type": "default" with neox=false. Callers
-     * that need NEOX rotation should split + concat outside. */
+    /* HF/Llama NEOX-style RoPE: split the head into two halves and rotate
+     * (x[i], x[i + half]) by angle pos * theta^(-2i/head_dim) for i in [0, half).
+     *   y[i]        = x[i]        * cos - x[i + half] * sin
+     *   y[i + half] = x[i + half] * cos + x[i]        * sin
+     */
+    int half = head_dim / 2;
     for (int h = 0; h < n_heads; h++) {
         float* xh = x + (size_t)h * head_dim;
-        for (int i = 0; i < head_dim / 2; i++) {
+        for (int i = 0; i < half; i++) {
             float freq = powf(theta, -2.0f * (float)i / (float)head_dim);
             float angle = (float)pos * freq;
             float c = cosf(angle), s = sinf(angle);
-            float a = xh[2 * i];
-            float b = xh[2 * i + 1];
-            xh[2 * i]     = a * c - b * s;
-            xh[2 * i + 1] = a * s + b * c;
+            float a = xh[i];
+            float b = xh[i + half];
+            xh[i]        = a * c - b * s;
+            xh[i + half] = b * c + a * s;
         }
     }
 }
