@@ -424,6 +424,18 @@ void ib_rope_f32(float* x, int n_heads, int head_dim, int pos, float theta);
 /* Softmax in place over n elements. Numerically stable (subtracts max). */
 void ib_softmax_f32(float* x, int n);
 
+/* Orthonormal Fast Walsh-Hadamard transform on a length-n vector,
+ * pads internally to next power of 2 and divides by sqrt(n_padded).
+ * For decode of tensors encoded with rotate=1 (the encoder applied
+ * fwht_norm to W's input columns).
+ *
+ * x_buf must point to at least max(n_padded, n) floats; the input is
+ * read from x[0..n) and the output is written back to x[0..n_padded).
+ * Caller must allocate the trailing zero pad slots if n != n_padded.
+ * Returns n_padded.
+ */
+int ib_fwht_norm_f32(float* x, int n);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

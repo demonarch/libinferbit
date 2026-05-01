@@ -3135,6 +3135,27 @@ void ib_softmax_f32(float* x, int n) {
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
+int ib_fwht_norm_f32(float* x, int n) {
+    int npow = 1;
+    while (npow < n) npow *= 2;
+    if (npow != n) {
+        for (int i = n; i < npow; i++) x[i] = 0.0f;
+    }
+    for (int h = 1; h < npow; h *= 2) {
+        for (int i = 0; i < npow; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j];
+                float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    float inv = 1.0f / sqrtf((float)npow);
+    for (int i = 0; i < npow; i++) x[i] *= inv;
+    return npow;
+}
+
 /* ── Phase 9: KV cache + single-token forward ── */
 
 struct ib_pq_kv_cache {
