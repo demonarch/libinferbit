@@ -2982,16 +2982,19 @@ static void pq_streaming_cached_row_task(void* arg, int tid, int r0, int r1) {
             pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R);
         }
 
-        const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
-        const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
-        if (has_l2) {
-            const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
-            const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
+        if (has_l2 && cache->idx_T_packed) {
+            /* F1.h packed indices: one u64 load per row, no strided streams. */
+            const uint64_t* p_row = cache->idx_T_packed + (size_t)c * M;
             for (int r = r0; r < r1; r++) {
-                a->out[r] += C1L[i1l_row[r]] + C1R[i1r_row[r]]
-                            + C2L[i2l_row[r]] + C2R[i2r_row[r]];
+                uint64_t p = p_row[r];
+                a->out[r] += C1L[(int)( p        & 0xff)]
+                            + C1R[(int)((p >>  8) & 0xff)]
+                            + C2L[(int)((p >> 16) & 0xffff)]
+                            + C2R[(int)((p >> 32) & 0xffff)];
             }
         } else {
+            const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+            const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
             for (int r = r0; r < r1; r++) {
                 a->out[r] += C1L[i1l_row[r]] + C1R[i1r_row[r]];
             }
@@ -3227,9 +3230,15 @@ struct pq_spin_pool {
     void* arg;
     int total;
     int chunk_size;
-    /* per-thread tid (passed to worker thread). */
     int* tids;
+    /* F1.b: hybrid spin-then-sleep — workers spin SPIN_LIMIT pq_cpu_pauses
+     * before falling back to cond_wait; main always cond_broadcasts after
+     * publishing the new generation, so a sleeping worker still wakes. */
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
 };
+
+#define PQ_SPIN_LIMIT 50000  /* ~50 µs on M-series */
 
 static inline void pq_cpu_pause(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -3244,12 +3253,27 @@ static void* pq_spin_worker(void* raw) {
     pq_spin_pool* p = *(pq_spin_pool**)((char*)raw + sizeof(int));
     int my_gen = 0;
     while (1) {
-        while (atomic_load_explicit(&p->generation, memory_order_acquire) == my_gen) {
+        /* Spin briefly first (hot back-to-back call case). */
+        int spins = 0;
+        int gen;
+        while (1) {
+            gen = atomic_load_explicit(&p->generation, memory_order_acquire);
+            if (gen != my_gen) break;
             if (atomic_load_explicit(&p->shutdown, memory_order_acquire)) return NULL;
+            if (++spins >= PQ_SPIN_LIMIT) break;
             pq_cpu_pause();
         }
-        my_gen = atomic_load_explicit(&p->generation, memory_order_acquire);
+        if (gen == my_gen) {
+            /* Cold path: sleep on condvar. */
+            pthread_mutex_lock(&p->mu);
+            while ((gen = atomic_load_explicit(&p->generation, memory_order_acquire)) == my_gen
+                && !atomic_load_explicit(&p->shutdown, memory_order_acquire)) {
+                pthread_cond_wait(&p->cv, &p->mu);
+            }
+            pthread_mutex_unlock(&p->mu);
+        }
         if (atomic_load_explicit(&p->shutdown, memory_order_acquire)) return NULL;
+        my_gen = gen;
         pq_spin_fn fn = p->fn;
         void* arg = p->arg;
         int total = p->total;
@@ -3275,21 +3299,37 @@ static pq_spin_pool* pq_spin_pool_create(int n_threads) {
     if (!p->threads || !p->tids) { free(p->threads); free(p->tids); free(p); return NULL; }
     atomic_store(&p->generation, 0);
     atomic_store(&p->shutdown, 0);
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv, NULL);
+    /* macOS: give workers user-interactive QoS so the scheduler keeps
+     * them on P-cores instead of dumping them on E-cores. Big M-series
+     * impact on hot-loop throughput. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+#if defined(__APPLE__)
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     for (int i = 0; i < n_threads; i++) {
         char* slot = (char*)p->tids + (size_t)i * (sizeof(int) + sizeof(pq_spin_pool*));
         *(int*)slot = i;
         *(pq_spin_pool**)(slot + sizeof(int)) = p;
-        pthread_create(&p->threads[i], NULL, pq_spin_worker, slot);
+        pthread_create(&p->threads[i], &attr, pq_spin_worker, slot);
     }
+    pthread_attr_destroy(&attr);
     return p;
 }
 
 static void pq_spin_pool_destroy(pq_spin_pool* p) {
     if (!p) return;
     atomic_store_explicit(&p->shutdown, 1, memory_order_release);
-    /* Bump generation to wake spinners that are waiting. */
+    /* Bump generation + wake any sleepers. */
     atomic_fetch_add_explicit(&p->generation, 1, memory_order_release);
+    pthread_mutex_lock(&p->mu);
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
     for (int i = 0; i < p->n_threads; i++) pthread_join(p->threads[i], NULL);
+    pthread_cond_destroy(&p->cv);
+    pthread_mutex_destroy(&p->mu);
     free(p->threads); free(p->tids); free(p);
 }
 
@@ -3305,6 +3345,18 @@ static void pq_spin_pool_run(pq_spin_pool* p, pq_spin_fn fn, void* arg,
     atomic_store_explicit(&p->next_chunk, 0, memory_order_relaxed);
     atomic_store_explicit(&p->n_done, 0, memory_order_relaxed);
     atomic_fetch_add_explicit(&p->generation, 1, memory_order_release);
+    /* Wake any sleeping workers. Spinning ones already see the new gen. */
+    pthread_mutex_lock(&p->mu);
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+    /* Main thread also takes work — turns N+1 active cores into useful
+     * cores instead of having main idle. tid n_threads is the main slot. */
+    while (1) {
+        int s = atomic_fetch_add_explicit(&p->next_chunk, chunk_size, memory_order_relaxed);
+        if (s >= total) break;
+        int e = s + chunk_size; if (e > total) e = total;
+        fn(arg, p->n_threads, s, e);
+    }
     while (atomic_load_explicit(&p->n_done, memory_order_acquire) < p->n_threads) {
         pq_cpu_pause();
     }
@@ -3424,7 +3476,8 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
         s->spin = pq_spin_pool_create(n_threads);
         size_t per_thread = (size_t)(2 * max_K + 2 * max_Kl2);
         if (per_thread > 0) {
-            s->thread_scratch = (float*)malloc(per_thread * (size_t)n_threads * sizeof(float));
+            /* +1 slot: main thread uses tid = n_threads in pq_spin_pool_run. */
+            s->thread_scratch = (float*)malloc(per_thread * (size_t)(n_threads + 1) * sizeof(float));
             s->thread_scratch_per = per_thread;
         }
     }
@@ -3497,6 +3550,17 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
         return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x_for_kernel, out);
     case IB_PQ_VARIANT_STREAMING:
     default:
+        /* F1.b: hybrid spin-then-sleep pool with QoS-pinned P-core
+         * workers. Threaded path also uses F1.h packed indices in the
+         * row loop. Threshold tuned high — only the very biggest
+         * matmuls get threaded so per-call sync overhead is amortized. */
+        if (s->spin && s->n_threads > 1 && s->thread_scratch
+         && (size_t)t->M * (size_t)t->C >= 1500000) {
+            return ib_pq_matmul_fp32_streaming_cached_spin(t, c, x_for_kernel, out,
+                                                              s->spin, s->n_threads,
+                                                              s->thread_scratch,
+                                                              s->thread_scratch_per);
+        }
         return streaming_cached_kernel(t, c, x_for_kernel, out,
                                           s->scratch_C1L, s->scratch_C1R,
                                           s->scratch_C2L, s->scratch_C2R);
