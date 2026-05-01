@@ -1758,23 +1758,37 @@ int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
         free(mask);
     }
 
-    /* Phase 8.F: precompute per-outer-cluster ||C2[k]||_max for L and R.
-     * For PYRAMID format L2 is conditional [K1][K2][G/2]; for L1_L2 it's
-     * flat [K_l2][G/2]. We use K_l2 as the index range; for the PYRAMID
-     * case the 'k' index is the combined i1*K_inner+i2 — to compute
-     * per-outer-cluster max we'd need to know K_inner. Approximation:
-     * just use the global max ||C2[*]||_max as the bound. Conservative;
-     * skips less aggressively than per-cluster. */
-    float c2l_max_global = 0.0f, c2r_max_global = 0.0f;
-    for (int k = 0; k < K_l2; k++) {
-        float nl = 0.0f, nr = 0.0f;
-        for (int j = 0; j < half; j++) {
-            nl += cb2l[k * half + j] * cb2l[k * half + j];
-            nr += cb2r[k * half + j] * cb2r[k * half + j];
+    /* Phase 8.F+8.I: precompute per-outer-cluster ||C2[k]||_max for L and R.
+     * For PYRAMID format the conditional L2 is logically [K1][K_inner][G/2];
+     * the flat storage is [K_l2 = K1*K_inner][G/2] with index = k1*K_inner + k_inner.
+     * Per-cluster bound (tight): max over k_inner of ||C2[k1*K_inner + k_inner]||.
+     * For L1_L2 (non-pyramid): K_inner = K_l2 (global bound, fall through). */
+    int is_pyramid = (t->format == IB_PQ_FMT_PYRAMID);
+    int K_inner = (is_pyramid && K > 0) ? (K_l2 / K) : K_l2;
+    int n_outer = (is_pyramid && K > 0) ? K : 1;
+    float* c2l_max_per_cluster = (float*)calloc((size_t)n_outer, sizeof(float));
+    float* c2r_max_per_cluster = (float*)calloc((size_t)n_outer, sizeof(float));
+    if (!c2l_max_per_cluster || !c2r_max_per_cluster) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(c2l_max_per_cluster); free(c2r_max_per_cluster);
+        return -1;
+    }
+    for (int k1 = 0; k1 < n_outer; k1++) {
+        float ml = 0.0f, mr = 0.0f;
+        int k_lo = is_pyramid ? k1 * K_inner : 0;
+        int k_hi = is_pyramid ? (k1 + 1) * K_inner : K_l2;
+        for (int k = k_lo; k < k_hi; k++) {
+            float nl = 0.0f, nr = 0.0f;
+            for (int j = 0; j < half; j++) {
+                nl += cb2l[k * half + j] * cb2l[k * half + j];
+                nr += cb2r[k * half + j] * cb2r[k * half + j];
+            }
+            nl = sqrtf(nl); nr = sqrtf(nr);
+            if (nl > ml) ml = nl;
+            if (nr > mr) mr = nr;
         }
-        nl = sqrtf(nl); nr = sqrtf(nr);
-        if (nl > c2l_max_global) c2l_max_global = nl;
-        if (nr > c2r_max_global) c2r_max_global = nr;
+        c2l_max_per_cluster[k1] = ml;
+        c2r_max_per_cluster[k1] = mr;
     }
 
     float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
@@ -1783,6 +1797,7 @@ int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
     float* C2R_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
     if (!C1L_dot_x || !C1R_dot_x || !C2L_dot_x || !C2R_dot_x) {
         free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(c2l_max_per_cluster); free(c2r_max_per_cluster);
         free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
         return -1;
     }
@@ -1805,9 +1820,6 @@ int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
         }
         float xL_norm = sqrtf(xL_norm2);
         float xR_norm = sqrtf(xR_norm2);
-        /* Per-chunk L2 contribution bound (conservative: ||C2||_max * ||x||) */
-        float l2_bound_l = c2l_max_global * xL_norm;
-        float l2_bound_r = c2r_max_global * xR_norm;
 
         pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
         pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
@@ -1819,10 +1831,13 @@ int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
             int i1r = t->indices_l1_r[(size_t)r * C + c];
             float l1_contrib = C1L_dot_x[i1l] + C1R_dot_x[i1r];
             float v = l1_contrib;
-            /* Variance-bound skip: if L1 contribution magnitude is large
-             * relative to L2 contribution bound, skip L2. */
-            if (skip_threshold > 0.0f
-                && fabsf(l1_contrib) > skip_threshold * (l2_bound_l + l2_bound_r)) {
+            /* Per-cluster L2 bound (Phase 8.I): tighter than global bound;
+             * uses ||C2[k1, *]||_max for the cluster k1 the row picked. */
+            int oc_l = is_pyramid ? i1l : 0;
+            int oc_r = is_pyramid ? i1r : 0;
+            float l2_bound = skip_threshold * (c2l_max_per_cluster[oc_l] * xL_norm
+                                             + c2r_max_per_cluster[oc_r] * xR_norm);
+            if (skip_threshold > 0.0f && fabsf(l1_contrib) > l2_bound) {
                 n_skipped++;
             } else {
                 const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
@@ -1844,6 +1859,7 @@ int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
     (void)n_skipped; (void)n_evaluated;  /* could expose stats via a debug API */
 
     free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    free(c2l_max_per_cluster); free(c2r_max_per_cluster);
     free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
     return 0;
 }
