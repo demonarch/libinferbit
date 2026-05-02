@@ -3396,6 +3396,13 @@ struct ib_pq_session {
     /* INT4 weight path: raw_tensor pair `<base>__i4_q` (uint8 [M, N/2])
      * + `<base>__i4_s` (fp16 [M, N/G]). Detected at session_open;
      * routes ahead of PQ in session_matmul. */
+    /* fp16 raw matmul tensors: <base>__fp16w shape [M, N]. */
+    int n_fp16;
+    struct ib_fp16w_tensor {
+        char* name;
+        const uint16_t* w;     /* [M, N] fp16 */
+        int M, N;
+    } *fp16_tensors;
     int n_int4;
     struct ib_int4_tensor {
         char* name;            /* base name (no suffix) */
@@ -3407,6 +3414,27 @@ struct ib_pq_session {
         int M, N, G, K_out;
     } *int4_tensors;
 };
+
+static const struct ib_fp16w_tensor* session_fp16_find(const ib_pq_session* s,
+                                                          const char* name) {
+    if (!s || !name) return NULL;
+    for (int i = 0; i < s->n_fp16; i++) {
+        if (strcmp(s->fp16_tensors[i].name, name) == 0) return &s->fp16_tensors[i];
+    }
+    return NULL;
+}
+
+static int fp16w_matmul_fp32(const struct ib_fp16w_tensor* t,
+                                const float* x, float* out) {
+    const int M = t->M, N = t->N;
+    for (int m = 0; m < M; m++) {
+        const uint16_t* row = t->w + (size_t)m * N;
+        float acc = 0.0f;
+        for (int j = 0; j < N; j++) acc += ib_fp16_to_fp32(row[j]) * x[j];
+        out[m] = acc;
+    }
+    return 0;
+}
 
 static const struct ib_int4_tensor* session_int4_find(const ib_pq_session* s,
                                                         const char* name) {
@@ -3585,6 +3613,38 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
         s->x_scratch_n = max_N;
     }
 
+    /* fp16 raw matmul: scan for `<base>__fp16w` tensors. */
+    {
+        const char* SF = "__fp16w";
+        const size_t flen = strlen(SF);
+        int cap = 0;
+        for (int i = 0; i < s->multi.n_raw; i++) {
+            const char* nm = s->multi.raw_tensors[i].name;
+            size_t L = nm ? strlen(nm) : 0;
+            if (L > flen && strcmp(nm + L - flen, SF) == 0) cap++;
+        }
+        if (cap > 0) {
+            s->fp16_tensors = (struct ib_fp16w_tensor*)calloc((size_t)cap,
+                                  sizeof(struct ib_fp16w_tensor));
+            for (int i = 0; i < s->multi.n_raw; i++) {
+                ib_pq_raw_tensor* r = &s->multi.raw_tensors[i];
+                if (!r->name) continue;
+                size_t L = strlen(r->name);
+                if (L <= flen || strcmp(r->name + L - flen, SF) != 0) continue;
+                if (r->dtype != IB_RAW_F16 || r->ndim != 2) continue;
+                size_t base_len = L - flen;
+                struct ib_fp16w_tensor* t = &s->fp16_tensors[s->n_fp16++];
+                t->name = (char*)malloc(base_len + 1);
+                memcpy(t->name, r->name, base_len);
+                t->name[base_len] = '\0';
+                t->w = (const uint16_t*)r->data;
+                t->M = r->shape[0];
+                t->N = r->shape[1];
+                if (t->N > max_N) max_N = t->N;
+            }
+        }
+    }
+
     /* INT4 weight path: scan raw_tensors for `__i4_q` + `__i4_s` pairs. */
     {
         const char* I4Q = "__i4_q";
@@ -3728,6 +3788,10 @@ void ib_pq_session_close(ib_pq_session* s) {
         for (int i = 0; i < s->n_int4; i++) free(s->int4_tensors[i].name);
         free(s->int4_tensors);
     }
+    if (s->fp16_tensors) {
+        for (int i = 0; i < s->n_fp16; i++) free(s->fp16_tensors[i].name);
+        free(s->fp16_tensors);
+    }
     ib_pq_multi_caches_free(s->mc);
     ib_pq_multi_free(&s->multi);
     free(s->policies);
@@ -3764,6 +3828,8 @@ static int session_matmul_with_scratch(ib_pq_session* s, const char* name,
                                           float* C1L, float* C1R,
                                           float* C2L, float* C2R,
                                           float* x_scratch, int x_scratch_n) {
+    const struct ib_fp16w_tensor* fw = session_fp16_find(s, name);
+    if (fw) return fp16w_matmul_fp32(fw, x, out);
     const struct ib_int4_tensor* i4 = session_int4_find(s, name);
     if (i4) {
         const float* xk = x;
@@ -3805,6 +3871,8 @@ static int session_matmul_with_scratch(ib_pq_session* s, const char* name,
 
 int ib_pq_session_matmul(ib_pq_session* s, const char* name,
                           const float* x, float* out) {
+    const struct ib_fp16w_tensor* fw = session_fp16_find(s, name);
+    if (fw) return fp16w_matmul_fp32(fw, x, out);
     const struct ib_int4_tensor* i4 = session_int4_find(s, name);
     if (i4) {
         const float* xk = x;
@@ -3863,6 +3931,12 @@ int ib_pq_session_lm_head_topk(ib_pq_session* s, const char* name,
 
 int ib_pq_session_tensor_shape(const ib_pq_session* s, const char* name,
                                 int* out_M, int* out_N) {
+    const struct ib_fp16w_tensor* fw = session_fp16_find(s, name);
+    if (fw) {
+        if (out_M) *out_M = fw->M;
+        if (out_N) *out_N = fw->N;
+        return 0;
+    }
     const struct ib_int4_tensor* i4 = session_int4_find(s, name);
     if (i4) {
         if (out_M) *out_M = i4->M;
