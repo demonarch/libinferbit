@@ -3738,22 +3738,40 @@ struct ib_pq_kv_cache {
     int kv_dim;        /* num_kv_heads * head_dim */
     int length;
     /* Storage layout: [layer][pos][kv_dim].
-     * F1.d / Phase 7: storage selects fp32 (default), fp16, or int8.
-     *   IB_PQ_KV_FP16=1 → fp16 backing (half bandwidth, neutral cvt cost
-     *                      with vcvt_f32_f16 on ARM)
-     *   IB_PQ_KV_INT8=1 → int8 backing + per-token scale (4× vs fp16,
-     *                      8× vs fp32; ~0.1-0.2% PPL hit typical)
+     * F1.d / Phase 7: storage selects fp32 (default), fp16, int8, or
+     * pyramid (Phase 7 v2):
+     *   IB_PQ_KV_FP16=1     → fp16 backing
+     *   IB_PQ_KV_INT8=1     → int8 backing + per-token scale (4× vs fp16)
+     *   IB_PQ_KV_PYRAMID=1  → pyramid PQ + per-token scale (2× vs int8,
+     *                          requires K_codebook_L<N>_l/_r and
+     *                          V_codebook_L<N>_l/_r raw tensors)
      */
     int storage_fp16;
     int storage_int8;
+    int storage_pyramid;
     float*    k_f32;
     float*    v_f32;
     uint16_t* k_f16;
     uint16_t* v_f16;
-    int8_t*   k_q8;     /* [n_layers][max_seq][kv_dim] */
+    int8_t*   k_q8;
     int8_t*   v_q8;
-    float*    k_q8_scale;  /* [n_layers][max_seq] one scale per slot */
+    float*    k_q8_scale;
     float*    v_q8_scale;
+    /* Pyramid storage: per (layer, pos), 2*C uint8 indices for K and V
+     * (i_L per chunk + i_R per chunk). Plus per-(layer, pos) row scale
+     * for K and V. */
+    uint8_t*  k_pq_idx;     /* [n_layers][max_seq][2*C] */
+    uint8_t*  v_pq_idx;
+    float*    k_pq_scale;   /* [n_layers][max_seq] */
+    float*    v_pq_scale;
+    int       pq_C;         /* kv_dim / G */
+    int       pq_G;
+    int       pq_K1;
+    /* Codebook pointers (borrowed from session raw tensors). */
+    const uint16_t** k_cb_l;  /* [n_layers] */
+    const uint16_t** k_cb_r;
+    const uint16_t** v_cb_l;
+    const uint16_t** v_cb_r;
 };
 
 static int session_config_int(const char* json, const char* key, int def) {
@@ -3794,11 +3812,62 @@ int ib_pq_kv_cache_create(const ib_pq_session* s, int max_seq_len,
     kv->n_layers = n_layers; kv->max_seq = max_seq_len; kv->kv_dim = kv_dim;
     const char* fp16_env = getenv("IB_PQ_KV_FP16");
     const char* int8_env = getenv("IB_PQ_KV_INT8");
-    kv->storage_int8 = (int8_env && atoi(int8_env) > 0) ? 1 : 0;
-    kv->storage_fp16 = (!kv->storage_int8 && fp16_env && atoi(fp16_env) > 0) ? 1 : 0;
+    const char* pq_env   = getenv("IB_PQ_KV_PYRAMID");
+    kv->storage_pyramid = (pq_env && atoi(pq_env) > 0) ? 1 : 0;
+    kv->storage_int8 = (!kv->storage_pyramid && int8_env && atoi(int8_env) > 0) ? 1 : 0;
+    kv->storage_fp16 = (!kv->storage_int8 && !kv->storage_pyramid && fp16_env && atoi(fp16_env) > 0) ? 1 : 0;
+    /* Pyramid mode requires codebooks present in the session — verify
+     * they exist for L0; assume the rest follow. */
+    if (kv->storage_pyramid) {
+        const void* d=NULL; int dt=0,nd=0; int sh[4]={0};
+        if (ib_pq_session_raw_get(s, "K_codebook_L0_l", &d, &dt, sh, &nd) != 0
+         || dt != IB_RAW_F16 || nd != 2) {
+            /* Fall back to fp32 silently. */
+            kv->storage_pyramid = 0;
+        } else {
+            kv->pq_K1 = sh[0];
+            int half = sh[1];
+            kv->pq_G = half * 2;
+            kv->pq_C = kv_dim / kv->pq_G;
+            if (kv->pq_C * kv->pq_G != kv_dim) kv->storage_pyramid = 0;
+        }
+    }
     size_t n_elem = (size_t)n_layers * max_seq_len * kv_dim;
     size_t n_slots = (size_t)n_layers * max_seq_len;
-    if (kv->storage_int8) {
+    if (kv->storage_pyramid) {
+        size_t idx_bytes = (size_t)n_layers * max_seq_len * (size_t)(2 * kv->pq_C);
+        kv->k_pq_idx = (uint8_t*)malloc(idx_bytes);
+        kv->v_pq_idx = (uint8_t*)malloc(idx_bytes);
+        kv->k_pq_scale = (float*)malloc(n_slots * sizeof(float));
+        kv->v_pq_scale = (float*)malloc(n_slots * sizeof(float));
+        kv->k_cb_l = (const uint16_t**)calloc((size_t)n_layers, sizeof(*kv->k_cb_l));
+        kv->k_cb_r = (const uint16_t**)calloc((size_t)n_layers, sizeof(*kv->k_cb_r));
+        kv->v_cb_l = (const uint16_t**)calloc((size_t)n_layers, sizeof(*kv->v_cb_l));
+        kv->v_cb_r = (const uint16_t**)calloc((size_t)n_layers, sizeof(*kv->v_cb_r));
+        if (!kv->k_pq_idx || !kv->v_pq_idx || !kv->k_pq_scale || !kv->v_pq_scale
+         || !kv->k_cb_l || !kv->k_cb_r || !kv->v_cb_l || !kv->v_cb_r) {
+            free(kv->k_pq_idx); free(kv->v_pq_idx);
+            free(kv->k_pq_scale); free(kv->v_pq_scale);
+            free(kv->k_cb_l); free(kv->k_cb_r); free(kv->v_cb_l); free(kv->v_cb_r);
+            free(kv); return -1;
+        }
+        char buf[64];
+        for (int L = 0; L < n_layers; L++) {
+            const void* d; int dt, nd; int sh[4];
+            snprintf(buf, sizeof(buf), "K_codebook_L%d_l", L);
+            if (ib_pq_session_raw_get(s, buf, &d, &dt, sh, &nd) != 0) { free(kv); return -1; }
+            kv->k_cb_l[L] = (const uint16_t*)d;
+            snprintf(buf, sizeof(buf), "K_codebook_L%d_r", L);
+            if (ib_pq_session_raw_get(s, buf, &d, &dt, sh, &nd) != 0) { free(kv); return -1; }
+            kv->k_cb_r[L] = (const uint16_t*)d;
+            snprintf(buf, sizeof(buf), "V_codebook_L%d_l", L);
+            if (ib_pq_session_raw_get(s, buf, &d, &dt, sh, &nd) != 0) { free(kv); return -1; }
+            kv->v_cb_l[L] = (const uint16_t*)d;
+            snprintf(buf, sizeof(buf), "V_codebook_L%d_r", L);
+            if (ib_pq_session_raw_get(s, buf, &d, &dt, sh, &nd) != 0) { free(kv); return -1; }
+            kv->v_cb_r[L] = (const uint16_t*)d;
+        }
+    } else if (kv->storage_int8) {
         kv->k_q8 = (int8_t*)malloc(n_elem);
         kv->v_q8 = (int8_t*)malloc(n_elem);
         kv->k_q8_scale = (float*)malloc(n_slots * sizeof(float));
@@ -3831,6 +3900,10 @@ void ib_pq_kv_cache_free(ib_pq_kv_cache* kv) {
     free(kv->k_f16); free(kv->v_f16);
     free(kv->k_q8); free(kv->v_q8);
     free(kv->k_q8_scale); free(kv->v_q8_scale);
+    free(kv->k_pq_idx); free(kv->v_pq_idx);
+    free(kv->k_pq_scale); free(kv->v_pq_scale);
+    free(kv->k_cb_l); free(kv->k_cb_r);
+    free(kv->v_cb_l); free(kv->v_cb_r);
     free(kv);
 }
 
@@ -3979,11 +4052,69 @@ static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
         ib_rope_f32(k_now, n_kv,    head_dim, pos, theta);
 
         /* Write into kv cache. fp32 path: memcpy. fp16 path: convert.
-         * int8 path: per-vector scale + round. */
+         * int8 path: per-vector scale + round. pyramid: per-vector scale
+         * + nearest codeword per chunk half. */
         if (kv) {
             size_t kv_offset = ((size_t)L * kv->max_seq + pos) * kv_dim;
             size_t slot = (size_t)L * kv->max_seq + pos;
-            if (kv->storage_int8) {
+            if (kv->storage_pyramid) {
+                int G = kv->pq_G, C = kv->pq_C, half = G / 2, K1 = kv->pq_K1;
+                /* per-vector row scale (max_abs / 7), normalize, then
+                 * find nearest codeword per chunk-half. */
+                float k_max = 1e-12f, v_max = 1e-12f;
+                for (int d = 0; d < kv_dim; d++) {
+                    float ak = fabsf(k_now[d]); if (ak > k_max) k_max = ak;
+                    float av = fabsf(v_now[d]); if (av > v_max) v_max = av;
+                }
+                float k_s = k_max / 7.0f, v_s = v_max / 7.0f;
+                if (k_s < 1e-12f) k_s = 1e-12f;
+                if (v_s < 1e-12f) v_s = 1e-12f;
+                float k_inv = 1.0f / k_s, v_inv = 1.0f / v_s;
+                kv->k_pq_scale[slot] = k_s;
+                kv->v_pq_scale[slot] = v_s;
+                uint8_t* k_idx = kv->k_pq_idx + slot * (size_t)(2 * C);
+                uint8_t* v_idx = kv->v_pq_idx + slot * (size_t)(2 * C);
+                const uint16_t* kcb_l = kv->k_cb_l[L];
+                const uint16_t* kcb_r = kv->k_cb_r[L];
+                const uint16_t* vcb_l = kv->v_cb_l[L];
+                const uint16_t* vcb_r = kv->v_cb_r[L];
+                for (int c = 0; c < C; c++) {
+                    /* For each chunk c, normalize the K and V sub-vectors,
+                     * then find the nearest codeword in their L/R half. */
+                    float kL[16], kR[16], vL[16], vR[16];
+                    for (int j = 0; j < half; j++) {
+                        kL[j] = k_now[c * G + j] * k_inv;
+                        kR[j] = k_now[c * G + half + j] * k_inv;
+                        vL[j] = v_now[c * G + j] * v_inv;
+                        vR[j] = v_now[c * G + half + j] * v_inv;
+                    }
+                    int best_kl = 0, best_kr = 0, best_vl = 0, best_vr = 0;
+                    float best_kl_d = 1e30f, best_kr_d = 1e30f;
+                    float best_vl_d = 1e30f, best_vr_d = 1e30f;
+                    for (int k = 0; k < K1; k++) {
+                        float dkl = 0, dkr = 0, dvl = 0, dvr = 0;
+                        for (int j = 0; j < half; j++) {
+                            float ekl = ib_fp16_to_fp32(kcb_l[(size_t)k*half+j]);
+                            float ekr = ib_fp16_to_fp32(kcb_r[(size_t)k*half+j]);
+                            float evl = ib_fp16_to_fp32(vcb_l[(size_t)k*half+j]);
+                            float evr = ib_fp16_to_fp32(vcb_r[(size_t)k*half+j]);
+                            float ed;
+                            ed = kL[j] - ekl; dkl += ed*ed;
+                            ed = kR[j] - ekr; dkr += ed*ed;
+                            ed = vL[j] - evl; dvl += ed*ed;
+                            ed = vR[j] - evr; dvr += ed*ed;
+                        }
+                        if (dkl < best_kl_d) { best_kl_d = dkl; best_kl = k; }
+                        if (dkr < best_kr_d) { best_kr_d = dkr; best_kr = k; }
+                        if (dvl < best_vl_d) { best_vl_d = dvl; best_vl = k; }
+                        if (dvr < best_vr_d) { best_vr_d = dvr; best_vr = k; }
+                    }
+                    k_idx[c]         = (uint8_t)best_kl;
+                    k_idx[C + c]     = (uint8_t)best_kr;
+                    v_idx[c]         = (uint8_t)best_vl;
+                    v_idx[C + c]     = (uint8_t)best_vr;
+                }
+            } else if (kv->storage_int8) {
                 int8_t* k_slot = kv->k_q8 + kv_offset;
                 int8_t* v_slot = kv->v_q8 + kv_offset;
                 float k_max = 1e-12f, v_max = 1e-12f;
@@ -4050,7 +4181,28 @@ static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
             const float* qh = q + (size_t)h * head_dim;
             for (int t = 0; t <= pos; t++) {
                 const float* k_t;
-                if (kv && kv->storage_int8) {
+                if (kv && kv->storage_pyramid) {
+                    int G = kv->pq_G, C = kv->pq_C, half = G / 2;
+                    size_t slot = (size_t)L * kv->max_seq + t;
+                    const uint8_t* k_idx = kv->k_pq_idx + slot * (size_t)(2 * C);
+                    const uint16_t* cb_l = kv->k_cb_l[L];
+                    const uint16_t* cb_r = kv->k_cb_r[L];
+                    float scale = kv->k_pq_scale[slot];
+                    /* head_dim/G chunks of this kv head: starts at chunk
+                     * (kv_h * head_dim) / G; head_dim must be multiple of G. */
+                    int chunk0 = (kv_h * head_dim) / G;
+                    int n_ch   = head_dim / G;
+                    for (int cc = 0; cc < n_ch; cc++) {
+                        int ci = chunk0 + cc;
+                        const uint16_t* eL = cb_l + (size_t)k_idx[ci] * half;
+                        const uint16_t* eR = cb_r + (size_t)k_idx[C + ci] * half;
+                        for (int j = 0; j < half; j++) {
+                            k_scratch[cc * G + j]        = ib_fp16_to_fp32(eL[j]) * scale;
+                            k_scratch[cc * G + half + j] = ib_fp16_to_fp32(eR[j]) * scale;
+                        }
+                    }
+                    k_t = k_scratch;
+                } else if (kv && kv->storage_int8) {
                     size_t base = ((size_t)L * kv->max_seq + t) * kv_dim
                                 + (size_t)kv_h * head_dim;
                     const int8_t* k_src = kv->k_q8 + base;
@@ -4085,7 +4237,26 @@ static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
             memset(outh, 0, (size_t)head_dim * sizeof(float));
             for (int t = 0; t <= pos; t++) {
                 const float* v_t;
-                if (kv && kv->storage_int8) {
+                if (kv && kv->storage_pyramid) {
+                    int G = kv->pq_G, C = kv->pq_C, half = G / 2;
+                    size_t slot = (size_t)L * kv->max_seq + t;
+                    const uint8_t* v_idx = kv->v_pq_idx + slot * (size_t)(2 * C);
+                    const uint16_t* cb_l = kv->v_cb_l[L];
+                    const uint16_t* cb_r = kv->v_cb_r[L];
+                    float scale = kv->v_pq_scale[slot];
+                    int chunk0 = (kv_h * head_dim) / G;
+                    int n_ch   = head_dim / G;
+                    for (int cc = 0; cc < n_ch; cc++) {
+                        int ci = chunk0 + cc;
+                        const uint16_t* eL = cb_l + (size_t)v_idx[ci] * half;
+                        const uint16_t* eR = cb_r + (size_t)v_idx[C + ci] * half;
+                        for (int j = 0; j < half; j++) {
+                            v_scratch[cc * G + j]        = ib_fp16_to_fp32(eL[j]) * scale;
+                            v_scratch[cc * G + half + j] = ib_fp16_to_fp32(eR[j]) * scale;
+                        }
+                    }
+                    v_t = v_scratch;
+                } else if (kv && kv->storage_int8) {
                     size_t base = ((size_t)L * kv->max_seq + t) * kv_dim
                                 + (size_t)kv_h * head_dim;
                     const int8_t* v_src = kv->v_q8 + base;
@@ -4594,11 +4765,10 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
                                const int* tokens, int B, int pos_start,
                                float* hidden_last_out) {
     if (!s || !kv || !tokens || B <= 0) return -1;
-    if (kv->storage_int8) {
-        /* int8 KV path uses per-vector quantization that's awkward to
-         * write from multiple threads without contention. For now fall
-         * back to sequential for int8 KV; the win recovers when this
-         * gets a per-slot scale array path. */
+    if (kv->storage_int8 || kv->storage_pyramid) {
+        /* int8 / pyramid KV paths use per-vector quantization (or NN
+         * encoding) that's awkward to write from multiple threads
+         * cleanly. Fall back to sequential. */
         int rc = 0;
         for (int b = 0; b < B && rc == 0; b++) {
             float* hbuf = (b == B - 1) ? hidden_last_out : NULL;
