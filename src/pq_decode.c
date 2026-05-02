@@ -3934,6 +3934,13 @@ static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
 
     char buf[64];
     int rc = 0;
+    /* F1.i: detect fused qkv / gateup at start; fused = present in IBF. */
+    int fused_qkv = (ib_pq_session_tensor_shape(s, "L0_qkv_proj", NULL, NULL) == 0);
+    int fused_gu  = (ib_pq_session_tensor_shape(s, "L0_gateup_proj", NULL, NULL) == 0);
+    /* qkv buffer (hidden + 2*kv_dim); gateup buffer (2*inter). Allocate
+     * lazily (only if a fused tensor exists). */
+    float* qkv_buf = fused_qkv ? (float*)malloc((size_t)(hidden + 2 * kv_dim) * sizeof(float)) : NULL;
+    float* gu_buf  = fused_gu  ? (float*)malloc((size_t)(2 * inter) * sizeof(float)) : NULL;
     for (int L = 0; L < n_layers && rc == 0; L++) {
         const float* w_in = NULL; const float* w_pn = NULL;
         snprintf(buf, sizeof(buf), "L%d_input_norm", L);
@@ -3944,12 +3951,20 @@ static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
         /* ── Attention block ── */
         ib_rmsnorm_f32(xb, x, w_in, hidden, eps);
 
-        snprintf(buf, sizeof(buf), "L%d_q_proj", L);
-        if (session_matmul_via(s, buf, xb, q, sc) != 0) { rc = -1; break; }
-        snprintf(buf, sizeof(buf), "L%d_k_proj", L);
-        if (session_matmul_via(s, buf, xb, k_now, sc) != 0) { rc = -1; break; }
-        snprintf(buf, sizeof(buf), "L%d_v_proj", L);
-        if (session_matmul_via(s, buf, xb, v_now, sc) != 0) { rc = -1; break; }
+        if (fused_qkv) {
+            snprintf(buf, sizeof(buf), "L%d_qkv_proj", L);
+            if (session_matmul_via(s, buf, xb, qkv_buf, sc) != 0) { rc = -1; break; }
+            memcpy(q,     qkv_buf,                          (size_t)hidden * sizeof(float));
+            memcpy(k_now, qkv_buf + hidden,                 (size_t)kv_dim * sizeof(float));
+            memcpy(v_now, qkv_buf + hidden + kv_dim,        (size_t)kv_dim * sizeof(float));
+        } else {
+            snprintf(buf, sizeof(buf), "L%d_q_proj", L);
+            if (session_matmul_via(s, buf, xb, q, sc) != 0) { rc = -1; break; }
+            snprintf(buf, sizeof(buf), "L%d_k_proj", L);
+            if (session_matmul_via(s, buf, xb, k_now, sc) != 0) { rc = -1; break; }
+            snprintf(buf, sizeof(buf), "L%d_v_proj", L);
+            if (session_matmul_via(s, buf, xb, v_now, sc) != 0) { rc = -1; break; }
+        }
 
         ib_rope_f32(q,     n_heads, head_dim, pos, theta);
         ib_rope_f32(k_now, n_kv,    head_dim, pos, theta);
@@ -4100,15 +4115,23 @@ static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
 
         /* ── MLP block ── */
         ib_rmsnorm_f32(xb, x, w_pn, hidden, eps);
-        snprintf(buf, sizeof(buf), "L%d_gate_proj", L);
-        if (session_matmul_via(s, buf, xb, gate, sc) != 0) { rc = -1; break; }
-        snprintf(buf, sizeof(buf), "L%d_up_proj", L);
-        if (session_matmul_via(s, buf, xb, up, sc) != 0) { rc = -1; break; }
+        if (fused_gu) {
+            snprintf(buf, sizeof(buf), "L%d_gateup_proj", L);
+            if (session_matmul_via(s, buf, xb, gu_buf, sc) != 0) { rc = -1; break; }
+            memcpy(gate, gu_buf,         (size_t)inter * sizeof(float));
+            memcpy(up,   gu_buf + inter, (size_t)inter * sizeof(float));
+        } else {
+            snprintf(buf, sizeof(buf), "L%d_gate_proj", L);
+            if (session_matmul_via(s, buf, xb, gate, sc) != 0) { rc = -1; break; }
+            snprintf(buf, sizeof(buf), "L%d_up_proj", L);
+            if (session_matmul_via(s, buf, xb, up, sc) != 0) { rc = -1; break; }
+        }
         ib_silu_gate_f32(gate, gate, up, inter);
         snprintf(buf, sizeof(buf), "L%d_down_proj", L);
         if (session_matmul_via(s, buf, gate, mlp_out, sc) != 0) { rc = -1; break; }
         ib_residual_add_f32(x, mlp_out, hidden);
     }
+    free(qkv_buf); free(gu_buf);
 
     if (rc == 0 && (logits || hidden_out)) {
         const float* w_final = NULL;
@@ -4428,6 +4451,9 @@ typedef struct {
     float* up;       /* [intermediate] */
     float* mlp_out;  /* [hidden] */
     float* scores;   /* [max_seq] */
+    /* F1.i: optional fused-output buffers (NULL if not fused). */
+    float* qkv_buf;  /* [hidden + 2*kv_dim] */
+    float* gu_buf;   /* [2*intermediate] */
     forward_scratch sc;
 } pq_batch_slot;
 
@@ -4445,6 +4471,9 @@ typedef struct {
     const float* w_pn;
     char  q_name[32], k_name[32], v_name[32], o_name[32];
     char  gate_name[32], up_name[32], down_name[32];
+    char  qkv_name[32], gu_name[32];
+    int   fused_qkv;
+    int   fused_gu;
 } pq_batch_ctx;
 
 /* PHASE 1 (pre-attn): norm → q/k/v_proj → RoPE → KV write. */
@@ -4455,9 +4484,16 @@ static void batch_pre_attn_task(void* arg, int tid, int b0, int b1) {
     for (int b = b0; b < b1; b++) {
         pq_batch_slot* s = &ctx->slots[b];
         ib_rmsnorm_f32(s->xb, s->x, ctx->w_in, hidden, ctx->eps);
-        session_matmul_via(ctx->s, ctx->q_name, s->xb, s->q, &s->sc);
-        session_matmul_via(ctx->s, ctx->k_name, s->xb, s->k_now, &s->sc);
-        session_matmul_via(ctx->s, ctx->v_name, s->xb, s->v_now, &s->sc);
+        if (ctx->fused_qkv) {
+            session_matmul_via(ctx->s, ctx->qkv_name, s->xb, s->qkv_buf, &s->sc);
+            memcpy(s->q,     s->qkv_buf,                   (size_t)hidden * sizeof(float));
+            memcpy(s->k_now, s->qkv_buf + hidden,          (size_t)kv_dim * sizeof(float));
+            memcpy(s->v_now, s->qkv_buf + hidden + kv_dim, (size_t)kv_dim * sizeof(float));
+        } else {
+            session_matmul_via(ctx->s, ctx->q_name, s->xb, s->q, &s->sc);
+            session_matmul_via(ctx->s, ctx->k_name, s->xb, s->k_now, &s->sc);
+            session_matmul_via(ctx->s, ctx->v_name, s->xb, s->v_now, &s->sc);
+        }
         ib_rope_f32(s->q,     ctx->n_heads, ctx->head_dim, s->pos, ctx->theta);
         ib_rope_f32(s->k_now, ctx->n_kv,    ctx->head_dim, s->pos, ctx->theta);
         /* KV write at slot's absolute position. fp32 path; int8/fp16
@@ -4531,8 +4567,14 @@ static void batch_post_attn_task(void* arg, int tid, int b0, int b1) {
         ib_residual_add_f32(sl->x, sl->xb, hidden);
 
         ib_rmsnorm_f32(sl->xb, sl->x, ctx->w_pn, hidden, ctx->eps);
-        session_matmul_via(ctx->s, ctx->gate_name, sl->xb, sl->gate, &sl->sc);
-        session_matmul_via(ctx->s, ctx->up_name, sl->xb, sl->up, &sl->sc);
+        if (ctx->fused_gu) {
+            session_matmul_via(ctx->s, ctx->gu_name, sl->xb, sl->gu_buf, &sl->sc);
+            memcpy(sl->gate, sl->gu_buf,         (size_t)inter * sizeof(float));
+            memcpy(sl->up,   sl->gu_buf + inter, (size_t)inter * sizeof(float));
+        } else {
+            session_matmul_via(ctx->s, ctx->gate_name, sl->xb, sl->gate, &sl->sc);
+            session_matmul_via(ctx->s, ctx->up_name, sl->xb, sl->up, &sl->sc);
+        }
         ib_silu_gate_f32(sl->gate, sl->gate, sl->up, inter);
         session_matmul_via(ctx->s, ctx->down_name, sl->gate, sl->mlp_out, &sl->sc);
         ib_residual_add_f32(sl->x, sl->mlp_out, hidden);
@@ -4583,6 +4625,8 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
         if (c->K > max_K) max_K = c->K;
         if (c->n_levels == 2 && c->K_l2 > max_Kl2) max_Kl2 = c->K_l2;
     }
+    int fused_qkv = (ib_pq_session_tensor_shape(s, "L0_qkv_proj", NULL, NULL) == 0);
+    int fused_gu  = (ib_pq_session_tensor_shape(s, "L0_gateup_proj", NULL, NULL) == 0);
     int rc = 0;
     for (int b = 0; b < B; b++) {
         pq_batch_slot* sl = &slots[b];
@@ -4604,9 +4648,12 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
         sl->sc.C2R  = (float*)malloc((size_t)max_Kl2 * sizeof(float));
         sl->sc.x    = (float*)malloc((size_t)hidden  * sizeof(float));
         sl->sc.x_n  = hidden;
+        sl->qkv_buf = fused_qkv ? (float*)malloc((size_t)(hidden + 2*kv_dim) * sizeof(float)) : NULL;
+        sl->gu_buf  = fused_gu  ? (float*)malloc((size_t)(2 * inter) * sizeof(float)) : NULL;
         if (!sl->x || !sl->xb || !sl->xb2 || !sl->q || !sl->k_now || !sl->v_now
          || !sl->gate || !sl->up || !sl->mlp_out || !sl->scores
-         || !sl->sc.C1L || !sl->sc.C1R || !sl->sc.C2L || !sl->sc.C2R || !sl->sc.x) {
+         || !sl->sc.C1L || !sl->sc.C1R || !sl->sc.C2L || !sl->sc.C2R || !sl->sc.x
+         || (fused_qkv && !sl->qkv_buf) || (fused_gu && !sl->gu_buf)) {
             rc = -1;
         }
         /* Embedding lookup. */
@@ -4620,6 +4667,8 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
         ctx.head_dim = head_dim; ctx.kv_dim = kv_dim; ctx.inter = inter;
         ctx.eps = eps; ctx.theta = theta;
         ctx.q_per_kv = n_heads / n_kv;
+        ctx.fused_qkv = fused_qkv;
+        ctx.fused_gu  = fused_gu;
 
         for (int L = 0; L < n_layers; L++) {
             ctx.L = L;
@@ -4637,6 +4686,8 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
             snprintf(ctx.gate_name, sizeof(ctx.gate_name), "L%d_gate_proj", L);
             snprintf(ctx.up_name, sizeof(ctx.up_name), "L%d_up_proj", L);
             snprintf(ctx.down_name, sizeof(ctx.down_name), "L%d_down_proj", L);
+            snprintf(ctx.qkv_name, sizeof(ctx.qkv_name), "L%d_qkv_proj", L);
+            snprintf(ctx.gu_name, sizeof(ctx.gu_name), "L%d_gateup_proj", L);
 
             /* PHASE 1: pre-attn (norm + qkv + RoPE + KV write). */
             if (s->spin && s->n_threads > 1) {
@@ -4675,6 +4726,7 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
         free(sl->gate); free(sl->up); free(sl->mlp_out); free(sl->scores);
         free(sl->sc.C1L); free(sl->sc.C1R); free(sl->sc.C2L); free(sl->sc.C2R);
         free(sl->sc.x);
+        free(sl->qkv_buf); free(sl->gu_buf);
     }
     free(slots);
     return rc;
