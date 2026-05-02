@@ -690,13 +690,14 @@ int ib_pq_load_multi(const char* path, ib_pq_multi* out) {
 
     int n = 0;
     for (cJSON* it = tensors->child; it; it = it->next) n++;
-    if (n <= 0) { cJSON_Delete(root); fclose(f); return -1; }
 
     out->n = n;
-    out->names = (char**)calloc((size_t)n, sizeof(char*));
-    out->tensors = (ib_pq_tensor*)calloc((size_t)n, sizeof(ib_pq_tensor));
-    if (!out->names || !out->tensors) {
-        cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+    if (n > 0) {
+        out->names = (char**)calloc((size_t)n, sizeof(char*));
+        out->tensors = (ib_pq_tensor*)calloc((size_t)n, sizeof(ib_pq_tensor));
+        if (!out->names || !out->tensors) {
+            cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+        }
     }
 
     int i = 0;
@@ -3173,9 +3174,11 @@ int ib_pq_multi_caches_create(const ib_pq_multi* multi, ib_pq_multi_caches** out
     ib_pq_multi_caches* mc = (ib_pq_multi_caches*)calloc(1, sizeof(*mc));
     if (!mc) return -1;
     mc->n = multi->n;
-    mc->caches = (ib_pq_lut_cache**)calloc((size_t)multi->n, sizeof(*mc->caches));
-    mc->names  = (char**)calloc((size_t)multi->n, sizeof(*mc->names));
-    if (!mc->caches || !mc->names) { ib_pq_multi_caches_free(mc); return -1; }
+    if (multi->n > 0) {
+        mc->caches = (ib_pq_lut_cache**)calloc((size_t)multi->n, sizeof(*mc->caches));
+        mc->names  = (char**)calloc((size_t)multi->n, sizeof(*mc->names));
+        if (!mc->caches || !mc->names) { ib_pq_multi_caches_free(mc); return -1; }
+    }
     for (int i = 0; i < multi->n; i++) {
         mc->names[i] = multi->names[i];
         if (ib_pq_lut_cache_create(&multi->tensors[i], &mc->caches[i]) != 0) {
@@ -3461,18 +3464,22 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
     if (ib_pq_multi_caches_create(&s->multi, &s->mc) != 0) {
         ib_pq_multi_free(&s->multi); free(s); return -1;
     }
-    s->policies = (ib_pq_policy*)calloc((size_t)s->multi.n, sizeof(*s->policies));
-    if (!s->policies) {
-        ib_pq_multi_caches_free(s->mc);
-        ib_pq_multi_free(&s->multi); free(s); return -1;
+    if (s->multi.n > 0) {
+        s->policies = (ib_pq_policy*)calloc((size_t)s->multi.n, sizeof(*s->policies));
+        if (!s->policies) {
+            ib_pq_multi_caches_free(s->mc);
+            ib_pq_multi_free(&s->multi); free(s); return -1;
+        }
     }
     /* Sentinel: variant=-1 means "use default". */
     for (int i = 0; i < s->multi.n; i++) s->policies[i].variant = -1;
 
     /* Phase 8.E: precompute per-tensor inv_act_scale pointer (NULL if no
      * matching raw block) + size x_scratch to max(N). */
-    s->act_scale_inv_per_tensor = (const float**)calloc((size_t)s->multi.n,
-                                                          sizeof(*s->act_scale_inv_per_tensor));
+    s->act_scale_inv_per_tensor = (s->multi.n > 0)
+        ? (const float**)calloc((size_t)s->multi.n,
+                                  sizeof(*s->act_scale_inv_per_tensor))
+        : NULL;
     int max_N = 0;
     char buf[256];
     for (int i = 0; i < s->multi.n; i++) {
@@ -3537,9 +3544,14 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
                 t->q = (const uint8_t*)rq->data;
                 t->s = (const uint16_t*)rs->data;
                 t->M = M; t->N = N; t->G = G;
+                if (N > max_N) max_N = N;
                 (void)slen;
             }
         }
+    }
+    if (max_N > 0 && !s->x_scratch) {
+        s->x_scratch = (float*)malloc((size_t)max_N * sizeof(float));
+        s->x_scratch_n = max_N;
     }
 
     /* F1.a: preallocate scratch sized to fleet max. */
