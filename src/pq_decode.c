@@ -3424,15 +3424,59 @@ static const struct ib_fp16w_tensor* session_fp16_find(const ib_pq_session* s,
     return NULL;
 }
 
-static int fp16w_matmul_fp32(const struct ib_fp16w_tensor* t,
-                                const float* x, float* out) {
-    const int M = t->M, N = t->N;
-    for (int m = 0; m < M; m++) {
+static void fp16w_rows(const struct ib_fp16w_tensor* t,
+                          const float* x, float* out, int m_start, int m_end) {
+    const int N = t->N;
+    for (int m = m_start; m < m_end; m++) {
         const uint16_t* row = t->w + (size_t)m * N;
         float acc = 0.0f;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+        float32x4_t v0 = vdupq_n_f32(0.0f), v1 = vdupq_n_f32(0.0f);
+        int j = 0;
+        for (; j + 8 <= N; j += 8) {
+            float16x8_t w8 = vreinterpretq_f16_u16(vld1q_u16(row + j));
+            float32x4_t wlo = vcvt_f32_f16(vget_low_f16(w8));
+            float32x4_t whi = vcvt_f32_f16(vget_high_f16(w8));
+            v0 = vfmaq_f32(v0, wlo, vld1q_f32(x + j));
+            v1 = vfmaq_f32(v1, whi, vld1q_f32(x + j + 4));
+        }
+        acc = vaddvq_f32(vaddq_f32(v0, v1));
+        for (; j < N; j++) acc += ib_fp16_to_fp32(row[j]) * x[j];
+#else
         for (int j = 0; j < N; j++) acc += ib_fp16_to_fp32(row[j]) * x[j];
+#endif
         out[m] = acc;
     }
+}
+
+typedef struct {
+    const struct ib_fp16w_tensor* t;
+    const float* x;
+    float* out;
+} fp16w_task_ctx;
+
+static void fp16w_row_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    fp16w_task_ctx* c = (fp16w_task_ctx*)arg;
+    fp16w_rows(c->t, c->x, c->out, s, e);
+}
+
+static int fp16w_matmul_fp32(const struct ib_fp16w_tensor* t,
+                                const float* x, float* out) {
+    fp16w_rows(t, x, out, 0, t->M);
+    return 0;
+}
+
+static int fp16w_matmul_fp32_threaded(const struct ib_fp16w_tensor* t,
+                                          const float* x, float* out,
+                                          pq_spin_pool* spin, int n_threads) {
+    if (!spin || n_threads <= 1 || t->M < 256) {
+        return fp16w_matmul_fp32(t, x, out);
+    }
+    fp16w_task_ctx ctx = { t, x, out };
+    int chunk = (t->M + n_threads - 1) / n_threads;
+    if (chunk < 32) chunk = 32;
+    pq_spin_pool_run(spin, fp16w_row_task, &ctx, t->M, chunk);
     return 0;
 }
 
@@ -3872,7 +3916,7 @@ static int session_matmul_with_scratch(ib_pq_session* s, const char* name,
 int ib_pq_session_matmul(ib_pq_session* s, const char* name,
                           const float* x, float* out) {
     const struct ib_fp16w_tensor* fw = session_fp16_find(s, name);
-    if (fw) return fp16w_matmul_fp32(fw, x, out);
+    if (fw) return fp16w_matmul_fp32_threaded(fw, x, out, s->spin, s->n_threads);
     const struct ib_int4_tensor* i4 = session_int4_find(s, name);
     if (i4) {
         const float* xk = x;
