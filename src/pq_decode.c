@@ -3831,10 +3831,12 @@ static int load_norm_weight(const ib_pq_session* s, const char* name,
     return 0;
 }
 
-int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
-                        int token_id, int pos, float* logits) {
-    /* logits == NULL: skip the final RMSNorm + lm_head matmul. Used by
-     * ib_pq_forward_step_no_logits during prompt prefill. */
+/* Internal worker. logits != NULL: write vocab logits via lm_head.
+ * hidden_out != NULL: write post-final-norm hidden state. Both NULL:
+ * skip the tail (prefill no-logits). */
+static int forward_step_internal(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos,
+                                   float* logits, float* hidden_out) {
     if (!s) return -1;
     const char* cfg = ib_pq_session_config_json(s);
     int n_layers = session_config_int(cfg, "num_layers", 0);
@@ -4048,12 +4050,15 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
         ib_residual_add_f32(x, mlp_out, hidden);
     }
 
-    if (rc == 0 && logits) {
+    if (rc == 0 && (logits || hidden_out)) {
         const float* w_final = NULL;
         if (load_norm_weight(s, "final_norm", &w_final, hidden) != 0) rc = -1;
         else {
             ib_rmsnorm_f32(xb, x, w_final, hidden, eps);
-            if (ib_pq_session_matmul(s, "lm_head", xb, logits) != 0) rc = -1;
+            if (hidden_out) memcpy(hidden_out, xb, (size_t)hidden * sizeof(float));
+            if (logits) {
+                if (ib_pq_session_matmul(s, "lm_head", xb, logits) != 0) rc = -1;
+            }
             (void)vocab;
         }
     }
@@ -4065,6 +4070,17 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
     return rc;
 }
 
+int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                        int token_id, int pos, float* logits) {
+    return forward_step_internal(s, kv, token_id, pos, logits, NULL);
+}
+
+int ib_pq_forward_step_to_hidden(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos, float* hidden_out) {
+    if (!hidden_out) return -1;
+    return forward_step_internal(s, kv, token_id, pos, NULL, hidden_out);
+}
+
 int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
                             const int* prompt_ids, int n_prompt,
                             int max_new, int eos_token_id,
@@ -4073,49 +4089,54 @@ int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
     if (!s || !kv || !prompt_ids || n_prompt <= 0 || max_new < 0
      || !out_ids || !n_out) return -1;
     const char* cfg = ib_pq_session_config_json(s);
-    int vocab = session_config_int(cfg, "vocab_size", 0);
-    if (vocab <= 0) return -1;
-    float* logits = (float*)malloc((size_t)vocab * sizeof(float));
-    if (!logits) return -1;
+    int hidden = session_config_int(cfg, "hidden_size", 0);
+    if (hidden <= 0) return -1;
+    float* hbuf = (float*)malloc((size_t)hidden * sizeof(float));
+    if (!hbuf) return -1;
 
     int pos = 0;
-    int last_token = -1;
-    /* Feed prompt: skip lm_head on all but the last prompt token.
-     * Only the last position's logits feed the decode loop below. */
+    /* Feed prompt: skip both final norm + lm_head on all but the last
+     * prompt token; on the last, capture the post-final-norm hidden so
+     * we can dispatch through lm_head_topk(K=1) instead of full vocab. */
     for (int i = 0; i < n_prompt; i++) {
         int tid = prompt_ids[i];
-        float* lg = (i == n_prompt - 1) ? logits : NULL;
-        if (ib_pq_forward_step(s, kv, tid, pos, lg) != 0) {
-            free(logits); return -1;
+        int rc;
+        if (i == n_prompt - 1) {
+            rc = forward_step_internal(s, kv, tid, pos, NULL, hbuf);
+        } else {
+            rc = forward_step_internal(s, kv, tid, pos, NULL, NULL);
         }
-        last_token = tid;
+        if (rc != 0) { free(hbuf); return -1; }
         pos++;
     }
 
     int written = 0;
+    /* K_TOP_GREEDY: 8 candidates is enough to virtually always include
+     * the true argmax (test 50: K=32 captured full argmax 100% of runs;
+     * 8 is the sweet spot for cost/safety). Output is sorted desc, so
+     * element 0 is the refined best. */
+    enum { K_TOP_GREEDY = 8 };
+    float top_logits[K_TOP_GREEDY];
+    int32_t top_ids[K_TOP_GREEDY];
     for (int g = 0; g < max_new; g++) {
-        /* Greedy: argmax of last logits. */
-        int best = 0;
-        float bv = logits[0];
-        for (int v = 1; v < vocab; v++) {
-            if (logits[v] > bv) { bv = logits[v]; best = v; }
+        if (ib_pq_session_lm_head_topk(s, "lm_head", hbuf, K_TOP_GREEDY,
+                                          top_logits, top_ids) != 0) {
+            free(hbuf); *n_out = written; return -1;
         }
+        int best = (int)top_ids[0];
         out_ids[written++] = best;
         if (cb && cb(best, cb_ctx) != 0) break;
         if (eos_token_id >= 0 && best == eos_token_id) break;
         if (pos >= kv->max_seq) break;
 
-        /* Feed best back in. */
-        if (ib_pq_forward_step(s, kv, best, pos, logits) != 0) {
-            free(logits); *n_out = written; return -1;
+        if (forward_step_internal(s, kv, best, pos, NULL, hbuf) != 0) {
+            free(hbuf); *n_out = written; return -1;
         }
-        last_token = best;
         pos++;
     }
 
     *n_out = written;
-    (void)last_token;
-    free(logits);
+    free(hbuf);
     return 0;
 }
 

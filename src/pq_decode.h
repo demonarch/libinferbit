@@ -402,6 +402,12 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
 int ib_pq_forward_step_no_logits(ib_pq_session* s, ib_pq_kv_cache* kv,
                                    int token_id, int pos);
 
+/* F1.j: forward step that returns the post-final-norm hidden state
+ * instead of vocab logits. Lets the caller dispatch lm_head via the
+ * cheaper ib_pq_session_lm_head_topk for greedy / top-K sampling. */
+int ib_pq_forward_step_to_hidden(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos, float* hidden_out);
+
 /* Greedy generate: feed prompt_ids[0..n_prompt) into the kv cache,
  * then greedily emit up to max_new tokens (argmax of logits). Stops
  * early if eos_token_id is produced. Writes generated tokens into
