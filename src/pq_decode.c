@@ -4155,20 +4155,13 @@ int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
     if (!hbuf) return -1;
 
     int pos = 0;
-    /* Feed prompt: skip both final norm + lm_head on all but the last
-     * prompt token; on the last, capture the post-final-norm hidden so
-     * we can dispatch through lm_head_topk(K=1) instead of full vocab. */
-    for (int i = 0; i < n_prompt; i++) {
-        int tid = prompt_ids[i];
-        int rc;
-        if (i == n_prompt - 1) {
-            rc = forward_step_internal_sc(s, kv, tid, pos, NULL, hbuf, NULL);
-        } else {
-            rc = forward_step_internal_sc(s, kv, tid, pos, NULL, NULL, NULL);
-        }
-        if (rc != 0) { free(hbuf); return -1; }
-        pos++;
+    /* F1.c: batched prefill — runs the prompt through one barrier-coupled
+     * parallel pass per layer (B/T inputs per worker), bit-exact vs
+     * sequential. Final norm is applied to the last slot. */
+    if (ib_pq_forward_step_batch(s, kv, prompt_ids, n_prompt, 0, hbuf) != 0) {
+        free(hbuf); return -1;
     }
+    pos = n_prompt;
 
     int written = 0;
     /* K_TOP_GREEDY: 8 candidates is enough to virtually always include
@@ -4367,18 +4360,22 @@ int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
     }
 
     int pos = 0;
-    for (int i = 0; i < n_prompt; i++) {
-        int last = (i == n_prompt - 1);
-        int rc;
-        if (use_topk) {
-            rc = forward_step_internal_sc(s, kv, prompt_ids[i], pos, NULL,
-                                          last ? hbuf : NULL, NULL);
-        } else {
-            rc = forward_step_internal_sc(s, kv, prompt_ids[i], pos,
-                                          last ? logits : NULL, NULL, NULL);
+    if (use_topk) {
+        /* F1.c: batched prefill into the last slot's hidden. */
+        if (ib_pq_forward_step_batch(s, kv, prompt_ids, n_prompt, 0, hbuf) != 0) {
+            free(logits); free(hbuf); return -1;
         }
-        if (rc != 0) { free(logits); free(hbuf); return -1; }
-        pos++;
+        pos = n_prompt;
+    } else {
+        /* Full-vocab sample path keeps the sequential prefill (still
+         * skips lm_head on non-final positions). */
+        for (int i = 0; i < n_prompt; i++) {
+            int last = (i == n_prompt - 1);
+            int rc = forward_step_internal_sc(s, kv, prompt_ids[i], pos,
+                                                 last ? logits : NULL, NULL, NULL);
+            if (rc != 0) { free(logits); free(hbuf); return -1; }
+            pos++;
+        }
     }
     int written = 0;
     for (int g = 0; g < max_new; g++) {
@@ -4413,4 +4410,272 @@ int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
 int ib_pq_forward_step_no_logits(ib_pq_session* s, ib_pq_kv_cache* kv,
                                    int token_id, int pos) {
     return ib_pq_forward_step(s, kv, token_id, pos, NULL);
+}
+
+/* ── F1.c full batched prefill ── */
+
+typedef struct {
+    /* Per-batch-slot state. All buffers are slot-local; threads never share. */
+    int   token_id;
+    int   pos;
+    float* x;        /* [hidden] residual stream */
+    float* xb;       /* [hidden] norm output */
+    float* xb2;      /* [hidden] attn output */
+    float* q;        /* [n_heads * head_dim] */
+    float* k_now;    /* [kv_dim] */
+    float* v_now;    /* [kv_dim] */
+    float* gate;     /* [intermediate] */
+    float* up;       /* [intermediate] */
+    float* mlp_out;  /* [hidden] */
+    float* scores;   /* [max_seq] */
+    forward_scratch sc;
+} pq_batch_slot;
+
+typedef struct {
+    ib_pq_session* s;
+    ib_pq_kv_cache* kv;
+    pq_batch_slot* slots;
+    int B;
+    int L;             /* current layer */
+    /* Cached config & layer weights for the current layer. */
+    int hidden, n_heads, n_kv, head_dim, kv_dim, inter;
+    float eps, theta;
+    int q_per_kv;
+    const float* w_in;
+    const float* w_pn;
+    char  q_name[32], k_name[32], v_name[32], o_name[32];
+    char  gate_name[32], up_name[32], down_name[32];
+} pq_batch_ctx;
+
+/* PHASE 1 (pre-attn): norm → q/k/v_proj → RoPE → KV write. */
+static void batch_pre_attn_task(void* arg, int tid, int b0, int b1) {
+    (void)tid;
+    pq_batch_ctx* ctx = (pq_batch_ctx*)arg;
+    int hidden = ctx->hidden, kv_dim = ctx->kv_dim;
+    for (int b = b0; b < b1; b++) {
+        pq_batch_slot* s = &ctx->slots[b];
+        ib_rmsnorm_f32(s->xb, s->x, ctx->w_in, hidden, ctx->eps);
+        session_matmul_via(ctx->s, ctx->q_name, s->xb, s->q, &s->sc);
+        session_matmul_via(ctx->s, ctx->k_name, s->xb, s->k_now, &s->sc);
+        session_matmul_via(ctx->s, ctx->v_name, s->xb, s->v_now, &s->sc);
+        ib_rope_f32(s->q,     ctx->n_heads, ctx->head_dim, s->pos, ctx->theta);
+        ib_rope_f32(s->k_now, ctx->n_kv,    ctx->head_dim, s->pos, ctx->theta);
+        /* KV write at slot's absolute position. fp32 path; int8/fp16
+         * paths are not currently used by the prefill helper to keep
+         * this commit small. */
+        if (ctx->kv && !ctx->kv->storage_int8 && !ctx->kv->storage_fp16) {
+            size_t off = ((size_t)ctx->L * ctx->kv->max_seq + s->pos) * kv_dim;
+            memcpy(ctx->kv->k_f32 + off, s->k_now, (size_t)kv_dim * sizeof(float));
+            memcpy(ctx->kv->v_f32 + off, s->v_now, (size_t)kv_dim * sizeof(float));
+        } else if (ctx->kv && ctx->kv->storage_fp16) {
+            uint16_t* kp = ctx->kv->k_f16 + ((size_t)ctx->L * ctx->kv->max_seq + s->pos) * kv_dim;
+            uint16_t* vp = ctx->kv->v_f16 + ((size_t)ctx->L * ctx->kv->max_seq + s->pos) * kv_dim;
+            for (int d = 0; d < kv_dim; d++) {
+                kp[d] = ib_fp32_to_fp16(s->k_now[d]);
+                vp[d] = ib_fp32_to_fp16(s->v_now[d]);
+            }
+        }
+        /* int8 path falls back to sequential — not used here. */
+    }
+}
+
+/* PHASE 2 (post-attn): attention reads → o_proj → residual → norm →
+ * gate/up → silu_gate → down → residual. */
+static void batch_post_attn_task(void* arg, int tid, int b0, int b1) {
+    (void)tid;
+    pq_batch_ctx* ctx = (pq_batch_ctx*)arg;
+    int hidden = ctx->hidden, n_heads = ctx->n_heads, n_kv = ctx->n_kv;
+    int head_dim = ctx->head_dim, kv_dim = ctx->kv_dim, inter = ctx->inter;
+    int q_per_kv = ctx->q_per_kv;
+    float inv_sqrt = 1.0f / sqrtf((float)head_dim);
+    float k_scratch[256], v_scratch[256];
+    for (int b = b0; b < b1; b++) {
+        pq_batch_slot* sl = &ctx->slots[b];
+        /* Multi-head causal attention over kv positions [0, sl->pos]. */
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = h / q_per_kv;
+            const float* qh = sl->q + (size_t)h * head_dim;
+            for (int t = 0; t <= sl->pos; t++) {
+                const float* k_t;
+                if (ctx->kv->storage_fp16) {
+                    const uint16_t* k_src = ctx->kv->k_f16
+                        + ((size_t)ctx->L * ctx->kv->max_seq + t) * kv_dim
+                        + (size_t)kv_h * head_dim;
+                    for (int d = 0; d < head_dim; d++) k_scratch[d] = ib_fp16_to_fp32(k_src[d]);
+                    k_t = k_scratch;
+                } else {
+                    k_t = ctx->kv->k_f32 + ((size_t)ctx->L * ctx->kv->max_seq + t) * kv_dim
+                                         + (size_t)kv_h * head_dim;
+                }
+                sl->scores[t] = pq_dot_f32(qh, k_t, head_dim) * inv_sqrt;
+            }
+            ib_softmax_f32(sl->scores, sl->pos + 1);
+            float* outh = sl->xb2 + (size_t)h * head_dim;
+            memset(outh, 0, (size_t)head_dim * sizeof(float));
+            for (int t = 0; t <= sl->pos; t++) {
+                const float* v_t;
+                if (ctx->kv->storage_fp16) {
+                    const uint16_t* v_src = ctx->kv->v_f16
+                        + ((size_t)ctx->L * ctx->kv->max_seq + t) * kv_dim
+                        + (size_t)kv_h * head_dim;
+                    for (int d = 0; d < head_dim; d++) v_scratch[d] = ib_fp16_to_fp32(v_src[d]);
+                    v_t = v_scratch;
+                } else {
+                    v_t = ctx->kv->v_f32 + ((size_t)ctx->L * ctx->kv->max_seq + t) * kv_dim
+                                          + (size_t)kv_h * head_dim;
+                }
+                pq_accum_scaled_f32(outh, v_t, sl->scores[t], head_dim);
+            }
+        }
+        session_matmul_via(ctx->s, ctx->o_name, sl->xb2, sl->xb, &sl->sc);
+        ib_residual_add_f32(sl->x, sl->xb, hidden);
+
+        ib_rmsnorm_f32(sl->xb, sl->x, ctx->w_pn, hidden, ctx->eps);
+        session_matmul_via(ctx->s, ctx->gate_name, sl->xb, sl->gate, &sl->sc);
+        session_matmul_via(ctx->s, ctx->up_name, sl->xb, sl->up, &sl->sc);
+        ib_silu_gate_f32(sl->gate, sl->gate, sl->up, inter);
+        session_matmul_via(ctx->s, ctx->down_name, sl->gate, sl->mlp_out, &sl->sc);
+        ib_residual_add_f32(sl->x, sl->mlp_out, hidden);
+    }
+}
+
+int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
+                               const int* tokens, int B, int pos_start,
+                               float* hidden_last_out) {
+    if (!s || !kv || !tokens || B <= 0) return -1;
+    if (kv->storage_int8) {
+        /* int8 KV path uses per-vector quantization that's awkward to
+         * write from multiple threads without contention. For now fall
+         * back to sequential for int8 KV; the win recovers when this
+         * gets a per-slot scale array path. */
+        int rc = 0;
+        for (int b = 0; b < B && rc == 0; b++) {
+            float* hbuf = (b == B - 1) ? hidden_last_out : NULL;
+            rc = forward_step_internal_sc(s, kv, tokens[b], pos_start + b,
+                                            NULL, hbuf, NULL);
+        }
+        return rc;
+    }
+    if (B == 1) {
+        return forward_step_internal_sc(s, kv, tokens[0], pos_start,
+                                          NULL, hidden_last_out, NULL);
+    }
+
+    const char* cfg = ib_pq_session_config_json(s);
+    int n_layers = session_config_int(cfg, "num_layers", 0);
+    int hidden   = session_config_int(cfg, "hidden_size", 0);
+    int n_heads  = session_config_int(cfg, "num_heads", 0);
+    int n_kv     = session_config_int(cfg, "num_kv_heads", n_heads);
+    int head_dim = session_config_int(cfg, "head_dim", hidden / n_heads);
+    int inter    = session_config_int(cfg, "intermediate_size", 0);
+    float eps    = session_config_float(cfg, "rms_norm_eps", 1e-5f);
+    float theta  = session_config_float(cfg, "rope_theta", 10000.0f);
+    int kv_dim   = n_kv * head_dim;
+    if (n_layers <= 0 || hidden <= 0) return -1;
+
+    /* Per-slot allocation. All slots own their state independently. */
+    int max_seq = kv->max_seq;
+    pq_batch_slot* slots = (pq_batch_slot*)calloc((size_t)B, sizeof(*slots));
+    if (!slots) return -1;
+    int max_K = 0, max_Kl2 = 0;
+    for (int i = 0; i < s->multi.n; i++) {
+        const ib_pq_lut_cache* c = s->mc->caches[i];
+        if (c->K > max_K) max_K = c->K;
+        if (c->n_levels == 2 && c->K_l2 > max_Kl2) max_Kl2 = c->K_l2;
+    }
+    int rc = 0;
+    for (int b = 0; b < B; b++) {
+        pq_batch_slot* sl = &slots[b];
+        sl->token_id = tokens[b];
+        sl->pos = pos_start + b;
+        sl->x       = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->xb      = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->xb2     = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->q       = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->k_now   = (float*)calloc((size_t)kv_dim, sizeof(float));
+        sl->v_now   = (float*)calloc((size_t)kv_dim, sizeof(float));
+        sl->gate    = (float*)calloc((size_t)inter,  sizeof(float));
+        sl->up      = (float*)calloc((size_t)inter,  sizeof(float));
+        sl->mlp_out = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->scores  = (float*)calloc((size_t)(max_seq + 1), sizeof(float));
+        sl->sc.C1L  = (float*)malloc((size_t)max_K   * sizeof(float));
+        sl->sc.C1R  = (float*)malloc((size_t)max_K   * sizeof(float));
+        sl->sc.C2L  = (float*)malloc((size_t)max_Kl2 * sizeof(float));
+        sl->sc.C2R  = (float*)malloc((size_t)max_Kl2 * sizeof(float));
+        sl->sc.x    = (float*)malloc((size_t)hidden  * sizeof(float));
+        sl->sc.x_n  = hidden;
+        if (!sl->x || !sl->xb || !sl->xb2 || !sl->q || !sl->k_now || !sl->v_now
+         || !sl->gate || !sl->up || !sl->mlp_out || !sl->scores
+         || !sl->sc.C1L || !sl->sc.C1R || !sl->sc.C2L || !sl->sc.C2R || !sl->sc.x) {
+            rc = -1;
+        }
+        /* Embedding lookup. */
+        if (rc == 0 && embed_lookup(s, sl->token_id, sl->x, hidden) != 0) rc = -1;
+    }
+
+    if (rc == 0) {
+        pq_batch_ctx ctx = {0};
+        ctx.s = s; ctx.kv = kv; ctx.slots = slots; ctx.B = B;
+        ctx.hidden = hidden; ctx.n_heads = n_heads; ctx.n_kv = n_kv;
+        ctx.head_dim = head_dim; ctx.kv_dim = kv_dim; ctx.inter = inter;
+        ctx.eps = eps; ctx.theta = theta;
+        ctx.q_per_kv = n_heads / n_kv;
+
+        for (int L = 0; L < n_layers; L++) {
+            ctx.L = L;
+            const float* w_in = NULL; const float* w_pn = NULL;
+            char buf[64];
+            snprintf(buf, sizeof(buf), "L%d_input_norm", L);
+            if (load_norm_weight(s, buf, &w_in, hidden) != 0) { rc = -1; break; }
+            snprintf(buf, sizeof(buf), "L%d_post_attn_norm", L);
+            if (load_norm_weight(s, buf, &w_pn, hidden) != 0) { rc = -1; break; }
+            ctx.w_in = w_in; ctx.w_pn = w_pn;
+            snprintf(ctx.q_name, sizeof(ctx.q_name), "L%d_q_proj", L);
+            snprintf(ctx.k_name, sizeof(ctx.k_name), "L%d_k_proj", L);
+            snprintf(ctx.v_name, sizeof(ctx.v_name), "L%d_v_proj", L);
+            snprintf(ctx.o_name, sizeof(ctx.o_name), "L%d_o_proj", L);
+            snprintf(ctx.gate_name, sizeof(ctx.gate_name), "L%d_gate_proj", L);
+            snprintf(ctx.up_name, sizeof(ctx.up_name), "L%d_up_proj", L);
+            snprintf(ctx.down_name, sizeof(ctx.down_name), "L%d_down_proj", L);
+
+            /* PHASE 1: pre-attn (norm + qkv + RoPE + KV write). */
+            if (s->spin && s->n_threads > 1) {
+                int chunk = (B + s->n_threads - 1) / s->n_threads;
+                if (chunk < 1) chunk = 1;
+                pq_spin_pool_run(s->spin, batch_pre_attn_task, &ctx, B, chunk);
+            } else {
+                batch_pre_attn_task(&ctx, 0, 0, B);
+            }
+
+            /* PHASE 2: attn read + remainder. KV writes from PHASE 1 are
+             * fully synchronized at this point (pool returned). */
+            if (s->spin && s->n_threads > 1) {
+                int chunk = (B + s->n_threads - 1) / s->n_threads;
+                if (chunk < 1) chunk = 1;
+                pq_spin_pool_run(s->spin, batch_post_attn_task, &ctx, B, chunk);
+            } else {
+                batch_post_attn_task(&ctx, 0, 0, B);
+            }
+        }
+        if (rc == 0) kv->length = pos_start + B;
+
+        if (rc == 0 && hidden_last_out) {
+            const float* w_final = NULL;
+            if (load_norm_weight(s, "final_norm", &w_final, hidden) != 0) rc = -1;
+            else {
+                ib_rmsnorm_f32(hidden_last_out, slots[B - 1].x, w_final, hidden, eps);
+            }
+        }
+    }
+
+    for (int b = 0; b < B; b++) {
+        pq_batch_slot* sl = &slots[b];
+        free(sl->x); free(sl->xb); free(sl->xb2); free(sl->q);
+        free(sl->k_now); free(sl->v_now);
+        free(sl->gate); free(sl->up); free(sl->mlp_out); free(sl->scores);
+        free(sl->sc.C1L); free(sl->sc.C1R); free(sl->sc.C2L); free(sl->sc.C2R);
+        free(sl->sc.x);
+    }
+    free(slots);
+    return rc;
 }
