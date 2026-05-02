@@ -3522,8 +3522,15 @@ int ib_pq_session_set_policy(ib_pq_session* s, const char* name, ib_pq_policy p)
     return 0;
 }
 
-int ib_pq_session_matmul(ib_pq_session* s, const char* name,
-                          const float* x, float* out) {
+/* F1.c: reentrant matmul that takes its scratch + x_scratch as args.
+ * No use of session->scratch_C* / session->x_scratch / session->spin.
+ * Used by forward_step_batch where multiple threads run independent
+ * forward steps in parallel and each thread brings its own scratch. */
+static int session_matmul_with_scratch(ib_pq_session* s, const char* name,
+                                          const float* x, float* out,
+                                          float* C1L, float* C1R,
+                                          float* C2L, float* C2R,
+                                          float* x_scratch, int x_scratch_n) {
     int i = session_find_index(s, name);
     if (i < 0) return -1;
     const ib_pq_tensor* t = &s->multi.tensors[i];
@@ -3531,6 +3538,38 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
     ib_pq_policy p = (s->policies[i].variant >= 0) ? s->policies[i] : s->default_policy;
 
     /* Phase 8.E: pre-scale x by inv_act_scale if calibration was used. */
+    const float* x_for_kernel = x;
+    const float* inv_s = (s->act_scale_inv_per_tensor
+                            ? s->act_scale_inv_per_tensor[i] : NULL);
+    if (inv_s && x_scratch && t->N <= x_scratch_n) {
+        for (int j = 0; j < t->N; j++) x_scratch[j] = x[j] * inv_s[j];
+        x_for_kernel = x_scratch;
+    }
+
+    switch (p.variant) {
+    case IB_PQ_VARIANT_L1_ONLY:
+        return ib_pq_matmul_fp32_l1_only(t, x_for_kernel, out);
+    case IB_PQ_VARIANT_L2SKIP:
+        return ib_pq_matmul_fp32_streaming_l2skip_cached(t, c, x_for_kernel, out, p.skip_threshold);
+    case IB_PQ_VARIANT_SPARSE:
+        return ib_pq_matmul_fp32_streaming_sparse(t, x_for_kernel, out, p.act_threshold);
+    case IB_PQ_VARIANT_INT8:
+        return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x_for_kernel, out);
+    case IB_PQ_VARIANT_STREAMING:
+    default:
+        return streaming_cached_kernel(t, c, x_for_kernel, out, C1L, C1R, C2L, C2R);
+    }
+}
+
+int ib_pq_session_matmul(ib_pq_session* s, const char* name,
+                          const float* x, float* out) {
+    /* Public entry: uses session-level shared scratch. */
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    const ib_pq_tensor* t = &s->multi.tensors[i];
+    const ib_pq_lut_cache* c = s->mc->caches[i];
+    ib_pq_policy p = (s->policies[i].variant >= 0) ? s->policies[i] : s->default_policy;
+
     const float* x_for_kernel = x;
     const float* inv_s = (s->act_scale_inv_per_tensor
                             ? s->act_scale_inv_per_tensor[i] : NULL);
@@ -3550,10 +3589,6 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
         return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x_for_kernel, out);
     case IB_PQ_VARIANT_STREAMING:
     default:
-        /* F1.b: hybrid spin-then-sleep pool with QoS-pinned P-core
-         * workers. Threaded path also uses F1.h packed indices in the
-         * row loop. Threshold tuned high — only the very biggest
-         * matmuls get threaded so per-call sync overhead is amortized. */
         if (s->spin && s->n_threads > 1 && s->thread_scratch
          && (size_t)t->M * (size_t)t->C >= 1500000) {
             return ib_pq_matmul_fp32_streaming_cached_spin(t, c, x_for_kernel, out,
@@ -3831,12 +3866,37 @@ static int load_norm_weight(const ib_pq_session* s, const char* name,
     return 0;
 }
 
+/* F1.c: per-call scratch for thread-safe forward steps. NULL = use
+ * session's shared scratch (single-threaded path). */
+typedef struct {
+    float* C1L;
+    float* C1R;
+    float* C2L;
+    float* C2R;
+    float* x;       /* x_scratch buffer for AWQ pre-scaling */
+    int    x_n;
+} forward_scratch;
+
+static int session_matmul_via(ib_pq_session* s, const char* name,
+                                const float* x, float* out,
+                                const forward_scratch* sc) {
+    if (sc) {
+        return session_matmul_with_scratch(s, name, x, out,
+                                              sc->C1L, sc->C1R, sc->C2L, sc->C2R,
+                                              sc->x, sc->x_n);
+    }
+    return ib_pq_session_matmul(s, name, x, out);
+}
+
 /* Internal worker. logits != NULL: write vocab logits via lm_head.
  * hidden_out != NULL: write post-final-norm hidden state. Both NULL:
- * skip the tail (prefill no-logits). */
-static int forward_step_internal(ib_pq_session* s, ib_pq_kv_cache* kv,
-                                   int token_id, int pos,
-                                   float* logits, float* hidden_out) {
+ * skip the tail (prefill no-logits). sc != NULL: use the provided
+ * per-thread scratch instead of session-shared scratch (for batched
+ * prefill threading). */
+static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                       int token_id, int pos,
+                                       float* logits, float* hidden_out,
+                                       const forward_scratch* sc) {
     if (!s) return -1;
     const char* cfg = ib_pq_session_config_json(s);
     int n_layers = session_config_int(cfg, "num_layers", 0);
@@ -3885,11 +3945,11 @@ static int forward_step_internal(ib_pq_session* s, ib_pq_kv_cache* kv,
         ib_rmsnorm_f32(xb, x, w_in, hidden, eps);
 
         snprintf(buf, sizeof(buf), "L%d_q_proj", L);
-        if (ib_pq_session_matmul(s, buf, xb, q) != 0) { rc = -1; break; }
+        if (session_matmul_via(s, buf, xb, q, sc) != 0) { rc = -1; break; }
         snprintf(buf, sizeof(buf), "L%d_k_proj", L);
-        if (ib_pq_session_matmul(s, buf, xb, k_now) != 0) { rc = -1; break; }
+        if (session_matmul_via(s, buf, xb, k_now, sc) != 0) { rc = -1; break; }
         snprintf(buf, sizeof(buf), "L%d_v_proj", L);
-        if (ib_pq_session_matmul(s, buf, xb, v_now) != 0) { rc = -1; break; }
+        if (session_matmul_via(s, buf, xb, v_now, sc) != 0) { rc = -1; break; }
 
         ib_rope_f32(q,     n_heads, head_dim, pos, theta);
         ib_rope_f32(k_now, n_kv,    head_dim, pos, theta);
@@ -4035,18 +4095,18 @@ static int forward_step_internal(ib_pq_session* s, ib_pq_kv_cache* kv,
 
         /* o_proj + residual */
         snprintf(buf, sizeof(buf), "L%d_o_proj", L);
-        if (ib_pq_session_matmul(s, buf, xb2, xb) != 0) { rc = -1; break; }
+        if (session_matmul_via(s, buf, xb2, xb, sc) != 0) { rc = -1; break; }
         ib_residual_add_f32(x, xb, hidden);
 
         /* ── MLP block ── */
         ib_rmsnorm_f32(xb, x, w_pn, hidden, eps);
         snprintf(buf, sizeof(buf), "L%d_gate_proj", L);
-        if (ib_pq_session_matmul(s, buf, xb, gate) != 0) { rc = -1; break; }
+        if (session_matmul_via(s, buf, xb, gate, sc) != 0) { rc = -1; break; }
         snprintf(buf, sizeof(buf), "L%d_up_proj", L);
-        if (ib_pq_session_matmul(s, buf, xb, up) != 0) { rc = -1; break; }
+        if (session_matmul_via(s, buf, xb, up, sc) != 0) { rc = -1; break; }
         ib_silu_gate_f32(gate, gate, up, inter);
         snprintf(buf, sizeof(buf), "L%d_down_proj", L);
-        if (ib_pq_session_matmul(s, buf, gate, mlp_out) != 0) { rc = -1; break; }
+        if (session_matmul_via(s, buf, gate, mlp_out, sc) != 0) { rc = -1; break; }
         ib_residual_add_f32(x, mlp_out, hidden);
     }
 
@@ -4057,7 +4117,7 @@ static int forward_step_internal(ib_pq_session* s, ib_pq_kv_cache* kv,
             ib_rmsnorm_f32(xb, x, w_final, hidden, eps);
             if (hidden_out) memcpy(hidden_out, xb, (size_t)hidden * sizeof(float));
             if (logits) {
-                if (ib_pq_session_matmul(s, "lm_head", xb, logits) != 0) rc = -1;
+                if (session_matmul_via(s, "lm_head", xb, logits, sc) != 0) rc = -1;
             }
             (void)vocab;
         }
@@ -4072,13 +4132,13 @@ static int forward_step_internal(ib_pq_session* s, ib_pq_kv_cache* kv,
 
 int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
                         int token_id, int pos, float* logits) {
-    return forward_step_internal(s, kv, token_id, pos, logits, NULL);
+    return forward_step_internal_sc(s, kv, token_id, pos, logits, NULL, NULL);
 }
 
 int ib_pq_forward_step_to_hidden(ib_pq_session* s, ib_pq_kv_cache* kv,
                                    int token_id, int pos, float* hidden_out) {
     if (!hidden_out) return -1;
-    return forward_step_internal(s, kv, token_id, pos, NULL, hidden_out);
+    return forward_step_internal_sc(s, kv, token_id, pos, NULL, hidden_out, NULL);
 }
 
 int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
@@ -4102,9 +4162,9 @@ int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
         int tid = prompt_ids[i];
         int rc;
         if (i == n_prompt - 1) {
-            rc = forward_step_internal(s, kv, tid, pos, NULL, hbuf);
+            rc = forward_step_internal_sc(s, kv, tid, pos, NULL, hbuf, NULL);
         } else {
-            rc = forward_step_internal(s, kv, tid, pos, NULL, NULL);
+            rc = forward_step_internal_sc(s, kv, tid, pos, NULL, NULL, NULL);
         }
         if (rc != 0) { free(hbuf); return -1; }
         pos++;
@@ -4129,7 +4189,7 @@ int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
         if (eos_token_id >= 0 && best == eos_token_id) break;
         if (pos >= kv->max_seq) break;
 
-        if (forward_step_internal(s, kv, best, pos, NULL, hbuf) != 0) {
+        if (forward_step_internal_sc(s, kv, best, pos, NULL, hbuf, NULL) != 0) {
             free(hbuf); *n_out = written; return -1;
         }
         pos++;
@@ -4311,11 +4371,11 @@ int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
         int last = (i == n_prompt - 1);
         int rc;
         if (use_topk) {
-            rc = forward_step_internal(s, kv, prompt_ids[i], pos, NULL,
-                                          last ? hbuf : NULL);
+            rc = forward_step_internal_sc(s, kv, prompt_ids[i], pos, NULL,
+                                          last ? hbuf : NULL, NULL);
         } else {
-            rc = forward_step_internal(s, kv, prompt_ids[i], pos,
-                                          last ? logits : NULL, NULL);
+            rc = forward_step_internal_sc(s, kv, prompt_ids[i], pos,
+                                          last ? logits : NULL, NULL, NULL);
         }
         if (rc != 0) { free(logits); free(hbuf); return -1; }
         pos++;
@@ -4338,9 +4398,9 @@ int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
         if (pos >= kv->max_seq) break;
         int rc;
         if (use_topk) {
-            rc = forward_step_internal(s, kv, tok, pos, NULL, hbuf);
+            rc = forward_step_internal_sc(s, kv, tok, pos, NULL, hbuf, NULL);
         } else {
-            rc = forward_step_internal(s, kv, tok, pos, logits, NULL);
+            rc = forward_step_internal_sc(s, kv, tok, pos, logits, NULL, NULL);
         }
         if (rc != 0) { free(logits); free(hbuf); *n_out = written; return -1; }
         pos++;

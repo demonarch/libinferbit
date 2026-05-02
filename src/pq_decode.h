@@ -408,6 +408,24 @@ int ib_pq_forward_step_no_logits(ib_pq_session* s, ib_pq_kv_cache* kv,
 int ib_pq_forward_step_to_hidden(ib_pq_session* s, ib_pq_kv_cache* kv,
                                    int token_id, int pos, float* hidden_out);
 
+/* F1.c full batched prefill: process B prompt tokens in parallel using
+ * the spin pool. Each worker thread runs an independent forward step
+ * with its own scratch — no contention, no redundant LUT compute. KV
+ * cache writes happen at distinct positions so are race-free; a barrier
+ * inside the implementation ensures attention reads see all prior KV
+ * writes for the same batch.
+ *
+ * tokens[B] maps to absolute KV positions [pos_start, pos_start+B).
+ * hidden_out, when non-NULL, is filled with the post-final-norm hidden
+ * state for the LAST token (B-1) only — the only one needed for
+ * sampling. Earlier batch positions skip the final norm + lm_head.
+ *
+ * For B==1 falls through to the sequential forward_step_to_hidden.
+ */
+int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
+                               const int* tokens, int B, int pos_start,
+                               float* hidden_last_out);
+
 /* Greedy generate: feed prompt_ids[0..n_prompt) into the kv cache,
  * then greedily emit up to max_new tokens (argmax of logits). Stops
  * early if eos_token_id is produced. Writes generated tokens into
