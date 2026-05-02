@@ -3833,7 +3833,9 @@ static int load_norm_weight(const ib_pq_session* s, const char* name,
 
 int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
                         int token_id, int pos, float* logits) {
-    if (!s || !logits) return -1;
+    /* logits == NULL: skip the final RMSNorm + lm_head matmul. Used by
+     * ib_pq_forward_step_no_logits during prompt prefill. */
+    if (!s) return -1;
     const char* cfg = ib_pq_session_config_json(s);
     int n_layers = session_config_int(cfg, "num_layers", 0);
     int hidden   = session_config_int(cfg, "hidden_size", 0);
@@ -4046,7 +4048,7 @@ int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
         ib_residual_add_f32(x, mlp_out, hidden);
     }
 
-    if (rc == 0) {
+    if (rc == 0 && logits) {
         const float* w_final = NULL;
         if (load_norm_weight(s, "final_norm", &w_final, hidden) != 0) rc = -1;
         else {
@@ -4078,11 +4080,12 @@ int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
 
     int pos = 0;
     int last_token = -1;
-    /* Feed prompt: forward each token, record logits; only the last
-     * one's argmax matters for greedy decode. */
+    /* Feed prompt: skip lm_head on all but the last prompt token.
+     * Only the last position's logits feed the decode loop below. */
     for (int i = 0; i < n_prompt; i++) {
         int tid = prompt_ids[i];
-        if (ib_pq_forward_step(s, kv, tid, pos, logits) != 0) {
+        float* lg = (i == n_prompt - 1) ? logits : NULL;
+        if (ib_pq_forward_step(s, kv, tid, pos, lg) != 0) {
             free(logits); return -1;
         }
         last_token = tid;
@@ -4227,7 +4230,8 @@ int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
 
     int pos = 0;
     for (int i = 0; i < n_prompt; i++) {
-        if (ib_pq_forward_step(s, kv, prompt_ids[i], pos, logits) != 0) {
+        float* lg = (i == n_prompt - 1) ? logits : NULL;
+        if (ib_pq_forward_step(s, kv, prompt_ids[i], pos, lg) != 0) {
             free(logits); return -1;
         }
         pos++;
@@ -4247,4 +4251,9 @@ int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
     *n_out = written;
     free(logits);
     return 0;
+}
+
+int ib_pq_forward_step_no_logits(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos) {
+    return ib_pq_forward_step(s, kv, token_id, pos, NULL);
 }

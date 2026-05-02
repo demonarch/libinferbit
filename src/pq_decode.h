@@ -396,6 +396,12 @@ int  ib_pq_kv_cache_length(const ib_pq_kv_cache* kv);
 int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
                         int token_id, int pos, float* logits);
 
+/* Phase F1.c-light: forward step without lm_head — for prompt prefill
+ * positions whose logits won't be used. Skips the M=vocab_size matmul
+ * (the single biggest matmul in the model). logits buffer is unused. */
+int ib_pq_forward_step_no_logits(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos);
+
 /* Greedy generate: feed prompt_ids[0..n_prompt) into the kv cache,
  * then greedily emit up to max_new tokens (argmax of logits). Stops
  * early if eos_token_id is produced. Writes generated tokens into
