@@ -4229,6 +4229,48 @@ static int sample_from_logits(const float* logits, int vocab,
     return picked;
 }
 
+/* F1.j-sample: when top_k > 0, sample from the lm_head_topk subset
+ * (sorted desc) with temperature + top_p truncation. */
+static int sample_from_topk(const float* top_logits, const int32_t* top_ids,
+                              int K, ib_pq_sample_params params, pq_rng* rng) {
+    if (K <= 0) return 0;
+    if (params.temperature <= 0.0f) return (int)top_ids[0];
+
+    float invT = 1.0f / params.temperature;
+    float pr[256];
+    if (K > 256) K = 256;
+    float m = top_logits[0] * invT;
+    float sum = 0.0f;
+    for (int i = 0; i < K; i++) {
+        pr[i] = expf(top_logits[i] * invT - m);
+        sum += pr[i];
+    }
+    float invs = 1.0f / sum;
+    for (int i = 0; i < K; i++) pr[i] *= invs;
+
+    if (params.top_p > 0.0f && params.top_p < 1.0f) {
+        float cum = 0.0f; int trunc = K;
+        for (int i = 0; i < K; i++) {
+            cum += pr[i];
+            if (cum >= params.top_p) { trunc = i + 1; break; }
+        }
+        K = trunc;
+        float s2 = 0.0f;
+        for (int i = 0; i < K; i++) s2 += pr[i];
+        float inv2 = 1.0f / s2;
+        for (int i = 0; i < K; i++) pr[i] *= inv2;
+    }
+
+    float u = pq_rng_unit(rng);
+    float c = 0.0f;
+    int picked = (int)top_ids[K - 1];
+    for (int i = 0; i < K; i++) {
+        c += pr[i];
+        if (u <= c) { picked = (int)top_ids[i]; break; }
+    }
+    return picked;
+}
+
 int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
                             const int* prompt_ids, int n_prompt,
                             int max_new, int eos_token_id,
@@ -4239,38 +4281,72 @@ int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
      || !out_ids || !n_out) return -1;
     const char* cfg = ib_pq_session_config_json(s);
     int vocab = session_config_int(cfg, "vocab_size", 0);
-    if (vocab <= 0) return -1;
+    int hidden = session_config_int(cfg, "hidden_size", 0);
+    if (vocab <= 0 || hidden <= 0) return -1;
 
     pq_rng rng;
     rng.s = params.seed ? (uint64_t)params.seed : 0x9E3779B97F4A7C15ULL;
-    /* Mix to avoid weak first samples on small seeds. */
     rng.s ^= rng.s << 21; rng.s ^= rng.s >> 35; rng.s ^= rng.s << 4;
 
-    float* logits = (float*)malloc((size_t)vocab * sizeof(float));
-    if (!logits) return -1;
+    /* If top_k is in a reasonable bound use the lm_head_topk fast path —
+     * only K candidates need the refined matmul; the full M=vocab logits
+     * pass is replaced by the L1-only filter + K-row refine. */
+    int use_topk = (params.top_k > 0 && params.top_k <= 256);
+    int K_use = use_topk ? params.top_k : 0;
+
+    float* logits = NULL;
+    float* hbuf = NULL;
+    float top_logits[256];
+    int32_t top_ids[256];
+    if (use_topk) {
+        hbuf = (float*)malloc((size_t)hidden * sizeof(float));
+        if (!hbuf) return -1;
+    } else {
+        logits = (float*)malloc((size_t)vocab * sizeof(float));
+        if (!logits) return -1;
+    }
 
     int pos = 0;
     for (int i = 0; i < n_prompt; i++) {
-        float* lg = (i == n_prompt - 1) ? logits : NULL;
-        if (ib_pq_forward_step(s, kv, prompt_ids[i], pos, lg) != 0) {
-            free(logits); return -1;
+        int last = (i == n_prompt - 1);
+        int rc;
+        if (use_topk) {
+            rc = forward_step_internal(s, kv, prompt_ids[i], pos, NULL,
+                                          last ? hbuf : NULL);
+        } else {
+            rc = forward_step_internal(s, kv, prompt_ids[i], pos,
+                                          last ? logits : NULL, NULL);
         }
+        if (rc != 0) { free(logits); free(hbuf); return -1; }
         pos++;
     }
     int written = 0;
     for (int g = 0; g < max_new; g++) {
-        int tok = sample_from_logits(logits, vocab, params, &rng);
+        int tok;
+        if (use_topk) {
+            if (ib_pq_session_lm_head_topk(s, "lm_head", hbuf, K_use,
+                                              top_logits, top_ids) != 0) {
+                free(hbuf); *n_out = written; return -1;
+            }
+            tok = sample_from_topk(top_logits, top_ids, K_use, params, &rng);
+        } else {
+            tok = sample_from_logits(logits, vocab, params, &rng);
+        }
         out_ids[written++] = tok;
         if (cb && cb(tok, cb_ctx) != 0) break;
         if (eos_token_id >= 0 && tok == eos_token_id) break;
         if (pos >= kv->max_seq) break;
-        if (ib_pq_forward_step(s, kv, tok, pos, logits) != 0) {
-            free(logits); *n_out = written; return -1;
+        int rc;
+        if (use_topk) {
+            rc = forward_step_internal(s, kv, tok, pos, NULL, hbuf);
+        } else {
+            rc = forward_step_internal(s, kv, tok, pos, logits, NULL);
         }
+        if (rc != 0) { free(logits); free(hbuf); *n_out = written; return -1; }
         pos++;
     }
     *n_out = written;
-    free(logits);
+    free(logits); free(hbuf);
     return 0;
 }
 
