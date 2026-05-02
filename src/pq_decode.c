@@ -3400,6 +3400,7 @@ struct ib_pq_session {
         char* name;            /* base name (no suffix) */
         const uint8_t* q;      /* [M, N/2] packed nibbles */
         const uint16_t* s;     /* [M, N/G] fp16 group scales */
+        const float* inv_act;  /* optional [N] fp32, NULL if absent (AWQ) */
         int M, N, G;
     } *int4_tensors;
 };
@@ -3413,8 +3414,8 @@ static const struct ib_int4_tensor* session_int4_find(const ib_pq_session* s,
     return NULL;
 }
 
-static int int4_matmul_fp32(const struct ib_int4_tensor* t,
-                              const float* x, float* out) {
+static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
+                                   const float* x, float* out) {
     const int M = t->M, N = t->N, G = t->G;
     const int n_groups = N / G;
     const uint8_t* q = t->q;
@@ -3545,6 +3546,17 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
                 t->s = (const uint16_t*)rs->data;
                 t->M = M; t->N = N; t->G = G;
                 if (N > max_N) max_N = N;
+                /* AWQ: optional <base>__act_scale fp32[N] */
+                char asname[300];
+                snprintf(asname, sizeof(asname), "%s__act_scale", base);
+                for (int j = 0; j < s->multi.n_raw; j++) {
+                    ib_pq_raw_tensor* ra = &s->multi.raw_tensors[j];
+                    if (ra->name && strcmp(ra->name, asname) == 0
+                     && ra->dtype == IB_RAW_F32 && ra->ndim == 1
+                     && ra->shape[0] == N) {
+                        t->inv_act = (const float*)ra->data; break;
+                    }
+                }
                 (void)slen;
             }
         }
@@ -3645,7 +3657,14 @@ static int session_matmul_with_scratch(ib_pq_session* s, const char* name,
                                           float* C2L, float* C2R,
                                           float* x_scratch, int x_scratch_n) {
     const struct ib_int4_tensor* i4 = session_int4_find(s, name);
-    if (i4) return int4_matmul_fp32(i4, x, out);
+    if (i4) {
+        const float* xk = x;
+        if (i4->inv_act && x_scratch && i4->N <= x_scratch_n) {
+            for (int j = 0; j < i4->N; j++) x_scratch[j] = x[j] * i4->inv_act[j];
+            xk = x_scratch;
+        }
+        return int4_matmul_fp32_raw(i4, xk, out);
+    }
     int i = session_find_index(s, name);
     if (i < 0) return -1;
     const ib_pq_tensor* t = &s->multi.tensors[i];
@@ -3679,7 +3698,14 @@ static int session_matmul_with_scratch(ib_pq_session* s, const char* name,
 int ib_pq_session_matmul(ib_pq_session* s, const char* name,
                           const float* x, float* out) {
     const struct ib_int4_tensor* i4 = session_int4_find(s, name);
-    if (i4) return int4_matmul_fp32(i4, x, out);
+    if (i4) {
+        const float* xk = x;
+        if (i4->inv_act && s->x_scratch && i4->N <= s->x_scratch_n) {
+            for (int j = 0; j < i4->N; j++) s->x_scratch[j] = x[j] * i4->inv_act[j];
+            xk = s->x_scratch;
+        }
+        return int4_matmul_fp32_raw(i4, xk, out);
+    }
     /* Public entry: uses session-level shared scratch. */
     int i = session_find_index(s, name);
     if (i < 0) return -1;
