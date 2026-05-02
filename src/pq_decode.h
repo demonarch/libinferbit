@@ -503,6 +503,13 @@ void ib_softmax_f32(float* x, int n);
  */
 int ib_fwht_norm_f32(float* x, int n);
 
+/* Embeddings-PQ: reconstruct a single row of a PQ tensor (no matmul,
+ * just decode the codebook for that row). Used by forward step's token
+ * embedding lookup when tok_embed is stored as a PQ tensor instead of
+ * raw fp16 — saves ~75% of bundle size on big-vocab models. */
+int ib_pq_session_reconstruct_row(ib_pq_session* s, const char* name,
+                                    int row, float* out_row);
+
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);
 uint16_t ib_fp32_to_fp16(float f);

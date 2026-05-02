@@ -3838,7 +3838,16 @@ void ib_pq_kv_cache_clear(ib_pq_kv_cache* kv) { if (kv) kv->length = 0; }
 int  ib_pq_kv_cache_length(const ib_pq_kv_cache* kv) { return kv ? kv->length : 0; }
 
 /* Embedding lookup: out[i] = embed[token_id][i]. Embed is stored fp16. */
-static int embed_lookup(const ib_pq_session* s, int token_id, float* out, int hidden) {
+static int embed_lookup(ib_pq_session* s, int token_id, float* out, int hidden) {
+    /* Embeddings-PQ: prefer 'tok_embed' as a PQ tensor (smaller bundle).
+     * Fall back to raw fp16 / fp32 storage. */
+    int idx = session_find_index(s, "tok_embed");
+    if (idx >= 0) {
+        const ib_pq_tensor* t = &s->multi.tensors[idx];
+        if (t->N != hidden) return -1;
+        if (token_id < 0 || token_id >= t->M) return -1;
+        return ib_pq_session_reconstruct_row(s, "tok_embed", token_id, out);
+    }
     const void* data = NULL;
     int dtype = 0, ndim = 0;
     int shape[4] = {0};
@@ -4730,4 +4739,71 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
     }
     free(slots);
     return rc;
+}
+
+int ib_pq_session_reconstruct_row(ib_pq_session* s, const char* name,
+                                    int row, float* out_row) {
+    if (!s || !name || !out_row) return -1;
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    const ib_pq_tensor* t = &s->multi.tensors[i];
+    const ib_pq_lut_cache* c = s->mc->caches[i];
+    if (row < 0 || row >= t->M) return -1;
+    int N = t->N, G = t->G, C = t->C;
+    int half = c->half;
+    int K = t->K, K_l2 = c->K_l2;
+    int has_l2 = (c->n_levels == 2);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    /* Initialize output to zero so outliers + chunks accumulate cleanly. */
+    memset(out_row, 0, (size_t)N * sizeof(float));
+
+    /* Walk chunks and place reconstructed half-values into the
+     * corresponding columns. inner_cols maps chunk position → original
+     * column index. Per row scale + outlier sidecar applied at end. */
+    float row_scale = ib_fp16_to_fp32(t->row_scale[row]);
+    for (int cc = 0; cc < C; cc++) {
+        int base = cc * G;
+        int i1l = t->indices_l1_l[(size_t)row * C + cc];
+        int i1r = t->indices_l1_r[(size_t)row * C + cc];
+        const float* eL = c->cb1l_fp32 + (size_t)i1l * half;
+        const float* eR = c->cb1r_fp32 + (size_t)i1r * half;
+        for (int j = 0; j < half; j++) {
+            int col_l = c->inner_cols[base + j];
+            int col_r = c->inner_cols[base + half + j];
+            out_row[col_l] = eL[j];
+            out_row[col_r] = eR[j];
+        }
+        if (has_l2) {
+            const uint8_t* il2l = t->indices_l2_l + (size_t)row * l2_stride;
+            const uint8_t* il2r = t->indices_l2_r + (size_t)row * l2_stride;
+            int i2l = pq_l2_idx_at(il2l, cc, l2_packed, l2_idx_bytes);
+            int i2r = pq_l2_idx_at(il2r, cc, l2_packed, l2_idx_bytes);
+            const float* eL2 = c->cb2l_fp32 + (size_t)i2l * half;
+            const float* eR2 = c->cb2r_fp32 + (size_t)i2r * half;
+            for (int j = 0; j < half; j++) {
+                int col_l = c->inner_cols[base + j];
+                int col_r = c->inner_cols[base + half + j];
+                out_row[col_l] += eL2[j];
+                out_row[col_r] += eR2[j];
+            }
+        }
+    }
+    /* Apply per-row scale to the reconstructed values. */
+    for (int n = 0; n < N; n++) out_row[n] *= row_scale;
+
+    /* Outlier columns: dequant int8 sidecar with per-column scale. */
+    if (t->n_outlier > 0) {
+        for (int j = 0; j < t->n_outlier; j++) {
+            int col = t->outlier_cols[j];
+            float os = ib_fp16_to_fp32(t->outlier_scale[j]);
+            float w = (float)t->outlier_sidecar[(size_t)row * t->n_outlier + j] * os;
+            out_row[col] = w;
+        }
+    }
+    return 0;
 }
