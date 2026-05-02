@@ -742,6 +742,7 @@ int ib_pq_load_multi(const char* path, ib_pq_multi* out) {
                 else if (!strcmp(dt, "int16"))   rt->dtype = IB_RAW_I16;
                 else if (!strcmp(dt, "int8"))    rt->dtype = IB_RAW_I8;
                 else if (!strcmp(dt, "uint8"))   rt->dtype = IB_RAW_U8;
+                else if (!strcmp(dt, "uint16"))  rt->dtype = IB_RAW_U16;
                 else { cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1; }
 
                 cJSON* shape = cJSON_GetObjectItemCaseSensitive(it, "shape");
@@ -3401,7 +3402,9 @@ struct ib_pq_session {
         const uint8_t* q;      /* [M, N/2] packed nibbles */
         const uint16_t* s;     /* [M, N/G] fp16 group scales */
         const float* inv_act;  /* optional [N] fp32, NULL if absent (AWQ) */
-        int M, N, G;
+        const uint16_t* outl_idx;  /* optional [M, K_out] uint16 col indices */
+        const uint16_t* outl_val;  /* optional [M, K_out] fp16 values */
+        int M, N, G, K_out;
     } *int4_tensors;
 };
 
@@ -3480,6 +3483,14 @@ static void int4_matmul_rows(const struct ib_int4_tensor* t,
                 }
             }
             acc += scale * gacc;
+        }
+        /* Outlier sidecar: out[m] += sum_k outl_val[m,k] * x[outl_idx[m,k]] */
+        if (t->outl_idx) {
+            const uint16_t* oi = t->outl_idx + (size_t)m * t->K_out;
+            const uint16_t* ov = t->outl_val + (size_t)m * t->K_out;
+            for (int k = 0; k < t->K_out; k++) {
+                acc += ib_fp16_to_fp32(ov[k]) * x[oi[k]];
+            }
         }
         out[m] = acc;
     }
@@ -3630,6 +3641,29 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
                      && ra->shape[0] == N) {
                         t->inv_act = (const float*)ra->data; break;
                     }
+                }
+                /* Outlier sidecar: <base>__i4_outl_idx u16 [M, K_out] +
+                 * <base>__i4_outl_val f16 [M, K_out] */
+                char oin[300], ovn[300];
+                snprintf(oin, sizeof(oin), "%s__i4_outl_idx", base);
+                snprintf(ovn, sizeof(ovn), "%s__i4_outl_val", base);
+                ib_pq_raw_tensor *roi = NULL, *rov = NULL;
+                for (int j = 0; j < s->multi.n_raw; j++) {
+                    if (s->multi.raw_tensors[j].name) {
+                        if (!roi && strcmp(s->multi.raw_tensors[j].name, oin) == 0)
+                            roi = &s->multi.raw_tensors[j];
+                        if (!rov && strcmp(s->multi.raw_tensors[j].name, ovn) == 0)
+                            rov = &s->multi.raw_tensors[j];
+                    }
+                }
+                if (roi && rov && roi->dtype == IB_RAW_U16
+                 && rov->dtype == IB_RAW_F16
+                 && roi->ndim == 2 && rov->ndim == 2
+                 && roi->shape[0] == M && rov->shape[0] == M
+                 && roi->shape[1] == rov->shape[1]) {
+                    t->outl_idx = (const uint16_t*)roi->data;
+                    t->outl_val = (const uint16_t*)rov->data;
+                    t->K_out = roi->shape[1];
                 }
                 (void)slen;
             }
