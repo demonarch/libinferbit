@@ -3420,6 +3420,11 @@ static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
     const int n_groups = N / G;
     const uint8_t* q = t->q;
     const uint16_t* sh = t->s;
+#if defined(__ARM_NEON)
+    const int neon_ok = (G % 16 == 0);
+#else
+    const int neon_ok = 0;
+#endif
     for (int m = 0; m < M; m++) {
         const uint8_t* qrow = q + (size_t)m * (N / 2);
         const uint16_t* srow = sh + (size_t)m * n_groups;
@@ -3429,11 +3434,49 @@ static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
             const float* xg = x + g * G;
             const uint8_t* qg = qrow + (g * G) / 2;
             float gacc = 0.0f;
-            for (int j = 0; j < G; j += 2) {
-                uint8_t b = qg[j / 2];
-                int lo = (int)(b & 0x0F) - 8;
-                int hi = (int)(b >> 4) - 8;
-                gacc += (float)lo * xg[j] + (float)hi * xg[j + 1];
+#if defined(__ARM_NEON)
+            if (neon_ok) {
+                /* NEON int4 dot: 16 columns per iter, 8 packed bytes,
+                 * decode to fp32, FMA with x. */
+                float32x4_t v0 = vdupq_n_f32(0.0f);
+                float32x4_t v1 = vdupq_n_f32(0.0f);
+                const int16x8_t bias = vdupq_n_s16(8);
+                for (int j = 0; j < G; j += 16) {
+                    uint8x8_t b = vld1_u8(qg + j / 2);
+                    uint8x8_t lo_u = vand_u8(b, vdup_n_u8(0x0F));
+                    uint8x8_t hi_u = vshr_n_u8(b, 4);
+                    int16x8_t lo_s = vsubq_s16(
+                        vreinterpretq_s16_u16(vmovl_u8(lo_u)), bias);
+                    int16x8_t hi_s = vsubq_s16(
+                        vreinterpretq_s16_u16(vmovl_u8(hi_u)), bias);
+                    float32x4_t lo_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_s)));
+                    float32x4_t lo_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo_s)));
+                    float32x4_t hi_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_s)));
+                    float32x4_t hi_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi_s)));
+                    /* Interleave: x is laid out [col0 col1 col2 ...]
+                     * lo holds even cols, hi holds odd cols. zip to
+                     * get [lo0 hi0 lo1 hi1] etc. */
+                    float32x4x2_t za = vzipq_f32(lo_lo, hi_lo);
+                    float32x4x2_t zb = vzipq_f32(lo_hi, hi_hi);
+                    float32x4_t x0 = vld1q_f32(xg + j);
+                    float32x4_t x1 = vld1q_f32(xg + j + 4);
+                    float32x4_t x2 = vld1q_f32(xg + j + 8);
+                    float32x4_t x3 = vld1q_f32(xg + j + 12);
+                    v0 = vfmaq_f32(v0, za.val[0], x0);
+                    v1 = vfmaq_f32(v1, za.val[1], x1);
+                    v0 = vfmaq_f32(v0, zb.val[0], x2);
+                    v1 = vfmaq_f32(v1, zb.val[1], x3);
+                }
+                gacc = vaddvq_f32(vaddq_f32(v0, v1));
+            } else
+#endif
+            {
+                for (int j = 0; j < G; j += 2) {
+                    uint8_t b = qg[j / 2];
+                    int lo = (int)(b & 0x0F) - 8;
+                    int hi = (int)(b >> 4) - 8;
+                    gacc += (float)lo * xg[j] + (float)hi * xg[j + 1];
+                }
             }
             acc += scale * gacc;
         }
