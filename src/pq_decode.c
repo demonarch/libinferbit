@@ -3414,9 +3414,10 @@ static const struct ib_int4_tensor* session_int4_find(const ib_pq_session* s,
     return NULL;
 }
 
-static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
-                                   const float* x, float* out) {
-    const int M = t->M, N = t->N, G = t->G;
+static void int4_matmul_rows(const struct ib_int4_tensor* t,
+                                const float* x, float* out,
+                                int m_start, int m_end) {
+    const int N = t->N, G = t->G;
     const int n_groups = N / G;
     const uint8_t* q = t->q;
     const uint16_t* sh = t->s;
@@ -3425,7 +3426,7 @@ static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
 #else
     const int neon_ok = 0;
 #endif
-    for (int m = 0; m < M; m++) {
+    for (int m = m_start; m < m_end; m++) {
         const uint8_t* qrow = q + (size_t)m * (N / 2);
         const uint16_t* srow = sh + (size_t)m * n_groups;
         float acc = 0.0f;
@@ -3482,6 +3483,36 @@ static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
         }
         out[m] = acc;
     }
+}
+
+typedef struct {
+    const struct ib_int4_tensor* t;
+    const float* x;
+    float* out;
+} int4_task_ctx;
+
+static void int4_row_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    int4_task_ctx* c = (int4_task_ctx*)arg;
+    int4_matmul_rows(c->t, c->x, c->out, s, e);
+}
+
+static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
+                                   const float* x, float* out) {
+    int4_matmul_rows(t, x, out, 0, t->M);
+    return 0;
+}
+
+static int int4_matmul_fp32_threaded(const struct ib_int4_tensor* t,
+                                        const float* x, float* out,
+                                        pq_spin_pool* spin, int n_threads) {
+    if (!spin || n_threads <= 1 || t->M < 256) {
+        return int4_matmul_fp32_raw(t, x, out);
+    }
+    int4_task_ctx ctx = { t, x, out };
+    int chunk = (t->M + n_threads - 1) / n_threads;
+    if (chunk < 32) chunk = 32;
+    pq_spin_pool_run(spin, int4_row_task, &ctx, t->M, chunk);
     return 0;
 }
 
@@ -3747,7 +3778,7 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
             for (int j = 0; j < i4->N; j++) s->x_scratch[j] = x[j] * i4->inv_act[j];
             xk = s->x_scratch;
         }
-        return int4_matmul_fp32_raw(i4, xk, out);
+        return int4_matmul_fp32_threaded(i4, xk, out, s->spin, s->n_threads);
     }
     /* Public entry: uses session-level shared scratch. */
     int i = session_find_index(s, name);
