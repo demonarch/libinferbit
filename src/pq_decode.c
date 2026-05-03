@@ -6,14 +6,63 @@
 #include "pq_decode.h"
 #include "cJSON.h"
 #include "inferbit_internal.h"  /* ib_thread_pool, ib_pool_run */
-#include <pthread.h>
-#include <stdatomic.h>
 
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Threading + atomics. C11 stdatomic isn't reliably available on MSVC,
+ * so on Windows we use Interlocked intrinsics with the same API names
+ * (mirrors the shim in threading.c). On POSIX we use the real ones. */
+#ifdef _WIN32
+#include <windows.h>
+typedef volatile LONG atomic_int;
+typedef volatile LONG atomic_long;
+typedef int memory_order;
+#define memory_order_relaxed 0
+#define memory_order_acquire 1
+#define memory_order_release 2
+#define memory_order_acq_rel 3
+#define memory_order_seq_cst 4
+#define atomic_store(p, v)                  InterlockedExchange((p), (v))
+#define atomic_load(p)                      InterlockedCompareExchange((p), 0, 0)
+#define atomic_fetch_add(p, v)              InterlockedExchangeAdd((p), (v))
+#define atomic_fetch_sub(p, v)              InterlockedExchangeAdd((p), -(v))
+#define atomic_store_explicit(p, v, m)      InterlockedExchange((p), (v))
+#define atomic_load_explicit(p, m)          InterlockedCompareExchange((p), 0, 0)
+#define atomic_fetch_add_explicit(p, v, m)  InterlockedExchangeAdd((p), (v))
+#define atomic_fetch_sub_explicit(p, v, m)  InterlockedExchangeAdd((p), -(v))
+
+typedef HANDLE pthread_t;
+typedef SRWLOCK pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+#define pthread_mutex_init(m, a)     (InitializeSRWLock(m), 0)
+#define pthread_mutex_destroy(m)     ((void)0)
+#define pthread_mutex_lock(m)        AcquireSRWLockExclusive(m)
+#define pthread_mutex_unlock(m)      ReleaseSRWLockExclusive(m)
+#define pthread_cond_init(c, a)      (InitializeConditionVariable(c), 0)
+#define pthread_cond_destroy(c)      ((void)0)
+#define pthread_cond_wait(c, m)      SleepConditionVariableSRW(c, m, INFINITE, 0)
+#define pthread_cond_signal(c)       WakeConditionVariable(c)
+#define pthread_cond_broadcast(c)    WakeAllConditionVariable(c)
+typedef DWORD (WINAPI *win_thread_fn)(LPVOID);
+static int pthread_create(pthread_t* t, void* attr, void* (*fn)(void*), void* arg) {
+    (void)attr;
+    *t = CreateThread(NULL, 0, (win_thread_fn)fn, arg, 0, NULL);
+    return (*t == NULL) ? -1 : 0;
+}
+static int pthread_join(pthread_t t, void** retval) {
+    (void)retval;
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
+    return 0;
+}
+#else
+#include <pthread.h>
+#include <stdatomic.h>
+#endif
 
 /* mmap support — POSIX. On Windows we fall back to fread-style loaders
  * (the existing ib_pq_load_single/multi paths) because Win32 file
@@ -29,9 +78,15 @@
 /* SIMD-accelerated outlier dot kernels.
  *   - ARM with +dotprod: vdotq_s32 (16x int8 dot per cycle)
  *   - x86_64 with AVX2: pmaddubsw / madd_epi16 cascade (16x int8 per call)
- *   - else: scalar fallback in apply_outliers_scalar */
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+ *   - else: scalar fallback in apply_outliers_scalar
+ * arm_neon.h is needed whenever __ARM_NEON is defined (NEON ≥ baseline
+ * v8). Don't gate it on DOTPROD — DOTPROD is an additional feature on
+ * top of NEON and may not be enabled by the compile flags even when
+ * NEON is. */
+#if defined(__ARM_NEON)
 #include <arm_neon.h>
+#endif
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 #define IB_PQ_HAVE_NEON_DOTPROD 1
 #endif
 #if defined(__AVX2__)
