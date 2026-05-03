@@ -364,6 +364,21 @@ int  ib_pq_session_matmul_batched(ib_pq_session* s, const char* name,
                                     const float* const* x_arr,
                                     float* const* out_arr);
 
+/* Speculative decoding (self-speculative via early-exit draft).
+ * - last_token: most recent committed token (already in KV at pos-1).
+ * - pos: position to decode next.
+ * - K: max number of speculative tokens to verify per round (≤ 16).
+ * - n_draft_layers: layer count for draft forward (must be < n_layers).
+ *   The draft is the same INT4 weights but stops early.
+ * - out_tokens[K]: filled with accepted tokens (may include verifier's
+ *   correction at the rejection position).
+ * - out_n_accepted: number of tokens written (1..K).
+ *
+ * On return, kv->length is set to pos + out_n_accepted.
+ *
+ * Greedy semantics (rejection on argmax mismatch). */
+/* Spec-decode prototype declared after ib_pq_kv_cache. */
+
 /* Top-K lm_head two-stage. K_top values in out_logits + ids, sorted desc. */
 int  ib_pq_session_lm_head_topk(ib_pq_session* s, const char* name,
                                  const float* x, int K_top,
@@ -404,6 +419,29 @@ int  ib_pq_kv_cache_length(const ib_pq_kv_cache* kv);
  */
 int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
                         int token_id, int pos, float* logits);
+
+/* Speculative decoding.
+ * - prev_logits: vocab fp32 logits from the prior full forward.
+ * - pos: next position to fill (KV[L][0..pos-1] must be populated).
+ * - K: max draft tokens (1..16).
+ * - draft_tokens: caller-provided K candidate tokens (e.g. from prompt
+ *   lookup, n-gram, or smaller draft model). draft_tokens[0] should
+ *   match argmax(prev_logits) for round consistency; if it doesn't,
+ *   rejection at i=0 emits the verifier's choice.
+ *
+ * Output:
+ *   out_tokens[K] — accepted tokens (1..K written) including verifier's
+ *                   correction at the rejection position when applicable.
+ *   *out_n_accepted — number of tokens written.
+ *   next_logits[vocab] — P(pos + out_n_accepted) for the next round.
+ *   kv->length     — set to pos + out_n_accepted.
+ *
+ * Greedy semantics. */
+int  ib_pq_speculative_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                              const float* prev_logits, int pos, int K,
+                              const int* draft_tokens,
+                              int* out_tokens, int* out_n_accepted,
+                              float* next_logits);
 
 /* Phase F1.c-light: forward step without lm_head — for prompt prefill
  * positions whose logits won't be used. Skips the M=vocab_size matmul

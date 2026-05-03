@@ -4848,6 +4848,13 @@ static int session_matmul_via(ib_pq_session* s, const char* name,
  * skip the tail (prefill no-logits). sc != NULL: use the provided
  * per-thread scratch instead of session-shared scratch (for batched
  * prefill threading). */
+/* Spec-decode: thread-local layer-cap override. When > 0, the forward
+ * stops after this many layers and applies final_norm + lm_head. The
+ * KV cache is only written through these layers (safe: verify will
+ * overwrite layers 0..max_layers with identical values, and write
+ * layers max_layers..n_layers-1 itself). */
+static __thread int ib_draft_layer_cap = 0;
+
 static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
                                        int token_id, int pos,
                                        float* logits, float* hidden_out,
@@ -4855,6 +4862,9 @@ static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
     if (!s) return -1;
     const char* cfg = ib_pq_session_config_json(s);
     int n_layers = session_config_int(cfg, "num_layers", 0);
+    if (ib_draft_layer_cap > 0 && ib_draft_layer_cap < n_layers) {
+        n_layers = ib_draft_layer_cap;
+    }
     int hidden   = session_config_int(cfg, "hidden_size", 0);
     int n_heads  = session_config_int(cfg, "num_heads", 0);
     int n_kv     = session_config_int(cfg, "num_kv_heads", n_heads);
@@ -5634,9 +5644,29 @@ static void batch_post_attn_task(void* arg, int tid, int b0, int b1) {
     }
 }
 
+/* Internal: forward_step_batch with optional per-slot logits output.
+ * per_slot_logits, if non-NULL, must have B * vocab fp32 floats.
+ * per_slot_hidden, if non-NULL, must have B * hidden fp32 floats —
+ * fills with post-final-norm hidden state for each slot, enabling
+ * lazy per-slot lm_head in spec-decode. */
+static int forward_step_batch_impl(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                       const int* tokens, int B, int pos_start,
+                                       float* hidden_last_out,
+                                       float* per_slot_logits,
+                                       float* per_slot_hidden);
+
 int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
                                const int* tokens, int B, int pos_start,
                                float* hidden_last_out) {
+    return forward_step_batch_impl(s, kv, tokens, B, pos_start,
+                                       hidden_last_out, NULL, NULL);
+}
+
+static int forward_step_batch_impl(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                       const int* tokens, int B, int pos_start,
+                                       float* hidden_last_out,
+                                       float* per_slot_logits,
+                                       float* per_slot_hidden) {
     if (!s || !kv || !tokens || B <= 0) return -1;
     if (kv->storage_int8 || kv->storage_pyramid) {
         /* int8 / pyramid KV paths use per-vector quantization (or NN
@@ -5657,6 +5687,9 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
 
     const char* cfg = ib_pq_session_config_json(s);
     int n_layers = session_config_int(cfg, "num_layers", 0);
+    if (ib_draft_layer_cap > 0 && ib_draft_layer_cap < n_layers) {
+        n_layers = ib_draft_layer_cap;
+    }
     int hidden   = session_config_int(cfg, "hidden_size", 0);
     int n_heads  = session_config_int(cfg, "num_heads", 0);
     int n_kv     = session_config_int(cfg, "num_kv_heads", n_heads);
@@ -5906,6 +5939,35 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
                 ib_rmsnorm_f32(hidden_last_out, slots[B - 1].x, w_final, hidden, eps);
             }
         }
+        /* Per-slot final-norm hidden + optional batched lm_head. */
+        if (rc == 0 && (per_slot_logits || per_slot_hidden)) {
+            const float* w_final = NULL;
+            if (load_norm_weight(s, "final_norm", &w_final, hidden) != 0) rc = -1;
+            if (rc == 0) {
+                /* Norm into each slot's xb (or directly into per_slot_hidden). */
+                for (int b = 0; b < B; b++) {
+                    float* dst = per_slot_hidden
+                                  ? (per_slot_hidden + (size_t)b * hidden)
+                                  : slots[b].xb;
+                    ib_rmsnorm_f32(dst, slots[b].x, w_final, hidden, eps);
+                    if (per_slot_hidden) {
+                        /* Also keep a copy in slots[b].xb for legacy paths
+                         * (not strictly needed when only per_slot_hidden). */
+                    }
+                }
+            }
+            int vocab = session_config_int(cfg, "vocab_size", 0);
+            if (rc == 0 && per_slot_logits && vocab > 0) {
+                const float* in_arr[16]; float* out_arr_logits[16];
+                for (int b = 0; b < B; b++) {
+                    in_arr[b] = per_slot_hidden
+                                 ? (per_slot_hidden + (size_t)b * hidden)
+                                 : slots[b].xb;
+                    out_arr_logits[b] = per_slot_logits + (size_t)b * vocab;
+                }
+                ib_pq_session_matmul_batched(s, "lm_head", B, in_arr, out_arr_logits);
+            }
+        }
     }
 
     for (int b = 0; b < B; b++) {
@@ -5918,6 +5980,89 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
         free(sl->qkv_buf); free(sl->gu_buf);
     }
     free(slots);
+    return rc;
+}
+
+int ib_pq_speculative_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                              const float* prev_logits, int pos, int K,
+                              const int* draft_tokens_in,
+                              int* out_tokens, int* out_n_accepted,
+                              float* next_logits) {
+    if (!s || !kv || !prev_logits || !out_tokens || !out_n_accepted
+     || !draft_tokens_in || K <= 0 || K > 16) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int vocab    = session_config_int(cfg, "vocab_size", 0);
+    int saved_len = kv->length;
+    /* Drafts come from caller (prompt lookup / n-gram / external model). */
+    int draft_tokens[16];
+    for (int i = 0; i < K; i++) draft_tokens[i] = draft_tokens_in[i];
+    int rc = 0;
+    /* Phase 2: batched verify (full layers).
+     * Inputs are d[0..K-1] at positions pos..pos+K-1. */
+    float* per_slot = (float*)malloc((size_t)K * vocab * sizeof(float));
+    if (!per_slot) return -1;
+    kv->length = saved_len;
+    rc = forward_step_batch_impl(s, kv, draft_tokens, K, pos, NULL, per_slot, NULL);
+    /* Phase 3: greedy acceptance.
+     * For i in [0, K):
+     *   prev = (i==0) ? prev_logits : per_slot_logits[i-1]
+     *   verifier_choice_for_pos_i = argmax(prev)
+     *   if verifier_choice == d[i]: accept d[i], continue.
+     *   else: emit verifier's choice (correction), stop.
+     * If all K accepted: emit one bonus token = argmax(per_slot_logits[K-1]). */
+    int n_acc = 0;
+    int rejected = 0;  /* 1 iff loop hit the mismatch branch */
+    if (rc == 0) {
+        const float* prev = prev_logits;
+        for (int i = 0; i < K; i++) {
+            int v_choice = 0; float bv = prev[0];
+            for (int v = 1; v < vocab; v++) { if (prev[v] > bv) { bv = prev[v]; v_choice = v; } }
+            if (v_choice == draft_tokens[i]) {
+                out_tokens[n_acc++] = draft_tokens[i];
+                prev = per_slot + (size_t)i * vocab;
+            } else {
+                out_tokens[n_acc++] = v_choice;
+                rejected = 1;
+                break;
+            }
+        }
+        if (getenv("IB_SPEC_TRACE")) {
+            fprintf(stderr, "[spec] pos=%d K=%d n_acc=%d  draft=", pos, K, n_acc);
+            for (int i = 0; i < K; i++) fprintf(stderr, "%d ", draft_tokens[i]);
+            fprintf(stderr, " out=");
+            for (int i = 0; i < n_acc; i++) fprintf(stderr, "%d ", out_tokens[i]);
+            int verifier_first_argmax = 0; float bv0 = per_slot[0];
+            for (int v = 1; v < vocab; v++) if (per_slot[v] > bv0) { bv0 = per_slot[v]; verifier_first_argmax = v; }
+            fprintf(stderr, " verif_slot0_argmax=%d  prev_argmax=%d\n",
+                    verifier_first_argmax, draft_tokens[0]);
+        }
+        kv->length = pos + n_acc;
+        /* next_logits: P(pos + n_acc).
+         * Full accept (n_acc == K): per_slot[K-1] is correct (sequence
+         *   matches verifier's input).
+         * Rejection at i (n_acc == i+1): per_slot[i] would be P based on
+         *   d[i] at slot i, but we replaced d[i] with correction c. KV
+         *   at pos+i is also stale. Run a refresh forward(c, pos+i) so
+         *   next_logits is correct AND KV is consistent. */
+        if (rc == 0 && next_logits) {
+            if (!rejected) {
+                /* Full accept: per_slot[K-1] is correct logits for next pos. */
+                memcpy(next_logits, per_slot + (size_t)(K - 1) * vocab,
+                       (size_t)vocab * sizeof(float));
+            } else {
+                /* n_acc-1 is the rejection index; out_tokens[n_acc-1] is the
+                 * correction. Run forward(correction, pos+n_acc-1). This
+                 * overwrites the stale KV write at that position with the
+                 * correct value and produces P(pos+n_acc). */
+                kv->length = pos + n_acc - 1;  /* roll back so forward fills pos+n_acc-1 */
+                rc = forward_step_internal_sc(s, kv, out_tokens[n_acc - 1],
+                                                  pos + n_acc - 1,
+                                                  next_logits, NULL, NULL);
+            }
+        }
+    }
+    *out_n_accepted = n_acc;
+    free(per_slot);
     return rc;
 }
 
