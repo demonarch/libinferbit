@@ -42,6 +42,7 @@ typedef int memory_order;
 typedef HANDLE pthread_t;
 typedef SRWLOCK pthread_mutex_t;
 typedef CONDITION_VARIABLE pthread_cond_t;
+typedef int pthread_attr_t;
 #define pthread_mutex_init(m, a)     (InitializeSRWLock(m), 0)
 #define pthread_mutex_destroy(m)     ((void)0)
 #define pthread_mutex_lock(m)        AcquireSRWLockExclusive(m)
@@ -51,8 +52,11 @@ typedef CONDITION_VARIABLE pthread_cond_t;
 #define pthread_cond_wait(c, m)      SleepConditionVariableSRW(c, m, INFINITE, 0)
 #define pthread_cond_signal(c)       WakeConditionVariable(c)
 #define pthread_cond_broadcast(c)    WakeAllConditionVariable(c)
+#define pthread_attr_init(a)         ((void)(a), 0)
+#define pthread_attr_destroy(a)      ((void)(a), 0)
 typedef DWORD (WINAPI *win_thread_fn)(LPVOID);
-static int pthread_create(pthread_t* t, void* attr, void* (*fn)(void*), void* arg) {
+static int pthread_create(pthread_t* t, const pthread_attr_t* attr,
+                            void* (*fn)(void*), void* arg) {
     (void)attr;
     *t = CreateThread(NULL, 0, (win_thread_fn)fn, arg, 0, NULL);
     return (*t == NULL) ? -1 : 0;
@@ -63,6 +67,10 @@ static int pthread_join(pthread_t t, void** retval) {
     CloseHandle(t);
     return 0;
 }
+
+/* GCC/Clang thread-local + prefetch builtins → MSVC equivalents. */
+#define __thread __declspec(thread)
+#define __builtin_prefetch(addr, ...) ((void)(addr))
 #else
 #include <pthread.h>
 #include <stdatomic.h>
