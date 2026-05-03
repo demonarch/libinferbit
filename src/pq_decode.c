@@ -3576,6 +3576,102 @@ static void int4_matmul_rows_skip(const struct ib_int4_tensor* t,
     }
 }
 
+/* Phase 2.w: static activation int8 quantization + SDOT kernel.
+ * Per-group x quantization: each G-column chunk gets its own s_x[g] =
+ * max|x_chunk|/127. Preserves int8 precision per chunk where x has
+ * dynamic range across N (typical at deep-layer activations).
+ * Final: out[m] = sum_g s_x[g] * s_W[m,g] * sum_{j∈g} qW[m,j] * qx[j].
+ * ~3-4× throughput on Apple SDOT. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static void int4_sdot_rows(const struct ib_int4_tensor* t,
+                              const int8_t* qx, const float* sxg,
+                              float* out, int m_start, int m_end) {
+    const int N = t->N, G = t->G;
+    const int n_groups = N / G;
+    const uint8_t* q = t->q;
+    const uint16_t* sh = t->s;
+    /* G must be multiple of 16 for SDOT vector path; 32/64/128 all qualify. */
+    for (int m = m_start; m < m_end; m++) {
+        const uint8_t* qrow = q + (size_t)m * (N / 2);
+        const uint16_t* srow = sh + (size_t)m * n_groups;
+        float acc = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            const int8_t* xg = qx + g * G;
+            const uint8_t* qg = qrow + (g * G) / 2;
+            int32x4_t v = vdupq_n_s32(0);
+            for (int j = 0; j < G; j += 16) {
+                /* Decode 8 packed bytes → 16 int8 nibbles in column order. */
+                uint8x8_t b = vld1_u8(qg + j / 2);
+                int8x16_t lo16, hi16;
+                {
+                    uint8x8_t lo_u = vand_u8(b, vdup_n_u8(0x0F));
+                    uint8x8_t hi_u = vshr_n_u8(b, 4);
+                    int8x8_t lo_s = vsub_s8(vreinterpret_s8_u8(lo_u),
+                                              vdup_n_s8(8));
+                    int8x8_t hi_s = vsub_s8(vreinterpret_s8_u8(hi_u),
+                                              vdup_n_s8(8));
+                    /* Interleave low/high to recover column order. */
+                    int8x8x2_t z = vzip_s8(lo_s, hi_s);
+                    lo16 = vcombine_s8(z.val[0], z.val[1]);
+                    (void)hi16;
+                }
+                int8x16_t xv = vld1q_s8(xg + j);
+                v = vdotq_s32(v, lo16, xv);
+            }
+            int32_t int_acc = vaddvq_s32(v);
+            float scale_w = ib_fp16_to_fp32(srow[g]);
+            acc += sxg[g] * scale_w * (float)int_acc;
+        }
+        /* Outlier sidecar in fp32 — use per-group s_x for the column. */
+        if (t->outl_idx) {
+            const uint16_t* oi = t->outl_idx + (size_t)m * t->K_out;
+            const uint16_t* ov = t->outl_val + (size_t)m * t->K_out;
+            for (int k = 0; k < t->K_out; k++) {
+                int oj = oi[k];
+                acc += ib_fp16_to_fp32(ov[k]) * (float)qx[oj] * sxg[oj / G];
+            }
+        }
+        out[m] = acc;
+    }
+}
+
+typedef struct {
+    const struct ib_int4_tensor* t;
+    const int8_t* qx;
+    const float* sxg;
+    float* out;
+} int4_sdot_ctx;
+
+static void int4_sdot_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    int4_sdot_ctx* c = (int4_sdot_ctx*)arg;
+    int4_sdot_rows(c->t, c->qx, c->sxg, c->out, s, e);
+}
+
+/* Quantize x to int8 per-group: chunks of G columns share one scale.
+ * Writes qx[N] int8 + sxg[N/G] fp32. */
+static void quantize_x_int8_grp(const float* x, int N, int G,
+                                   int8_t* qx, float* sxg) {
+    int n_groups = N / G;
+    for (int g = 0; g < n_groups; g++) {
+        const float* xg = x + g * G;
+        float xmax = 0.0f;
+        for (int j = 0; j < G; j++) { float a = fabsf(xg[j]); if (a > xmax) xmax = a; }
+        float sx = xmax / 127.0f + 1e-30f;
+        sxg[g] = sx;
+        float inv = 1.0f / sx;
+        int8_t* qg = qx + g * G;
+        for (int j = 0; j < G; j++) {
+            float v = xg[j] * inv;
+            if (v > 127.0f) v = 127.0f; else if (v < -127.0f) v = -127.0f;
+            qg[j] = (int8_t)lrintf(v);
+        }
+    }
+    /* Tail: if N % G != 0, leave as-is. Caller guarantees N % G == 0
+     * since W's encoder asserts it. */
+}
+#endif
+
 /* Build per-group skip mask: skip_grp[g] = 1 iff max|x[g*G..]| ≤ eps_rel·max|x|. */
 static char* build_skip_mask(int N, int G, const float* x) {
     static float eps_act_rel = -2.0f;
@@ -3631,6 +3727,38 @@ static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
 static int int4_matmul_fp32_threaded(const struct ib_int4_tensor* t,
                                         const float* x, float* out,
                                         pq_spin_pool* spin, int n_threads) {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    /* Phase 2.w: static-act-int8 SDOT path. Default ON via env (1).
+     * Set IB_STATIC_ACT_INT8=0 to disable for fp32 baseline. */
+    static int sdot_enabled = -1;
+    if (sdot_enabled < 0) {
+        const char* env = getenv("IB_STATIC_ACT_INT8");
+        sdot_enabled = (env && atoi(env) == 0) ? 0 : 1;
+    }
+    if (sdot_enabled && (t->G % 16 == 0) && (t->N % t->G == 0)) {
+        int N = t->N;
+        int n_groups = N / t->G;
+        int8_t* qx = (int8_t*)malloc((size_t)N);
+        float* sxg = (float*)malloc((size_t)n_groups * sizeof(float));
+        if (qx && sxg) {
+            quantize_x_int8_grp(x, N, t->G, qx, sxg);
+            int rc;
+            if (spin && n_threads > 1 && t->M >= 256) {
+                int4_sdot_ctx c = { t, qx, sxg, out };
+                int chunk = (t->M + n_threads - 1) / n_threads;
+                if (chunk < 32) chunk = 32;
+                pq_spin_pool_run(spin, int4_sdot_task, &c, t->M, chunk);
+                rc = 0;
+            } else {
+                int4_sdot_rows(t, qx, sxg, out, 0, t->M);
+                rc = 0;
+            }
+            free(qx); free(sxg);
+            return rc;
+        }
+        free(qx); free(sxg);
+    }
+#endif
     if (!spin || n_threads <= 1 || t->M < 256) {
         return int4_matmul_fp32_raw(t, x, out);
     }
