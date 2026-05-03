@@ -18,6 +18,10 @@
  * (mirrors the shim in threading.c). On POSIX we use the real ones. */
 #ifdef _WIN32
 #include <windows.h>
+/* MSVC doesn't support C11 _Atomic. Map it to volatile so struct members
+ * using `_Atomic int x` parse correctly; runtime atomicity comes from
+ * the Interlocked* intrinsics in the macros below. */
+#define _Atomic volatile
 typedef volatile LONG atomic_int;
 typedef volatile LONG atomic_long;
 typedef int memory_order;
@@ -26,14 +30,14 @@ typedef int memory_order;
 #define memory_order_release 2
 #define memory_order_acq_rel 3
 #define memory_order_seq_cst 4
-#define atomic_store(p, v)                  InterlockedExchange((p), (v))
-#define atomic_load(p)                      InterlockedCompareExchange((p), 0, 0)
-#define atomic_fetch_add(p, v)              InterlockedExchangeAdd((p), (v))
-#define atomic_fetch_sub(p, v)              InterlockedExchangeAdd((p), -(v))
-#define atomic_store_explicit(p, v, m)      InterlockedExchange((p), (v))
-#define atomic_load_explicit(p, m)          InterlockedCompareExchange((p), 0, 0)
-#define atomic_fetch_add_explicit(p, v, m)  InterlockedExchangeAdd((p), (v))
-#define atomic_fetch_sub_explicit(p, v, m)  InterlockedExchangeAdd((p), -(v))
+#define atomic_store(p, v)                  InterlockedExchange((volatile LONG*)(p), (LONG)(v))
+#define atomic_load(p)                      InterlockedCompareExchange((volatile LONG*)(p), 0, 0)
+#define atomic_fetch_add(p, v)              InterlockedExchangeAdd((volatile LONG*)(p), (LONG)(v))
+#define atomic_fetch_sub(p, v)              InterlockedExchangeAdd((volatile LONG*)(p), -(LONG)(v))
+#define atomic_store_explicit(p, v, m)      InterlockedExchange((volatile LONG*)(p), (LONG)(v))
+#define atomic_load_explicit(p, m)          InterlockedCompareExchange((volatile LONG*)(p), 0, 0)
+#define atomic_fetch_add_explicit(p, v, m)  InterlockedExchangeAdd((volatile LONG*)(p), (LONG)(v))
+#define atomic_fetch_sub_explicit(p, v, m)  InterlockedExchangeAdd((volatile LONG*)(p), -(LONG)(v))
 
 typedef HANDLE pthread_t;
 typedef SRWLOCK pthread_mutex_t;
