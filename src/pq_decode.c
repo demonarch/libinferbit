@@ -5698,8 +5698,12 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
         sl->sc.C1R  = (float*)malloc((size_t)max_K   * sizeof(float));
         sl->sc.C2L  = (float*)malloc((size_t)max_Kl2 * sizeof(float));
         sl->sc.C2R  = (float*)malloc((size_t)max_Kl2 * sizeof(float));
-        sl->sc.x    = (float*)malloc((size_t)hidden  * sizeof(float));
-        sl->sc.x_n  = hidden;
+        /* Bug fix: x_scratch must fit max tensor N across the model
+         * (down_proj N=inter > hidden), else session_matmul_with_scratch
+         * silently skips inv_act AWQ pre-scaling on tall tensors. */
+        int sc_x_n = hidden > inter ? hidden : inter;
+        sl->sc.x    = (float*)malloc((size_t)sc_x_n * sizeof(float));
+        sl->sc.x_n  = sc_x_n;
         sl->qkv_buf = fused_qkv ? (float*)malloc((size_t)(hidden + 2*kv_dim) * sizeof(float)) : NULL;
         sl->gu_buf  = fused_gu  ? (float*)malloc((size_t)(2 * inter) * sizeof(float)) : NULL;
         if (!sl->x || !sl->xb || !sl->xb2 || !sl->q || !sl->k_now || !sl->v_now
@@ -5748,7 +5752,8 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
             static int f1c_enabled = -1;
             if (f1c_enabled < 0) {
                 const char* env = getenv("IB_F1C_BATCH");
-                f1c_enabled = (env && atoi(env) > 0) ? 1 : 0;
+                /* Default ON: bit-identical math, 1.1–1.5× prefill speedup. */
+                f1c_enabled = (env && atoi(env) == 0) ? 0 : 1;
             }
             if (f1c_enabled && B <= 16 && !ctx.fused_qkv && !ctx.fused_gu) {
                 /* Phase 1a: rmsnorm pre-attn (per slot, cheap, do inline). */
@@ -5786,14 +5791,9 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
                         }
                     }
                 }
-                /* Phase 2a: attention read per slot (no matmul, KV gather +
-                 * softmax + value mix only). */
+                /* Phase 2 bisect2: F1.c attention inline + PER-SLOT
+                 * session_matmul for o/gate/up/down (no batched matmul). */
                 {
-                    int chunk = (B + s->n_threads - 1) / s->n_threads;
-                    if (chunk < 1) chunk = 1;
-                    /* Reuse batch_post_attn_task but with a temp ctx whose
-                     * post-attn tasks know the matmuls were done — actually
-                     * easier: do attention inline. */
                     float k_scratch[256], v_scratch[256];
                     int q_per_kv = ctx.q_per_kv;
                     float inv_sqrt = 1.0f / sqrtf((float)head_dim);
@@ -5835,45 +5835,47 @@ int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
                             }
                         }
                     }
-                    (void)chunk;
-                }
-                /* Phase 2b: batched o_proj. */
-                float* xb2_ptrs[16]; float* xb_ptrs2[16];
-                for (int b = 0; b < B; b++) {
-                    xb2_ptrs[b] = ctx.slots[b].xb2;
-                    xb_ptrs2[b] = ctx.slots[b].xb;
-                }
-                ib_pq_session_matmul_batched(s, ctx.o_name, B, (const float**)xb2_ptrs, xb_ptrs2);
-                /* Phase 2c: residual + post-attn rmsnorm per slot. */
-                for (int b = 0; b < B; b++) {
-                    pq_batch_slot* sl = &ctx.slots[b];
-                    ib_residual_add_f32(sl->x, sl->xb, hidden);
-                    ib_rmsnorm_f32(sl->xb, sl->x, ctx.w_pn, hidden, ctx.eps);
-                }
-                /* Phase 2d: batched gate + up. */
-                float* gate_ptrs[16]; float* up_ptrs[16];
-                for (int b = 0; b < B; b++) {
-                    gate_ptrs[b] = ctx.slots[b].gate;
-                    up_ptrs[b]   = ctx.slots[b].up;
-                    xb_ptrs[b]   = ctx.slots[b].xb;
-                }
-                ib_pq_session_matmul_batched(s, ctx.gate_name, B, xb_ptrs, gate_ptrs);
-                ib_pq_session_matmul_batched(s, ctx.up_name, B, xb_ptrs, up_ptrs);
-                /* Phase 2e: silu_gate per slot. */
-                for (int b = 0; b < B; b++) {
-                    ib_silu_gate_f32(ctx.slots[b].gate, ctx.slots[b].gate,
-                                       ctx.slots[b].up, inter);
-                }
-                /* Phase 2f: batched down_proj. */
-                float* mlp_ptrs[16]; const float* gate_in_ptrs[16];
-                for (int b = 0; b < B; b++) {
-                    mlp_ptrs[b]    = ctx.slots[b].mlp_out;
-                    gate_in_ptrs[b] = ctx.slots[b].gate;
-                }
-                ib_pq_session_matmul_batched(s, ctx.down_name, B, gate_in_ptrs, mlp_ptrs);
-                /* Phase 2g: residual per slot. */
-                for (int b = 0; b < B; b++) {
-                    ib_residual_add_f32(ctx.slots[b].x, ctx.slots[b].mlp_out, hidden);
+                    /* Bisect 3: BATCHED o_proj, per-slot rest. */
+                    {
+                        const float* xb2_in[16]; float* xb_out[16];
+                        for (int b = 0; b < B; b++) {
+                            xb2_in[b] = ctx.slots[b].xb2;
+                            xb_out[b] = ctx.slots[b].xb;
+                        }
+                        ib_pq_session_matmul_batched(s, ctx.o_name, B, xb2_in, xb_out);
+                    }
+                    for (int b = 0; b < B; b++) {
+                        pq_batch_slot* sl = &ctx.slots[b];
+                        ib_residual_add_f32(sl->x, sl->xb, hidden);
+                        ib_rmsnorm_f32(sl->xb, sl->x, ctx.w_pn, hidden, ctx.eps);
+                    }
+                    /* Bisect 4: + batched gate, up. */
+                    {
+                        const float* xb_in[16]; float* gate_out[16]; float* up_out[16];
+                        for (int b = 0; b < B; b++) {
+                            xb_in[b]    = ctx.slots[b].xb;
+                            gate_out[b] = ctx.slots[b].gate;
+                            up_out[b]   = ctx.slots[b].up;
+                        }
+                        ib_pq_session_matmul_batched(s, ctx.gate_name, B, xb_in, gate_out);
+                        ib_pq_session_matmul_batched(s, ctx.up_name,   B, xb_in, up_out);
+                    }
+                    /* silu_gate per slot. */
+                    for (int b = 0; b < B; b++) {
+                        ib_silu_gate_f32(ctx.slots[b].gate, ctx.slots[b].gate,
+                                           ctx.slots[b].up, inter);
+                    }
+                    {
+                        const float* gate_in[16]; float* mlp_out[16];
+                        for (int b = 0; b < B; b++) {
+                            gate_in[b] = ctx.slots[b].gate;
+                            mlp_out[b] = ctx.slots[b].mlp_out;
+                        }
+                        ib_pq_session_matmul_batched(s, ctx.down_name, B, gate_in, mlp_out);
+                    }
+                    for (int b = 0; b < B; b++) {
+                        ib_residual_add_f32(ctx.slots[b].x, ctx.slots[b].mlp_out, hidden);
+                    }
                 }
             } else {
                 /* PHASE 1: pre-attn (norm + qkv + RoPE + KV write). */
