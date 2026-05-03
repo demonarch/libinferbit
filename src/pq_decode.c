@@ -3413,6 +3413,12 @@ struct ib_pq_session {
         const uint16_t* outl_val;  /* optional [M, K_out] fp16 values */
         int M, N, G, K_out;
     } *int4_tensors;
+    /* Phase 6 cross-token delta cache (INT4): per-tensor (x_prev, out_prev).
+     * On call: if ||Δx|| is small enough, do sparse-Δ incremental update
+     * instead of full M×N matmul. Lazily allocated; reset on new session. */
+    float** int4_x_cache;     /* parallel to int4_tensors; NULL = invalid */
+    float** int4_out_cache;
+    int delta_cache_enabled;  /* 1 if IB_DELTA_CACHE=1 at session_open */
 };
 
 static const struct ib_fp16w_tensor* session_fp16_find(const ib_pq_session* s,
@@ -3489,9 +3495,10 @@ static const struct ib_int4_tensor* session_int4_find(const ib_pq_session* s,
     return NULL;
 }
 
-static void int4_matmul_rows(const struct ib_int4_tensor* t,
-                                const float* x, float* out,
-                                int m_start, int m_end) {
+static void int4_matmul_rows_skip(const struct ib_int4_tensor* t,
+                                     const float* x, float* out,
+                                     int m_start, int m_end,
+                                     const char* skip_grp) {
     const int N = t->N, G = t->G;
     const int n_groups = N / G;
     const uint8_t* q = t->q;
@@ -3506,6 +3513,7 @@ static void int4_matmul_rows(const struct ib_int4_tensor* t,
         const uint16_t* srow = sh + (size_t)m * n_groups;
         float acc = 0.0f;
         for (int g = 0; g < n_groups; g++) {
+            if (skip_grp && skip_grp[g]) continue;
             float scale = ib_fp16_to_fp32(srow[g]);
             const float* xg = x + g * G;
             const uint8_t* qg = qrow + (g * G) / 2;
@@ -3568,21 +3576,55 @@ static void int4_matmul_rows(const struct ib_int4_tensor* t,
     }
 }
 
+/* Build per-group skip mask: skip_grp[g] = 1 iff max|x[g*G..]| ≤ eps_rel·max|x|. */
+static char* build_skip_mask(int N, int G, const float* x) {
+    static float eps_act_rel = -2.0f;
+    if (eps_act_rel < -1.0f) {
+        /* Default off: at the thresholds where quality survives (1e-5),
+         * skip-mask build cost equals the savings on most TinyLlama
+         * tensors. Only post-SwiGLU input to down_proj has natural
+         * sparsity. Keep as opt-in for future per-tensor wiring. */
+        const char* env = getenv("IB_ACT_SPARSE_REL");
+        eps_act_rel = (env && atof(env) >= 0.0f) ? (float)atof(env) : 0.0f;
+    }
+    if (eps_act_rel <= 0.0f) return NULL;
+    int n_groups = N / G;
+    float xmax = 0.0f;
+    for (int j = 0; j < N; j++) { float a = fabsf(x[j]); if (a > xmax) xmax = a; }
+    float thr = eps_act_rel * xmax;
+    char* skip_grp = (char*)malloc((size_t)n_groups);
+    if (!skip_grp) return NULL;
+    int n_skip = 0;
+    for (int g = 0; g < n_groups; g++) {
+        float gmax = 0.0f;
+        const float* xg = x + g * G;
+        for (int j = 0; j < G; j++) { float a = fabsf(xg[j]); if (a > gmax) gmax = a; }
+        skip_grp[g] = (gmax <= thr) ? 1 : 0;
+        if (skip_grp[g]) n_skip++;
+    }
+    if (getenv("IB_ACT_SPARSE_TRACE"))
+        fprintf(stderr, "[act-sparse] skip %d/%d groups\n", n_skip, n_groups);
+    return skip_grp;
+}
+
 typedef struct {
     const struct ib_int4_tensor* t;
     const float* x;
     float* out;
+    const char* skip_grp;
 } int4_task_ctx;
 
 static void int4_row_task(void* arg, int tid, int s, int e) {
     (void)tid;
     int4_task_ctx* c = (int4_task_ctx*)arg;
-    int4_matmul_rows(c->t, c->x, c->out, s, e);
+    int4_matmul_rows_skip(c->t, c->x, c->out, s, e, c->skip_grp);
 }
 
 static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
                                    const float* x, float* out) {
-    int4_matmul_rows(t, x, out, 0, t->M);
+    char* skip_grp = build_skip_mask(t->N, t->G, x);
+    int4_matmul_rows_skip(t, x, out, 0, t->M, skip_grp);
+    free(skip_grp);
     return 0;
 }
 
@@ -3592,11 +3634,164 @@ static int int4_matmul_fp32_threaded(const struct ib_int4_tensor* t,
     if (!spin || n_threads <= 1 || t->M < 256) {
         return int4_matmul_fp32_raw(t, x, out);
     }
-    int4_task_ctx ctx = { t, x, out };
+    char* skip_grp = build_skip_mask(t->N, t->G, x);
+    int4_task_ctx ctx = { t, x, out, skip_grp };
     int chunk = (t->M + n_threads - 1) / n_threads;
     if (chunk < 32) chunk = 32;
     pq_spin_pool_run(spin, int4_row_task, &ctx, t->M, chunk);
+    free(skip_grp);
     return 0;
+}
+
+/* Sparse-Δx incremental update: out[m] += sum_k W[m, idx[k]] * dx[k].
+ * idx is the list of significant Δx column indices, dx the corresponding
+ * Δx values. Each W column read decodes one nibble (high or low) per row. */
+static void int4_delta_rows(const struct ib_int4_tensor* t,
+                              const int* idx, const float* dx, int n_sig,
+                              float* out, int m_start, int m_end) {
+    const int N = t->N, G = t->G;
+    const uint8_t* q = t->q;
+    const uint16_t* sh = t->s;
+    for (int m = m_start; m < m_end; m++) {
+        const uint8_t* qrow = q + (size_t)m * (N / 2);
+        const uint16_t* srow = sh + (size_t)m * (N / G);
+        float acc = 0.0f;
+        for (int k = 0; k < n_sig; k++) {
+            int j = idx[k];
+            uint8_t b = qrow[j / 2];
+            int nib = (j & 1) ? (int)(b >> 4) : (int)(b & 0x0F);
+            float scale = ib_fp16_to_fp32(srow[j / G]);
+            acc += (float)(nib - 8) * scale * dx[k];
+        }
+        /* Outlier sidecar Δ: outl values are in AWQ basis, but dx is in
+         * AWQ basis too (caller already applied inv_act), so this works
+         * symmetrically with the full-matmul kernel. */
+        if (t->outl_idx) {
+            const uint16_t* oi = t->outl_idx + (size_t)m * t->K_out;
+            const uint16_t* ov = t->outl_val + (size_t)m * t->K_out;
+            for (int kk = 0; kk < t->K_out; kk++) {
+                int oj = oi[kk];
+                /* Naive: scan idx[] for oj. For typical K_out ≤ 6 this is
+                 * cheaper than a hash map. */
+                for (int s = 0; s < n_sig; s++) {
+                    if (idx[s] == oj) {
+                        acc += ib_fp16_to_fp32(ov[kk]) * dx[s];
+                        break;
+                    }
+                }
+            }
+        }
+        out[m] += acc;
+    }
+}
+
+typedef struct {
+    const struct ib_int4_tensor* t;
+    const int* idx;
+    const float* dx;
+    int n_sig;
+    float* out;
+} int4_delta_ctx;
+
+static void int4_delta_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    int4_delta_ctx* c = (int4_delta_ctx*)arg;
+    int4_delta_rows(c->t, c->idx, c->dx, c->n_sig, c->out, s, e);
+}
+
+/* Decide sparse-Δ vs full path based on Δx sparsity. xk is the AWQ-basis
+ * input (already pre-multiplied by inv_act if applicable). */
+static int int4_matmul_with_delta_cache(ib_pq_session* s, int idx,
+                                          const struct ib_int4_tensor* t,
+                                          const float* xk, float* out) {
+    /* Lazy alloc cache slot. */
+    if (!s->int4_x_cache[idx]) {
+        s->int4_x_cache[idx] = (float*)malloc((size_t)t->N * sizeof(float));
+        s->int4_out_cache[idx] = (float*)malloc((size_t)t->M * sizeof(float));
+        if (!s->int4_x_cache[idx] || !s->int4_out_cache[idx]) goto full;
+        /* Sentinel: NaN means uninitialized. */
+        s->int4_x_cache[idx][0] = NAN;
+    }
+    float* x_prev = s->int4_x_cache[idx];
+    float* out_prev = s->int4_out_cache[idx];
+    /* If cache uninitialized (first call or after reset), do full and seed. */
+    if (isnan(x_prev[0])) {
+        int rc = int4_matmul_fp32_threaded(t, xk, out, s->spin, s->n_threads);
+        if (rc == 0) {
+            memcpy(x_prev, xk, (size_t)t->N * sizeof(float));
+            memcpy(out_prev, out, (size_t)t->M * sizeof(float));
+        }
+        return rc;
+    }
+    /* Compute Δx and significant-index list in one pass. */
+    /* Significance threshold scales with ||x|| to be relative. */
+    int N = t->N;
+    int* sig_idx = (int*)malloc((size_t)N * sizeof(int));
+    float* sig_dx = (float*)malloc((size_t)N * sizeof(float));
+    if (!sig_idx || !sig_dx) { free(sig_idx); free(sig_dx); goto full; }
+    /* Threshold: relative to ||Δx||. Mark as significant when
+     * |Δx_j| > eps_rel × max|Δx|. Adaptive — handles both tiny shifts
+     * (decode steady state, mostly < eps) and large changes (token
+     * boundary, mostly > eps so we fall through to full). */
+    float dxmax = 0.0f;
+    for (int j = 0; j < N; j++) {
+        float d = fabsf(xk[j] - x_prev[j]);
+        if (d > dxmax) dxmax = d;
+    }
+    /* Tunable via env: default 0.01 (skip Δx within 1% of max-Δx). */
+    static float eps_rel = -1.0f;
+    if (eps_rel < 0.0f) {
+        const char* env = getenv("IB_DELTA_EPS_REL");
+        eps_rel = (env && atof(env) > 0) ? (float)atof(env) : 0.01f;
+    }
+    float eps = eps_rel * dxmax + 1e-30f;
+    int n_sig = 0;
+    for (int j = 0; j < N; j++) {
+        float d = xk[j] - x_prev[j];
+        if (fabsf(d) > eps) {
+            sig_idx[n_sig] = j;
+            sig_dx[n_sig] = d;
+            n_sig++;
+        }
+    }
+    if (getenv("IB_DELTA_TRACE")) {
+        fprintf(stderr, "[delta] %s: n_sig=%d/%d (%.1f%%) dxmax=%g\n",
+                t->name, n_sig, N, 100.0*n_sig/N, (double)dxmax);
+    }
+    /* If sparse fraction is too high (>50%), full matmul wins on cache
+     * locality; sparse path doesn't pay off below that. */
+    if (n_sig > N / 2) {
+        free(sig_idx); free(sig_dx);
+        goto full;
+    }
+    /* Sparse delta update: start from out_prev, add W·Δx_sparse row-wise. */
+    memcpy(out, out_prev, (size_t)t->M * sizeof(float));
+    if (s->spin && s->n_threads > 1 && t->M >= 256) {
+        int4_delta_ctx c = { t, sig_idx, sig_dx, n_sig, out };
+        int chunk = (t->M + s->n_threads - 1) / s->n_threads;
+        if (chunk < 32) chunk = 32;
+        pq_spin_pool_run(s->spin, int4_delta_task, &c, t->M, chunk);
+    } else {
+        int4_delta_rows(t, sig_idx, sig_dx, n_sig, out, 0, t->M);
+    }
+    free(sig_idx); free(sig_dx);
+    /* Refresh caches. */
+    memcpy(x_prev, xk, (size_t)N * sizeof(float));
+    memcpy(out_prev, out, (size_t)t->M * sizeof(float));
+    return 0;
+full:
+    {
+        int rc = int4_matmul_fp32_threaded(t, xk, out, s->spin, s->n_threads);
+        if (rc == 0 && s->int4_x_cache[idx] && s->int4_out_cache[idx]) {
+            memcpy(s->int4_x_cache[idx], xk, (size_t)t->N * sizeof(float));
+            memcpy(s->int4_out_cache[idx], out, (size_t)t->M * sizeof(float));
+        }
+        return rc;
+    }
+}
+
+static int session_int4_index(const ib_pq_session* s, const struct ib_int4_tensor* t) {
+    return (int)(t - s->int4_tensors);
 }
 
 static int session_find_index(const ib_pq_session* s, const char* name) {
@@ -3778,6 +3973,16 @@ int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
         s->x_scratch_n = max_N;
     }
 
+    /* Phase 6 delta cache: allocate slot pointers (NULL = lazily allocated). */
+    {
+        const char* env = getenv("IB_DELTA_CACHE");
+        s->delta_cache_enabled = (env && atoi(env) > 0) ? 1 : 0;
+        if (s->delta_cache_enabled && s->n_int4 > 0) {
+            s->int4_x_cache = (float**)calloc((size_t)s->n_int4, sizeof(float*));
+            s->int4_out_cache = (float**)calloc((size_t)s->n_int4, sizeof(float*));
+        }
+    }
+
     /* F1.a: preallocate scratch sized to fleet max. */
     int max_K = 0, max_Kl2 = 0;
     for (int i = 0; i < s->multi.n; i++) {
@@ -3828,6 +4033,14 @@ void ib_pq_session_close(ib_pq_session* s) {
     free(s->thread_scratch);
     free(s->act_scale_inv_per_tensor);
     free(s->x_scratch);
+    if (s->int4_x_cache) {
+        for (int i = 0; i < s->n_int4; i++) free(s->int4_x_cache[i]);
+        free(s->int4_x_cache);
+    }
+    if (s->int4_out_cache) {
+        for (int i = 0; i < s->n_int4; i++) free(s->int4_out_cache[i]);
+        free(s->int4_out_cache);
+    }
     if (s->int4_tensors) {
         for (int i = 0; i < s->n_int4; i++) free(s->int4_tensors[i].name);
         free(s->int4_tensors);
@@ -3923,6 +4136,10 @@ int ib_pq_session_matmul(ib_pq_session* s, const char* name,
         if (i4->inv_act && s->x_scratch && i4->N <= s->x_scratch_n) {
             for (int j = 0; j < i4->N; j++) s->x_scratch[j] = x[j] * i4->inv_act[j];
             xk = s->x_scratch;
+        }
+        if (s->delta_cache_enabled && s->int4_x_cache) {
+            int idx = session_int4_index(s, i4);
+            return int4_matmul_with_delta_cache(s, idx, i4, xk, out);
         }
         return int4_matmul_fp32_threaded(i4, xk, out, s->spin, s->n_threads);
     }
