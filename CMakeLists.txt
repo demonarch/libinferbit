@@ -104,6 +104,11 @@ add_library(inferbit SHARED ${INFERBIT_SOURCES})
 target_include_directories(inferbit PUBLIC include)
 target_include_directories(inferbit PRIVATE src)
 target_link_libraries(inferbit ${PLATFORM_LIBS})
+# On Windows, MSVC requires explicit dllexport for symbols to be visible
+# from the DLL. Internal headers (pq_decode.h, etc.) declare functions
+# without IB_API; auto-export all global symbols so Python ctypes /
+# dlsym can resolve them. POSIX is unaffected (no-op there).
+set_target_properties(inferbit PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 # Static library
 add_library(inferbit_static STATIC ${INFERBIT_SOURCES})
