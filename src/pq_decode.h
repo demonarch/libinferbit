@@ -28,6 +28,12 @@ typedef enum {
     IB_PQ_FMT_L1,        /* "pq2d_v1_l1"     — 1 level, optional outlier */
     IB_PQ_FMT_L2,        /* "pq2d_v1_l2"     — 2 level residual, no outlier */
     IB_PQ_FMT_L1_L2,     /* "pq2d_v1_l1_l2"  — 2 level + outlier */
+    IB_PQ_FMT_PYRAMID,   /* "pq2d_v1_pyramid" — conditional pyramid:
+                          * L2 codebook flattened as [K_outer * K_inner, G/2];
+                          * indices i2 are combined as i1*K_inner + i2_local.
+                          * K_l2 unrestricted (vs L1_L2 which requires {16,64,K}).
+                          * Reconstruct path is identical to L1_L2 — only the
+                          * validation differs. */
 } ib_pq_format;
 
 typedef struct {
@@ -49,12 +55,18 @@ typedef struct {
     uint16_t* codebook_l2_l;   /* NULL if n_levels == 1 */
     uint16_t* codebook_l2_r;   /* NULL if n_levels == 1 */
 
-    /* Indices: M rows × C columns where C = (N - n_outlier) / G. */
+    /* Indices: M rows × C columns where C = (N - n_outlier) / G.
+     * L2 indices may be 1 byte (K_l2 ≤ 256) or 2 bytes (PYRAMID with
+     * K_l2 > 256). l2_idx_bytes encodes which. Packed 4-bit (K_l2==16)
+     * uses 1 byte per chunk pair regardless. */
     uint8_t* indices_l1_l;
     uint8_t* indices_l1_r;
-    uint8_t* indices_l2_l;     /* NULL if n_levels == 1 */
-    uint8_t* indices_l2_r;     /* NULL if n_levels == 1 */
+    uint8_t* indices_l2_l;     /* NULL if n_levels == 1; raw bytes — cast per l2_idx_bytes */
+    uint8_t* indices_l2_r;     /* NULL if n_levels == 1; raw bytes — cast per l2_idx_bytes */
     int C;                     /* chunks per row */
+    int l2_idx_bytes;          /* 1 = uint8 (default); 2 = uint16 (PYRAMID K_l2>256) */
+    int l2_packed_bits;        /* 0 = unpacked (default); >0 = N-bit packed on
+                                * disk, unpacked to uint16 in RAM at load. */
 
     /* Per-row scale */
     uint16_t* row_scale;       /* M FP16 entries */
@@ -80,6 +92,29 @@ typedef struct {
 int  ib_pq_load_single(const char* path, ib_pq_tensor* out);
 void ib_pq_free(ib_pq_tensor* t);
 
+/* Raw (non-PQ) tensor stored alongside PQ tensors in the IBF v5
+ * file. Used for token embeddings, RMSNorm weights, and any other
+ * model state needed by inferbit_pq_forward that isn't PQ-quantized. */
+typedef enum {
+    IB_RAW_F32 = 0,
+    IB_RAW_F16 = 1,
+    IB_RAW_I32 = 2,
+    IB_RAW_I16 = 3,
+    IB_RAW_I8  = 4,
+    IB_RAW_U8  = 5,
+    IB_RAW_U16 = 6,
+} ib_raw_dtype;
+
+typedef struct {
+    char*  name;          /* heap-allocated */
+    void*  data;          /* heap-allocated copy (or mmap pointer) */
+    int    dtype;         /* ib_raw_dtype */
+    int    ndim;
+    int    shape[4];
+    size_t size_bytes;
+    int    _owns_data;    /* 1 if heap-allocated and we should free it */
+} ib_pq_raw_tensor;
+
 /* Multi-tensor IBF v5 loader. Returns an array of tensors and their
  * names. Caller must free both via ib_pq_multi_free. */
 typedef struct {
@@ -88,6 +123,11 @@ typedef struct {
     ib_pq_tensor* tensors; /* parallel array */
     void* _mmap_base;      /* non-NULL when mmap-backed (Path D) */
     size_t _mmap_size;
+    /* Phase 9: raw tensors + free-form JSON config. NULL/0/n_raw=0 if
+     * the file was written without them (backward compatible). */
+    int    n_raw;
+    ib_pq_raw_tensor* raw_tensors;
+    char*  config_json;    /* heap-allocated NUL-terminated, NULL if absent */
 } ib_pq_multi;
 
 int  ib_pq_load_multi(const char* path, ib_pq_multi* out);
@@ -166,6 +206,356 @@ int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
  * for inference; use ib_pq_matmul_fp32 for verification. */
 int ib_pq_matmul_fp32_q8lut(const ib_pq_tensor* t, const float* x,
                              float* out, void* pool);
+
+/* Phase 2: cache-resident streaming-precompute matmul.
+ *
+ * Same math as ib_pq_matmul_fp32 but restructured so codebook ↔ activation
+ * dot-product tables are computed PER CHUNK and stay in L1/L2 cache for
+ * the whole-row accumulation pass over that chunk. Replaces the existing
+ * "all-chunks-at-once" precompute that blows cache on big-K tensors.
+ *
+ * Per-chunk working set: (K + K_l2) × 2 floats ≈ a few KB; fits in L1
+ * even on Raspberry Pi (64 KB L1). Index streams are sequential reads.
+ *
+ * Numerically equivalent to ib_pq_matmul_fp32 (FP32 throughout). Use
+ * for performance; the existing entry point remains for verification. */
+int ib_pq_matmul_fp32_streaming(const ib_pq_tensor* t, const float* x, float* out);
+
+/* Phase 5 helpers — top-K lm_head two-stage.
+ *
+ * L1-only matmul: skips the L2 codebook contribution. Cheap pass over
+ * full M output rows; used as the candidate filter. Output is a coarse
+ * approximation to the full pyramid logits but preserves rank structure
+ * well (validated test 35: 100% argmax coverage at top-32 on 32K vocab).
+ */
+int ib_pq_matmul_fp32_l1_only(const ib_pq_tensor* t, const float* x, float* out);
+
+/* Subset matmul: full-pyramid logits computed only for the selected
+ * row indices. Used as the refinement pass after top-K extraction.
+ * row_indices: array of n_rows int32 row indices; out: float[n_rows]. */
+int ib_pq_matmul_fp32_subset(const ib_pq_tensor* t, const float* x,
+                              const int32_t* row_indices, int n_rows,
+                              float* out);
+
+/* Top-K orchestrator: cheap L1-only pass → top-K extract → full pyramid
+ * on the K candidates → fill out_logits[K] and out_token_ids[K] sorted
+ * descending by refined logit. Caller-allocated buffers must hold K
+ * elements each. K ≤ M. Returns 0 on success.
+ *
+ * For sampling: caller applies temperature/top-P over out_logits[K]
+ * and indexes into out_token_ids[K]. */
+int ib_pq_lm_head_topk(const ib_pq_tensor* t, const float* x, int K_top,
+                        float* out_logits, int32_t* out_token_ids);
+
+/* Phase 4: activation-sparse streaming matmul.
+ *
+ * Skips chunks whose input activation values (in x) are all below
+ * `act_threshold` in absolute value. Designed for the down_proj
+ * matmul whose input (post-SwiGLU intermediate) is ~50% near-zero
+ * per token (test 33). Skipping zero-contributing chunks delivers
+ * ~2× MLP compute reduction with no quality loss.
+ *
+ * act_threshold ≤ 0 disables the sparsity check (equivalent to
+ * ib_pq_matmul_fp32_streaming).
+ */
+int ib_pq_matmul_fp32_streaming_sparse(const ib_pq_tensor* t, const float* x,
+                                        float* out, float act_threshold);
+
+/* Phase 8.F: variance-bounded L2 skip.
+ *
+ * Per (output_row, chunk) pair, decides whether to apply L2 based on
+ * a precomputed per-cluster ||C2[k]||_max bound vs the L1 contribution
+ * magnitude. Skip L2 when the L1 contribution dominates the L2 bound.
+ *
+ * skip_threshold ≥ 0: ratio above which L2 is skipped. 0 = always
+ * apply L2 (equivalent to streaming matmul). Larger = more aggressive
+ * skip, lower compute, higher quality cost. Test 41b found ~1pp PPL
+ * edge over random skip at low rates; mechanism is marginal but
+ * cheap once the bound table is precomputed.
+ */
+int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
+                                        float* out, float skip_threshold);
+
+/* Phase 6: persistent decode cache for cross-token reuse.
+ *
+ * The fp16→fp32 codebook decode and inner_cols build happen once on
+ * cache creation; cached matmul variants skip that prelude on every
+ * call. Intended use: build one cache per (tensor) at model load,
+ * reuse across all token forward passes.
+ */
+typedef struct ib_pq_lut_cache ib_pq_lut_cache;
+
+int  ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out);
+void ib_pq_lut_cache_free(ib_pq_lut_cache* c);
+
+int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
+                                        const ib_pq_lut_cache* cache,
+                                        const float* x, float* out);
+int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
+                                                const ib_pq_lut_cache* cache,
+                                                const float* x, float* out,
+                                                float skip_threshold);
+
+/* Phase 3: INT8 activations on top of cache.
+ *
+ * Quantizes the cached fp32 codebooks to int8 per-row scales and exposes
+ * a streaming matmul that quantizes x_chunk to int8 per chunk and uses
+ * NEON dotprod (ARM_FEATURE_DOTPROD) / AVX2 cascade for the inner dot.
+ * Accuracy budget: ~10-12 effective bits per product after scaling.
+ *
+ * Call once on an existing cache before using the int8 matmul; idempotent.
+ */
+int ib_pq_lut_cache_quantize_int8(ib_pq_lut_cache* cache);
+int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
+                                              const ib_pq_lut_cache* cache,
+                                              const float* x, float* out);
+
+/* Phase 9: per-tensor cache fleet for a multi-tensor IBF.
+ * Builds one ib_pq_lut_cache per tensor; lookup-by-name in O(1).
+ * Owns and frees the underlying caches.
+ */
+typedef struct ib_pq_multi_caches ib_pq_multi_caches;
+
+int  ib_pq_multi_caches_create(const ib_pq_multi* multi, ib_pq_multi_caches** out);
+void ib_pq_multi_caches_free(ib_pq_multi_caches* mc);
+const ib_pq_lut_cache* ib_pq_multi_caches_get(const ib_pq_multi_caches* mc, const char* name);
+int  ib_pq_multi_caches_quantize_all_int8(ib_pq_multi_caches* mc);
+
+/* ── Session: owns IBF + cache fleet + per-tensor policy. ──
+ *
+ * Design goal: dispatch decisions live in C, not in the language wrapper.
+ * The wrapper opens a session, optionally tunes per-tensor policies, and
+ * issues matmul-by-name calls. The session picks the right kernel.
+ */
+
+typedef enum {
+    IB_PQ_VARIANT_STREAMING = 0,  /* default, full pyramid */
+    IB_PQ_VARIANT_L1_ONLY,        /* skip L2 entirely (cheap, lossy) */
+    IB_PQ_VARIANT_L2SKIP,         /* variance-bounded L2 skip */
+    IB_PQ_VARIANT_SPARSE,         /* skip near-zero activation chunks */
+    IB_PQ_VARIANT_INT8,           /* int8 codebook + activations */
+} ib_pq_variant;
+
+typedef struct {
+    int   variant;            /* ib_pq_variant */
+    float skip_threshold;     /* for L2SKIP */
+    float act_threshold;      /* for SPARSE */
+} ib_pq_policy;
+
+typedef struct ib_pq_session ib_pq_session;
+
+int  ib_pq_session_open(const char* ibf_path, ib_pq_session** out);
+void ib_pq_session_close(ib_pq_session* s);
+
+int  ib_pq_session_set_default_policy(ib_pq_session* s, ib_pq_policy p);
+int  ib_pq_session_set_policy(ib_pq_session* s, const char* name, ib_pq_policy p);
+
+/* Matmul by tensor name. Variant comes from the per-tensor policy
+ * (or the session default if none set). Out is M floats.
+ */
+int  ib_pq_session_matmul(ib_pq_session* s, const char* name,
+                           const float* x, float* out);
+
+/* F1.c batched: B inputs → B outputs through one matmul. Loads W once
+ * per row, fans across B slots. Currently only the INT4+SDOT path is
+ * truly batched; other backends fall back to per-slot calls. */
+int  ib_pq_session_matmul_batched(ib_pq_session* s, const char* name,
+                                    int B,
+                                    const float* const* x_arr,
+                                    float* const* out_arr);
+
+/* Speculative decoding (self-speculative via early-exit draft).
+ * - last_token: most recent committed token (already in KV at pos-1).
+ * - pos: position to decode next.
+ * - K: max number of speculative tokens to verify per round (≤ 16).
+ * - n_draft_layers: layer count for draft forward (must be < n_layers).
+ *   The draft is the same INT4 weights but stops early.
+ * - out_tokens[K]: filled with accepted tokens (may include verifier's
+ *   correction at the rejection position).
+ * - out_n_accepted: number of tokens written (1..K).
+ *
+ * On return, kv->length is set to pos + out_n_accepted.
+ *
+ * Greedy semantics (rejection on argmax mismatch). */
+/* Spec-decode prototype declared after ib_pq_kv_cache. */
+
+/* Top-K lm_head two-stage. K_top values in out_logits + ids, sorted desc. */
+int  ib_pq_session_lm_head_topk(ib_pq_session* s, const char* name,
+                                 const float* x, int K_top,
+                                 float* out_logits, int32_t* out_ids);
+
+/* Read-only metadata for the wrapper (so it doesn't need to redeclare
+ * the IbPqTensor struct just to know shape). */
+int  ib_pq_session_tensor_shape(const ib_pq_session* s, const char* name,
+                                 int* out_M, int* out_N);
+int  ib_pq_session_tensor_count(const ib_pq_session* s);
+const char* ib_pq_session_tensor_name(const ib_pq_session* s, int i);
+
+/* Phase 9: raw (non-PQ) tensor access. Returns 0 on success.
+ * out_data borrows from the session — do not free. */
+int  ib_pq_session_raw_count(const ib_pq_session* s);
+const char* ib_pq_session_raw_name(const ib_pq_session* s, int i);
+int  ib_pq_session_raw_get(const ib_pq_session* s, const char* name,
+                            const void** out_data, int* out_dtype,
+                            int* out_shape, int* out_ndim);
+
+/* Phase 9: free-form JSON config string (NUL-terminated). NULL if absent. */
+const char* ib_pq_session_config_json(const ib_pq_session* s);
+
+/* ── Phase 9: KV cache + transformer forward pass ── */
+
+typedef struct ib_pq_kv_cache ib_pq_kv_cache;
+
+int  ib_pq_kv_cache_create(const ib_pq_session* s, int max_seq_len,
+                            ib_pq_kv_cache** out);
+void ib_pq_kv_cache_free(ib_pq_kv_cache* kv);
+void ib_pq_kv_cache_clear(ib_pq_kv_cache* kv);
+int  ib_pq_kv_cache_length(const ib_pq_kv_cache* kv);
+
+/* Single-token forward step. Reads token_id, runs the full transformer
+ * stack using the session for matmuls, writes vocab_size logits.
+ * pos is the absolute position in the sequence (0 for the first token).
+ * Caller is responsible for incrementing pos and using the same kv across calls.
+ */
+int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                        int token_id, int pos, float* logits);
+
+/* Speculative decoding.
+ * - prev_logits: vocab fp32 logits from the prior full forward.
+ * - pos: next position to fill (KV[L][0..pos-1] must be populated).
+ * - K: max draft tokens (1..16).
+ * - draft_tokens: caller-provided K candidate tokens (e.g. from prompt
+ *   lookup, n-gram, or smaller draft model). draft_tokens[0] should
+ *   match argmax(prev_logits) for round consistency; if it doesn't,
+ *   rejection at i=0 emits the verifier's choice.
+ *
+ * Output:
+ *   out_tokens[K] — accepted tokens (1..K written) including verifier's
+ *                   correction at the rejection position when applicable.
+ *   *out_n_accepted — number of tokens written.
+ *   next_logits[vocab] — P(pos + out_n_accepted) for the next round.
+ *   kv->length     — set to pos + out_n_accepted.
+ *
+ * Greedy semantics. */
+int  ib_pq_speculative_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                              const float* prev_logits, int pos, int K,
+                              const int* draft_tokens,
+                              int* out_tokens, int* out_n_accepted,
+                              float* next_logits);
+
+/* Phase F1.c-light: forward step without lm_head — for prompt prefill
+ * positions whose logits won't be used. Skips the M=vocab_size matmul
+ * (the single biggest matmul in the model). logits buffer is unused. */
+int ib_pq_forward_step_no_logits(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos);
+
+/* F1.j: forward step that returns the post-final-norm hidden state
+ * instead of vocab logits. Lets the caller dispatch lm_head via the
+ * cheaper ib_pq_session_lm_head_topk for greedy / top-K sampling. */
+int ib_pq_forward_step_to_hidden(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos, float* hidden_out);
+
+/* F1.c full batched prefill: process B prompt tokens in parallel using
+ * the spin pool. Each worker thread runs an independent forward step
+ * with its own scratch — no contention, no redundant LUT compute. KV
+ * cache writes happen at distinct positions so are race-free; a barrier
+ * inside the implementation ensures attention reads see all prior KV
+ * writes for the same batch.
+ *
+ * tokens[B] maps to absolute KV positions [pos_start, pos_start+B).
+ * hidden_out, when non-NULL, is filled with the post-final-norm hidden
+ * state for the LAST token (B-1) only — the only one needed for
+ * sampling. Earlier batch positions skip the final norm + lm_head.
+ *
+ * For B==1 falls through to the sequential forward_step_to_hidden.
+ */
+int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
+                               const int* tokens, int B, int pos_start,
+                               float* hidden_last_out);
+
+/* Greedy generate: feed prompt_ids[0..n_prompt) into the kv cache,
+ * then greedily emit up to max_new tokens (argmax of logits). Stops
+ * early if eos_token_id is produced. Writes generated tokens into
+ * out_ids[0..*n_out) and *n_out is set on return.
+ *
+ * If callback is non-NULL it is invoked once per emitted token with
+ * (token_id, ctx); returning non-zero from the callback aborts.
+ */
+typedef int (*ib_pq_token_cb)(int token_id, void* ctx);
+
+int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
+                            const int* prompt_ids, int n_prompt,
+                            int max_new, int eos_token_id,
+                            int* out_ids, int* n_out,
+                            ib_pq_token_cb cb, void* cb_ctx);
+
+/* Sampling generate: top-K filtered, optional top-P nucleus, with
+ * temperature. seed=0 picks a non-zero from time().
+ *
+ *   temperature  — divides logits before softmax. T<=0 falls back to argmax.
+ *   top_k        — keep only the top-K candidates (<=0 = full vocab).
+ *   top_p        — keep smallest set whose cumulative prob >= p (<=0 disables).
+ */
+typedef struct {
+    float temperature;
+    int   top_k;
+    float top_p;
+    uint32_t seed;
+} ib_pq_sample_params;
+
+int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
+                            const int* prompt_ids, int n_prompt,
+                            int max_new, int eos_token_id,
+                            ib_pq_sample_params params,
+                            int* out_ids, int* n_out,
+                            ib_pq_token_cb cb, void* cb_ctx);
+
+/* ── Phase 9: forward-pass primitives (no PQ inside) ──
+ * Used to assemble inferbit_pq_forward: matmuls go through the session,
+ * everything else (norm, rotary, activation, residual, attention) uses
+ * these. Pure C, scalar-then-SIMD where it matters.
+ */
+
+/* RMSNorm: out[i] = x[i] * weight[i] / sqrt(mean(x*x) + eps).
+ * Layer-by-layer in float; weight is fp32. */
+void ib_rmsnorm_f32(float* out, const float* x, const float* weight,
+                     int hidden, float eps);
+
+/* SwiGLU activation in place (or to out): out[i] = silu(gate[i]) * up[i]
+ *   silu(x) = x / (1 + exp(-x))
+ */
+void ib_silu_gate_f32(float* out, const float* gate, const float* up, int n);
+
+/* Residual add: x[i] += delta[i]. */
+void ib_residual_add_f32(float* x, const float* delta, int n);
+
+/* RoPE (rotary positional embedding). Rotates x in pairs (x[2i], x[2i+1])
+ * by angle pos * theta^(-2i/head_dim). x is shaped [n_heads * head_dim],
+ * head_dim must be even. theta is the rope base (typically 10000.0).
+ * For a single position. For batched / cached positions call once per pos. */
+void ib_rope_f32(float* x, int n_heads, int head_dim, int pos, float theta);
+
+/* Softmax in place over n elements. Numerically stable (subtracts max). */
+void ib_softmax_f32(float* x, int n);
+
+/* Orthonormal Fast Walsh-Hadamard transform on a length-n vector,
+ * pads internally to next power of 2 and divides by sqrt(n_padded).
+ * For decode of tensors encoded with rotate=1 (the encoder applied
+ * fwht_norm to W's input columns).
+ *
+ * x_buf must point to at least max(n_padded, n) floats; the input is
+ * read from x[0..n) and the output is written back to x[0..n_padded).
+ * Caller must allocate the trailing zero pad slots if n != n_padded.
+ * Returns n_padded.
+ */
+int ib_fwht_norm_f32(float* x, int n);
+
+/* Embeddings-PQ: reconstruct a single row of a PQ tensor (no matmul,
+ * just decode the codebook for that row). Used by forward step's token
+ * embedding lookup when tok_embed is stored as a PQ tensor instead of
+ * raw fp16 — saves ~75% of bundle size on big-vocab models. */
+int ib_pq_session_reconstruct_row(ib_pq_session* s, const char* name,
+                                    int row, float* out_row);
 
 /* Float16 helpers (IEEE 754 binary16). Pure software, portable. */
 float    ib_fp16_to_fp32(uint16_t h);

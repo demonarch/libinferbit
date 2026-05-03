@@ -6,8 +6,11 @@
 #include "pq_decode.h"
 #include "cJSON.h"
 #include "inferbit_internal.h"  /* ib_thread_pool, ib_pool_run */
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +38,153 @@
 #include <immintrin.h>
 #define IB_PQ_HAVE_AVX2 1
 #endif
+
+/* F1.e: SIMD-accelerated fp32 dot + scaled accumulator (for attention). */
+static inline float pq_dot_f32(const float* a, const float* b, int n) {
+#if defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+    }
+    float s = vaddvq_f32(acc);
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                              _mm256_loadu_ps(b + i), acc);
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float total = _mm_cvtss_f32(s);
+    for (; i < n; i++) total += a[i] * b[i];
+    return total;
+#else
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+#endif
+}
+
+static inline void pq_accum_scaled_f32(float* out, const float* v, float w, int n) {
+#if defined(__ARM_NEON)
+    float32x4_t wv = vdupq_n_f32(w);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t o = vld1q_f32(out + i);
+        o = vfmaq_f32(o, vld1q_f32(v + i), wv);
+        vst1q_f32(out + i, o);
+    }
+    for (; i < n; i++) out[i] += w * v[i];
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 wv = _mm256_set1_ps(w);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 o = _mm256_loadu_ps(out + i);
+        o = _mm256_fmadd_ps(_mm256_loadu_ps(v + i), wv, o);
+        _mm256_storeu_ps(out + i, o);
+    }
+    for (; i < n; i++) out[i] += w * v[i];
+#else
+    for (int i = 0; i < n; i++) out[i] += w * v[i];
+#endif
+}
+
+/* Per-chunk codebook ↔ x dot table.
+ * For each k in [0, K): out[k] = sum_{j in [0, half)} cb[k*half + j] * x[j].
+ * Specialized for half ∈ {8, 16} on NEON / AVX2; scalar otherwise. */
+static inline void pq_chunk_dot_table_f32(const float* cb, const float* x,
+                                            int half, int K, float* out) {
+#if defined(__ARM_NEON)
+    if (half == 2) {
+        /* G=4 case: 2 floats per codebook entry. Pack 4 entries (8 floats)
+         * into 2 NEON regs, multiply by [x0,x1,x0,x1,x0,x1,x0,x1], use
+         * vpaddq_f32 to get the 4 paired-sum dots in one vector. */
+        float32x4_t xx = {x[0], x[1], x[0], x[1]};
+        int k = 0;
+        for (; k + 4 <= K; k += 4) {
+            float32x4_t e0 = vld1q_f32(cb + (size_t)k * 2);
+            float32x4_t e1 = vld1q_f32(cb + (size_t)k * 2 + 4);
+            float32x4_t p0 = vmulq_f32(e0, xx);
+            float32x4_t p1 = vmulq_f32(e1, xx);
+            vst1q_f32(out + k, vpaddq_f32(p0, p1));
+        }
+        for (; k < K; k++) {
+            const float* e = cb + (size_t)k * 2;
+            out[k] = e[0] * x[0] + e[1] * x[1];
+        }
+        return;
+    }
+    if (half == 16) {
+        float32x4_t xv0 = vld1q_f32(x + 0);
+        float32x4_t xv1 = vld1q_f32(x + 4);
+        float32x4_t xv2 = vld1q_f32(x + 8);
+        float32x4_t xv3 = vld1q_f32(x + 12);
+        for (int k = 0; k < K; k++) {
+            const float* e = cb + (size_t)k * 16;
+            float32x4_t acc = vmulq_f32(vld1q_f32(e + 0),  xv0);
+            acc = vfmaq_f32(acc, vld1q_f32(e + 4),  xv1);
+            acc = vfmaq_f32(acc, vld1q_f32(e + 8),  xv2);
+            acc = vfmaq_f32(acc, vld1q_f32(e + 12), xv3);
+            out[k] = vaddvq_f32(acc);
+        }
+        return;
+    }
+    if (half == 8) {
+        float32x4_t xv0 = vld1q_f32(x + 0);
+        float32x4_t xv1 = vld1q_f32(x + 4);
+        for (int k = 0; k < K; k++) {
+            const float* e = cb + (size_t)k * 8;
+            float32x4_t acc = vmulq_f32(vld1q_f32(e + 0), xv0);
+            acc = vfmaq_f32(acc, vld1q_f32(e + 4), xv1);
+            out[k] = vaddvq_f32(acc);
+        }
+        return;
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    if (half == 16) {
+        __m256 xv0 = _mm256_loadu_ps(x + 0);
+        __m256 xv1 = _mm256_loadu_ps(x + 8);
+        for (int k = 0; k < K; k++) {
+            const float* e = cb + (size_t)k * 16;
+            __m256 acc = _mm256_mul_ps(_mm256_loadu_ps(e + 0), xv0);
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(e + 8), xv1, acc);
+            __m128 lo = _mm256_castps256_ps128(acc);
+            __m128 hi = _mm256_extractf128_ps(acc, 1);
+            __m128 s = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            out[k] = _mm_cvtss_f32(s);
+        }
+        return;
+    }
+    if (half == 8) {
+        __m256 xv = _mm256_loadu_ps(x);
+        for (int k = 0; k < K; k++) {
+            __m256 acc = _mm256_mul_ps(_mm256_loadu_ps(cb + (size_t)k * 8), xv);
+            __m128 lo = _mm256_castps256_ps128(acc);
+            __m128 hi = _mm256_extractf128_ps(acc, 1);
+            __m128 s = _mm_add_ps(lo, hi);
+            s = _mm_hadd_ps(s, s);
+            s = _mm_hadd_ps(s, s);
+            out[k] = _mm_cvtss_f32(s);
+        }
+        return;
+    }
+#endif
+    for (int k = 0; k < K; k++) {
+        const float* e = cb + (size_t)k * half;
+        float d = 0.0f;
+        for (int j = 0; j < half; j++) d += e[j] * x[j];
+        out[k] = d;
+    }
+}
 
 #define IBF_MAGIC      "INFERBIT"
 #define IBF_MAGIC_SIZE 8
@@ -143,11 +293,16 @@ static int read_block(const cJSON* parent, const char* key, size_t* off, size_t*
 
 static ib_pq_format parse_format(const char* s) {
     if (!s) return IB_PQ_FMT_NONE;
-    if (strcmp(s, "pq2d_v1_l1")    == 0) return IB_PQ_FMT_L1;
-    if (strcmp(s, "pq2d_v1_l2")    == 0) return IB_PQ_FMT_L2;
-    if (strcmp(s, "pq2d_v1_l1_l2") == 0) return IB_PQ_FMT_L1_L2;
+    if (strcmp(s, "pq2d_v1_l1")      == 0) return IB_PQ_FMT_L1;
+    if (strcmp(s, "pq2d_v1_l2")      == 0) return IB_PQ_FMT_L2;
+    if (strcmp(s, "pq2d_v1_l1_l2")   == 0) return IB_PQ_FMT_L1_L2;
+    if (strcmp(s, "pq2d_v1_pyramid") == 0) return IB_PQ_FMT_PYRAMID;
     return IB_PQ_FMT_NONE;
 }
+
+/* Forward declaration: defined later near the L2 index helpers. */
+static void pq_unpack_bits_to_u16(const uint8_t* src, uint16_t* dst,
+                                   size_t n_total, int n_bits);
 
 /* ── Loader ────────────────────────────────────────────────────── */
 
@@ -197,10 +352,33 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     out->C = n_inner / G;
     int C = out->C;
     int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
-    /* Per docs/26: K_l2 must be in {16, 64, K} (with K typically 256). */
-    if (out->n_levels == 2 && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
+    /* Per docs/26: K_l2 must be in {16, 64, K} for L1_L2 format (with K
+     * typically 256). The PYRAMID format relaxes this — K_l2 = K_outer *
+     * K_inner where K_inner can be arbitrary up to 65535. */
+    if (out->n_levels == 2 && out->format != IB_PQ_FMT_PYRAMID
+        && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
-    size_t l2_idx_per_row = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
+    /* L2 index byte-width: PYRAMID with K_l2>256 uses uint16 (2 bytes).
+     * Otherwise uint8 (1 byte). Packed 4-bit (K_l2==16) is 1 byte/2 indices. */
+    out->l2_idx_bytes = (out->format == IB_PQ_FMT_PYRAMID && K_l2_eff > 256) ? 2 : 1;
+    /* Phase 1.5: Bit-packed L2 indices on disk (PYRAMID only). At load we
+     * unpack to uint16 in the arena. l2_packed_bits = 0 = no packing. */
+    out->l2_packed_bits = (int)json_int_field(tm, "l2_packed_bits", 0);
+    size_t l2_idx_per_row, l2_idx_disk_per_row;
+    if (l2_packed) {
+        l2_idx_per_row = (size_t)((C + 1) / 2);
+        l2_idx_disk_per_row = l2_idx_per_row;
+    } else {
+        l2_idx_per_row = (size_t)C * (size_t)out->l2_idx_bytes;
+        if (out->l2_packed_bits > 0) {
+            /* Disk: ceil(C * bits / 8). RAM: still uint16 (l2_idx_per_row). */
+            l2_idx_disk_per_row =
+                ((size_t)C * (size_t)out->l2_packed_bits + 7) >> 3;
+        } else {
+            l2_idx_disk_per_row = l2_idx_per_row;
+        }
+    }
+    (void)l2_idx_disk_per_row;  /* used in LOAD_BLOCK below */
 
     size_t cb_sz       = (size_t)K * (G / 2) * sizeof(uint16_t);
     size_t cb_l2_sz    = (size_t)K_l2_eff * (G / 2) * sizeof(uint16_t);
@@ -258,8 +436,43 @@ static int load_one_tensor(FILE* f, const cJSON* tm, size_t weight_data_start,
     if (out->n_levels == 2) {
         LOAD_BLOCK("codebook_l2_l", out->codebook_l2_l, cb_l2_sz);
         LOAD_BLOCK("codebook_l2_r", out->codebook_l2_r, cb_l2_sz);
-        LOAD_BLOCK("indices_l2_l",  out->indices_l2_l,  idx_l2_sz);
-        LOAD_BLOCK("indices_l2_r",  out->indices_l2_r,  idx_l2_sz);
+        if (out->l2_packed_bits > 0 && !l2_packed) {
+            /* Read packed bytes from disk, unpack into arena uint16 buffer. */
+            size_t disk_per_row =
+                ((size_t)C * (size_t)out->l2_packed_bits + 7) >> 3;
+            size_t disk_total = (size_t)M * disk_per_row;
+            uint8_t* tmp = (uint8_t*)malloc(disk_total + 4);  /* +4 pad for safe overread */
+            if (!tmp) goto err;
+            size_t off, sz;
+            if (read_block(tm, "indices_l2_l", &off, &sz) != 0
+                || sz != disk_total
+                || weight_data_start + off + sz > file_sz
+                || fseek(f, (long)(weight_data_start + off), SEEK_SET) != 0
+                || fread(tmp, 1, sz, f) != sz) {
+                free(tmp); goto err;
+            }
+            for (int r = 0; r < M; r++) {
+                pq_unpack_bits_to_u16(tmp + (size_t)r * disk_per_row,
+                                      ((uint16_t*)out->indices_l2_l) + (size_t)r * C,
+                                      (size_t)C, out->l2_packed_bits);
+            }
+            if (read_block(tm, "indices_l2_r", &off, &sz) != 0
+                || sz != disk_total
+                || weight_data_start + off + sz > file_sz
+                || fseek(f, (long)(weight_data_start + off), SEEK_SET) != 0
+                || fread(tmp, 1, sz, f) != sz) {
+                free(tmp); goto err;
+            }
+            for (int r = 0; r < M; r++) {
+                pq_unpack_bits_to_u16(tmp + (size_t)r * disk_per_row,
+                                      ((uint16_t*)out->indices_l2_r) + (size_t)r * C,
+                                      (size_t)C, out->l2_packed_bits);
+            }
+            free(tmp);
+        } else {
+            LOAD_BLOCK("indices_l2_l", out->indices_l2_l, idx_l2_sz);
+            LOAD_BLOCK("indices_l2_r", out->indices_l2_r, idx_l2_sz);
+        }
     }
     if (out->n_outlier > 0) {
         LOAD_BLOCK("outlier_cols",    out->outlier_cols,    oc_sz);
@@ -310,15 +523,32 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
     int K_l2_eff = out->K_l2 > 0 ? out->K_l2 : K;
     /* Stage D guard removed: matmul_impl + ib_pq_reconstruct_fp32 now
      * handle K_l2 ∈ {16, 64, 256} including 4-bit packed indices for
-     * K_l2 == 16. */
-    if (out->n_levels == 2 && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
+     * K_l2 == 16. The PYRAMID format relaxes the {16,64,K} restriction
+     * (K_l2 = K_outer × K_inner, arbitrary). */
+    if (out->n_levels == 2 && out->format != IB_PQ_FMT_PYRAMID
+        && K_l2_eff != 16 && K_l2_eff != 64 && K_l2_eff != K) return -1;
     int l2_packed = (K_l2_eff == 16);
-    size_t l2_idx_per_row = l2_packed ? (size_t)((out->C + 1) / 2) : (size_t)out->C;
+    out->l2_idx_bytes = (out->format == IB_PQ_FMT_PYRAMID && K_l2_eff > 256) ? 2 : 1;
+    out->l2_packed_bits = (int)json_int_field(tm, "l2_packed_bits", 0);
+    size_t l2_idx_per_row, l2_idx_disk_per_row;
+    if (l2_packed) {
+        l2_idx_per_row = (size_t)((out->C + 1) / 2);
+        l2_idx_disk_per_row = l2_idx_per_row;
+    } else {
+        l2_idx_per_row = (size_t)out->C * (size_t)out->l2_idx_bytes;
+        if (out->l2_packed_bits > 0) {
+            l2_idx_disk_per_row =
+                ((size_t)out->C * (size_t)out->l2_packed_bits + 7) >> 3;
+        } else {
+            l2_idx_disk_per_row = l2_idx_per_row;
+        }
+    }
 
     size_t cb_sz       = (size_t)K * (G / 2) * sizeof(uint16_t);
     size_t cb_l2_sz    = (size_t)K_l2_eff * (G / 2) * sizeof(uint16_t);
     size_t idx_sz      = (size_t)M * (size_t)out->C * sizeof(uint8_t);
     size_t idx_l2_sz   = (size_t)M * l2_idx_per_row;
+    size_t idx_l2_disk_sz = (size_t)M * l2_idx_disk_per_row;
     size_t rs_sz       = (size_t)M * sizeof(uint16_t);
     size_t oc_sz       = (size_t)out->n_outlier * sizeof(int32_t);
     size_t osc_sz      = (size_t)M * (size_t)out->n_outlier * sizeof(int8_t);
@@ -341,8 +571,36 @@ static int view_one_tensor(const uint8_t* mmap_base, size_t file_sz,
     if (out->n_levels == 2) {
         VIEW_BLOCK("codebook_l2_l", out->codebook_l2_l, uint16_t, cb_l2_sz);
         VIEW_BLOCK("codebook_l2_r", out->codebook_l2_r, uint16_t, cb_l2_sz);
-        VIEW_BLOCK("indices_l2_l",  out->indices_l2_l,  uint8_t,  idx_l2_sz);
-        VIEW_BLOCK("indices_l2_r",  out->indices_l2_r,  uint8_t,  idx_l2_sz);
+        if (out->l2_packed_bits > 0 && !l2_packed) {
+            /* Packed-on-disk indices: view the packed bytes via mmap, then
+             * unpack into a heap-allocated uint16 buffer (stored in _arena
+             * for cleanup). Decode path reads uint16 from heap, not mmap. */
+            uint8_t* packed_l;
+            uint8_t* packed_r;
+            VIEW_BLOCK("indices_l2_l", packed_l, uint8_t, idx_l2_disk_sz);
+            VIEW_BLOCK("indices_l2_r", packed_r, uint8_t, idx_l2_disk_sz);
+            /* Allocate uint16 for L and R indices (2 × idx_l2_sz bytes). */
+            size_t total = 2 * idx_l2_sz + 4;  /* +4 pad for safe over-read */
+            uint8_t* buf = (uint8_t*)malloc(total);
+            if (!buf) return -1;
+            out->_arena = buf;
+            out->_arena_size = total;
+            uint16_t* unp_l = (uint16_t*)buf;
+            uint16_t* unp_r = (uint16_t*)(buf + idx_l2_sz);
+            for (int r = 0; r < M; r++) {
+                pq_unpack_bits_to_u16(packed_l + (size_t)r * l2_idx_disk_per_row,
+                                       unp_l + (size_t)r * out->C,
+                                       (size_t)out->C, out->l2_packed_bits);
+                pq_unpack_bits_to_u16(packed_r + (size_t)r * l2_idx_disk_per_row,
+                                       unp_r + (size_t)r * out->C,
+                                       (size_t)out->C, out->l2_packed_bits);
+            }
+            out->indices_l2_l = (uint8_t*)unp_l;
+            out->indices_l2_r = (uint8_t*)unp_r;
+        } else {
+            VIEW_BLOCK("indices_l2_l", out->indices_l2_l, uint8_t, idx_l2_sz);
+            VIEW_BLOCK("indices_l2_r", out->indices_l2_r, uint8_t, idx_l2_sz);
+        }
     }
     if (out->n_outlier > 0) {
         VIEW_BLOCK("outlier_cols",    out->outlier_cols,    int32_t,  oc_sz);
@@ -432,13 +690,14 @@ int ib_pq_load_multi(const char* path, ib_pq_multi* out) {
 
     int n = 0;
     for (cJSON* it = tensors->child; it; it = it->next) n++;
-    if (n <= 0) { cJSON_Delete(root); fclose(f); return -1; }
 
     out->n = n;
-    out->names = (char**)calloc((size_t)n, sizeof(char*));
-    out->tensors = (ib_pq_tensor*)calloc((size_t)n, sizeof(ib_pq_tensor));
-    if (!out->names || !out->tensors) {
-        cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+    if (n > 0) {
+        out->names = (char**)calloc((size_t)n, sizeof(char*));
+        out->tensors = (ib_pq_tensor*)calloc((size_t)n, sizeof(ib_pq_tensor));
+        if (!out->names || !out->tensors) {
+            cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+        }
     }
 
     int i = 0;
@@ -454,6 +713,67 @@ int ib_pq_load_multi(const char* path, ib_pq_multi* out) {
         if (load_one_tensor(f, it, weight_data_start, file_sz, &out->tensors[i]) != 0) {
             cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
         }
+    }
+
+    /* Phase 9: optional raw tensors + config (additive header fields). */
+    cJSON* raws = cJSON_GetObjectItemCaseSensitive(root, "raw_tensors");
+    if (cJSON_IsObject(raws)) {
+        int rn = 0;
+        for (cJSON* it = raws->child; it; it = it->next) rn++;
+        if (rn > 0) {
+            out->n_raw = rn;
+            out->raw_tensors = (ib_pq_raw_tensor*)calloc((size_t)rn, sizeof(ib_pq_raw_tensor));
+            if (!out->raw_tensors) {
+                cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+            }
+            int ri = 0;
+            for (cJSON* it = raws->child; it; it = it->next, ri++) {
+                ib_pq_raw_tensor* rt = &out->raw_tensors[ri];
+                size_t nl = it->string ? strlen(it->string) : 0;
+                rt->name = (char*)malloc(nl + 1);
+                if (!rt->name) { cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1; }
+                memcpy(rt->name, it->string ? it->string : "", nl); rt->name[nl] = '\0';
+
+                cJSON* dtit = cJSON_GetObjectItemCaseSensitive(it, "dtype");
+                const char* dt = cJSON_IsString(dtit) ? dtit->valuestring : "float32";
+                if      (!strcmp(dt, "float32")) rt->dtype = IB_RAW_F32;
+                else if (!strcmp(dt, "float16")) rt->dtype = IB_RAW_F16;
+                else if (!strcmp(dt, "int32"))   rt->dtype = IB_RAW_I32;
+                else if (!strcmp(dt, "int16"))   rt->dtype = IB_RAW_I16;
+                else if (!strcmp(dt, "int8"))    rt->dtype = IB_RAW_I8;
+                else if (!strcmp(dt, "uint8"))   rt->dtype = IB_RAW_U8;
+                else if (!strcmp(dt, "uint16"))  rt->dtype = IB_RAW_U16;
+                else { cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1; }
+
+                cJSON* shape = cJSON_GetObjectItemCaseSensitive(it, "shape");
+                rt->ndim = cJSON_IsArray(shape) ? cJSON_GetArraySize(shape) : 0;
+                if (rt->ndim > 4) rt->ndim = 4;
+                for (int d = 0; d < rt->ndim; d++) {
+                    rt->shape[d] = (int)cJSON_GetArrayItem(shape, d)->valuedouble;
+                }
+
+                cJSON* oit = cJSON_GetObjectItemCaseSensitive(it, "offset");
+                cJSON* sit = cJSON_GetObjectItemCaseSensitive(it, "size");
+                if (!cJSON_IsNumber(oit) || !cJSON_IsNumber(sit)) {
+                    cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+                }
+                size_t off = (size_t)oit->valuedouble;
+                size_t sz  = (size_t)sit->valuedouble;
+                rt->size_bytes = sz;
+                rt->data = malloc(sz);
+                if (!rt->data) { cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1; }
+                rt->_owns_data = 1;
+                if (fseek(f, (long)(weight_data_start + off), SEEK_SET) != 0
+                 || fread(rt->data, 1, sz, f) != sz) {
+                    cJSON_Delete(root); fclose(f); ib_pq_multi_free(out); return -1;
+                }
+            }
+        }
+    }
+    cJSON* cfg = cJSON_GetObjectItemCaseSensitive(root, "config");
+    if (cJSON_IsObject(cfg)) {
+        char* s = cJSON_PrintUnformatted(cfg);
+        if (s) out->config_json = s;
     }
 
     cJSON_Delete(root);
@@ -481,6 +801,14 @@ void ib_pq_multi_free(ib_pq_multi* m) {
         for (int i = 0; i < m->n; i++) ib_pq_free(&m->tensors[i]);
         free(m->tensors);
     }
+    if (m->raw_tensors) {
+        for (int i = 0; i < m->n_raw; i++) {
+            free(m->raw_tensors[i].name);
+            if (m->raw_tensors[i]._owns_data) free(m->raw_tensors[i].data);
+        }
+        free(m->raw_tensors);
+    }
+    free(m->config_json);
 #ifdef IB_PQ_HAVE_MMAP
     if (m->_mmap_base && m->_mmap_size) {
         munmap(m->_mmap_base, m->_mmap_size);
@@ -602,8 +930,15 @@ static void pq_advise_tensor(const ib_pq_tensor* t, int advice) {
     } while (0)
 
     int K = t->K, M = t->M, half = t->G / 2, C = t->C, no = t->n_outlier;
+    int K_l2_eff = t->K_l2 > 0 ? t->K_l2 : K;
+    int l2_packed = (K_l2_eff == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_idx_per_row = l2_packed ? (size_t)((C + 1) / 2)
+                                      : (size_t)C * (size_t)l2_idx_bytes;
     size_t cb_sz   = (size_t)K * (size_t)half * sizeof(uint16_t);
+    size_t cb_l2_sz = (size_t)K_l2_eff * (size_t)half * sizeof(uint16_t);
     size_t idx_sz  = (size_t)M * (size_t)C * sizeof(uint8_t);
+    size_t idx_l2_sz = (size_t)M * l2_idx_per_row;
     size_t rs_sz   = (size_t)M * sizeof(uint16_t);
 
     ADJUST(t->codebook_l1_l, cb_sz);
@@ -611,10 +946,10 @@ static void pq_advise_tensor(const ib_pq_tensor* t, int advice) {
     ADJUST(t->indices_l1_l,  idx_sz);
     ADJUST(t->indices_l1_r,  idx_sz);
     ADJUST(t->row_scale,     rs_sz);
-    if (t->codebook_l2_l) ADJUST(t->codebook_l2_l, cb_sz);
-    if (t->codebook_l2_r) ADJUST(t->codebook_l2_r, cb_sz);
-    if (t->indices_l2_l)  ADJUST(t->indices_l2_l,  idx_sz);
-    if (t->indices_l2_r)  ADJUST(t->indices_l2_r,  idx_sz);
+    if (t->codebook_l2_l) ADJUST(t->codebook_l2_l, cb_l2_sz);
+    if (t->codebook_l2_r) ADJUST(t->codebook_l2_r, cb_l2_sz);
+    if (t->indices_l2_l)  ADJUST(t->indices_l2_l,  idx_l2_sz);
+    if (t->indices_l2_r)  ADJUST(t->indices_l2_r,  idx_l2_sz);
     if (no > 0) {
         ADJUST(t->outlier_cols,    (size_t)no * sizeof(int32_t));
         ADJUST(t->outlier_sidecar, (size_t)M * (size_t)no);
@@ -654,14 +989,42 @@ void ib_pq_advise_dontneed_n(const ib_pq_tensor* const* tensors, int n) {
 #endif
 
 /* ── L2 index unpack helper ───────────────────────────────────── */
-/* When K_l2 == 16, indices_l2_* arrays store 4-bit indices packed
- * 2-per-byte (low nibble = even chunk, high nibble = odd chunk). */
-static inline uint8_t pq_l2_idx_at(const uint8_t* il2, int c, int packed) {
+/* L2 index byte modes:
+ *   packed (K_l2==16): 4-bit indices, 2-per-byte (low nibble = even chunk).
+ *   bytes==1: standard uint8 indices, K_l2 ≤ 256.
+ *   bytes==2: uint16 little-endian indices, K_l2 > 256 (PYRAMID format).
+ * Returns int (not uint8) to fit values up to 65535. */
+static inline int pq_l2_idx_at(const uint8_t* il2, int c, int packed, int bytes) {
     if (packed) {
         uint8_t b = il2[c >> 1];
         return (c & 1) ? ((b >> 4) & 0x0F) : (b & 0x0F);
     }
-    return il2[c];
+    if (bytes == 2) {
+        const uint16_t* il2_u16 = (const uint16_t*)il2;
+        return (int)il2_u16[c];
+    }
+    return (int)il2[c];
+}
+
+/* Bit-unpack N-bit indices (LSB-first) into a uint16 array.
+ * src: packed byte stream; dst: uint16 buffer with n_total slots; n_bits in [1, 16]. */
+static void pq_unpack_bits_to_u16(const uint8_t* src, uint16_t* dst,
+                                   size_t n_total, int n_bits) {
+    if (n_bits <= 0 || n_bits > 16) return;
+    uint32_t mask = (n_bits == 16) ? 0xFFFFu : ((1u << n_bits) - 1u);
+    size_t bit_pos = 0;
+    for (size_t i = 0; i < n_total; i++) {
+        size_t byte_off = bit_pos >> 3;
+        int bit_off = (int)(bit_pos & 7);
+        /* Read up to 4 bytes to cover any 16-bit value crossing byte boundaries. */
+        uint32_t word = (uint32_t)src[byte_off];
+        word |= (uint32_t)src[byte_off + 1] << 8;
+        if (bit_off + n_bits > 16) {
+            word |= (uint32_t)src[byte_off + 2] << 16;
+        }
+        dst[i] = (uint16_t)((word >> bit_off) & mask);
+        bit_pos += (size_t)n_bits;
+    }
 }
 
 static inline int pq_K_l2_eff(const ib_pq_tensor* t) {
@@ -714,8 +1077,15 @@ int ib_pq_reconstruct_fp32(const ib_pq_tensor* t, float* out) {
     /* Fill output: zero first so any uninitialized columns are deterministic */
     memset(out, 0, (size_t)M * (size_t)N * sizeof(float));
 
-    /* L2 indices array stride: bytes per row. Packed (K_l2=16): ceil(C/2). */
-    size_t l2_stride = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
+    /* L2 indices array stride: bytes per row. Packed (K_l2=16): ceil(C/2).
+     * uint8: C bytes. uint16 (PYRAMID K_l2>256): 2*C bytes. */
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_stride;
+    if (l2_packed) {
+        l2_stride = (size_t)((C + 1) / 2);
+    } else {
+        l2_stride = (size_t)C * (size_t)l2_idx_bytes;
+    }
 
     for (int r = 0; r < M; r++) {
         float scale = ib_fp16_to_fp32(t->row_scale[r]);
@@ -727,8 +1097,8 @@ int ib_pq_reconstruct_fp32(const ib_pq_tensor* t, float* out) {
             int base = c * G;
             const float* lvec = &cb1l[(size_t)il_l[c] * half];
             const float* rvec = &cb1r[(size_t)il_r[c] * half];
-            uint8_t i2l = il2l ? pq_l2_idx_at(il2l, c, l2_packed) : 0;
-            uint8_t i2r = il2r ? pq_l2_idx_at(il2r, c, l2_packed) : 0;
+            int i2l = il2l ? pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes) : 0;
+            int i2r = il2r ? pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes) : 0;
             for (int k = 0; k < half; k++) {
                 float v = lvec[k];
                 if (cb2l) v += cb2l[(size_t)i2l * half + k];
@@ -1005,6 +1375,7 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
     const ib_pq_tensor* t = g->t;
     int C = g->C, K = g->K, K_l2 = g->K_l2;
     int l2_packed = g->l2_packed;
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
     size_t l2_stride = g->l2_idx_stride;
     const float* TL1 = g->TL1;
     const float* TR1 = g->TR1;
@@ -1027,8 +1398,8 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
                     size_t base1 = (size_t)c * K;
                     size_t base2 = (size_t)c * K_l2;
                     acc += TL1[base1 + il_l[c]] + TR1[base1 + il_r[c]];
-                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed)]
-                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed)];
+                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes)]
+                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes)];
                 }
             } else {
                 for (int aii = 0; aii < n_active; aii++) {
@@ -1043,8 +1414,8 @@ static void pq_gather_rows(pq_gather_ctx* g, int r0, int r1) {
                     size_t base1 = (size_t)c * K;
                     size_t base2 = (size_t)c * K_l2;
                     acc += TL1[base1 + il_l[c]] + TR1[base1 + il_r[c]];
-                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed)]
-                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed)];
+                    acc += TL2[base2 + pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes)]
+                         + TR2[base2 + pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes)];
                 }
             } else {
                 for (int c = 0; c < C; c++) {
@@ -1070,7 +1441,10 @@ static int matmul_impl(const ib_pq_tensor* t, const float* x, float* out,
     int half = G / 2;
     int K_l2 = pq_K_l2_eff(t);
     int l2_packed = (K_l2 == 16);
-    size_t l2_idx_stride = l2_packed ? (size_t)((C + 1) / 2) : (size_t)C;
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_idx_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
 
     /* Codebook tables decoded to fp32 once. L1: K entries; L2: K_l2 entries. */
     int cb1_entries = K * half;
@@ -1244,9 +1618,659 @@ int ib_pq_matmul_fp32(const ib_pq_tensor* t, const float* x, float* out) {
     return matmul_impl(t, x, out, NULL);
 }
 
+/* Phase 2: streaming-precompute matmul. Per-chunk codebook dots stay
+ * in cache for the row accumulation pass over that chunk. Scalar
+ * implementation; SIMD variants in 2.x. */
+int ib_pq_matmul_fp32_streaming(const ib_pq_tensor* t, const float* x, float* out) {
+    if (!t || !x || !out) return -1;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    int has_l2 = (t->n_levels == 2);
+
+    /* Decode codebooks to fp32 once. */
+    int cb1_entries = K * half;
+    int cb2_entries = K_l2 * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    float* cb2l = NULL;
+    float* cb2r = NULL;
+    if (has_l2) {
+        cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        if (!cb2l || !cb2r) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+        }
+        for (int i = 0; i < cb2_entries; i++) {
+            cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+            cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+        }
+    }
+
+    /* Build inner-column index list (skip outlier columns). */
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            return -1;
+        }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+
+    /* Per-chunk lookup tables (stay in cache). */
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    /* Stream chunks. For each chunk position c, build the per-chunk lookup
+     * tables, then accumulate across all M output rows. Tables stay in L1. */
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        /* Extract the activation half-chunks for this chunk's columns. */
+        float xL[16];  /* G/2 ≤ 16 in any sane config; G is small */
+        float xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[inner_cols[base + j]];
+            xR[j] = x[inner_cols[base + half + j]];
+        }
+        pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
+        if (has_l2) {
+            pq_chunk_dot_table_f32(cb2l, xL, half, K_l2, C2L_dot_x);
+            pq_chunk_dot_table_f32(cb2r, xR, half, K_l2, C2R_dot_x);
+        }
+
+        /* Walk all output rows; accumulate from cache-resident tables. */
+        const uint8_t* il_l_col = t->indices_l1_l;
+        const uint8_t* il_r_col = t->indices_l1_r;
+        for (int r = 0; r < M; r++) {
+            int i1l = il_l_col[(size_t)r * C + c];
+            int i1r = il_r_col[(size_t)r * C + c];
+            float v = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            if (has_l2) {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+            out[r] += v;
+        }
+    }
+
+    /* Apply per-row scale. */
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+
+    /* Add outlier sidecar contribution (existing helper). */
+    apply_outliers(t, x, out);
+
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
+
 int ib_pq_matmul_fp32_threaded(const ib_pq_tensor* t, const float* x,
                                 float* out, void* pool) {
     return matmul_impl(t, x, out, (ib_thread_pool*)pool);
+}
+
+/* Phase 4: activation-sparse streaming matmul. Skip chunks whose
+ * input x values are all below threshold. */
+int ib_pq_matmul_fp32_streaming_sparse(const ib_pq_tensor* t, const float* x,
+                                        float* out, float act_threshold) {
+    if (!t || !x || !out) return -1;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    int has_l2 = (t->n_levels == 2);
+
+    int cb1_entries = K * half;
+    int cb2_entries = K_l2 * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    float* cb2l = NULL;
+    float* cb2r = NULL;
+    if (has_l2) {
+        cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        if (!cb2l || !cb2r) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+        }
+        for (int i = 0; i < cb2_entries; i++) {
+            cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+            cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+        }
+    }
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            return -1;
+        }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    int n_skipped = 0, n_total_chunks = 0;
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[inner_cols[base + j]];
+            xR[j] = x[inner_cols[base + half + j]];
+        }
+        n_total_chunks++;
+        /* Activation-sparsity check: skip if all x values in this chunk
+         * are below threshold (their L1+L2 contribution is bounded by
+         * ||codebook||*||x_chunk|| which is tiny). */
+        if (act_threshold > 0.0f) {
+            int all_small = 1;
+            for (int j = 0; j < half; j++) {
+                if (fabsf(xL[j]) > act_threshold || fabsf(xR[j]) > act_threshold) {
+                    all_small = 0; break;
+                }
+            }
+            if (all_small) { n_skipped++; continue; }
+        }
+
+        pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
+        if (has_l2) {
+            pq_chunk_dot_table_f32(cb2l, xL, half, K_l2, C2L_dot_x);
+            pq_chunk_dot_table_f32(cb2r, xR, half, K_l2, C2R_dot_x);
+        }
+
+        for (int r = 0; r < M; r++) {
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            float v = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            if (has_l2) {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+            out[r] += v;
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
+
+/* Phase 8.F: variance-bounded L2 skip variant of streaming matmul.
+ * Adds per-cluster ||C2||_max precompute and per-(row, chunk) skip
+ * decision. */
+int ib_pq_matmul_fp32_streaming_l2skip(const ib_pq_tensor* t, const float* x,
+                                        float* out, float skip_threshold) {
+    if (!t || !x || !out) return -1;
+    if (t->n_levels != 2) return ib_pq_matmul_fp32_streaming(t, x, out);
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+
+    int cb1_entries = K * half;
+    int cb2_entries = K_l2 * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+    float* cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
+    if (!cb1l || !cb1r || !cb2l || !cb2r) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    for (int i = 0; i < cb2_entries; i++) {
+        cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+        cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+    }
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            return -1;
+        }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+
+    /* Phase 8.F+8.I: precompute per-outer-cluster ||C2[k]||_max for L and R.
+     * For PYRAMID format the conditional L2 is logically [K1][K_inner][G/2];
+     * the flat storage is [K_l2 = K1*K_inner][G/2] with index = k1*K_inner + k_inner.
+     * Per-cluster bound (tight): max over k_inner of ||C2[k1*K_inner + k_inner]||.
+     * For L1_L2 (non-pyramid): K_inner = K_l2 (global bound, fall through). */
+    int is_pyramid = (t->format == IB_PQ_FMT_PYRAMID);
+    int K_inner = (is_pyramid && K > 0) ? (K_l2 / K) : K_l2;
+    int n_outer = (is_pyramid && K > 0) ? K : 1;
+    float* c2l_max_per_cluster = (float*)calloc((size_t)n_outer, sizeof(float));
+    float* c2r_max_per_cluster = (float*)calloc((size_t)n_outer, sizeof(float));
+    if (!c2l_max_per_cluster || !c2r_max_per_cluster) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(c2l_max_per_cluster); free(c2r_max_per_cluster);
+        return -1;
+    }
+    for (int k1 = 0; k1 < n_outer; k1++) {
+        float ml = 0.0f, mr = 0.0f;
+        int k_lo = is_pyramid ? k1 * K_inner : 0;
+        int k_hi = is_pyramid ? (k1 + 1) * K_inner : K_l2;
+        for (int k = k_lo; k < k_hi; k++) {
+            float nl = 0.0f, nr = 0.0f;
+            for (int j = 0; j < half; j++) {
+                nl += cb2l[k * half + j] * cb2l[k * half + j];
+                nr += cb2r[k * half + j] * cb2r[k * half + j];
+            }
+            nl = sqrtf(nl); nr = sqrtf(nr);
+            if (nl > ml) ml = nl;
+            if (nr > mr) mr = nr;
+        }
+        c2l_max_per_cluster[k1] = ml;
+        c2r_max_per_cluster[k1] = mr;
+    }
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
+    float* C2R_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
+    if (!C1L_dot_x || !C1R_dot_x || !C2L_dot_x || !C2R_dot_x) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+        free(c2l_max_per_cluster); free(c2r_max_per_cluster);
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    int n_skipped = 0, n_evaluated = 0;
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        float xL_norm2 = 0.0f, xR_norm2 = 0.0f;
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[inner_cols[base + j]];
+            xR[j] = x[inner_cols[base + half + j]];
+            xL_norm2 += xL[j] * xL[j];
+            xR_norm2 += xR[j] * xR[j];
+        }
+        float xL_norm = sqrtf(xL_norm2);
+        float xR_norm = sqrtf(xR_norm2);
+
+        pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
+        pq_chunk_dot_table_f32(cb2l, xL, half, K_l2, C2L_dot_x);
+        pq_chunk_dot_table_f32(cb2r, xR, half, K_l2, C2R_dot_x);
+
+        for (int r = 0; r < M; r++) {
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            float l1_contrib = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            float v = l1_contrib;
+            /* Per-cluster L2 bound (Phase 8.I): tighter than global bound;
+             * uses ||C2[k1, *]||_max for the cluster k1 the row picked. */
+            int oc_l = is_pyramid ? i1l : 0;
+            int oc_r = is_pyramid ? i1r : 0;
+            float l2_bound = skip_threshold * (c2l_max_per_cluster[oc_l] * xL_norm
+                                             + c2r_max_per_cluster[oc_r] * xR_norm);
+            if (skip_threshold > 0.0f && fabsf(l1_contrib) > l2_bound) {
+                n_skipped++;
+            } else {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                v += C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+            n_evaluated++;
+            out[r] += v;
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    (void)n_skipped; (void)n_evaluated;  /* could expose stats via a debug API */
+
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    free(c2l_max_per_cluster); free(c2r_max_per_cluster);
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
+
+/* Phase 5: L1-only matmul. Same as streaming matmul but pretends
+ * n_levels=1 — skip the L2 codebook contribution. Cheap pass for
+ * top-K candidate filtering. */
+int ib_pq_matmul_fp32_l1_only(const ib_pq_tensor* t, const float* x, float* out) {
+    if (!t || !x || !out) return -1;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+
+    /* Decode L1 codebooks to fp32 once. */
+    int cb1_entries = K * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) { free(cb1l); free(cb1r); return -1; }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) { free(cb1l); free(cb1r); free(inner_cols); return -1; }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    if (!C1L_dot_x || !C1R_dot_x) {
+        free(cb1l); free(cb1r); free(inner_cols); free(C1L_dot_x); free(C1R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[inner_cols[base + j]];
+            xR[j] = x[inner_cols[base + half + j]];
+        }
+        pq_chunk_dot_table_f32(cb1l, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cb1r, xR, half, K, C1R_dot_x);
+        for (int r = 0; r < M; r++) {
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            out[r] += C1L_dot_x[i1l] + C1R_dot_x[i1r];
+        }
+    }
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+    free(cb1l); free(cb1r); free(inner_cols);
+    free(C1L_dot_x); free(C1R_dot_x);
+    return 0;
+}
+
+/* Phase 5: subset matmul. Full pyramid logits for the selected row
+ * indices only. n_rows-element output. Linear in n_rows × C, vs
+ * full matmul which is M × C. For n_rows ≪ M (top-K refinement),
+ * a fraction of the full matmul cost. */
+int ib_pq_matmul_fp32_subset(const ib_pq_tensor* t, const float* x,
+                              const int32_t* row_indices, int n_rows,
+                              float* out) {
+    if (!t || !x || !out || (!row_indices && n_rows > 0)) return -1;
+    if (n_rows <= 0) return 0;
+    int M = t->M, N = t->N, G = t->G, C = t->C, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    int has_l2 = (t->n_levels == 2);
+
+    /* Bounds check row indices. */
+    for (int i = 0; i < n_rows; i++) {
+        if (row_indices[i] < 0 || row_indices[i] >= M) return -1;
+    }
+
+    int cb1_entries = K * half;
+    int cb2_entries = K_l2 * half;
+    float* cb1l = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    float* cb1r = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!cb1l || !cb1r) { free(cb1l); free(cb1r); return -1; }
+    for (int i = 0; i < cb1_entries; i++) {
+        cb1l[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        cb1r[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    float* cb2l = NULL;
+    float* cb2r = NULL;
+    if (has_l2) {
+        cb2l = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        cb2r = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        if (!cb2l || !cb2r) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+        }
+        for (int i = 0; i < cb2_entries; i++) {
+            cb2l[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+            cb2r[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+        }
+    }
+    int* inner_cols = (int*)malloc((size_t)(N - t->n_outlier) * sizeof(int));
+    if (!inner_cols) {
+        free(cb1l); free(cb1r); free(cb2l); free(cb2r); return -1;
+    }
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) {
+            free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+            return -1;
+        }
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) inner_cols[k++] = j;
+        free(mask);
+    }
+
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    /* For each selected row, walk all chunks and accumulate. Per-chunk
+     * lookup tables are per-row here (we don't share across rows, since
+     * rows are sparse). For small n_rows ≪ M this is still cheaper than
+     * the full matmul which precomputes K dot products M times. */
+    for (int ri = 0; ri < n_rows; ri++) {
+        int r = row_indices[ri];
+        float acc = 0.0f;
+        for (int c = 0; c < C; c++) {
+            int base = c * G;
+            int i1l = t->indices_l1_l[(size_t)r * C + c];
+            int i1r = t->indices_l1_r[(size_t)r * C + c];
+            const float* eL = &cb1l[(size_t)i1l * half];
+            const float* eR = &cb1r[(size_t)i1r * half];
+            for (int j = 0; j < half; j++) {
+                acc += eL[j] * x[inner_cols[base + j]];
+                acc += eR[j] * x[inner_cols[base + half + j]];
+            }
+            if (has_l2) {
+                const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+                const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+                int i2l = pq_l2_idx_at(il2l, c, l2_packed, l2_idx_bytes);
+                int i2r = pq_l2_idx_at(il2r, c, l2_packed, l2_idx_bytes);
+                const float* eL2 = &cb2l[(size_t)i2l * half];
+                const float* eR2 = &cb2r[(size_t)i2r * half];
+                for (int j = 0; j < half; j++) {
+                    acc += eL2[j] * x[inner_cols[base + j]];
+                    acc += eR2[j] * x[inner_cols[base + half + j]];
+                }
+            }
+        }
+        acc *= ib_fp16_to_fp32(t->row_scale[r]);
+        /* Outlier sidecar contribution for this row. */
+        if (t->n_outlier > 0) {
+            for (int j = 0; j < t->n_outlier; j++) {
+                int col = t->outlier_cols[j];
+                float os = ib_fp16_to_fp32(t->outlier_scale[j]);
+                float w = (float)t->outlier_sidecar[(size_t)r * t->n_outlier + j] * os;
+                acc += w * x[col];
+            }
+        }
+        out[ri] = acc;
+    }
+
+    free(cb1l); free(cb1r); free(cb2l); free(cb2r); free(inner_cols);
+    return 0;
+}
+
+/* Phase 5: top-K orchestrator. Two-stage:
+ *   1. L1-only matmul for full-vocab cheap logits.
+ *   2. Partial sort to extract top-K candidate row indices.
+ *   3. Subset matmul for full-pyramid logits on those K rows.
+ *   4. Sort candidates by refined logit, fill outputs descending.
+ *
+ * Memory: O(M) scratch for stage 1, O(K) for stage 3.
+ */
+int ib_pq_lm_head_topk(const ib_pq_tensor* t, const float* x, int K_top,
+                        float* out_logits, int32_t* out_token_ids) {
+    if (!t || !x || !out_logits || !out_token_ids) return -1;
+    if (K_top <= 0 || K_top > t->M) return -1;
+    int M = t->M;
+
+    /* Stage 1: cheap L1-only logits over full vocab. */
+    float* coarse = (float*)malloc((size_t)M * sizeof(float));
+    if (!coarse) return -1;
+    int rc = ib_pq_matmul_fp32_l1_only(t, x, coarse);
+    if (rc != 0) { free(coarse); return rc; }
+
+    /* Stage 2: extract top-K row indices by coarse logit (partial sort).
+     * Use a simple max-heap-like O(M log K) selection. */
+    int32_t* top_ids = (int32_t*)malloc((size_t)K_top * sizeof(int32_t));
+    float* top_vals = (float*)malloc((size_t)K_top * sizeof(float));
+    if (!top_ids || !top_vals) {
+        free(coarse); free(top_ids); free(top_vals); return -1;
+    }
+    /* Initialize heap with the first K elements (min-heap so we pop the
+     * smallest when a larger candidate arrives). */
+    for (int i = 0; i < K_top; i++) { top_ids[i] = i; top_vals[i] = coarse[i]; }
+    /* Build min-heap (sift-down from middle). */
+    for (int start = K_top / 2 - 1; start >= 0; start--) {
+        int i = start;
+        while (1) {
+            int l = 2 * i + 1, r = 2 * i + 2, smallest = i;
+            if (l < K_top && top_vals[l] < top_vals[smallest]) smallest = l;
+            if (r < K_top && top_vals[r] < top_vals[smallest]) smallest = r;
+            if (smallest == i) break;
+            float tv = top_vals[i]; top_vals[i] = top_vals[smallest]; top_vals[smallest] = tv;
+            int32_t ti = top_ids[i]; top_ids[i] = top_ids[smallest]; top_ids[smallest] = ti;
+            i = smallest;
+        }
+    }
+    /* Stream the rest: if val > heap-min, replace and sift down. */
+    for (int j = K_top; j < M; j++) {
+        if (coarse[j] > top_vals[0]) {
+            top_vals[0] = coarse[j];
+            top_ids[0] = (int32_t)j;
+            /* Sift down. */
+            int i = 0;
+            while (1) {
+                int l = 2 * i + 1, r = 2 * i + 2, smallest = i;
+                if (l < K_top && top_vals[l] < top_vals[smallest]) smallest = l;
+                if (r < K_top && top_vals[r] < top_vals[smallest]) smallest = r;
+                if (smallest == i) break;
+                float tv = top_vals[i]; top_vals[i] = top_vals[smallest]; top_vals[smallest] = tv;
+                int32_t ti = top_ids[i]; top_ids[i] = top_ids[smallest]; top_ids[smallest] = ti;
+                i = smallest;
+            }
+        }
+    }
+    free(coarse);
+
+    /* Stage 3: full-pyramid refinement on top-K. */
+    float* refined = (float*)malloc((size_t)K_top * sizeof(float));
+    if (!refined) { free(top_ids); free(top_vals); return -1; }
+    rc = ib_pq_matmul_fp32_subset(t, x, top_ids, K_top, refined);
+    if (rc != 0) { free(top_ids); free(top_vals); free(refined); return rc; }
+
+    /* Stage 4: sort by refined logit descending. Insertion sort for K small. */
+    /* Build pairs (refined, id) and sort. */
+    for (int i = 1; i < K_top; i++) {
+        float v = refined[i];
+        int32_t id = top_ids[i];
+        int j = i - 1;
+        while (j >= 0 && refined[j] < v) {
+            refined[j + 1] = refined[j];
+            top_ids[j + 1] = top_ids[j];
+            j--;
+        }
+        refined[j + 1] = v;
+        top_ids[j + 1] = id;
+    }
+
+    for (int i = 0; i < K_top; i++) {
+        out_logits[i] = refined[i];
+        out_token_ids[i] = top_ids[i];
+    }
+    free(top_ids); free(top_vals); free(refined);
+    return 0;
 }
 
 /* ── Byte-quantised LUT path ───────────────────────────────────── */
@@ -1481,4 +2505,3630 @@ fail:
     free(qL); free(sL); free(qR); free(sR);
     free(qL2); free(sL2); free(qR2); free(sR2);
     return -1;
+}
+
+/* ── Phase 6: persistent codebook + inner_cols + per-cluster bound cache ── */
+
+struct ib_pq_lut_cache {
+    float* cb1l_fp32;
+    float* cb1r_fp32;
+    float* cb2l_fp32;
+    float* cb2r_fp32;
+    int*   inner_cols;
+    float* c2l_max_per_cluster;
+    float* c2r_max_per_cluster;
+    int M, N, G, K, K_l2, half, n_levels;
+    int n_inner;
+    int is_pyramid;
+    int n_outer;
+    int K_inner;
+    /* Phase 3: optional int8 quantized codebooks (NULL until quantize_int8). */
+    int8_t* cb1l_q8;
+    int8_t* cb1r_q8;
+    int8_t* cb2l_q8;
+    int8_t* cb2r_q8;
+    float* cb1l_scale;  /* [K] */
+    float* cb1r_scale;
+    float* cb2l_scale;  /* [K_l2] */
+    float* cb2r_scale;
+    /* Phase 8.X: transposed indices [C][M] for sequential reads in row loop.
+     * For L2: stored as flat uint16 to avoid runtime unpacking inside the
+     * hot loop (handles K_l2 in [1, 65535]). */
+    uint8_t*  i1l_T;  /* [C][M] uint8 */
+    uint8_t*  i1r_T;
+    uint16_t* i2l_T;  /* [C][M] uint16, valid when n_levels == 2 */
+    uint16_t* i2r_T;
+    int has_idx_T;
+    /* F1.h: packed [C][M] uint64 layout for n_levels=2:
+     *   bits  [0..8)  i1l   (uint8)
+     *   bits  [8..16) i1r   (uint8)
+     *   bits  [16..32) i2l  (uint16)
+     *   bits  [32..48) i2r  (uint16)
+     * One sequential 8-byte load per row in the streaming kernel
+     * instead of 4 strided loads from 4 separate streams. */
+    uint64_t* idx_T_packed;
+};
+
+int ib_pq_lut_cache_create(const ib_pq_tensor* t, ib_pq_lut_cache** out_p) {
+    if (!t || !out_p) return -1;
+    *out_p = NULL;
+    int M = t->M, N = t->N, G = t->G, K = t->K;
+    int half = G / 2;
+    int K_l2 = pq_K_l2_eff(t);
+    int has_l2 = (t->n_levels == 2);
+
+    ib_pq_lut_cache* c = (ib_pq_lut_cache*)calloc(1, sizeof(*c));
+    if (!c) return -1;
+    c->M = M; c->N = N; c->G = G; c->K = K; c->K_l2 = K_l2;
+    c->half = half; c->n_levels = t->n_levels;
+    c->is_pyramid = (t->format == IB_PQ_FMT_PYRAMID);
+    c->n_outer = (c->is_pyramid && K > 0) ? K : 1;
+    c->K_inner = (c->is_pyramid && K > 0) ? (K_l2 / K) : K_l2;
+    c->n_inner = N - t->n_outlier;
+
+    int cb1_entries = K * half;
+    c->cb1l_fp32 = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    c->cb1r_fp32 = (float*)malloc((size_t)cb1_entries * sizeof(float));
+    if (!c->cb1l_fp32 || !c->cb1r_fp32) goto fail;
+    for (int i = 0; i < cb1_entries; i++) {
+        c->cb1l_fp32[i] = ib_fp16_to_fp32(t->codebook_l1_l[i]);
+        c->cb1r_fp32[i] = ib_fp16_to_fp32(t->codebook_l1_r[i]);
+    }
+    if (has_l2) {
+        int cb2_entries = K_l2 * half;
+        c->cb2l_fp32 = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        c->cb2r_fp32 = (float*)malloc((size_t)cb2_entries * sizeof(float));
+        if (!c->cb2l_fp32 || !c->cb2r_fp32) goto fail;
+        for (int i = 0; i < cb2_entries; i++) {
+            c->cb2l_fp32[i] = ib_fp16_to_fp32(t->codebook_l2_l[i]);
+            c->cb2r_fp32[i] = ib_fp16_to_fp32(t->codebook_l2_r[i]);
+        }
+
+        c->c2l_max_per_cluster = (float*)calloc((size_t)c->n_outer, sizeof(float));
+        c->c2r_max_per_cluster = (float*)calloc((size_t)c->n_outer, sizeof(float));
+        if (!c->c2l_max_per_cluster || !c->c2r_max_per_cluster) goto fail;
+        for (int k1 = 0; k1 < c->n_outer; k1++) {
+            float ml = 0.0f, mr = 0.0f;
+            int k_lo = c->is_pyramid ? k1 * c->K_inner : 0;
+            int k_hi = c->is_pyramid ? (k1 + 1) * c->K_inner : K_l2;
+            for (int k = k_lo; k < k_hi; k++) {
+                float nl = 0.0f, nr = 0.0f;
+                for (int j = 0; j < half; j++) {
+                    nl += c->cb2l_fp32[k * half + j] * c->cb2l_fp32[k * half + j];
+                    nr += c->cb2r_fp32[k * half + j] * c->cb2r_fp32[k * half + j];
+                }
+                nl = sqrtf(nl); nr = sqrtf(nr);
+                if (nl > ml) ml = nl;
+                if (nr > mr) mr = nr;
+            }
+            c->c2l_max_per_cluster[k1] = ml;
+            c->c2r_max_per_cluster[k1] = mr;
+        }
+    }
+
+    c->inner_cols = (int*)malloc((size_t)c->n_inner * sizeof(int));
+    if (!c->inner_cols) goto fail;
+    {
+        uint8_t* mask = (uint8_t*)calloc((size_t)N, 1);
+        if (!mask) goto fail;
+        for (int i = 0; i < t->n_outlier; i++) mask[t->outlier_cols[i]] = 1;
+        int k = 0;
+        for (int j = 0; j < N; j++) if (!mask[j]) c->inner_cols[k++] = j;
+        free(mask);
+    }
+
+    /* Phase 8.X: transpose indices to [C][M] for sequential row-loop reads. */
+    int C = t->C;
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+    c->i1l_T = (uint8_t*)malloc((size_t)C * (size_t)M);
+    c->i1r_T = (uint8_t*)malloc((size_t)C * (size_t)M);
+    if (!c->i1l_T || !c->i1r_T) goto fail;
+    for (int r = 0; r < M; r++) {
+        for (int cc = 0; cc < C; cc++) {
+            c->i1l_T[(size_t)cc * M + r] = t->indices_l1_l[(size_t)r * C + cc];
+            c->i1r_T[(size_t)cc * M + r] = t->indices_l1_r[(size_t)r * C + cc];
+        }
+    }
+    if (has_l2) {
+        c->i2l_T = (uint16_t*)malloc((size_t)C * (size_t)M * sizeof(uint16_t));
+        c->i2r_T = (uint16_t*)malloc((size_t)C * (size_t)M * sizeof(uint16_t));
+        if (!c->i2l_T || !c->i2r_T) goto fail;
+        for (int r = 0; r < M; r++) {
+            const uint8_t* il2l = t->indices_l2_l + (size_t)r * l2_stride;
+            const uint8_t* il2r = t->indices_l2_r + (size_t)r * l2_stride;
+            for (int cc = 0; cc < C; cc++) {
+                c->i2l_T[(size_t)cc * M + r] = (uint16_t)pq_l2_idx_at(il2l, cc, l2_packed, l2_idx_bytes);
+                c->i2r_T[(size_t)cc * M + r] = (uint16_t)pq_l2_idx_at(il2r, cc, l2_packed, l2_idx_bytes);
+            }
+        }
+    }
+    c->has_idx_T = 1;
+
+    /* F1.h: pack i1l, i1r, i2l, i2r into one [C][M] uint64 stream.
+     * Only when n_levels==2; otherwise the i1l/i1r uint8 path is small
+     * enough on its own. */
+    if (has_l2) {
+        c->idx_T_packed = (uint64_t*)malloc((size_t)C * (size_t)M * sizeof(uint64_t));
+        if (!c->idx_T_packed) goto fail;
+        for (int cc = 0; cc < C; cc++) {
+            const uint8_t*  i1l = c->i1l_T + (size_t)cc * M;
+            const uint8_t*  i1r = c->i1r_T + (size_t)cc * M;
+            const uint16_t* i2l = c->i2l_T + (size_t)cc * M;
+            const uint16_t* i2r = c->i2r_T + (size_t)cc * M;
+            uint64_t* dst = c->idx_T_packed + (size_t)cc * M;
+            for (int r = 0; r < M; r++) {
+                dst[r] = ((uint64_t)i1l[r])
+                       | ((uint64_t)i1r[r]    << 8)
+                       | ((uint64_t)i2l[r]    << 16)
+                       | ((uint64_t)i2r[r]    << 32);
+            }
+        }
+    }
+
+    *out_p = c;
+    return 0;
+
+fail:
+    ib_pq_lut_cache_free(c);
+    return -1;
+}
+
+void ib_pq_lut_cache_free(ib_pq_lut_cache* c) {
+    if (!c) return;
+    free(c->cb1l_fp32); free(c->cb1r_fp32);
+    free(c->cb2l_fp32); free(c->cb2r_fp32);
+    free(c->inner_cols);
+    free(c->c2l_max_per_cluster); free(c->c2r_max_per_cluster);
+    free(c->cb1l_q8); free(c->cb1r_q8);
+    free(c->cb2l_q8); free(c->cb2r_q8);
+    free(c->cb1l_scale); free(c->cb1r_scale);
+    free(c->cb2l_scale); free(c->cb2r_scale);
+    free(c->i1l_T); free(c->i1r_T);
+    free(c->i2l_T); free(c->i2r_T);
+    free(c->idx_T_packed);
+    free(c);
+}
+
+/* Quantize a [K, half] fp32 codebook to int8 with per-row scale.
+ * scale[k] = max|cb[k]|/127; q[k][j] = round(cb[k][j] / scale[k]) clamped to [-127, 127].
+ */
+static int pq_quantize_codebook_int8(const float* cb_fp32, int K, int half,
+                                       int8_t** out_q, float** out_scale) {
+    int8_t* q = (int8_t*)malloc((size_t)K * half);
+    float* s = (float*)malloc((size_t)K * sizeof(float));
+    if (!q || !s) { free(q); free(s); return -1; }
+    for (int k = 0; k < K; k++) {
+        const float* row = cb_fp32 + (size_t)k * half;
+        float m = 0.0f;
+        for (int j = 0; j < half; j++) {
+            float a = fabsf(row[j]);
+            if (a > m) m = a;
+        }
+        float scale = (m > 0.0f) ? (m / 127.0f) : 1.0f;
+        float inv = 1.0f / scale;
+        for (int j = 0; j < half; j++) {
+            float v = row[j] * inv;
+            int qi = (int)(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
+            if (qi >  127) qi =  127;
+            if (qi < -127) qi = -127;
+            q[(size_t)k * half + j] = (int8_t)qi;
+        }
+        s[k] = scale;
+    }
+    *out_q = q; *out_scale = s;
+    return 0;
+}
+
+int ib_pq_lut_cache_quantize_int8(ib_pq_lut_cache* c) {
+    if (!c) return -1;
+    if (c->cb1l_q8 != NULL) return 0;  /* idempotent */
+    int K = c->K, K_l2 = c->K_l2, half = c->half;
+    int has_l2 = (c->n_levels == 2);
+
+    if (pq_quantize_codebook_int8(c->cb1l_fp32, K, half,
+                                    &c->cb1l_q8, &c->cb1l_scale) != 0) return -1;
+    if (pq_quantize_codebook_int8(c->cb1r_fp32, K, half,
+                                    &c->cb1r_q8, &c->cb1r_scale) != 0) return -1;
+    if (has_l2) {
+        if (pq_quantize_codebook_int8(c->cb2l_fp32, K_l2, half,
+                                        &c->cb2l_q8, &c->cb2l_scale) != 0) return -1;
+        if (pq_quantize_codebook_int8(c->cb2r_fp32, K_l2, half,
+                                        &c->cb2r_q8, &c->cb2r_scale) != 0) return -1;
+    }
+    return 0;
+}
+
+/* INT8 chunk dot table: int_dot[k] = sum_j q_cb[k][j] * q_x[j];
+ * out[k] = int_dot[k] * cb_scale[k] * x_scale.
+ * Specialized for half ∈ {8, 16}; NEON dotprod path when available. */
+static inline void pq_chunk_dot_table_int8(const int8_t* cb_q, const float* cb_scale,
+                                             const int8_t* xq, float x_scale,
+                                             int half, int K, float* out) {
+#if defined(IB_PQ_HAVE_NEON_DOTPROD)
+    if (half == 16) {
+        int8x16_t xv = vld1q_s8(xq);
+        for (int k = 0; k < K; k++) {
+            int8x16_t ev = vld1q_s8(cb_q + (size_t)k * 16);
+            int32x4_t acc = vdupq_n_s32(0);
+            acc = vdotq_s32(acc, ev, xv);
+            int32_t s = vaddvq_s32(acc);
+            out[k] = (float)s * cb_scale[k] * x_scale;
+        }
+        return;
+    }
+#endif
+    for (int k = 0; k < K; k++) {
+        const int8_t* e = cb_q + (size_t)k * half;
+        int32_t s = 0;
+        for (int j = 0; j < half; j++) s += (int32_t)e[j] * (int32_t)xq[j];
+        out[k] = (float)s * cb_scale[k] * x_scale;
+    }
+}
+
+/* Quantize a small fp32 chunk (length half) to int8 with single scale. */
+static inline float pq_quantize_chunk_int8(const float* x, int half, int8_t* xq) {
+    float m = 0.0f;
+    for (int j = 0; j < half; j++) {
+        float a = fabsf(x[j]);
+        if (a > m) m = a;
+    }
+    float scale = (m > 0.0f) ? (m / 127.0f) : 1.0f;
+    float inv = 1.0f / scale;
+    for (int j = 0; j < half; j++) {
+        float v = x[j] * inv;
+        int qi = (int)(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
+        if (qi >  127) qi =  127;
+        if (qi < -127) qi = -127;
+        xq[j] = (int8_t)qi;
+    }
+    return scale;
+}
+
+int ib_pq_matmul_fp32_streaming_int8_cached(const ib_pq_tensor* t,
+                                              const ib_pq_lut_cache* cache,
+                                              const float* x, float* out) {
+    if (!t || !cache || !x || !out) return -1;
+    if (!cache->cb1l_q8) return -1;  /* must call quantize_int8 first */
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int has_l2 = (cache->n_levels == 2);
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        int8_t xLq[16], xRq[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[cache->inner_cols[base + j]];
+            xR[j] = x[cache->inner_cols[base + half + j]];
+        }
+        float xL_scale = pq_quantize_chunk_int8(xL, half, xLq);
+        float xR_scale = pq_quantize_chunk_int8(xR, half, xRq);
+
+        pq_chunk_dot_table_int8(cache->cb1l_q8, cache->cb1l_scale,
+                                xLq, xL_scale, half, K, C1L_dot_x);
+        pq_chunk_dot_table_int8(cache->cb1r_q8, cache->cb1r_scale,
+                                xRq, xR_scale, half, K, C1R_dot_x);
+        if (has_l2) {
+            pq_chunk_dot_table_int8(cache->cb2l_q8, cache->cb2l_scale,
+                                    xLq, xL_scale, half, K_l2, C2L_dot_x);
+            pq_chunk_dot_table_int8(cache->cb2r_q8, cache->cb2r_scale,
+                                    xRq, xR_scale, half, K_l2, C2R_dot_x);
+        }
+
+        const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+        const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+        if (has_l2) {
+            const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
+            const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
+            for (int r = 0; r < M; r++) {
+                out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]]
+                        + C2L_dot_x[i2l_row[r]] + C2R_dot_x[i2r_row[r]];
+            }
+        } else {
+            for (int r = 0; r < M; r++) {
+                out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]];
+            }
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
+
+/* F1.a: shared kernel with caller-supplied scratch. */
+static int streaming_cached_kernel(const ib_pq_tensor* t,
+                                    const ib_pq_lut_cache* cache,
+                                    const float* x, float* out,
+                                    float* C1L_dot_x, float* C1R_dot_x,
+                                    float* C2L_dot_x, float* C2R_dot_x) {
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int has_l2 = (cache->n_levels == 2);
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[cache->inner_cols[base + j]];
+            xR[j] = x[cache->inner_cols[base + half + j]];
+        }
+        pq_chunk_dot_table_f32(cache->cb1l_fp32, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cache->cb1r_fp32, xR, half, K, C1R_dot_x);
+        if (has_l2) {
+            pq_chunk_dot_table_f32(cache->cb2l_fp32, xL, half, K_l2, C2L_dot_x);
+            pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R_dot_x);
+        }
+
+        if (has_l2 && cache->idx_T_packed) {
+            /* F1.h: one sequential u64 load per row, all 4 indices unpacked
+             * with bit ops. ~4× fewer cache lines touched in the hot loop. */
+            const uint64_t* p_row = cache->idx_T_packed + (size_t)c * M;
+            if (c + 1 < C) __builtin_prefetch(p_row + M, 0, 1);
+            for (int r = 0; r < M; r++) {
+                uint64_t p = p_row[r];
+                int i1l = (int)( p        & 0xff);
+                int i1r = (int)((p >>  8) & 0xff);
+                int i2l = (int)((p >> 16) & 0xffff);
+                int i2r = (int)((p >> 32) & 0xffff);
+                out[r] += C1L_dot_x[i1l] + C1R_dot_x[i1r]
+                        + C2L_dot_x[i2l] + C2R_dot_x[i2r];
+            }
+        } else {
+            const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+            const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+            if (c + 1 < C) {
+                __builtin_prefetch(cache->i1l_T + (size_t)(c + 1) * M, 0, 1);
+                __builtin_prefetch(cache->i1r_T + (size_t)(c + 1) * M, 0, 1);
+            }
+            for (int r = 0; r < M; r++) {
+                out[r] += C1L_dot_x[i1l_row[r]] + C1R_dot_x[i1r_row[r]];
+            }
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+    return 0;
+}
+
+int ib_pq_matmul_fp32_streaming_cached(const ib_pq_tensor* t,
+                                        const ib_pq_lut_cache* cache,
+                                        const float* x, float* out) {
+    if (!t || !cache || !x || !out) return -1;
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int has_l2 = (cache->n_levels == 2);
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    float* C2R_dot_x = has_l2 ? (float*)malloc((size_t)K_l2 * sizeof(float)) : NULL;
+    if (!C1L_dot_x || !C1R_dot_x || (has_l2 && (!C2L_dot_x || !C2R_dot_x))) {
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+    int rc = streaming_cached_kernel(t, cache, x, out,
+                                       C1L_dot_x, C1R_dot_x, C2L_dot_x, C2R_dot_x);
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return rc;
+}
+
+/* Threaded streaming_cached: each thread processes a row slice across
+ * all chunks. LUT scratch is allocated per-call (thread-local on stack
+ * or one shared malloc partitioned by tid). */
+typedef struct {
+    const ib_pq_tensor* t;
+    const ib_pq_lut_cache* cache;
+    const float* x;
+    float* out;
+    int M, G, C, K, K_l2, half;
+    int has_l2;
+    int n_threads;
+    /* Per-thread scratch: 4 buffers each [K + K_l2] floats. Allocated
+     * by the caller as one contiguous block. */
+    float* scratch_base;
+    size_t scratch_per_thread;
+} pq_streaming_cached_threaded_args;
+
+static void pq_streaming_cached_row_task(void* arg, int tid, int r0, int r1) {
+    pq_streaming_cached_threaded_args* a = (pq_streaming_cached_threaded_args*)arg;
+    const ib_pq_lut_cache* cache = a->cache;
+    int M = a->M, G = a->G, C = a->C, K = a->K, K_l2 = a->K_l2, half = a->half;
+    int has_l2 = a->has_l2;
+
+    /* Per-thread LUT scratch slice. */
+    float* base = a->scratch_base + (size_t)tid * a->scratch_per_thread;
+    float* C1L = base;
+    float* C1R = base + K;
+    float* C2L = has_l2 ? (base + 2 * K) : NULL;
+    float* C2R = has_l2 ? (base + 2 * K + K_l2) : NULL;
+
+    for (int c = 0; c < C; c++) {
+        int bs = c * G;
+        float xL[16], xR[16];
+        for (int j = 0; j < half; j++) {
+            xL[j] = a->x[cache->inner_cols[bs + j]];
+            xR[j] = a->x[cache->inner_cols[bs + half + j]];
+        }
+        pq_chunk_dot_table_f32(cache->cb1l_fp32, xL, half, K, C1L);
+        pq_chunk_dot_table_f32(cache->cb1r_fp32, xR, half, K, C1R);
+        if (has_l2) {
+            pq_chunk_dot_table_f32(cache->cb2l_fp32, xL, half, K_l2, C2L);
+            pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R);
+        }
+
+        if (has_l2 && cache->idx_T_packed) {
+            /* F1.h packed indices: one u64 load per row, no strided streams. */
+            const uint64_t* p_row = cache->idx_T_packed + (size_t)c * M;
+            for (int r = r0; r < r1; r++) {
+                uint64_t p = p_row[r];
+                a->out[r] += C1L[(int)( p        & 0xff)]
+                            + C1R[(int)((p >>  8) & 0xff)]
+                            + C2L[(int)((p >> 16) & 0xffff)]
+                            + C2R[(int)((p >> 32) & 0xffff)];
+            }
+        } else {
+            const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+            const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+            for (int r = r0; r < r1; r++) {
+                a->out[r] += C1L[i1l_row[r]] + C1R[i1r_row[r]];
+            }
+        }
+    }
+}
+
+/* Forward declarations for spin-pool (defined below). */
+typedef struct pq_spin_pool pq_spin_pool;
+typedef void (*pq_spin_fn)(void* arg, int tid, int s, int e);
+static void pq_spin_pool_run(pq_spin_pool* p, pq_spin_fn fn, void* arg,
+                              int total, int chunk_size);
+
+static int ib_pq_matmul_fp32_streaming_cached_spin(const ib_pq_tensor* t,
+                                                     const ib_pq_lut_cache* cache,
+                                                     const float* x, float* out,
+                                                     pq_spin_pool* sp, int n_threads,
+                                                     float* scratch, size_t per_thread) {
+    if (!sp || n_threads <= 1) return -1;
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int has_l2 = (cache->n_levels == 2);
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    pq_streaming_cached_threaded_args args = {
+        .t = t, .cache = cache, .x = x, .out = out,
+        .M = M, .G = G, .C = C, .K = K, .K_l2 = K_l2, .half = half,
+        .has_l2 = has_l2,
+        .n_threads = n_threads,
+        .scratch_base = scratch,
+        .scratch_per_thread = per_thread,
+    };
+
+    int chunk = (M + n_threads - 1) / n_threads;
+    if (chunk < 1) chunk = 1;
+    pq_spin_pool_run(sp, pq_streaming_cached_row_task, &args, M, chunk);
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+    return 0;
+}
+
+static int ib_pq_matmul_fp32_streaming_cached_threaded(const ib_pq_tensor* t,
+                                                         const ib_pq_lut_cache* cache,
+                                                         const float* x, float* out,
+                                                         ib_thread_pool* pool, int n_threads) {
+    if (!pool || n_threads <= 1) {
+        return ib_pq_matmul_fp32_streaming_cached(t, cache, x, out);
+    }
+    if (!t || !cache || !x || !out) return -1;
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int has_l2 = (cache->n_levels == 2);
+
+    /* Per-thread scratch: 4 LUT buffers (C1L, C1R, C2L, C2R). */
+    size_t per_thread = (size_t)(2 * K + (has_l2 ? 2 * K_l2 : 0));
+    size_t total = per_thread * (size_t)n_threads;
+    float* scratch = (float*)malloc(total * sizeof(float));
+    if (!scratch) {
+        return ib_pq_matmul_fp32_streaming_cached(t, cache, x, out);
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    pq_streaming_cached_threaded_args args = {
+        .t = t, .cache = cache, .x = x, .out = out,
+        .M = M, .G = G, .C = C, .K = K, .K_l2 = K_l2, .half = half,
+        .has_l2 = has_l2,
+        .n_threads = n_threads,
+        .scratch_base = scratch,
+        .scratch_per_thread = per_thread,
+    };
+
+    /* One row slice per thread. */
+    int chunk = (M + n_threads - 1) / n_threads;
+    if (chunk < 1) chunk = 1;
+    ib_pool_run(pool, pq_streaming_cached_row_task, &args, M, chunk);
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    free(scratch);
+    return 0;
+}
+
+int ib_pq_matmul_fp32_streaming_l2skip_cached(const ib_pq_tensor* t,
+                                                const ib_pq_lut_cache* cache,
+                                                const float* x, float* out,
+                                                float skip_threshold) {
+    if (!t || !cache || !x || !out) return -1;
+    if (cache->n_levels != 2) return ib_pq_matmul_fp32_streaming_cached(t, cache, x, out);
+    int M = t->M, G = t->G, C = t->C, K = t->K;
+    int half = cache->half;
+    int K_l2 = cache->K_l2;
+    int is_pyramid = cache->is_pyramid;
+
+    float* C1L_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C1R_dot_x = (float*)malloc((size_t)K * sizeof(float));
+    float* C2L_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
+    float* C2R_dot_x = (float*)malloc((size_t)K_l2 * sizeof(float));
+    if (!C1L_dot_x || !C1R_dot_x || !C2L_dot_x || !C2R_dot_x) {
+        free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+        return -1;
+    }
+
+    memset(out, 0, (size_t)M * sizeof(float));
+
+    for (int c = 0; c < C; c++) {
+        int base = c * G;
+        float xL[16], xR[16];
+        float xL_n2 = 0.0f, xR_n2 = 0.0f;
+        for (int j = 0; j < half; j++) {
+            xL[j] = x[cache->inner_cols[base + j]];
+            xR[j] = x[cache->inner_cols[base + half + j]];
+            xL_n2 += xL[j] * xL[j];
+            xR_n2 += xR[j] * xR[j];
+        }
+        float xL_norm = sqrtf(xL_n2);
+        float xR_norm = sqrtf(xR_n2);
+
+        pq_chunk_dot_table_f32(cache->cb1l_fp32, xL, half, K, C1L_dot_x);
+        pq_chunk_dot_table_f32(cache->cb1r_fp32, xR, half, K, C1R_dot_x);
+        pq_chunk_dot_table_f32(cache->cb2l_fp32, xL, half, K_l2, C2L_dot_x);
+        pq_chunk_dot_table_f32(cache->cb2r_fp32, xR, half, K_l2, C2R_dot_x);
+
+        const uint8_t* i1l_row = cache->i1l_T + (size_t)c * M;
+        const uint8_t* i1r_row = cache->i1r_T + (size_t)c * M;
+        const uint16_t* i2l_row = cache->i2l_T + (size_t)c * M;
+        const uint16_t* i2r_row = cache->i2r_T + (size_t)c * M;
+        for (int r = 0; r < M; r++) {
+            int i1l = i1l_row[r];
+            int i1r = i1r_row[r];
+            float l1_contrib = C1L_dot_x[i1l] + C1R_dot_x[i1r];
+            float v = l1_contrib;
+            int oc_l = is_pyramid ? i1l : 0;
+            int oc_r = is_pyramid ? i1r : 0;
+            float l2_bound = skip_threshold
+                * (cache->c2l_max_per_cluster[oc_l] * xL_norm
+                 + cache->c2r_max_per_cluster[oc_r] * xR_norm);
+            if (skip_threshold > 0.0f && fabsf(l1_contrib) > l2_bound) {
+                /* skip L2 */
+            } else {
+                v += C2L_dot_x[i2l_row[r]] + C2R_dot_x[i2r_row[r]];
+            }
+            out[r] += v;
+        }
+    }
+
+    for (int r = 0; r < M; r++) {
+        out[r] *= ib_fp16_to_fp32(t->row_scale[r]);
+    }
+    apply_outliers(t, x, out);
+
+    free(C1L_dot_x); free(C1R_dot_x); free(C2L_dot_x); free(C2R_dot_x);
+    return 0;
+}
+
+/* ── Phase 9: multi-tensor cache fleet ── */
+
+struct ib_pq_multi_caches {
+    int n;
+    ib_pq_lut_cache** caches;
+    char** names;            /* shallow refs to multi->names */
+};
+
+int ib_pq_multi_caches_create(const ib_pq_multi* multi, ib_pq_multi_caches** out_p) {
+    if (!multi || !out_p) return -1;
+    *out_p = NULL;
+    ib_pq_multi_caches* mc = (ib_pq_multi_caches*)calloc(1, sizeof(*mc));
+    if (!mc) return -1;
+    mc->n = multi->n;
+    if (multi->n > 0) {
+        mc->caches = (ib_pq_lut_cache**)calloc((size_t)multi->n, sizeof(*mc->caches));
+        mc->names  = (char**)calloc((size_t)multi->n, sizeof(*mc->names));
+        if (!mc->caches || !mc->names) { ib_pq_multi_caches_free(mc); return -1; }
+    }
+    for (int i = 0; i < multi->n; i++) {
+        mc->names[i] = multi->names[i];
+        if (ib_pq_lut_cache_create(&multi->tensors[i], &mc->caches[i]) != 0) {
+            ib_pq_multi_caches_free(mc);
+            return -1;
+        }
+    }
+    *out_p = mc;
+    return 0;
+}
+
+void ib_pq_multi_caches_free(ib_pq_multi_caches* mc) {
+    if (!mc) return;
+    if (mc->caches) {
+        for (int i = 0; i < mc->n; i++) ib_pq_lut_cache_free(mc->caches[i]);
+        free(mc->caches);
+    }
+    free(mc->names);
+    free(mc);
+}
+
+const ib_pq_lut_cache* ib_pq_multi_caches_get(const ib_pq_multi_caches* mc, const char* name) {
+    if (!mc || !name) return NULL;
+    for (int i = 0; i < mc->n; i++) {
+        if (mc->names[i] && strcmp(mc->names[i], name) == 0) return mc->caches[i];
+    }
+    return NULL;
+}
+
+int ib_pq_multi_caches_quantize_all_int8(ib_pq_multi_caches* mc) {
+    if (!mc) return -1;
+    for (int i = 0; i < mc->n; i++) {
+        if (ib_pq_lut_cache_quantize_int8(mc->caches[i]) != 0) return -1;
+    }
+    return 0;
+}
+
+/* ── Session: IBF + cache fleet + per-tensor policy ── */
+
+/* F1.b: minimal spin pool — workers busy-wait on a generation counter
+ * instead of cond_wait. Sync latency drops from O(50–200 µs) to O(<1 µs)
+ * which is what makes per-call threading viable in a 154-call/token loop. */
+
+struct pq_spin_pool {
+    int n_threads;
+    pthread_t* threads;
+    _Atomic int generation;
+    _Atomic int next_chunk;
+    _Atomic int n_done;
+    _Atomic int shutdown;
+    pq_spin_fn fn;
+    void* arg;
+    int total;
+    int chunk_size;
+    int* tids;
+    /* F1.b: hybrid spin-then-sleep — workers spin SPIN_LIMIT pq_cpu_pauses
+     * before falling back to cond_wait; main always cond_broadcasts after
+     * publishing the new generation, so a sleeping worker still wakes. */
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+};
+
+#define PQ_SPIN_LIMIT 50000  /* ~50 µs on M-series */
+
+static inline void pq_cpu_pause(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause");
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+static void* pq_spin_worker(void* raw) {
+    int tid_box = *(int*)raw;
+    pq_spin_pool* p = *(pq_spin_pool**)((char*)raw + sizeof(int));
+    int my_gen = 0;
+    while (1) {
+        /* Spin briefly first (hot back-to-back call case). */
+        int spins = 0;
+        int gen;
+        while (1) {
+            gen = atomic_load_explicit(&p->generation, memory_order_acquire);
+            if (gen != my_gen) break;
+            if (atomic_load_explicit(&p->shutdown, memory_order_acquire)) return NULL;
+            if (++spins >= PQ_SPIN_LIMIT) break;
+            pq_cpu_pause();
+        }
+        if (gen == my_gen) {
+            /* Cold path: sleep on condvar. */
+            pthread_mutex_lock(&p->mu);
+            while ((gen = atomic_load_explicit(&p->generation, memory_order_acquire)) == my_gen
+                && !atomic_load_explicit(&p->shutdown, memory_order_acquire)) {
+                pthread_cond_wait(&p->cv, &p->mu);
+            }
+            pthread_mutex_unlock(&p->mu);
+        }
+        if (atomic_load_explicit(&p->shutdown, memory_order_acquire)) return NULL;
+        my_gen = gen;
+        pq_spin_fn fn = p->fn;
+        void* arg = p->arg;
+        int total = p->total;
+        int chunk = p->chunk_size;
+        while (1) {
+            int s = atomic_fetch_add_explicit(&p->next_chunk, chunk, memory_order_relaxed);
+            if (s >= total) break;
+            int e = s + chunk; if (e > total) e = total;
+            fn(arg, tid_box, s, e);
+        }
+        atomic_fetch_add_explicit(&p->n_done, 1, memory_order_release);
+    }
+}
+
+static pq_spin_pool* pq_spin_pool_create(int n_threads) {
+    if (n_threads <= 1) return NULL;
+    pq_spin_pool* p = (pq_spin_pool*)calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->n_threads = n_threads;
+    p->threads = (pthread_t*)calloc((size_t)n_threads, sizeof(pthread_t));
+    p->tids = (int*)calloc((size_t)n_threads,
+                              sizeof(int) + sizeof(pq_spin_pool*));
+    if (!p->threads || !p->tids) { free(p->threads); free(p->tids); free(p); return NULL; }
+    atomic_store(&p->generation, 0);
+    atomic_store(&p->shutdown, 0);
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv, NULL);
+    /* macOS: give workers user-interactive QoS so the scheduler keeps
+     * them on P-cores instead of dumping them on E-cores. Big M-series
+     * impact on hot-loop throughput. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+#if defined(__APPLE__)
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    for (int i = 0; i < n_threads; i++) {
+        char* slot = (char*)p->tids + (size_t)i * (sizeof(int) + sizeof(pq_spin_pool*));
+        *(int*)slot = i;
+        *(pq_spin_pool**)(slot + sizeof(int)) = p;
+        pthread_create(&p->threads[i], &attr, pq_spin_worker, slot);
+    }
+    pthread_attr_destroy(&attr);
+    return p;
+}
+
+static void pq_spin_pool_destroy(pq_spin_pool* p) {
+    if (!p) return;
+    atomic_store_explicit(&p->shutdown, 1, memory_order_release);
+    /* Bump generation + wake any sleepers. */
+    atomic_fetch_add_explicit(&p->generation, 1, memory_order_release);
+    pthread_mutex_lock(&p->mu);
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+    for (int i = 0; i < p->n_threads; i++) pthread_join(p->threads[i], NULL);
+    pthread_cond_destroy(&p->cv);
+    pthread_mutex_destroy(&p->mu);
+    free(p->threads); free(p->tids); free(p);
+}
+
+static void pq_spin_pool_run(pq_spin_pool* p, pq_spin_fn fn, void* arg,
+                              int total, int chunk_size) {
+    if (!p || total <= 0) {
+        if (fn && total > 0) fn(arg, 0, 0, total);
+        return;
+    }
+    if (chunk_size <= 0) chunk_size = (total + p->n_threads - 1) / p->n_threads;
+    if (chunk_size < 1) chunk_size = 1;
+    p->fn = fn; p->arg = arg; p->total = total; p->chunk_size = chunk_size;
+    atomic_store_explicit(&p->next_chunk, 0, memory_order_relaxed);
+    atomic_store_explicit(&p->n_done, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&p->generation, 1, memory_order_release);
+    /* Wake any sleeping workers. Spinning ones already see the new gen. */
+    pthread_mutex_lock(&p->mu);
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+    /* Main thread also takes work — turns N+1 active cores into useful
+     * cores instead of having main idle. tid n_threads is the main slot. */
+    while (1) {
+        int s = atomic_fetch_add_explicit(&p->next_chunk, chunk_size, memory_order_relaxed);
+        if (s >= total) break;
+        int e = s + chunk_size; if (e > total) e = total;
+        fn(arg, p->n_threads, s, e);
+    }
+    while (atomic_load_explicit(&p->n_done, memory_order_acquire) < p->n_threads) {
+        pq_cpu_pause();
+    }
+}
+
+struct ib_pq_session {
+    ib_pq_multi multi;            /* owned */
+    ib_pq_multi_caches* mc;       /* owned */
+    ib_pq_policy default_policy;
+    ib_pq_policy* policies;       /* parallel to multi.tensors[i]; NULL => default */
+    int int8_quantized;
+    ib_thread_pool* pool;         /* legacy cond_wait pool (kept for compat) */
+    pq_spin_pool* spin;           /* F1.b: hot-loop spin pool used by matmul */
+    int n_threads;
+    /* F1.a: preallocated LUT scratch sized to max(K), max(K_l2) across the
+     * fleet. One block, four buffers laid out contiguously. */
+    float* scratch_C1L;
+    float* scratch_C1R;
+    float* scratch_C2L;  /* may be NULL if no L2 in fleet */
+    float* scratch_C2R;
+    int scratch_K;
+    int scratch_K_l2;
+    /* F1.b: per-thread scratch for spin-pool matmul (4 LUTs per thread). */
+    float* thread_scratch;
+    size_t thread_scratch_per;
+    /* Phase 8.E: per-tensor inv_act_scale pointer (NULL if absent),
+     * indexed parallel to multi.tensors[i]. The session scratch
+     * x_scratch is used to materialize x * inv_act_scale once per matmul
+     * call; sized to max(N) across the fleet. */
+    const float** act_scale_inv_per_tensor;
+    float* x_scratch;
+    int x_scratch_n;
+    /* INT4 weight path: raw_tensor pair `<base>__i4_q` (uint8 [M, N/2])
+     * + `<base>__i4_s` (fp16 [M, N/G]). Detected at session_open;
+     * routes ahead of PQ in session_matmul. */
+    /* fp16 raw matmul tensors: <base>__fp16w shape [M, N]. */
+    int n_fp16;
+    struct ib_fp16w_tensor {
+        char* name;
+        const uint16_t* w;     /* [M, N] fp16 */
+        int M, N;
+    } *fp16_tensors;
+    int n_int4;
+    struct ib_int4_tensor {
+        char* name;            /* base name (no suffix) */
+        const uint8_t* q;      /* [M, N/2] packed nibbles */
+        const uint16_t* s;     /* [M, N/G] fp16 group scales */
+        const float* inv_act;  /* optional [N] fp32, NULL if absent (AWQ) */
+        const uint16_t* outl_idx;  /* optional [M, K_out] uint16 col indices */
+        const uint16_t* outl_val;  /* optional [M, K_out] fp16 values */
+        int M, N, G, K_out;
+    } *int4_tensors;
+    /* Phase 6 cross-token delta cache (INT4): per-tensor (x_prev, out_prev).
+     * On call: if ||Δx|| is small enough, do sparse-Δ incremental update
+     * instead of full M×N matmul. Lazily allocated; reset on new session. */
+    float** int4_x_cache;     /* parallel to int4_tensors; NULL = invalid */
+    float** int4_out_cache;
+    int delta_cache_enabled;  /* 1 if IB_DELTA_CACHE=1 at session_open */
+};
+
+static const struct ib_fp16w_tensor* session_fp16_find(const ib_pq_session* s,
+                                                          const char* name) {
+    if (!s || !name) return NULL;
+    for (int i = 0; i < s->n_fp16; i++) {
+        if (strcmp(s->fp16_tensors[i].name, name) == 0) return &s->fp16_tensors[i];
+    }
+    return NULL;
+}
+
+static void fp16w_rows(const struct ib_fp16w_tensor* t,
+                          const float* x, float* out, int m_start, int m_end) {
+    const int N = t->N;
+    for (int m = m_start; m < m_end; m++) {
+        const uint16_t* row = t->w + (size_t)m * N;
+        float acc = 0.0f;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+        float32x4_t v0 = vdupq_n_f32(0.0f), v1 = vdupq_n_f32(0.0f);
+        int j = 0;
+        for (; j + 8 <= N; j += 8) {
+            float16x8_t w8 = vreinterpretq_f16_u16(vld1q_u16(row + j));
+            float32x4_t wlo = vcvt_f32_f16(vget_low_f16(w8));
+            float32x4_t whi = vcvt_f32_f16(vget_high_f16(w8));
+            v0 = vfmaq_f32(v0, wlo, vld1q_f32(x + j));
+            v1 = vfmaq_f32(v1, whi, vld1q_f32(x + j + 4));
+        }
+        acc = vaddvq_f32(vaddq_f32(v0, v1));
+        for (; j < N; j++) acc += ib_fp16_to_fp32(row[j]) * x[j];
+#else
+        for (int j = 0; j < N; j++) acc += ib_fp16_to_fp32(row[j]) * x[j];
+#endif
+        out[m] = acc;
+    }
+}
+
+typedef struct {
+    const struct ib_fp16w_tensor* t;
+    const float* x;
+    float* out;
+} fp16w_task_ctx;
+
+static void fp16w_row_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    fp16w_task_ctx* c = (fp16w_task_ctx*)arg;
+    fp16w_rows(c->t, c->x, c->out, s, e);
+}
+
+static int fp16w_matmul_fp32(const struct ib_fp16w_tensor* t,
+                                const float* x, float* out) {
+    fp16w_rows(t, x, out, 0, t->M);
+    return 0;
+}
+
+static int fp16w_matmul_fp32_threaded(const struct ib_fp16w_tensor* t,
+                                          const float* x, float* out,
+                                          pq_spin_pool* spin, int n_threads) {
+    if (!spin || n_threads <= 1 || t->M < 256) {
+        return fp16w_matmul_fp32(t, x, out);
+    }
+    fp16w_task_ctx ctx = { t, x, out };
+    int chunk = (t->M + n_threads - 1) / n_threads;
+    if (chunk < 32) chunk = 32;
+    pq_spin_pool_run(spin, fp16w_row_task, &ctx, t->M, chunk);
+    return 0;
+}
+
+static const struct ib_int4_tensor* session_int4_find(const ib_pq_session* s,
+                                                        const char* name) {
+    if (!s || !name) return NULL;
+    for (int i = 0; i < s->n_int4; i++) {
+        if (strcmp(s->int4_tensors[i].name, name) == 0) return &s->int4_tensors[i];
+    }
+    return NULL;
+}
+
+static void int4_matmul_rows_skip(const struct ib_int4_tensor* t,
+                                     const float* x, float* out,
+                                     int m_start, int m_end,
+                                     const char* skip_grp) {
+    const int N = t->N, G = t->G;
+    const int n_groups = N / G;
+    const uint8_t* q = t->q;
+    const uint16_t* sh = t->s;
+#if defined(__ARM_NEON)
+    const int neon_ok = (G % 16 == 0);
+#else
+    const int neon_ok = 0;
+#endif
+    for (int m = m_start; m < m_end; m++) {
+        const uint8_t* qrow = q + (size_t)m * (N / 2);
+        const uint16_t* srow = sh + (size_t)m * n_groups;
+        float acc = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            if (skip_grp && skip_grp[g]) continue;
+            float scale = ib_fp16_to_fp32(srow[g]);
+            const float* xg = x + g * G;
+            const uint8_t* qg = qrow + (g * G) / 2;
+            float gacc = 0.0f;
+#if defined(__ARM_NEON)
+            if (neon_ok) {
+                /* NEON int4 dot: 16 columns per iter, 8 packed bytes,
+                 * decode to fp32, FMA with x. */
+                float32x4_t v0 = vdupq_n_f32(0.0f);
+                float32x4_t v1 = vdupq_n_f32(0.0f);
+                const int16x8_t bias = vdupq_n_s16(8);
+                for (int j = 0; j < G; j += 16) {
+                    uint8x8_t b = vld1_u8(qg + j / 2);
+                    uint8x8_t lo_u = vand_u8(b, vdup_n_u8(0x0F));
+                    uint8x8_t hi_u = vshr_n_u8(b, 4);
+                    int16x8_t lo_s = vsubq_s16(
+                        vreinterpretq_s16_u16(vmovl_u8(lo_u)), bias);
+                    int16x8_t hi_s = vsubq_s16(
+                        vreinterpretq_s16_u16(vmovl_u8(hi_u)), bias);
+                    float32x4_t lo_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_s)));
+                    float32x4_t lo_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo_s)));
+                    float32x4_t hi_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_s)));
+                    float32x4_t hi_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi_s)));
+                    /* Interleave: x is laid out [col0 col1 col2 ...]
+                     * lo holds even cols, hi holds odd cols. zip to
+                     * get [lo0 hi0 lo1 hi1] etc. */
+                    float32x4x2_t za = vzipq_f32(lo_lo, hi_lo);
+                    float32x4x2_t zb = vzipq_f32(lo_hi, hi_hi);
+                    float32x4_t x0 = vld1q_f32(xg + j);
+                    float32x4_t x1 = vld1q_f32(xg + j + 4);
+                    float32x4_t x2 = vld1q_f32(xg + j + 8);
+                    float32x4_t x3 = vld1q_f32(xg + j + 12);
+                    v0 = vfmaq_f32(v0, za.val[0], x0);
+                    v1 = vfmaq_f32(v1, za.val[1], x1);
+                    v0 = vfmaq_f32(v0, zb.val[0], x2);
+                    v1 = vfmaq_f32(v1, zb.val[1], x3);
+                }
+                gacc = vaddvq_f32(vaddq_f32(v0, v1));
+            } else
+#endif
+            {
+                for (int j = 0; j < G; j += 2) {
+                    uint8_t b = qg[j / 2];
+                    int lo = (int)(b & 0x0F) - 8;
+                    int hi = (int)(b >> 4) - 8;
+                    gacc += (float)lo * xg[j] + (float)hi * xg[j + 1];
+                }
+            }
+            acc += scale * gacc;
+        }
+        /* Outlier sidecar: out[m] += sum_k outl_val[m,k] * x[outl_idx[m,k]] */
+        if (t->outl_idx) {
+            const uint16_t* oi = t->outl_idx + (size_t)m * t->K_out;
+            const uint16_t* ov = t->outl_val + (size_t)m * t->K_out;
+            for (int k = 0; k < t->K_out; k++) {
+                acc += ib_fp16_to_fp32(ov[k]) * x[oi[k]];
+            }
+        }
+        out[m] = acc;
+    }
+}
+
+/* Phase 2.w: static activation int8 quantization + SDOT kernel.
+ * Per-group x quantization: each G-column chunk gets its own s_x[g] =
+ * max|x_chunk|/127. Preserves int8 precision per chunk where x has
+ * dynamic range across N (typical at deep-layer activations).
+ * Final: out[m] = sum_g s_x[g] * s_W[m,g] * sum_{j∈g} qW[m,j] * qx[j].
+ * ~3-4× throughput on Apple SDOT. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static void int4_sdot_rows(const struct ib_int4_tensor* t,
+                              const int8_t* qx, const float* sxg,
+                              float* out, int m_start, int m_end) {
+    const int N = t->N, G = t->G;
+    const int n_groups = N / G;
+    const uint8_t* q = t->q;
+    const uint16_t* sh = t->s;
+    /* G must be multiple of 16 for SDOT vector path; 32/64/128 all qualify. */
+    for (int m = m_start; m < m_end; m++) {
+        const uint8_t* qrow = q + (size_t)m * (N / 2);
+        const uint16_t* srow = sh + (size_t)m * n_groups;
+        float acc = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            const int8_t* xg = qx + g * G;
+            const uint8_t* qg = qrow + (g * G) / 2;
+            int32x4_t v = vdupq_n_s32(0);
+            for (int j = 0; j < G; j += 16) {
+                /* Decode 8 packed bytes → 16 int8 nibbles in column order. */
+                uint8x8_t b = vld1_u8(qg + j / 2);
+                int8x16_t lo16, hi16;
+                {
+                    uint8x8_t lo_u = vand_u8(b, vdup_n_u8(0x0F));
+                    uint8x8_t hi_u = vshr_n_u8(b, 4);
+                    int8x8_t lo_s = vsub_s8(vreinterpret_s8_u8(lo_u),
+                                              vdup_n_s8(8));
+                    int8x8_t hi_s = vsub_s8(vreinterpret_s8_u8(hi_u),
+                                              vdup_n_s8(8));
+                    /* Interleave low/high to recover column order. */
+                    int8x8x2_t z = vzip_s8(lo_s, hi_s);
+                    lo16 = vcombine_s8(z.val[0], z.val[1]);
+                    (void)hi16;
+                }
+                int8x16_t xv = vld1q_s8(xg + j);
+                v = vdotq_s32(v, lo16, xv);
+            }
+            int32_t int_acc = vaddvq_s32(v);
+            float scale_w = ib_fp16_to_fp32(srow[g]);
+            acc += sxg[g] * scale_w * (float)int_acc;
+        }
+        /* Outlier sidecar in fp32 — use per-group s_x for the column. */
+        if (t->outl_idx) {
+            const uint16_t* oi = t->outl_idx + (size_t)m * t->K_out;
+            const uint16_t* ov = t->outl_val + (size_t)m * t->K_out;
+            for (int k = 0; k < t->K_out; k++) {
+                int oj = oi[k];
+                acc += ib_fp16_to_fp32(ov[k]) * (float)qx[oj] * sxg[oj / G];
+            }
+        }
+        out[m] = acc;
+    }
+}
+
+typedef struct {
+    const struct ib_int4_tensor* t;
+    const int8_t* qx;
+    const float* sxg;
+    float* out;
+} int4_sdot_ctx;
+
+static void int4_sdot_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    int4_sdot_ctx* c = (int4_sdot_ctx*)arg;
+    int4_sdot_rows(c->t, c->qx, c->sxg, c->out, s, e);
+}
+
+static void quantize_x_int8_grp(const float*, int, int, int8_t*, float*);
+
+/* F1.c batched SDOT: B inputs → B outputs. Loads W row once per m,
+ * fans out across B slots. Each slot has its own (qx, sxg) — they
+ * already passed through quantize_x_int8_grp once per slot. */
+static void int4_sdot_rows_batched(const struct ib_int4_tensor* t,
+                                       int B,
+                                       const int8_t* const* qx_arr,
+                                       const float* const* sxg_arr,
+                                       float* const* out_arr,
+                                       int m_start, int m_end) {
+    const int N = t->N, G = t->G;
+    const int n_groups = N / G;
+    const uint8_t* q = t->q;
+    const uint16_t* sh = t->s;
+    /* int_acc per slot, per group — flushed at row end. */
+    int32x4_t v[16];   /* up to B=16 slots; assert B<=16 below */
+    for (int m = m_start; m < m_end; m++) {
+        const uint8_t* qrow = q + (size_t)m * (N / 2);
+        const uint16_t* srow = sh + (size_t)m * n_groups;
+        float acc[16];
+        for (int b = 0; b < B; b++) acc[b] = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            float scale_w = ib_fp16_to_fp32(srow[g]);
+            for (int b = 0; b < B; b++) v[b] = vdupq_n_s32(0);
+            const uint8_t* qg = qrow + (g * G) / 2;
+            for (int j = 0; j < G; j += 16) {
+                /* Decode 16 int8 nibbles ONCE; reuse across B slots. */
+                uint8x8_t b8 = vld1_u8(qg + j / 2);
+                uint8x8_t lo_u = vand_u8(b8, vdup_n_u8(0x0F));
+                uint8x8_t hi_u = vshr_n_u8(b8, 4);
+                int8x8_t lo_s = vsub_s8(vreinterpret_s8_u8(lo_u), vdup_n_s8(8));
+                int8x8_t hi_s = vsub_s8(vreinterpret_s8_u8(hi_u), vdup_n_s8(8));
+                int8x8x2_t z = vzip_s8(lo_s, hi_s);
+                int8x16_t wcol = vcombine_s8(z.val[0], z.val[1]);
+                /* For each slot, SDOT this w-vector against its qx[g*G+j..]. */
+                for (int b = 0; b < B; b++) {
+                    int8x16_t xv = vld1q_s8(qx_arr[b] + g * G + j);
+                    v[b] = vdotq_s32(v[b], wcol, xv);
+                }
+            }
+            for (int b = 0; b < B; b++) {
+                int32_t int_acc = vaddvq_s32(v[b]);
+                acc[b] += sxg_arr[b][g] * scale_w * (float)int_acc;
+            }
+        }
+        /* Outlier sidecar per slot. */
+        if (t->outl_idx) {
+            const uint16_t* oi = t->outl_idx + (size_t)m * t->K_out;
+            const uint16_t* ov = t->outl_val + (size_t)m * t->K_out;
+            for (int b = 0; b < B; b++) {
+                for (int k = 0; k < t->K_out; k++) {
+                    int oj = oi[k];
+                    acc[b] += ib_fp16_to_fp32(ov[k]) *
+                              (float)qx_arr[b][oj] * sxg_arr[b][oj / G];
+                }
+            }
+        }
+        for (int b = 0; b < B; b++) out_arr[b][m] = acc[b];
+    }
+}
+
+typedef struct {
+    const struct ib_int4_tensor* t;
+    int B;
+    const int8_t* const* qx_arr;
+    const float* const* sxg_arr;
+    float* const* out_arr;
+} int4_sdot_batched_ctx;
+
+static void int4_sdot_batched_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    int4_sdot_batched_ctx* c = (int4_sdot_batched_ctx*)arg;
+    int4_sdot_rows_batched(c->t, c->B, c->qx_arr, c->sxg_arr, c->out_arr, s, e);
+}
+
+/* Public entry: B inputs → B outputs through one matmul. */
+static int int4_matmul_batched_sdot(const struct ib_int4_tensor* t, int B,
+                                       const float* const* x_arr,
+                                       float* const* out_arr,
+                                       pq_spin_pool* spin, int n_threads) {
+    if (B <= 0 || B > 16) return -1;
+    if (t->G % 16 != 0 || t->N % t->G != 0) return -1;
+    int N = t->N, n_groups = N / t->G;
+    int8_t* qx_buf = (int8_t*)malloc((size_t)B * N);
+    float* sxg_buf = (float*)malloc((size_t)B * n_groups * sizeof(float));
+    if (!qx_buf || !sxg_buf) { free(qx_buf); free(sxg_buf); return -1; }
+    const int8_t* qx_arr[16];
+    const float* sxg_arr[16];
+    for (int b = 0; b < B; b++) {
+        int8_t* qx_b = qx_buf + (size_t)b * N;
+        float* sxg_b = sxg_buf + (size_t)b * n_groups;
+        quantize_x_int8_grp(x_arr[b], N, t->G, qx_b, sxg_b);
+        qx_arr[b] = qx_b;
+        sxg_arr[b] = sxg_b;
+    }
+    int rc;
+    if (spin && n_threads > 1 && t->M >= 256) {
+        int4_sdot_batched_ctx c = { t, B, qx_arr, sxg_arr, out_arr };
+        int chunk = (t->M + n_threads - 1) / n_threads;
+        if (chunk < 32) chunk = 32;
+        pq_spin_pool_run(spin, int4_sdot_batched_task, &c, t->M, chunk);
+        rc = 0;
+    } else {
+        int4_sdot_rows_batched(t, B, qx_arr, sxg_arr, out_arr, 0, t->M);
+        rc = 0;
+    }
+    free(qx_buf); free(sxg_buf);
+    return rc;
+}
+
+/* Quantize x to int8 per-group: chunks of G columns share one scale.
+ * Writes qx[N] int8 + sxg[N/G] fp32. */
+static void quantize_x_int8_grp(const float* x, int N, int G,
+                                   int8_t* qx, float* sxg) {
+    int n_groups = N / G;
+    for (int g = 0; g < n_groups; g++) {
+        const float* xg = x + g * G;
+        float xmax = 0.0f;
+        for (int j = 0; j < G; j++) { float a = fabsf(xg[j]); if (a > xmax) xmax = a; }
+        float sx = xmax / 127.0f + 1e-30f;
+        sxg[g] = sx;
+        float inv = 1.0f / sx;
+        int8_t* qg = qx + g * G;
+        for (int j = 0; j < G; j++) {
+            float v = xg[j] * inv;
+            if (v > 127.0f) v = 127.0f; else if (v < -127.0f) v = -127.0f;
+            qg[j] = (int8_t)lrintf(v);
+        }
+    }
+    /* Tail: if N % G != 0, leave as-is. Caller guarantees N % G == 0
+     * since W's encoder asserts it. */
+}
+#endif
+
+/* Build per-group skip mask: skip_grp[g] = 1 iff max|x[g*G..]| ≤ eps_rel·max|x|. */
+static char* build_skip_mask(int N, int G, const float* x) {
+    static float eps_act_rel = -2.0f;
+    if (eps_act_rel < -1.0f) {
+        /* Default off: at the thresholds where quality survives (1e-5),
+         * skip-mask build cost equals the savings on most TinyLlama
+         * tensors. Only post-SwiGLU input to down_proj has natural
+         * sparsity. Keep as opt-in for future per-tensor wiring. */
+        const char* env = getenv("IB_ACT_SPARSE_REL");
+        eps_act_rel = (env && atof(env) >= 0.0f) ? (float)atof(env) : 0.0f;
+    }
+    if (eps_act_rel <= 0.0f) return NULL;
+    int n_groups = N / G;
+    float xmax = 0.0f;
+    for (int j = 0; j < N; j++) { float a = fabsf(x[j]); if (a > xmax) xmax = a; }
+    float thr = eps_act_rel * xmax;
+    char* skip_grp = (char*)malloc((size_t)n_groups);
+    if (!skip_grp) return NULL;
+    int n_skip = 0;
+    for (int g = 0; g < n_groups; g++) {
+        float gmax = 0.0f;
+        const float* xg = x + g * G;
+        for (int j = 0; j < G; j++) { float a = fabsf(xg[j]); if (a > gmax) gmax = a; }
+        skip_grp[g] = (gmax <= thr) ? 1 : 0;
+        if (skip_grp[g]) n_skip++;
+    }
+    if (getenv("IB_ACT_SPARSE_TRACE"))
+        fprintf(stderr, "[act-sparse] skip %d/%d groups\n", n_skip, n_groups);
+    return skip_grp;
+}
+
+typedef struct {
+    const struct ib_int4_tensor* t;
+    const float* x;
+    float* out;
+    const char* skip_grp;
+} int4_task_ctx;
+
+static void int4_row_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    int4_task_ctx* c = (int4_task_ctx*)arg;
+    int4_matmul_rows_skip(c->t, c->x, c->out, s, e, c->skip_grp);
+}
+
+static int int4_matmul_fp32_raw(const struct ib_int4_tensor* t,
+                                   const float* x, float* out) {
+    char* skip_grp = build_skip_mask(t->N, t->G, x);
+    int4_matmul_rows_skip(t, x, out, 0, t->M, skip_grp);
+    free(skip_grp);
+    return 0;
+}
+
+static int int4_matmul_fp32_threaded(const struct ib_int4_tensor* t,
+                                        const float* x, float* out,
+                                        pq_spin_pool* spin, int n_threads) {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    /* Phase 2.w: static-act-int8 SDOT path. Default ON via env (1).
+     * Set IB_STATIC_ACT_INT8=0 to disable for fp32 baseline. */
+    static int sdot_enabled = -1;
+    if (sdot_enabled < 0) {
+        const char* env = getenv("IB_STATIC_ACT_INT8");
+        sdot_enabled = (env && atoi(env) == 0) ? 0 : 1;
+    }
+    if (sdot_enabled && (t->G % 16 == 0) && (t->N % t->G == 0)) {
+        int N = t->N;
+        int n_groups = N / t->G;
+        int8_t* qx = (int8_t*)malloc((size_t)N);
+        float* sxg = (float*)malloc((size_t)n_groups * sizeof(float));
+        if (qx && sxg) {
+            quantize_x_int8_grp(x, N, t->G, qx, sxg);
+            int rc;
+            if (spin && n_threads > 1 && t->M >= 256) {
+                int4_sdot_ctx c = { t, qx, sxg, out };
+                int chunk = (t->M + n_threads - 1) / n_threads;
+                if (chunk < 32) chunk = 32;
+                pq_spin_pool_run(spin, int4_sdot_task, &c, t->M, chunk);
+                rc = 0;
+            } else {
+                int4_sdot_rows(t, qx, sxg, out, 0, t->M);
+                rc = 0;
+            }
+            free(qx); free(sxg);
+            return rc;
+        }
+        free(qx); free(sxg);
+    }
+#endif
+    if (!spin || n_threads <= 1 || t->M < 256) {
+        return int4_matmul_fp32_raw(t, x, out);
+    }
+    char* skip_grp = build_skip_mask(t->N, t->G, x);
+    int4_task_ctx ctx = { t, x, out, skip_grp };
+    int chunk = (t->M + n_threads - 1) / n_threads;
+    if (chunk < 32) chunk = 32;
+    pq_spin_pool_run(spin, int4_row_task, &ctx, t->M, chunk);
+    free(skip_grp);
+    return 0;
+}
+
+/* Sparse-Δx incremental update: out[m] += sum_k W[m, idx[k]] * dx[k].
+ * idx is the list of significant Δx column indices, dx the corresponding
+ * Δx values. Each W column read decodes one nibble (high or low) per row. */
+static void int4_delta_rows(const struct ib_int4_tensor* t,
+                              const int* idx, const float* dx, int n_sig,
+                              float* out, int m_start, int m_end) {
+    const int N = t->N, G = t->G;
+    const uint8_t* q = t->q;
+    const uint16_t* sh = t->s;
+    for (int m = m_start; m < m_end; m++) {
+        const uint8_t* qrow = q + (size_t)m * (N / 2);
+        const uint16_t* srow = sh + (size_t)m * (N / G);
+        float acc = 0.0f;
+        for (int k = 0; k < n_sig; k++) {
+            int j = idx[k];
+            uint8_t b = qrow[j / 2];
+            int nib = (j & 1) ? (int)(b >> 4) : (int)(b & 0x0F);
+            float scale = ib_fp16_to_fp32(srow[j / G]);
+            acc += (float)(nib - 8) * scale * dx[k];
+        }
+        /* Outlier sidecar Δ: outl values are in AWQ basis, but dx is in
+         * AWQ basis too (caller already applied inv_act), so this works
+         * symmetrically with the full-matmul kernel. */
+        if (t->outl_idx) {
+            const uint16_t* oi = t->outl_idx + (size_t)m * t->K_out;
+            const uint16_t* ov = t->outl_val + (size_t)m * t->K_out;
+            for (int kk = 0; kk < t->K_out; kk++) {
+                int oj = oi[kk];
+                /* Naive: scan idx[] for oj. For typical K_out ≤ 6 this is
+                 * cheaper than a hash map. */
+                for (int s = 0; s < n_sig; s++) {
+                    if (idx[s] == oj) {
+                        acc += ib_fp16_to_fp32(ov[kk]) * dx[s];
+                        break;
+                    }
+                }
+            }
+        }
+        out[m] += acc;
+    }
+}
+
+typedef struct {
+    const struct ib_int4_tensor* t;
+    const int* idx;
+    const float* dx;
+    int n_sig;
+    float* out;
+} int4_delta_ctx;
+
+static void int4_delta_task(void* arg, int tid, int s, int e) {
+    (void)tid;
+    int4_delta_ctx* c = (int4_delta_ctx*)arg;
+    int4_delta_rows(c->t, c->idx, c->dx, c->n_sig, c->out, s, e);
+}
+
+/* Decide sparse-Δ vs full path based on Δx sparsity. xk is the AWQ-basis
+ * input (already pre-multiplied by inv_act if applicable). */
+static int int4_matmul_with_delta_cache(ib_pq_session* s, int idx,
+                                          const struct ib_int4_tensor* t,
+                                          const float* xk, float* out) {
+    /* Lazy alloc cache slot. */
+    if (!s->int4_x_cache[idx]) {
+        s->int4_x_cache[idx] = (float*)malloc((size_t)t->N * sizeof(float));
+        s->int4_out_cache[idx] = (float*)malloc((size_t)t->M * sizeof(float));
+        if (!s->int4_x_cache[idx] || !s->int4_out_cache[idx]) goto full;
+        /* Sentinel: NaN means uninitialized. */
+        s->int4_x_cache[idx][0] = NAN;
+    }
+    float* x_prev = s->int4_x_cache[idx];
+    float* out_prev = s->int4_out_cache[idx];
+    /* If cache uninitialized (first call or after reset), do full and seed. */
+    if (isnan(x_prev[0])) {
+        int rc = int4_matmul_fp32_threaded(t, xk, out, s->spin, s->n_threads);
+        if (rc == 0) {
+            memcpy(x_prev, xk, (size_t)t->N * sizeof(float));
+            memcpy(out_prev, out, (size_t)t->M * sizeof(float));
+        }
+        return rc;
+    }
+    /* Compute Δx and significant-index list in one pass. */
+    /* Significance threshold scales with ||x|| to be relative. */
+    int N = t->N;
+    int* sig_idx = (int*)malloc((size_t)N * sizeof(int));
+    float* sig_dx = (float*)malloc((size_t)N * sizeof(float));
+    if (!sig_idx || !sig_dx) { free(sig_idx); free(sig_dx); goto full; }
+    /* Threshold: relative to ||Δx||. Mark as significant when
+     * |Δx_j| > eps_rel × max|Δx|. Adaptive — handles both tiny shifts
+     * (decode steady state, mostly < eps) and large changes (token
+     * boundary, mostly > eps so we fall through to full). */
+    float dxmax = 0.0f;
+    for (int j = 0; j < N; j++) {
+        float d = fabsf(xk[j] - x_prev[j]);
+        if (d > dxmax) dxmax = d;
+    }
+    /* Tunable via env: default 0.01 (skip Δx within 1% of max-Δx). */
+    static float eps_rel = -1.0f;
+    if (eps_rel < 0.0f) {
+        const char* env = getenv("IB_DELTA_EPS_REL");
+        eps_rel = (env && atof(env) > 0) ? (float)atof(env) : 0.01f;
+    }
+    float eps = eps_rel * dxmax + 1e-30f;
+    int n_sig = 0;
+    for (int j = 0; j < N; j++) {
+        float d = xk[j] - x_prev[j];
+        if (fabsf(d) > eps) {
+            sig_idx[n_sig] = j;
+            sig_dx[n_sig] = d;
+            n_sig++;
+        }
+    }
+    if (getenv("IB_DELTA_TRACE")) {
+        fprintf(stderr, "[delta] %s: n_sig=%d/%d (%.1f%%) dxmax=%g\n",
+                t->name, n_sig, N, 100.0*n_sig/N, (double)dxmax);
+    }
+    /* If sparse fraction is too high (>50%), full matmul wins on cache
+     * locality; sparse path doesn't pay off below that. */
+    if (n_sig > N / 2) {
+        free(sig_idx); free(sig_dx);
+        goto full;
+    }
+    /* Sparse delta update: start from out_prev, add W·Δx_sparse row-wise. */
+    memcpy(out, out_prev, (size_t)t->M * sizeof(float));
+    if (s->spin && s->n_threads > 1 && t->M >= 256) {
+        int4_delta_ctx c = { t, sig_idx, sig_dx, n_sig, out };
+        int chunk = (t->M + s->n_threads - 1) / s->n_threads;
+        if (chunk < 32) chunk = 32;
+        pq_spin_pool_run(s->spin, int4_delta_task, &c, t->M, chunk);
+    } else {
+        int4_delta_rows(t, sig_idx, sig_dx, n_sig, out, 0, t->M);
+    }
+    free(sig_idx); free(sig_dx);
+    /* Refresh caches. */
+    memcpy(x_prev, xk, (size_t)N * sizeof(float));
+    memcpy(out_prev, out, (size_t)t->M * sizeof(float));
+    return 0;
+full:
+    {
+        int rc = int4_matmul_fp32_threaded(t, xk, out, s->spin, s->n_threads);
+        if (rc == 0 && s->int4_x_cache[idx] && s->int4_out_cache[idx]) {
+            memcpy(s->int4_x_cache[idx], xk, (size_t)t->N * sizeof(float));
+            memcpy(s->int4_out_cache[idx], out, (size_t)t->M * sizeof(float));
+        }
+        return rc;
+    }
+}
+
+static int session_int4_index(const ib_pq_session* s, const struct ib_int4_tensor* t) {
+    return (int)(t - s->int4_tensors);
+}
+
+static int session_find_index(const ib_pq_session* s, const char* name) {
+    if (!s || !name) return -1;
+    for (int i = 0; i < s->multi.n; i++) {
+        if (s->multi.names[i] && strcmp(s->multi.names[i], name) == 0) return i;
+    }
+    return -1;
+}
+
+int ib_pq_session_open(const char* ibf_path, ib_pq_session** out_p) {
+    if (!ibf_path || !out_p) return -1;
+    *out_p = NULL;
+    ib_pq_session* s = (ib_pq_session*)calloc(1, sizeof(*s));
+    if (!s) return -1;
+    s->default_policy.variant = IB_PQ_VARIANT_STREAMING;
+    s->default_policy.skip_threshold = 0.0f;
+    s->default_policy.act_threshold = 0.0f;
+
+    if (ib_pq_load_multi(ibf_path, &s->multi) != 0) {
+        free(s); return -1;
+    }
+    if (ib_pq_multi_caches_create(&s->multi, &s->mc) != 0) {
+        ib_pq_multi_free(&s->multi); free(s); return -1;
+    }
+    if (s->multi.n > 0) {
+        s->policies = (ib_pq_policy*)calloc((size_t)s->multi.n, sizeof(*s->policies));
+        if (!s->policies) {
+            ib_pq_multi_caches_free(s->mc);
+            ib_pq_multi_free(&s->multi); free(s); return -1;
+        }
+    }
+    /* Sentinel: variant=-1 means "use default". */
+    for (int i = 0; i < s->multi.n; i++) s->policies[i].variant = -1;
+
+    /* Phase 8.E: precompute per-tensor inv_act_scale pointer (NULL if no
+     * matching raw block) + size x_scratch to max(N). */
+    s->act_scale_inv_per_tensor = (s->multi.n > 0)
+        ? (const float**)calloc((size_t)s->multi.n,
+                                  sizeof(*s->act_scale_inv_per_tensor))
+        : NULL;
+    int max_N = 0;
+    char buf[256];
+    for (int i = 0; i < s->multi.n; i++) {
+        const ib_pq_tensor* tt = &s->multi.tensors[i];
+        if (tt->N > max_N) max_N = tt->N;
+        const char* name = s->multi.names[i];
+        if (!name || !s->act_scale_inv_per_tensor) continue;
+        snprintf(buf, sizeof(buf), "%s__act_scale", name);
+        const void* data = NULL; int dtype = 0, ndim = 0; int shape[4] = {0};
+        if (ib_pq_session_raw_get(s, buf, &data, &dtype, shape, &ndim) == 0
+         && dtype == IB_RAW_F32 && ndim == 1 && shape[0] == tt->N) {
+            s->act_scale_inv_per_tensor[i] = (const float*)data;
+        }
+    }
+    if (max_N > 0) {
+        s->x_scratch = (float*)malloc((size_t)max_N * sizeof(float));
+        s->x_scratch_n = max_N;
+    }
+
+    /* fp16 raw matmul: scan for `<base>__fp16w` tensors. */
+    {
+        const char* SF = "__fp16w";
+        const size_t flen = strlen(SF);
+        int cap = 0;
+        for (int i = 0; i < s->multi.n_raw; i++) {
+            const char* nm = s->multi.raw_tensors[i].name;
+            size_t L = nm ? strlen(nm) : 0;
+            if (L > flen && strcmp(nm + L - flen, SF) == 0) cap++;
+        }
+        if (cap > 0) {
+            s->fp16_tensors = (struct ib_fp16w_tensor*)calloc((size_t)cap,
+                                  sizeof(struct ib_fp16w_tensor));
+            for (int i = 0; i < s->multi.n_raw; i++) {
+                ib_pq_raw_tensor* r = &s->multi.raw_tensors[i];
+                if (!r->name) continue;
+                size_t L = strlen(r->name);
+                if (L <= flen || strcmp(r->name + L - flen, SF) != 0) continue;
+                if (r->dtype != IB_RAW_F16 || r->ndim != 2) continue;
+                size_t base_len = L - flen;
+                struct ib_fp16w_tensor* t = &s->fp16_tensors[s->n_fp16++];
+                t->name = (char*)malloc(base_len + 1);
+                memcpy(t->name, r->name, base_len);
+                t->name[base_len] = '\0';
+                t->w = (const uint16_t*)r->data;
+                t->M = r->shape[0];
+                t->N = r->shape[1];
+                if (t->N > max_N) max_N = t->N;
+            }
+        }
+    }
+
+    /* INT4 weight path: scan raw_tensors for `__i4_q` + `__i4_s` pairs. */
+    {
+        const char* I4Q = "__i4_q";
+        const char* I4S = "__i4_s";
+        const size_t qlen = strlen(I4Q), slen = strlen(I4S);
+        int cap = 0;
+        for (int i = 0; i < s->multi.n_raw; i++) {
+            const char* nm = s->multi.raw_tensors[i].name;
+            size_t L = nm ? strlen(nm) : 0;
+            if (L > qlen && strcmp(nm + L - qlen, I4Q) == 0) cap++;
+        }
+        if (cap > 0) {
+            s->int4_tensors = (struct ib_int4_tensor*)calloc((size_t)cap,
+                                  sizeof(struct ib_int4_tensor));
+            for (int i = 0; i < s->multi.n_raw; i++) {
+                ib_pq_raw_tensor* rq = &s->multi.raw_tensors[i];
+                if (!rq->name) continue;
+                size_t L = strlen(rq->name);
+                if (L <= qlen || strcmp(rq->name + L - qlen, I4Q) != 0) continue;
+                if (rq->dtype != IB_RAW_U8 || rq->ndim != 2) continue;
+                size_t base_len = L - qlen;
+                char base[256];
+                if (base_len >= sizeof(base)) continue;
+                memcpy(base, rq->name, base_len); base[base_len] = '\0';
+                char sname[300];
+                snprintf(sname, sizeof(sname), "%s%s", base, I4S);
+                ib_pq_raw_tensor* rs = NULL;
+                for (int j = 0; j < s->multi.n_raw; j++) {
+                    if (s->multi.raw_tensors[j].name
+                     && strcmp(s->multi.raw_tensors[j].name, sname) == 0) {
+                        rs = &s->multi.raw_tensors[j]; break;
+                    }
+                }
+                if (!rs || rs->dtype != IB_RAW_F16 || rs->ndim != 2) continue;
+                int M = rq->shape[0];
+                int N = rq->shape[1] * 2;
+                int n_groups = rs->shape[1];
+                if (n_groups <= 0 || N % n_groups != 0) continue;
+                int G = N / n_groups;
+                struct ib_int4_tensor* t = &s->int4_tensors[s->n_int4++];
+                t->name = (char*)malloc(base_len + 1);
+                memcpy(t->name, base, base_len + 1);
+                t->q = (const uint8_t*)rq->data;
+                t->s = (const uint16_t*)rs->data;
+                t->M = M; t->N = N; t->G = G;
+                if (N > max_N) max_N = N;
+                /* AWQ: optional <base>__act_scale fp32[N] */
+                char asname[300];
+                snprintf(asname, sizeof(asname), "%s__act_scale", base);
+                for (int j = 0; j < s->multi.n_raw; j++) {
+                    ib_pq_raw_tensor* ra = &s->multi.raw_tensors[j];
+                    if (ra->name && strcmp(ra->name, asname) == 0
+                     && ra->dtype == IB_RAW_F32 && ra->ndim == 1
+                     && ra->shape[0] == N) {
+                        t->inv_act = (const float*)ra->data; break;
+                    }
+                }
+                /* Outlier sidecar: <base>__i4_outl_idx u16 [M, K_out] +
+                 * <base>__i4_outl_val f16 [M, K_out] */
+                char oin[300], ovn[300];
+                snprintf(oin, sizeof(oin), "%s__i4_outl_idx", base);
+                snprintf(ovn, sizeof(ovn), "%s__i4_outl_val", base);
+                ib_pq_raw_tensor *roi = NULL, *rov = NULL;
+                for (int j = 0; j < s->multi.n_raw; j++) {
+                    if (s->multi.raw_tensors[j].name) {
+                        if (!roi && strcmp(s->multi.raw_tensors[j].name, oin) == 0)
+                            roi = &s->multi.raw_tensors[j];
+                        if (!rov && strcmp(s->multi.raw_tensors[j].name, ovn) == 0)
+                            rov = &s->multi.raw_tensors[j];
+                    }
+                }
+                if (roi && rov && roi->dtype == IB_RAW_U16
+                 && rov->dtype == IB_RAW_F16
+                 && roi->ndim == 2 && rov->ndim == 2
+                 && roi->shape[0] == M && rov->shape[0] == M
+                 && roi->shape[1] == rov->shape[1]) {
+                    t->outl_idx = (const uint16_t*)roi->data;
+                    t->outl_val = (const uint16_t*)rov->data;
+                    t->K_out = roi->shape[1];
+                }
+                (void)slen;
+            }
+        }
+    }
+    if (max_N > 0 && !s->x_scratch) {
+        s->x_scratch = (float*)malloc((size_t)max_N * sizeof(float));
+        s->x_scratch_n = max_N;
+    }
+
+    /* Phase 6 delta cache: allocate slot pointers (NULL = lazily allocated). */
+    {
+        const char* env = getenv("IB_DELTA_CACHE");
+        s->delta_cache_enabled = (env && atoi(env) > 0) ? 1 : 0;
+        if (s->delta_cache_enabled && s->n_int4 > 0) {
+            s->int4_x_cache = (float**)calloc((size_t)s->n_int4, sizeof(float*));
+            s->int4_out_cache = (float**)calloc((size_t)s->n_int4, sizeof(float*));
+        }
+    }
+
+    /* F1.a: preallocate scratch sized to fleet max. */
+    int max_K = 0, max_Kl2 = 0;
+    for (int i = 0; i < s->multi.n; i++) {
+        const ib_pq_lut_cache* c = s->mc->caches[i];
+        if (c->K > max_K) max_K = c->K;
+        if (c->n_levels == 2 && c->K_l2 > max_Kl2) max_Kl2 = c->K_l2;
+    }
+    s->scratch_K = max_K;
+    s->scratch_K_l2 = max_Kl2;
+    if (max_K > 0) {
+        s->scratch_C1L = (float*)malloc((size_t)max_K * sizeof(float));
+        s->scratch_C1R = (float*)malloc((size_t)max_K * sizeof(float));
+    }
+    if (max_Kl2 > 0) {
+        s->scratch_C2L = (float*)malloc((size_t)max_Kl2 * sizeof(float));
+        s->scratch_C2R = (float*)malloc((size_t)max_Kl2 * sizeof(float));
+    }
+
+    /* Thread pool. Off by default — pool sync overhead exceeds the
+     * row-work win for typical Llama-1B matmuls under the cached path.
+     * Set IB_PQ_THREADS > 1 to enable; only matmuls with M*C above the
+     * threshold below dispatch to the pool. */
+    int n_threads = 1;
+    const char* env = getenv("IB_PQ_THREADS");
+    if (env && *env) { int v = atoi(env); if (v > 0) n_threads = v; }
+    s->n_threads = n_threads;
+    if (n_threads > 1) {
+        s->pool = ib_pool_create(n_threads);
+        s->spin = pq_spin_pool_create(n_threads);
+        size_t per_thread = (size_t)(2 * max_K + 2 * max_Kl2);
+        if (per_thread > 0) {
+            /* +1 slot: main thread uses tid = n_threads in pq_spin_pool_run. */
+            s->thread_scratch = (float*)malloc(per_thread * (size_t)(n_threads + 1) * sizeof(float));
+            s->thread_scratch_per = per_thread;
+        }
+    }
+
+    *out_p = s;
+    return 0;
+}
+
+void ib_pq_session_close(ib_pq_session* s) {
+    if (!s) return;
+    if (s->spin) pq_spin_pool_destroy(s->spin);
+    if (s->pool) ib_pool_destroy(s->pool);
+    free(s->scratch_C1L); free(s->scratch_C1R);
+    free(s->scratch_C2L); free(s->scratch_C2R);
+    free(s->thread_scratch);
+    free(s->act_scale_inv_per_tensor);
+    free(s->x_scratch);
+    if (s->int4_x_cache) {
+        for (int i = 0; i < s->n_int4; i++) free(s->int4_x_cache[i]);
+        free(s->int4_x_cache);
+    }
+    if (s->int4_out_cache) {
+        for (int i = 0; i < s->n_int4; i++) free(s->int4_out_cache[i]);
+        free(s->int4_out_cache);
+    }
+    if (s->int4_tensors) {
+        for (int i = 0; i < s->n_int4; i++) free(s->int4_tensors[i].name);
+        free(s->int4_tensors);
+    }
+    if (s->fp16_tensors) {
+        for (int i = 0; i < s->n_fp16; i++) free(s->fp16_tensors[i].name);
+        free(s->fp16_tensors);
+    }
+    ib_pq_multi_caches_free(s->mc);
+    ib_pq_multi_free(&s->multi);
+    free(s->policies);
+    free(s);
+}
+
+int ib_pq_session_set_default_policy(ib_pq_session* s, ib_pq_policy p) {
+    if (!s) return -1;
+    s->default_policy = p;
+    if (p.variant == IB_PQ_VARIANT_INT8 && !s->int8_quantized) {
+        if (ib_pq_multi_caches_quantize_all_int8(s->mc) != 0) return -1;
+        s->int8_quantized = 1;
+    }
+    return 0;
+}
+
+int ib_pq_session_set_policy(ib_pq_session* s, const char* name, ib_pq_policy p) {
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    s->policies[i] = p;
+    if (p.variant == IB_PQ_VARIANT_INT8 && !s->int8_quantized) {
+        if (ib_pq_multi_caches_quantize_all_int8(s->mc) != 0) return -1;
+        s->int8_quantized = 1;
+    }
+    return 0;
+}
+
+/* F1.c: reentrant matmul that takes its scratch + x_scratch as args.
+ * No use of session->scratch_C* / session->x_scratch / session->spin.
+ * Used by forward_step_batch where multiple threads run independent
+ * forward steps in parallel and each thread brings its own scratch. */
+static int session_matmul_with_scratch(ib_pq_session* s, const char* name,
+                                          const float* x, float* out,
+                                          float* C1L, float* C1R,
+                                          float* C2L, float* C2R,
+                                          float* x_scratch, int x_scratch_n) {
+    const struct ib_fp16w_tensor* fw = session_fp16_find(s, name);
+    if (fw) return fp16w_matmul_fp32(fw, x, out);
+    const struct ib_int4_tensor* i4 = session_int4_find(s, name);
+    if (i4) {
+        const float* xk = x;
+        if (i4->inv_act && x_scratch && i4->N <= x_scratch_n) {
+            for (int j = 0; j < i4->N; j++) x_scratch[j] = x[j] * i4->inv_act[j];
+            xk = x_scratch;
+        }
+        /* Caller is already inside a spin-pool task — pass spin=NULL to
+         * avoid nested dispatch. Single-thread SDOT path still runs. */
+        return int4_matmul_fp32_threaded(i4, xk, out, NULL, 1);
+    }
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    const ib_pq_tensor* t = &s->multi.tensors[i];
+    const ib_pq_lut_cache* c = s->mc->caches[i];
+    ib_pq_policy p = (s->policies[i].variant >= 0) ? s->policies[i] : s->default_policy;
+
+    /* Phase 8.E: pre-scale x by inv_act_scale if calibration was used. */
+    const float* x_for_kernel = x;
+    const float* inv_s = (s->act_scale_inv_per_tensor
+                            ? s->act_scale_inv_per_tensor[i] : NULL);
+    if (inv_s && x_scratch && t->N <= x_scratch_n) {
+        for (int j = 0; j < t->N; j++) x_scratch[j] = x[j] * inv_s[j];
+        x_for_kernel = x_scratch;
+    }
+
+    switch (p.variant) {
+    case IB_PQ_VARIANT_L1_ONLY:
+        return ib_pq_matmul_fp32_l1_only(t, x_for_kernel, out);
+    case IB_PQ_VARIANT_L2SKIP:
+        return ib_pq_matmul_fp32_streaming_l2skip_cached(t, c, x_for_kernel, out, p.skip_threshold);
+    case IB_PQ_VARIANT_SPARSE:
+        return ib_pq_matmul_fp32_streaming_sparse(t, x_for_kernel, out, p.act_threshold);
+    case IB_PQ_VARIANT_INT8:
+        return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x_for_kernel, out);
+    case IB_PQ_VARIANT_STREAMING:
+    default:
+        return streaming_cached_kernel(t, c, x_for_kernel, out, C1L, C1R, C2L, C2R);
+    }
+}
+
+int ib_pq_session_matmul(ib_pq_session* s, const char* name,
+                          const float* x, float* out) {
+    const struct ib_fp16w_tensor* fw = session_fp16_find(s, name);
+    if (fw) return fp16w_matmul_fp32_threaded(fw, x, out, s->spin, s->n_threads);
+    const struct ib_int4_tensor* i4 = session_int4_find(s, name);
+    if (i4) {
+        const float* xk = x;
+        if (i4->inv_act && s->x_scratch && i4->N <= s->x_scratch_n) {
+            for (int j = 0; j < i4->N; j++) s->x_scratch[j] = x[j] * i4->inv_act[j];
+            xk = s->x_scratch;
+        }
+        if (s->delta_cache_enabled && s->int4_x_cache) {
+            int idx = session_int4_index(s, i4);
+            return int4_matmul_with_delta_cache(s, idx, i4, xk, out);
+        }
+        return int4_matmul_fp32_threaded(i4, xk, out, s->spin, s->n_threads);
+    }
+    /* Public entry: uses session-level shared scratch. */
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    const ib_pq_tensor* t = &s->multi.tensors[i];
+    const ib_pq_lut_cache* c = s->mc->caches[i];
+    ib_pq_policy p = (s->policies[i].variant >= 0) ? s->policies[i] : s->default_policy;
+
+    const float* x_for_kernel = x;
+    const float* inv_s = (s->act_scale_inv_per_tensor
+                            ? s->act_scale_inv_per_tensor[i] : NULL);
+    if (inv_s && s->x_scratch && t->N <= s->x_scratch_n) {
+        for (int j = 0; j < t->N; j++) s->x_scratch[j] = x[j] * inv_s[j];
+        x_for_kernel = s->x_scratch;
+    }
+
+    switch (p.variant) {
+    case IB_PQ_VARIANT_L1_ONLY:
+        return ib_pq_matmul_fp32_l1_only(t, x_for_kernel, out);
+    case IB_PQ_VARIANT_L2SKIP:
+        return ib_pq_matmul_fp32_streaming_l2skip_cached(t, c, x_for_kernel, out, p.skip_threshold);
+    case IB_PQ_VARIANT_SPARSE:
+        return ib_pq_matmul_fp32_streaming_sparse(t, x_for_kernel, out, p.act_threshold);
+    case IB_PQ_VARIANT_INT8:
+        return ib_pq_matmul_fp32_streaming_int8_cached(t, c, x_for_kernel, out);
+    case IB_PQ_VARIANT_STREAMING:
+    default:
+        if (s->spin && s->n_threads > 1 && s->thread_scratch
+         && (size_t)t->M * (size_t)t->C >= 1500000) {
+            return ib_pq_matmul_fp32_streaming_cached_spin(t, c, x_for_kernel, out,
+                                                              s->spin, s->n_threads,
+                                                              s->thread_scratch,
+                                                              s->thread_scratch_per);
+        }
+        return streaming_cached_kernel(t, c, x_for_kernel, out,
+                                          s->scratch_C1L, s->scratch_C1R,
+                                          s->scratch_C2L, s->scratch_C2R);
+    }
+}
+
+int ib_pq_session_lm_head_topk(ib_pq_session* s, const char* name,
+                                const float* x, int K_top,
+                                float* out_logits, int32_t* out_ids) {
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    return ib_pq_lm_head_topk(&s->multi.tensors[i], x, K_top, out_logits, out_ids);
+}
+
+int ib_pq_session_matmul_batched(ib_pq_session* s, const char* name,
+                                    int B,
+                                    const float* const* x_arr,
+                                    float* const* out_arr) {
+    if (!s || !name || B <= 0 || !x_arr || !out_arr) return -1;
+    const struct ib_int4_tensor* i4 = session_int4_find(s, name);
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    if (i4 && B <= 16 && (i4->G % 16 == 0)) {
+        /* Apply AWQ inv_act per slot first if needed. */
+        if (i4->inv_act) {
+            float* xk_buf = (float*)malloc((size_t)B * i4->N * sizeof(float));
+            const float* xk_arr_local[16];
+            if (!xk_buf) {
+                /* Fall back to per-slot. */
+            } else {
+                for (int b = 0; b < B; b++) {
+                    float* dst = xk_buf + (size_t)b * i4->N;
+                    for (int j = 0; j < i4->N; j++)
+                        dst[j] = x_arr[b][j] * i4->inv_act[j];
+                    xk_arr_local[b] = dst;
+                }
+                int rc = int4_matmul_batched_sdot(i4, B, xk_arr_local, out_arr,
+                                                     s->spin, s->n_threads);
+                free(xk_buf);
+                return rc;
+            }
+        } else {
+            return int4_matmul_batched_sdot(i4, B, x_arr, out_arr,
+                                              s->spin, s->n_threads);
+        }
+    }
+#endif
+    /* Fallback: B sequential per-slot calls. */
+    int rc = 0;
+    for (int b = 0; b < B && rc == 0; b++) {
+        rc = ib_pq_session_matmul(s, name, x_arr[b], out_arr[b]);
+    }
+    return rc;
+}
+
+int ib_pq_session_tensor_shape(const ib_pq_session* s, const char* name,
+                                int* out_M, int* out_N) {
+    const struct ib_fp16w_tensor* fw = session_fp16_find(s, name);
+    if (fw) {
+        if (out_M) *out_M = fw->M;
+        if (out_N) *out_N = fw->N;
+        return 0;
+    }
+    const struct ib_int4_tensor* i4 = session_int4_find(s, name);
+    if (i4) {
+        if (out_M) *out_M = i4->M;
+        if (out_N) *out_N = i4->N;
+        return 0;
+    }
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    if (out_M) *out_M = s->multi.tensors[i].M;
+    if (out_N) *out_N = s->multi.tensors[i].N;
+    return 0;
+}
+
+int ib_pq_session_tensor_count(const ib_pq_session* s) {
+    return s ? s->multi.n : 0;
+}
+
+const char* ib_pq_session_tensor_name(const ib_pq_session* s, int i) {
+    if (!s || i < 0 || i >= s->multi.n) return NULL;
+    return s->multi.names[i];
+}
+
+int ib_pq_session_raw_count(const ib_pq_session* s) {
+    return s ? s->multi.n_raw : 0;
+}
+
+const char* ib_pq_session_raw_name(const ib_pq_session* s, int i) {
+    if (!s || i < 0 || i >= s->multi.n_raw) return NULL;
+    return s->multi.raw_tensors[i].name;
+}
+
+int ib_pq_session_raw_get(const ib_pq_session* s, const char* name,
+                           const void** out_data, int* out_dtype,
+                           int* out_shape, int* out_ndim) {
+    if (!s || !name) return -1;
+    for (int i = 0; i < s->multi.n_raw; i++) {
+        ib_pq_raw_tensor* rt = &s->multi.raw_tensors[i];
+        if (rt->name && strcmp(rt->name, name) == 0) {
+            if (out_data)  *out_data  = rt->data;
+            if (out_dtype) *out_dtype = rt->dtype;
+            if (out_ndim)  *out_ndim  = rt->ndim;
+            if (out_shape) for (int d = 0; d < rt->ndim; d++) out_shape[d] = rt->shape[d];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+const char* ib_pq_session_config_json(const ib_pq_session* s) {
+    return s ? s->multi.config_json : NULL;
+}
+
+/* ── Phase 9: forward-pass primitives ── */
+
+void ib_rmsnorm_f32(float* out, const float* x, const float* w, int H, float eps) {
+    double s = 0.0;
+    for (int i = 0; i < H; i++) s += (double)x[i] * (double)x[i];
+    float inv = 1.0f / sqrtf((float)(s / (double)H) + eps);
+    for (int i = 0; i < H; i++) out[i] = x[i] * inv * w[i];
+}
+
+void ib_silu_gate_f32(float* out, const float* gate, const float* up, int n) {
+    for (int i = 0; i < n; i++) {
+        float g = gate[i];
+        float silu = g / (1.0f + expf(-g));
+        out[i] = silu * up[i];
+    }
+}
+
+void ib_residual_add_f32(float* x, const float* delta, int n) {
+    for (int i = 0; i < n; i++) x[i] += delta[i];
+}
+
+void ib_rope_f32(float* x, int n_heads, int head_dim, int pos, float theta) {
+    /* HF/Llama NEOX-style RoPE: split the head into two halves and rotate
+     * (x[i], x[i + half]) by angle pos * theta^(-2i/head_dim) for i in [0, half).
+     *   y[i]        = x[i]        * cos - x[i + half] * sin
+     *   y[i + half] = x[i + half] * cos + x[i]        * sin
+     */
+    int half = head_dim / 2;
+    for (int h = 0; h < n_heads; h++) {
+        float* xh = x + (size_t)h * head_dim;
+        for (int i = 0; i < half; i++) {
+            float freq = powf(theta, -2.0f * (float)i / (float)head_dim);
+            float angle = (float)pos * freq;
+            float c = cosf(angle), s = sinf(angle);
+            float a = xh[i];
+            float b = xh[i + half];
+            xh[i]        = a * c - b * s;
+            xh[i + half] = b * c + a * s;
+        }
+    }
+}
+
+void ib_softmax_f32(float* x, int n) {
+    float m = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > m) m = x[i];
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - m); sum += x[i]; }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv;
+}
+
+int ib_fwht_norm_f32(float* x, int n) {
+    int npow = 1;
+    while (npow < n) npow *= 2;
+    if (npow != n) {
+        for (int i = n; i < npow; i++) x[i] = 0.0f;
+    }
+    for (int h = 1; h < npow; h *= 2) {
+        for (int i = 0; i < npow; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j];
+                float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    float inv = 1.0f / sqrtf((float)npow);
+    for (int i = 0; i < npow; i++) x[i] *= inv;
+    return npow;
+}
+
+/* ── Phase 9: KV cache + single-token forward ── */
+
+struct ib_pq_kv_cache {
+    int n_layers;
+    int max_seq;
+    int kv_dim;        /* num_kv_heads * head_dim */
+    int length;
+    /* Storage layout: [layer][pos][kv_dim].
+     * F1.d / Phase 7: storage selects fp32 (default), fp16, int8, or
+     * pyramid (Phase 7 v2):
+     *   IB_PQ_KV_FP16=1     → fp16 backing
+     *   IB_PQ_KV_INT8=1     → int8 backing + per-token scale (4× vs fp16)
+     *   IB_PQ_KV_PYRAMID=1  → pyramid PQ + per-token scale (2× vs int8,
+     *                          requires K_codebook_L<N>_l/_r and
+     *                          V_codebook_L<N>_l/_r raw tensors)
+     */
+    int storage_fp16;
+    int storage_int8;
+    int storage_pyramid;
+    float*    k_f32;
+    float*    v_f32;
+    uint16_t* k_f16;
+    uint16_t* v_f16;
+    int8_t*   k_q8;
+    int8_t*   v_q8;
+    float*    k_q8_scale;
+    float*    v_q8_scale;
+    /* Pyramid storage: per (layer, pos), 2*C uint8 indices for K and V
+     * (i_L per chunk + i_R per chunk). Plus per-(layer, pos) row scale
+     * for K and V. */
+    uint8_t*  k_pq_idx;     /* [n_layers][max_seq][2*C] */
+    uint8_t*  v_pq_idx;
+    float*    k_pq_scale;   /* [n_layers][max_seq] */
+    float*    v_pq_scale;
+    int       pq_C;         /* kv_dim / G */
+    int       pq_G;
+    int       pq_K1;
+    /* Codebook pointers (borrowed from session raw tensors). */
+    const uint16_t** k_cb_l;  /* [n_layers] */
+    const uint16_t** k_cb_r;
+    const uint16_t** v_cb_l;
+    const uint16_t** v_cb_r;
+};
+
+static int session_config_int(const char* json, const char* key, int def) {
+    /* Tiny JSON int extractor. Looks for "key": <number>. Avoids cJSON
+     * dependency churn here; the strings come from our own writer so the
+     * format is predictable. */
+    if (!json) return def;
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char* p = strstr(json, pat);
+    if (!p) return def;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++;
+    return (int)atol(p);
+}
+
+static float session_config_float(const char* json, const char* key, float def) {
+    if (!json) return def;
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char* p = strstr(json, pat);
+    if (!p) return def;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++;
+    return (float)atof(p);
+}
+
+int ib_pq_kv_cache_create(const ib_pq_session* s, int max_seq_len,
+                           ib_pq_kv_cache** out_p) {
+    if (!s || !out_p || max_seq_len <= 0) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int n_layers = session_config_int(cfg, "num_layers", 0);
+    int n_kv     = session_config_int(cfg, "num_kv_heads", 0);
+    int head_dim = session_config_int(cfg, "head_dim", 0);
+    if (n_layers <= 0 || n_kv <= 0 || head_dim <= 0) return -1;
+    int kv_dim = n_kv * head_dim;
+
+    ib_pq_kv_cache* kv = (ib_pq_kv_cache*)calloc(1, sizeof(*kv));
+    if (!kv) return -1;
+    kv->n_layers = n_layers; kv->max_seq = max_seq_len; kv->kv_dim = kv_dim;
+    const char* fp16_env = getenv("IB_PQ_KV_FP16");
+    const char* int8_env = getenv("IB_PQ_KV_INT8");
+    const char* pq_env   = getenv("IB_PQ_KV_PYRAMID");
+    kv->storage_pyramid = (pq_env && atoi(pq_env) > 0) ? 1 : 0;
+    kv->storage_int8 = (!kv->storage_pyramid && int8_env && atoi(int8_env) > 0) ? 1 : 0;
+    kv->storage_fp16 = (!kv->storage_int8 && !kv->storage_pyramid && fp16_env && atoi(fp16_env) > 0) ? 1 : 0;
+    /* Pyramid mode requires codebooks present in the session — verify
+     * they exist for L0; assume the rest follow. */
+    if (kv->storage_pyramid) {
+        const void* d=NULL; int dt=0,nd=0; int sh[4]={0};
+        if (ib_pq_session_raw_get(s, "K_codebook_L0_l", &d, &dt, sh, &nd) != 0
+         || dt != IB_RAW_F16 || nd != 2) {
+            /* Fall back to fp32 silently. */
+            kv->storage_pyramid = 0;
+        } else {
+            kv->pq_K1 = sh[0];
+            int half = sh[1];
+            kv->pq_G = half * 2;
+            kv->pq_C = kv_dim / kv->pq_G;
+            if (kv->pq_C * kv->pq_G != kv_dim) kv->storage_pyramid = 0;
+        }
+    }
+    size_t n_elem = (size_t)n_layers * max_seq_len * kv_dim;
+    size_t n_slots = (size_t)n_layers * max_seq_len;
+    if (kv->storage_pyramid) {
+        size_t idx_bytes = (size_t)n_layers * max_seq_len * (size_t)(2 * kv->pq_C);
+        kv->k_pq_idx = (uint8_t*)malloc(idx_bytes);
+        kv->v_pq_idx = (uint8_t*)malloc(idx_bytes);
+        kv->k_pq_scale = (float*)malloc(n_slots * sizeof(float));
+        kv->v_pq_scale = (float*)malloc(n_slots * sizeof(float));
+        kv->k_cb_l = (const uint16_t**)calloc((size_t)n_layers, sizeof(*kv->k_cb_l));
+        kv->k_cb_r = (const uint16_t**)calloc((size_t)n_layers, sizeof(*kv->k_cb_r));
+        kv->v_cb_l = (const uint16_t**)calloc((size_t)n_layers, sizeof(*kv->v_cb_l));
+        kv->v_cb_r = (const uint16_t**)calloc((size_t)n_layers, sizeof(*kv->v_cb_r));
+        if (!kv->k_pq_idx || !kv->v_pq_idx || !kv->k_pq_scale || !kv->v_pq_scale
+         || !kv->k_cb_l || !kv->k_cb_r || !kv->v_cb_l || !kv->v_cb_r) {
+            free(kv->k_pq_idx); free(kv->v_pq_idx);
+            free(kv->k_pq_scale); free(kv->v_pq_scale);
+            free(kv->k_cb_l); free(kv->k_cb_r); free(kv->v_cb_l); free(kv->v_cb_r);
+            free(kv); return -1;
+        }
+        char buf[64];
+        for (int L = 0; L < n_layers; L++) {
+            const void* d; int dt, nd; int sh[4];
+            snprintf(buf, sizeof(buf), "K_codebook_L%d_l", L);
+            if (ib_pq_session_raw_get(s, buf, &d, &dt, sh, &nd) != 0) { free(kv); return -1; }
+            kv->k_cb_l[L] = (const uint16_t*)d;
+            snprintf(buf, sizeof(buf), "K_codebook_L%d_r", L);
+            if (ib_pq_session_raw_get(s, buf, &d, &dt, sh, &nd) != 0) { free(kv); return -1; }
+            kv->k_cb_r[L] = (const uint16_t*)d;
+            snprintf(buf, sizeof(buf), "V_codebook_L%d_l", L);
+            if (ib_pq_session_raw_get(s, buf, &d, &dt, sh, &nd) != 0) { free(kv); return -1; }
+            kv->v_cb_l[L] = (const uint16_t*)d;
+            snprintf(buf, sizeof(buf), "V_codebook_L%d_r", L);
+            if (ib_pq_session_raw_get(s, buf, &d, &dt, sh, &nd) != 0) { free(kv); return -1; }
+            kv->v_cb_r[L] = (const uint16_t*)d;
+        }
+    } else if (kv->storage_int8) {
+        kv->k_q8 = (int8_t*)malloc(n_elem);
+        kv->v_q8 = (int8_t*)malloc(n_elem);
+        kv->k_q8_scale = (float*)malloc(n_slots * sizeof(float));
+        kv->v_q8_scale = (float*)malloc(n_slots * sizeof(float));
+        if (!kv->k_q8 || !kv->v_q8 || !kv->k_q8_scale || !kv->v_q8_scale) {
+            free(kv->k_q8); free(kv->v_q8);
+            free(kv->k_q8_scale); free(kv->v_q8_scale);
+            free(kv); return -1;
+        }
+    } else if (kv->storage_fp16) {
+        kv->k_f16 = (uint16_t*)malloc(n_elem * sizeof(uint16_t));
+        kv->v_f16 = (uint16_t*)malloc(n_elem * sizeof(uint16_t));
+        if (!kv->k_f16 || !kv->v_f16) {
+            free(kv->k_f16); free(kv->v_f16); free(kv); return -1;
+        }
+    } else {
+        kv->k_f32 = (float*)malloc(n_elem * sizeof(float));
+        kv->v_f32 = (float*)malloc(n_elem * sizeof(float));
+        if (!kv->k_f32 || !kv->v_f32) {
+            free(kv->k_f32); free(kv->v_f32); free(kv); return -1;
+        }
+    }
+    *out_p = kv;
+    return 0;
+}
+
+void ib_pq_kv_cache_free(ib_pq_kv_cache* kv) {
+    if (!kv) return;
+    free(kv->k_f32); free(kv->v_f32);
+    free(kv->k_f16); free(kv->v_f16);
+    free(kv->k_q8); free(kv->v_q8);
+    free(kv->k_q8_scale); free(kv->v_q8_scale);
+    free(kv->k_pq_idx); free(kv->v_pq_idx);
+    free(kv->k_pq_scale); free(kv->v_pq_scale);
+    free(kv->k_cb_l); free(kv->k_cb_r);
+    free(kv->v_cb_l); free(kv->v_cb_r);
+    free(kv);
+}
+
+void ib_pq_kv_cache_clear(ib_pq_kv_cache* kv) { if (kv) kv->length = 0; }
+int  ib_pq_kv_cache_length(const ib_pq_kv_cache* kv) { return kv ? kv->length : 0; }
+
+/* Embedding lookup: out[i] = embed[token_id][i]. Embed is stored fp16. */
+static int embed_lookup(ib_pq_session* s, int token_id, float* out, int hidden) {
+    /* Embeddings-PQ: prefer 'tok_embed' as a PQ tensor (smaller bundle).
+     * Fall back to raw fp16 / fp32 storage. */
+    int idx = session_find_index(s, "tok_embed");
+    if (idx >= 0) {
+        const ib_pq_tensor* t = &s->multi.tensors[idx];
+        if (t->N != hidden) return -1;
+        if (token_id < 0 || token_id >= t->M) return -1;
+        return ib_pq_session_reconstruct_row(s, "tok_embed", token_id, out);
+    }
+    const void* data = NULL;
+    int dtype = 0, ndim = 0;
+    int shape[4] = {0};
+    if (ib_pq_session_raw_get(s, "tok_embed", &data, &dtype, shape, &ndim) != 0) return -1;
+    if (ndim != 2 || shape[1] != hidden) return -1;
+    if (token_id < 0 || token_id >= shape[0]) return -1;
+    if (dtype == IB_RAW_F16) {
+        const uint16_t* row = (const uint16_t*)data + (size_t)token_id * hidden;
+        for (int i = 0; i < hidden; i++) out[i] = ib_fp16_to_fp32(row[i]);
+    } else if (dtype == IB_RAW_F32) {
+        const float* row = (const float*)data + (size_t)token_id * hidden;
+        memcpy(out, row, (size_t)hidden * sizeof(float));
+    } else return -1;
+    return 0;
+}
+
+static int load_norm_weight(const ib_pq_session* s, const char* name,
+                              const float** out_w, int hidden) {
+    const void* data = NULL;
+    int dtype = 0, ndim = 0;
+    int shape[4] = {0};
+    if (ib_pq_session_raw_get(s, name, &data, &dtype, shape, &ndim) != 0) return -1;
+    if (ndim != 1 || shape[0] != hidden || dtype != IB_RAW_F32) return -1;
+    *out_w = (const float*)data;
+    return 0;
+}
+
+/* F1.c: per-call scratch for thread-safe forward steps. NULL = use
+ * session's shared scratch (single-threaded path). */
+typedef struct {
+    float* C1L;
+    float* C1R;
+    float* C2L;
+    float* C2R;
+    float* x;       /* x_scratch buffer for AWQ pre-scaling */
+    int    x_n;
+} forward_scratch;
+
+static int session_matmul_via(ib_pq_session* s, const char* name,
+                                const float* x, float* out,
+                                const forward_scratch* sc) {
+    if (sc) {
+        return session_matmul_with_scratch(s, name, x, out,
+                                              sc->C1L, sc->C1R, sc->C2L, sc->C2R,
+                                              sc->x, sc->x_n);
+    }
+    return ib_pq_session_matmul(s, name, x, out);
+}
+
+/* Internal worker. logits != NULL: write vocab logits via lm_head.
+ * hidden_out != NULL: write post-final-norm hidden state. Both NULL:
+ * skip the tail (prefill no-logits). sc != NULL: use the provided
+ * per-thread scratch instead of session-shared scratch (for batched
+ * prefill threading). */
+/* Spec-decode: thread-local layer-cap override. When > 0, the forward
+ * stops after this many layers and applies final_norm + lm_head. The
+ * KV cache is only written through these layers (safe: verify will
+ * overwrite layers 0..max_layers with identical values, and write
+ * layers max_layers..n_layers-1 itself). */
+static __thread int ib_draft_layer_cap = 0;
+
+static int forward_step_internal_sc(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                       int token_id, int pos,
+                                       float* logits, float* hidden_out,
+                                       const forward_scratch* sc) {
+    if (!s) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int n_layers = session_config_int(cfg, "num_layers", 0);
+    if (ib_draft_layer_cap > 0 && ib_draft_layer_cap < n_layers) {
+        n_layers = ib_draft_layer_cap;
+    }
+    int hidden   = session_config_int(cfg, "hidden_size", 0);
+    int n_heads  = session_config_int(cfg, "num_heads", 0);
+    int n_kv     = session_config_int(cfg, "num_kv_heads", n_heads);
+    int head_dim = session_config_int(cfg, "head_dim", hidden / n_heads);
+    int inter    = session_config_int(cfg, "intermediate_size", 0);
+    int vocab    = session_config_int(cfg, "vocab_size", 0);
+    float eps    = session_config_float(cfg, "rms_norm_eps", 1e-5f);
+    float theta  = session_config_float(cfg, "rope_theta", 10000.0f);
+    int kv_dim   = n_kv * head_dim;
+    if (n_layers <= 0 || hidden <= 0 || n_heads <= 0 || vocab <= 0) return -1;
+    if (kv && (pos < 0 || pos >= kv->max_seq)) return -1;
+
+    float* x        = (float*)calloc((size_t)hidden, sizeof(float));
+    float* xb       = (float*)calloc((size_t)hidden, sizeof(float));   /* normed */
+    float* xb2      = (float*)calloc((size_t)hidden, sizeof(float));   /* attn out */
+    float* q        = (float*)calloc((size_t)hidden, sizeof(float));   /* full Q */
+    float* k_now    = (float*)calloc((size_t)kv_dim, sizeof(float));
+    float* v_now    = (float*)calloc((size_t)kv_dim, sizeof(float));
+    float* gate     = (float*)calloc((size_t)inter,  sizeof(float));
+    float* up       = (float*)calloc((size_t)inter,  sizeof(float));
+    float* mlp_out  = (float*)calloc((size_t)hidden, sizeof(float));
+    float* scores   = (float*)calloc((size_t)(pos + 1), sizeof(float));
+    if (!x || !xb || !xb2 || !q || !k_now || !v_now || !gate || !up || !mlp_out || !scores) {
+        free(x); free(xb); free(xb2); free(q); free(k_now); free(v_now);
+        free(gate); free(up); free(mlp_out); free(scores); return -1;
+    }
+
+    if (embed_lookup(s, token_id, x, hidden) != 0) {
+        free(x); free(xb); free(xb2); free(q); free(k_now); free(v_now);
+        free(gate); free(up); free(mlp_out); free(scores); return -1;
+    }
+
+    char buf[64];
+    int rc = 0;
+    /* F1.i: detect fused qkv / gateup at start; fused = present in IBF. */
+    int fused_qkv = (ib_pq_session_tensor_shape(s, "L0_qkv_proj", NULL, NULL) == 0);
+    int fused_gu  = (ib_pq_session_tensor_shape(s, "L0_gateup_proj", NULL, NULL) == 0);
+    /* qkv buffer (hidden + 2*kv_dim); gateup buffer (2*inter). Allocate
+     * lazily (only if a fused tensor exists). */
+    float* qkv_buf = fused_qkv ? (float*)malloc((size_t)(hidden + 2 * kv_dim) * sizeof(float)) : NULL;
+    float* gu_buf  = fused_gu  ? (float*)malloc((size_t)(2 * inter) * sizeof(float)) : NULL;
+    for (int L = 0; L < n_layers && rc == 0; L++) {
+        const float* w_in = NULL; const float* w_pn = NULL;
+        snprintf(buf, sizeof(buf), "L%d_input_norm", L);
+        if (load_norm_weight(s, buf, &w_in, hidden) != 0) { rc = -1; break; }
+        snprintf(buf, sizeof(buf), "L%d_post_attn_norm", L);
+        if (load_norm_weight(s, buf, &w_pn, hidden) != 0) { rc = -1; break; }
+
+        /* ── Attention block ── */
+        ib_rmsnorm_f32(xb, x, w_in, hidden, eps);
+
+        if (fused_qkv) {
+            snprintf(buf, sizeof(buf), "L%d_qkv_proj", L);
+            if (session_matmul_via(s, buf, xb, qkv_buf, sc) != 0) { rc = -1; break; }
+            memcpy(q,     qkv_buf,                          (size_t)hidden * sizeof(float));
+            memcpy(k_now, qkv_buf + hidden,                 (size_t)kv_dim * sizeof(float));
+            memcpy(v_now, qkv_buf + hidden + kv_dim,        (size_t)kv_dim * sizeof(float));
+        } else {
+            snprintf(buf, sizeof(buf), "L%d_q_proj", L);
+            if (session_matmul_via(s, buf, xb, q, sc) != 0) { rc = -1; break; }
+            snprintf(buf, sizeof(buf), "L%d_k_proj", L);
+            if (session_matmul_via(s, buf, xb, k_now, sc) != 0) { rc = -1; break; }
+            snprintf(buf, sizeof(buf), "L%d_v_proj", L);
+            if (session_matmul_via(s, buf, xb, v_now, sc) != 0) { rc = -1; break; }
+        }
+
+        ib_rope_f32(q,     n_heads, head_dim, pos, theta);
+        ib_rope_f32(k_now, n_kv,    head_dim, pos, theta);
+
+        /* Write into kv cache. fp32 path: memcpy. fp16 path: convert.
+         * int8 path: per-vector scale + round. pyramid: per-vector scale
+         * + nearest codeword per chunk half. */
+        if (kv) {
+            size_t kv_offset = ((size_t)L * kv->max_seq + pos) * kv_dim;
+            size_t slot = (size_t)L * kv->max_seq + pos;
+            if (kv->storage_pyramid) {
+                int G = kv->pq_G, C = kv->pq_C, half = G / 2, K1 = kv->pq_K1;
+                /* per-vector row scale (max_abs / 7), normalize, then
+                 * find nearest codeword per chunk-half. */
+                float k_max = 1e-12f, v_max = 1e-12f;
+                for (int d = 0; d < kv_dim; d++) {
+                    float ak = fabsf(k_now[d]); if (ak > k_max) k_max = ak;
+                    float av = fabsf(v_now[d]); if (av > v_max) v_max = av;
+                }
+                float k_s = k_max / 7.0f, v_s = v_max / 7.0f;
+                if (k_s < 1e-12f) k_s = 1e-12f;
+                if (v_s < 1e-12f) v_s = 1e-12f;
+                float k_inv = 1.0f / k_s, v_inv = 1.0f / v_s;
+                kv->k_pq_scale[slot] = k_s;
+                kv->v_pq_scale[slot] = v_s;
+                uint8_t* k_idx = kv->k_pq_idx + slot * (size_t)(2 * C);
+                uint8_t* v_idx = kv->v_pq_idx + slot * (size_t)(2 * C);
+                const uint16_t* kcb_l = kv->k_cb_l[L];
+                const uint16_t* kcb_r = kv->k_cb_r[L];
+                const uint16_t* vcb_l = kv->v_cb_l[L];
+                const uint16_t* vcb_r = kv->v_cb_r[L];
+                for (int c = 0; c < C; c++) {
+                    /* For each chunk c, normalize the K and V sub-vectors,
+                     * then find the nearest codeword in their L/R half. */
+                    float kL[16], kR[16], vL[16], vR[16];
+                    for (int j = 0; j < half; j++) {
+                        kL[j] = k_now[c * G + j] * k_inv;
+                        kR[j] = k_now[c * G + half + j] * k_inv;
+                        vL[j] = v_now[c * G + j] * v_inv;
+                        vR[j] = v_now[c * G + half + j] * v_inv;
+                    }
+                    int best_kl = 0, best_kr = 0, best_vl = 0, best_vr = 0;
+                    float best_kl_d = 1e30f, best_kr_d = 1e30f;
+                    float best_vl_d = 1e30f, best_vr_d = 1e30f;
+                    for (int k = 0; k < K1; k++) {
+                        float dkl = 0, dkr = 0, dvl = 0, dvr = 0;
+                        for (int j = 0; j < half; j++) {
+                            float ekl = ib_fp16_to_fp32(kcb_l[(size_t)k*half+j]);
+                            float ekr = ib_fp16_to_fp32(kcb_r[(size_t)k*half+j]);
+                            float evl = ib_fp16_to_fp32(vcb_l[(size_t)k*half+j]);
+                            float evr = ib_fp16_to_fp32(vcb_r[(size_t)k*half+j]);
+                            float ed;
+                            ed = kL[j] - ekl; dkl += ed*ed;
+                            ed = kR[j] - ekr; dkr += ed*ed;
+                            ed = vL[j] - evl; dvl += ed*ed;
+                            ed = vR[j] - evr; dvr += ed*ed;
+                        }
+                        if (dkl < best_kl_d) { best_kl_d = dkl; best_kl = k; }
+                        if (dkr < best_kr_d) { best_kr_d = dkr; best_kr = k; }
+                        if (dvl < best_vl_d) { best_vl_d = dvl; best_vl = k; }
+                        if (dvr < best_vr_d) { best_vr_d = dvr; best_vr = k; }
+                    }
+                    k_idx[c]         = (uint8_t)best_kl;
+                    k_idx[C + c]     = (uint8_t)best_kr;
+                    v_idx[c]         = (uint8_t)best_vl;
+                    v_idx[C + c]     = (uint8_t)best_vr;
+                }
+            } else if (kv->storage_int8) {
+                int8_t* k_slot = kv->k_q8 + kv_offset;
+                int8_t* v_slot = kv->v_q8 + kv_offset;
+                float k_max = 1e-12f, v_max = 1e-12f;
+                for (int d = 0; d < kv_dim; d++) {
+                    float ak = fabsf(k_now[d]); if (ak > k_max) k_max = ak;
+                    float av = fabsf(v_now[d]); if (av > v_max) v_max = av;
+                }
+                float k_s = k_max / 127.0f, v_s = v_max / 127.0f;
+                float k_inv = 1.0f / k_s, v_inv = 1.0f / v_s;
+                kv->k_q8_scale[slot] = k_s;
+                kv->v_q8_scale[slot] = v_s;
+                for (int d = 0; d < kv_dim; d++) {
+                    float kq = k_now[d] * k_inv;
+                    float vq = v_now[d] * v_inv;
+                    int kqi = (int)(kq >= 0 ? kq + 0.5f : kq - 0.5f);
+                    int vqi = (int)(vq >= 0 ? vq + 0.5f : vq - 0.5f);
+                    if (kqi >  127) kqi =  127;
+                    if (kqi < -127) kqi = -127;
+                    if (vqi >  127) vqi =  127;
+                    if (vqi < -127) vqi = -127;
+                    k_slot[d] = (int8_t)kqi;
+                    v_slot[d] = (int8_t)vqi;
+                }
+            } else if (kv->storage_fp16) {
+                uint16_t* k_slot = kv->k_f16 + kv_offset;
+                uint16_t* v_slot = kv->v_f16 + kv_offset;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+                int d = 0;
+                for (; d + 4 <= kv_dim; d += 4) {
+                    float16x4_t kh = vcvt_f16_f32(vld1q_f32(k_now + d));
+                    float16x4_t vh = vcvt_f16_f32(vld1q_f32(v_now + d));
+                    vst1_u16(k_slot + d, vreinterpret_u16_f16(kh));
+                    vst1_u16(v_slot + d, vreinterpret_u16_f16(vh));
+                }
+                for (; d < kv_dim; d++) {
+                    k_slot[d] = ib_fp32_to_fp16(k_now[d]);
+                    v_slot[d] = ib_fp32_to_fp16(v_now[d]);
+                }
+#else
+                for (int d = 0; d < kv_dim; d++) {
+                    k_slot[d] = ib_fp32_to_fp16(k_now[d]);
+                    v_slot[d] = ib_fp32_to_fp16(v_now[d]);
+                }
+#endif
+            } else {
+                float* k_slot = kv->k_f32 + kv_offset;
+                float* v_slot = kv->v_f32 + kv_offset;
+                memcpy(k_slot, k_now, (size_t)kv_dim * sizeof(float));
+                memcpy(v_slot, v_now, (size_t)kv_dim * sizeof(float));
+            }
+        }
+
+        /* Multi-head attention with grouped-query (each query head h
+         * attends to the kv head h / (n_heads / n_kv)). */
+        int q_per_kv = n_heads / n_kv;
+        float inv_sqrt = 1.0f / sqrtf((float)head_dim);
+        /* For fp16-backed KV, dequant the slice for this layer + head into
+         * stack scratch once per (t, h) so the dot loop reads contiguous fp32
+         * (and SIMD on it). head_dim ≤ 256 in practice. */
+        float k_scratch[256];
+        float v_scratch[256];
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = h / q_per_kv;
+            const float* qh = q + (size_t)h * head_dim;
+            for (int t = 0; t <= pos; t++) {
+                const float* k_t;
+                if (kv && kv->storage_pyramid) {
+                    int G = kv->pq_G, C = kv->pq_C, half = G / 2;
+                    size_t slot = (size_t)L * kv->max_seq + t;
+                    const uint8_t* k_idx = kv->k_pq_idx + slot * (size_t)(2 * C);
+                    const uint16_t* cb_l = kv->k_cb_l[L];
+                    const uint16_t* cb_r = kv->k_cb_r[L];
+                    float scale = kv->k_pq_scale[slot];
+                    /* head_dim/G chunks of this kv head: starts at chunk
+                     * (kv_h * head_dim) / G; head_dim must be multiple of G. */
+                    int chunk0 = (kv_h * head_dim) / G;
+                    int n_ch   = head_dim / G;
+                    for (int cc = 0; cc < n_ch; cc++) {
+                        int ci = chunk0 + cc;
+                        const uint16_t* eL = cb_l + (size_t)k_idx[ci] * half;
+                        const uint16_t* eR = cb_r + (size_t)k_idx[C + ci] * half;
+                        for (int j = 0; j < half; j++) {
+                            k_scratch[cc * G + j]        = ib_fp16_to_fp32(eL[j]) * scale;
+                            k_scratch[cc * G + half + j] = ib_fp16_to_fp32(eR[j]) * scale;
+                        }
+                    }
+                    k_t = k_scratch;
+                } else if (kv && kv->storage_int8) {
+                    size_t base = ((size_t)L * kv->max_seq + t) * kv_dim
+                                + (size_t)kv_h * head_dim;
+                    const int8_t* k_src = kv->k_q8 + base;
+                    float k_s = kv->k_q8_scale[(size_t)L * kv->max_seq + t];
+                    for (int d = 0; d < head_dim; d++) k_scratch[d] = (float)k_src[d] * k_s;
+                    k_t = k_scratch;
+                } else if (kv && kv->storage_fp16) {
+                    const uint16_t* k_src = kv->k_f16
+                        + ((size_t)L * kv->max_seq + t) * kv_dim
+                        + (size_t)kv_h * head_dim;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+                    int d = 0;
+                    for (; d + 4 <= head_dim; d += 4) {
+                        float16x4_t hv = vreinterpret_f16_u16(vld1_u16(k_src + d));
+                        vst1q_f32(k_scratch + d, vcvt_f32_f16(hv));
+                    }
+                    for (; d < head_dim; d++) k_scratch[d] = ib_fp16_to_fp32(k_src[d]);
+#else
+                    for (int d = 0; d < head_dim; d++) k_scratch[d] = ib_fp16_to_fp32(k_src[d]);
+#endif
+                    k_t = k_scratch;
+                } else if (kv) {
+                    k_t = kv->k_f32 + ((size_t)L * kv->max_seq + t) * kv_dim
+                                    + (size_t)kv_h * head_dim;
+                } else {
+                    k_t = k_now + (size_t)kv_h * head_dim;
+                }
+                scores[t] = pq_dot_f32(qh, k_t, head_dim) * inv_sqrt;
+            }
+            ib_softmax_f32(scores, pos + 1);
+            float* outh = xb2 + (size_t)h * head_dim;
+            memset(outh, 0, (size_t)head_dim * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                const float* v_t;
+                if (kv && kv->storage_pyramid) {
+                    int G = kv->pq_G, C = kv->pq_C, half = G / 2;
+                    size_t slot = (size_t)L * kv->max_seq + t;
+                    const uint8_t* v_idx = kv->v_pq_idx + slot * (size_t)(2 * C);
+                    const uint16_t* cb_l = kv->v_cb_l[L];
+                    const uint16_t* cb_r = kv->v_cb_r[L];
+                    float scale = kv->v_pq_scale[slot];
+                    int chunk0 = (kv_h * head_dim) / G;
+                    int n_ch   = head_dim / G;
+                    for (int cc = 0; cc < n_ch; cc++) {
+                        int ci = chunk0 + cc;
+                        const uint16_t* eL = cb_l + (size_t)v_idx[ci] * half;
+                        const uint16_t* eR = cb_r + (size_t)v_idx[C + ci] * half;
+                        for (int j = 0; j < half; j++) {
+                            v_scratch[cc * G + j]        = ib_fp16_to_fp32(eL[j]) * scale;
+                            v_scratch[cc * G + half + j] = ib_fp16_to_fp32(eR[j]) * scale;
+                        }
+                    }
+                    v_t = v_scratch;
+                } else if (kv && kv->storage_int8) {
+                    size_t base = ((size_t)L * kv->max_seq + t) * kv_dim
+                                + (size_t)kv_h * head_dim;
+                    const int8_t* v_src = kv->v_q8 + base;
+                    float v_s = kv->v_q8_scale[(size_t)L * kv->max_seq + t];
+                    for (int d = 0; d < head_dim; d++) v_scratch[d] = (float)v_src[d] * v_s;
+                    v_t = v_scratch;
+                } else if (kv && kv->storage_fp16) {
+                    const uint16_t* v_src = kv->v_f16
+                        + ((size_t)L * kv->max_seq + t) * kv_dim
+                        + (size_t)kv_h * head_dim;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+                    int d = 0;
+                    for (; d + 4 <= head_dim; d += 4) {
+                        float16x4_t hv = vreinterpret_f16_u16(vld1_u16(v_src + d));
+                        vst1q_f32(v_scratch + d, vcvt_f32_f16(hv));
+                    }
+                    for (; d < head_dim; d++) v_scratch[d] = ib_fp16_to_fp32(v_src[d]);
+#else
+                    for (int d = 0; d < head_dim; d++) v_scratch[d] = ib_fp16_to_fp32(v_src[d]);
+#endif
+                    v_t = v_scratch;
+                } else if (kv) {
+                    v_t = kv->v_f32 + ((size_t)L * kv->max_seq + t) * kv_dim
+                                    + (size_t)kv_h * head_dim;
+                } else {
+                    v_t = v_now + (size_t)kv_h * head_dim;
+                }
+                pq_accum_scaled_f32(outh, v_t, scores[t], head_dim);
+            }
+        }
+
+        /* o_proj + residual */
+        snprintf(buf, sizeof(buf), "L%d_o_proj", L);
+        if (session_matmul_via(s, buf, xb2, xb, sc) != 0) { rc = -1; break; }
+        ib_residual_add_f32(x, xb, hidden);
+
+        /* ── MLP block ── */
+        ib_rmsnorm_f32(xb, x, w_pn, hidden, eps);
+        if (fused_gu) {
+            snprintf(buf, sizeof(buf), "L%d_gateup_proj", L);
+            if (session_matmul_via(s, buf, xb, gu_buf, sc) != 0) { rc = -1; break; }
+            memcpy(gate, gu_buf,         (size_t)inter * sizeof(float));
+            memcpy(up,   gu_buf + inter, (size_t)inter * sizeof(float));
+        } else {
+            snprintf(buf, sizeof(buf), "L%d_gate_proj", L);
+            if (session_matmul_via(s, buf, xb, gate, sc) != 0) { rc = -1; break; }
+            snprintf(buf, sizeof(buf), "L%d_up_proj", L);
+            if (session_matmul_via(s, buf, xb, up, sc) != 0) { rc = -1; break; }
+        }
+        ib_silu_gate_f32(gate, gate, up, inter);
+        snprintf(buf, sizeof(buf), "L%d_down_proj", L);
+        if (session_matmul_via(s, buf, gate, mlp_out, sc) != 0) { rc = -1; break; }
+        ib_residual_add_f32(x, mlp_out, hidden);
+    }
+    free(qkv_buf); free(gu_buf);
+
+    if (rc == 0 && (logits || hidden_out)) {
+        const float* w_final = NULL;
+        if (load_norm_weight(s, "final_norm", &w_final, hidden) != 0) rc = -1;
+        else {
+            ib_rmsnorm_f32(xb, x, w_final, hidden, eps);
+            if (hidden_out) memcpy(hidden_out, xb, (size_t)hidden * sizeof(float));
+            if (logits) {
+                if (session_matmul_via(s, "lm_head", xb, logits, sc) != 0) rc = -1;
+            }
+            (void)vocab;
+        }
+    }
+
+    if (kv && rc == 0) kv->length = pos + 1;
+
+    free(x); free(xb); free(xb2); free(q); free(k_now); free(v_now);
+    free(gate); free(up); free(mlp_out); free(scores);
+    return rc;
+}
+
+int ib_pq_forward_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                        int token_id, int pos, float* logits) {
+    return forward_step_internal_sc(s, kv, token_id, pos, logits, NULL, NULL);
+}
+
+int ib_pq_forward_step_to_hidden(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos, float* hidden_out) {
+    if (!hidden_out) return -1;
+    return forward_step_internal_sc(s, kv, token_id, pos, NULL, hidden_out, NULL);
+}
+
+int ib_pq_generate_greedy(ib_pq_session* s, ib_pq_kv_cache* kv,
+                            const int* prompt_ids, int n_prompt,
+                            int max_new, int eos_token_id,
+                            int* out_ids, int* n_out,
+                            ib_pq_token_cb cb, void* cb_ctx) {
+    if (!s || !kv || !prompt_ids || n_prompt <= 0 || max_new < 0
+     || !out_ids || !n_out) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int hidden = session_config_int(cfg, "hidden_size", 0);
+    if (hidden <= 0) return -1;
+    float* hbuf = (float*)malloc((size_t)hidden * sizeof(float));
+    if (!hbuf) return -1;
+
+    int pos = 0;
+    /* F1.c: batched prefill — runs the prompt through one barrier-coupled
+     * parallel pass per layer (B/T inputs per worker), bit-exact vs
+     * sequential. Final norm is applied to the last slot. */
+    if (ib_pq_forward_step_batch(s, kv, prompt_ids, n_prompt, 0, hbuf) != 0) {
+        free(hbuf); return -1;
+    }
+    pos = n_prompt;
+
+    int written = 0;
+    /* K_TOP_GREEDY: 8 candidates is enough to virtually always include
+     * the true argmax (test 50: K=32 captured full argmax 100% of runs;
+     * 8 is the sweet spot for cost/safety). Output is sorted desc, so
+     * element 0 is the refined best. */
+    enum { K_TOP_GREEDY = 8 };
+    float top_logits[K_TOP_GREEDY];
+    int32_t top_ids[K_TOP_GREEDY];
+    for (int g = 0; g < max_new; g++) {
+        if (ib_pq_session_lm_head_topk(s, "lm_head", hbuf, K_TOP_GREEDY,
+                                          top_logits, top_ids) != 0) {
+            free(hbuf); *n_out = written; return -1;
+        }
+        int best = (int)top_ids[0];
+        out_ids[written++] = best;
+        if (cb && cb(best, cb_ctx) != 0) break;
+        if (eos_token_id >= 0 && best == eos_token_id) break;
+        if (pos >= kv->max_seq) break;
+
+        if (forward_step_internal_sc(s, kv, best, pos, NULL, hbuf, NULL) != 0) {
+            free(hbuf); *n_out = written; return -1;
+        }
+        pos++;
+    }
+
+    *n_out = written;
+    free(hbuf);
+    return 0;
+}
+
+/* ── Sampling helpers ── */
+
+/* Tiny xorshift64 RNG. Deterministic from seed. */
+typedef struct { uint64_t s; } pq_rng;
+static inline uint32_t pq_rng_u32(pq_rng* r) {
+    uint64_t x = r->s; x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    r->s = x;
+    return (uint32_t)x;
+}
+static inline float pq_rng_unit(pq_rng* r) {
+    return (float)(pq_rng_u32(r) >> 8) * (1.0f / (float)(1 << 24));
+}
+
+/* Sample a token from logits given (temperature, top_k, top_p). */
+static int sample_from_logits(const float* logits, int vocab,
+                                ib_pq_sample_params params, pq_rng* rng) {
+    /* Greedy fallback. */
+    if (params.temperature <= 0.0f) {
+        int best = 0; float bv = logits[0];
+        for (int v = 1; v < vocab; v++) if (logits[v] > bv) { bv = logits[v]; best = v; }
+        return best;
+    }
+    /* Build probs with temperature. */
+    float invT = 1.0f / params.temperature;
+    /* Optional top-K: gather top_k indices first. */
+    int k = (params.top_k > 0 && params.top_k < vocab) ? params.top_k : vocab;
+    int* idx = (int*)malloc((size_t)vocab * sizeof(int));
+    float* sc = (float*)malloc((size_t)vocab * sizeof(float));
+    if (!idx || !sc) { free(idx); free(sc); return 0; }
+    for (int v = 0; v < vocab; v++) { idx[v] = v; sc[v] = logits[v]; }
+
+    if (k < vocab) {
+        /* Partial sort: pull top-K to front (descending). Quickselect-ish
+         * via simple selection — fine at K << vocab. */
+        for (int i = 0; i < k; i++) {
+            int max_j = i;
+            for (int j = i + 1; j < vocab; j++) if (sc[j] > sc[max_j]) max_j = j;
+            float tf = sc[i]; sc[i] = sc[max_j]; sc[max_j] = tf;
+            int   ti = idx[i]; idx[i] = idx[max_j]; idx[max_j] = ti;
+        }
+    } else {
+        /* Full vocab — sort descending for top-P. */
+        for (int i = 0; i < vocab; i++) {
+            int max_j = i;
+            for (int j = i + 1; j < vocab; j++) if (sc[j] > sc[max_j]) max_j = j;
+            float tf = sc[i]; sc[i] = sc[max_j]; sc[max_j] = tf;
+            int   ti = idx[i]; idx[i] = idx[max_j]; idx[max_j] = ti;
+        }
+    }
+
+    /* Softmax over the kept top-K (or full sorted vocab) with temperature. */
+    int n_keep = k;
+    float m = sc[0] * invT;
+    float sum = 0.0f;
+    for (int i = 0; i < n_keep; i++) {
+        sc[i] = expf(sc[i] * invT - m);
+        sum += sc[i];
+    }
+    float invs = 1.0f / sum;
+    for (int i = 0; i < n_keep; i++) sc[i] *= invs;
+
+    /* Top-P: keep smallest prefix whose cumprob >= p. */
+    if (params.top_p > 0.0f && params.top_p < 1.0f) {
+        float cum = 0.0f;
+        int trunc = n_keep;
+        for (int i = 0; i < n_keep; i++) {
+            cum += sc[i];
+            if (cum >= params.top_p) { trunc = i + 1; break; }
+        }
+        n_keep = trunc;
+        /* renormalize */
+        float s2 = 0.0f;
+        for (int i = 0; i < n_keep; i++) s2 += sc[i];
+        float inv2 = 1.0f / s2;
+        for (int i = 0; i < n_keep; i++) sc[i] *= inv2;
+    }
+
+    /* Sample by inverse CDF. */
+    float u = pq_rng_unit(rng);
+    float c = 0.0f;
+    int picked = idx[n_keep - 1];
+    for (int i = 0; i < n_keep; i++) {
+        c += sc[i];
+        if (u <= c) { picked = idx[i]; break; }
+    }
+    free(idx); free(sc);
+    return picked;
+}
+
+/* F1.j-sample: when top_k > 0, sample from the lm_head_topk subset
+ * (sorted desc) with temperature + top_p truncation. */
+static int sample_from_topk(const float* top_logits, const int32_t* top_ids,
+                              int K, ib_pq_sample_params params, pq_rng* rng) {
+    if (K <= 0) return 0;
+    if (params.temperature <= 0.0f) return (int)top_ids[0];
+
+    float invT = 1.0f / params.temperature;
+    float pr[256];
+    if (K > 256) K = 256;
+    float m = top_logits[0] * invT;
+    float sum = 0.0f;
+    for (int i = 0; i < K; i++) {
+        pr[i] = expf(top_logits[i] * invT - m);
+        sum += pr[i];
+    }
+    float invs = 1.0f / sum;
+    for (int i = 0; i < K; i++) pr[i] *= invs;
+
+    if (params.top_p > 0.0f && params.top_p < 1.0f) {
+        float cum = 0.0f; int trunc = K;
+        for (int i = 0; i < K; i++) {
+            cum += pr[i];
+            if (cum >= params.top_p) { trunc = i + 1; break; }
+        }
+        K = trunc;
+        float s2 = 0.0f;
+        for (int i = 0; i < K; i++) s2 += pr[i];
+        float inv2 = 1.0f / s2;
+        for (int i = 0; i < K; i++) pr[i] *= inv2;
+    }
+
+    float u = pq_rng_unit(rng);
+    float c = 0.0f;
+    int picked = (int)top_ids[K - 1];
+    for (int i = 0; i < K; i++) {
+        c += pr[i];
+        if (u <= c) { picked = (int)top_ids[i]; break; }
+    }
+    return picked;
+}
+
+int ib_pq_generate_sample(ib_pq_session* s, ib_pq_kv_cache* kv,
+                            const int* prompt_ids, int n_prompt,
+                            int max_new, int eos_token_id,
+                            ib_pq_sample_params params,
+                            int* out_ids, int* n_out,
+                            ib_pq_token_cb cb, void* cb_ctx) {
+    if (!s || !kv || !prompt_ids || n_prompt <= 0 || max_new < 0
+     || !out_ids || !n_out) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int vocab = session_config_int(cfg, "vocab_size", 0);
+    int hidden = session_config_int(cfg, "hidden_size", 0);
+    if (vocab <= 0 || hidden <= 0) return -1;
+
+    pq_rng rng;
+    rng.s = params.seed ? (uint64_t)params.seed : 0x9E3779B97F4A7C15ULL;
+    rng.s ^= rng.s << 21; rng.s ^= rng.s >> 35; rng.s ^= rng.s << 4;
+
+    /* If top_k is in a reasonable bound use the lm_head_topk fast path —
+     * only K candidates need the refined matmul; the full M=vocab logits
+     * pass is replaced by the L1-only filter + K-row refine. */
+    int use_topk = (params.top_k > 0 && params.top_k <= 256);
+    int K_use = use_topk ? params.top_k : 0;
+
+    float* logits = NULL;
+    float* hbuf = NULL;
+    float top_logits[256];
+    int32_t top_ids[256];
+    if (use_topk) {
+        hbuf = (float*)malloc((size_t)hidden * sizeof(float));
+        if (!hbuf) return -1;
+    } else {
+        logits = (float*)malloc((size_t)vocab * sizeof(float));
+        if (!logits) return -1;
+    }
+
+    int pos = 0;
+    if (use_topk) {
+        /* F1.c: batched prefill into the last slot's hidden. */
+        if (ib_pq_forward_step_batch(s, kv, prompt_ids, n_prompt, 0, hbuf) != 0) {
+            free(logits); free(hbuf); return -1;
+        }
+        pos = n_prompt;
+    } else {
+        /* Full-vocab sample path keeps the sequential prefill (still
+         * skips lm_head on non-final positions). */
+        for (int i = 0; i < n_prompt; i++) {
+            int last = (i == n_prompt - 1);
+            int rc = forward_step_internal_sc(s, kv, prompt_ids[i], pos,
+                                                 last ? logits : NULL, NULL, NULL);
+            if (rc != 0) { free(logits); free(hbuf); return -1; }
+            pos++;
+        }
+    }
+    int written = 0;
+    for (int g = 0; g < max_new; g++) {
+        int tok;
+        if (use_topk) {
+            if (ib_pq_session_lm_head_topk(s, "lm_head", hbuf, K_use,
+                                              top_logits, top_ids) != 0) {
+                free(hbuf); *n_out = written; return -1;
+            }
+            tok = sample_from_topk(top_logits, top_ids, K_use, params, &rng);
+        } else {
+            tok = sample_from_logits(logits, vocab, params, &rng);
+        }
+        out_ids[written++] = tok;
+        if (cb && cb(tok, cb_ctx) != 0) break;
+        if (eos_token_id >= 0 && tok == eos_token_id) break;
+        if (pos >= kv->max_seq) break;
+        int rc;
+        if (use_topk) {
+            rc = forward_step_internal_sc(s, kv, tok, pos, NULL, hbuf, NULL);
+        } else {
+            rc = forward_step_internal_sc(s, kv, tok, pos, logits, NULL, NULL);
+        }
+        if (rc != 0) { free(logits); free(hbuf); *n_out = written; return -1; }
+        pos++;
+    }
+    *n_out = written;
+    free(logits); free(hbuf);
+    return 0;
+}
+
+int ib_pq_forward_step_no_logits(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                   int token_id, int pos) {
+    return ib_pq_forward_step(s, kv, token_id, pos, NULL);
+}
+
+/* ── F1.c full batched prefill ── */
+
+typedef struct {
+    /* Per-batch-slot state. All buffers are slot-local; threads never share. */
+    int   token_id;
+    int   pos;
+    float* x;        /* [hidden] residual stream */
+    float* xb;       /* [hidden] norm output */
+    float* xb2;      /* [hidden] attn output */
+    float* q;        /* [n_heads * head_dim] */
+    float* k_now;    /* [kv_dim] */
+    float* v_now;    /* [kv_dim] */
+    float* gate;     /* [intermediate] */
+    float* up;       /* [intermediate] */
+    float* mlp_out;  /* [hidden] */
+    float* scores;   /* [max_seq] */
+    /* F1.i: optional fused-output buffers (NULL if not fused). */
+    float* qkv_buf;  /* [hidden + 2*kv_dim] */
+    float* gu_buf;   /* [2*intermediate] */
+    forward_scratch sc;
+} pq_batch_slot;
+
+typedef struct {
+    ib_pq_session* s;
+    ib_pq_kv_cache* kv;
+    pq_batch_slot* slots;
+    int B;
+    int L;             /* current layer */
+    /* Cached config & layer weights for the current layer. */
+    int hidden, n_heads, n_kv, head_dim, kv_dim, inter;
+    float eps, theta;
+    int q_per_kv;
+    const float* w_in;
+    const float* w_pn;
+    char  q_name[32], k_name[32], v_name[32], o_name[32];
+    char  gate_name[32], up_name[32], down_name[32];
+    char  qkv_name[32], gu_name[32];
+    int   fused_qkv;
+    int   fused_gu;
+} pq_batch_ctx;
+
+/* PHASE 1 (pre-attn): norm → q/k/v_proj → RoPE → KV write. */
+static void batch_pre_attn_task(void* arg, int tid, int b0, int b1) {
+    (void)tid;
+    pq_batch_ctx* ctx = (pq_batch_ctx*)arg;
+    int hidden = ctx->hidden, kv_dim = ctx->kv_dim;
+    for (int b = b0; b < b1; b++) {
+        pq_batch_slot* s = &ctx->slots[b];
+        ib_rmsnorm_f32(s->xb, s->x, ctx->w_in, hidden, ctx->eps);
+        if (ctx->fused_qkv) {
+            session_matmul_via(ctx->s, ctx->qkv_name, s->xb, s->qkv_buf, &s->sc);
+            memcpy(s->q,     s->qkv_buf,                   (size_t)hidden * sizeof(float));
+            memcpy(s->k_now, s->qkv_buf + hidden,          (size_t)kv_dim * sizeof(float));
+            memcpy(s->v_now, s->qkv_buf + hidden + kv_dim, (size_t)kv_dim * sizeof(float));
+        } else {
+            session_matmul_via(ctx->s, ctx->q_name, s->xb, s->q, &s->sc);
+            session_matmul_via(ctx->s, ctx->k_name, s->xb, s->k_now, &s->sc);
+            session_matmul_via(ctx->s, ctx->v_name, s->xb, s->v_now, &s->sc);
+        }
+        ib_rope_f32(s->q,     ctx->n_heads, ctx->head_dim, s->pos, ctx->theta);
+        ib_rope_f32(s->k_now, ctx->n_kv,    ctx->head_dim, s->pos, ctx->theta);
+        /* KV write at slot's absolute position. fp32 path; int8/fp16
+         * paths are not currently used by the prefill helper to keep
+         * this commit small. */
+        if (ctx->kv && !ctx->kv->storage_int8 && !ctx->kv->storage_fp16) {
+            size_t off = ((size_t)ctx->L * ctx->kv->max_seq + s->pos) * kv_dim;
+            memcpy(ctx->kv->k_f32 + off, s->k_now, (size_t)kv_dim * sizeof(float));
+            memcpy(ctx->kv->v_f32 + off, s->v_now, (size_t)kv_dim * sizeof(float));
+        } else if (ctx->kv && ctx->kv->storage_fp16) {
+            uint16_t* kp = ctx->kv->k_f16 + ((size_t)ctx->L * ctx->kv->max_seq + s->pos) * kv_dim;
+            uint16_t* vp = ctx->kv->v_f16 + ((size_t)ctx->L * ctx->kv->max_seq + s->pos) * kv_dim;
+            for (int d = 0; d < kv_dim; d++) {
+                kp[d] = ib_fp32_to_fp16(s->k_now[d]);
+                vp[d] = ib_fp32_to_fp16(s->v_now[d]);
+            }
+        }
+        /* int8 path falls back to sequential — not used here. */
+    }
+}
+
+/* PHASE 2 (post-attn): attention reads → o_proj → residual → norm →
+ * gate/up → silu_gate → down → residual. */
+static void batch_post_attn_task(void* arg, int tid, int b0, int b1) {
+    (void)tid;
+    pq_batch_ctx* ctx = (pq_batch_ctx*)arg;
+    int hidden = ctx->hidden, n_heads = ctx->n_heads, n_kv = ctx->n_kv;
+    int head_dim = ctx->head_dim, kv_dim = ctx->kv_dim, inter = ctx->inter;
+    int q_per_kv = ctx->q_per_kv;
+    float inv_sqrt = 1.0f / sqrtf((float)head_dim);
+    float k_scratch[256], v_scratch[256];
+    for (int b = b0; b < b1; b++) {
+        pq_batch_slot* sl = &ctx->slots[b];
+        /* Multi-head causal attention over kv positions [0, sl->pos]. */
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = h / q_per_kv;
+            const float* qh = sl->q + (size_t)h * head_dim;
+            for (int t = 0; t <= sl->pos; t++) {
+                const float* k_t;
+                if (ctx->kv->storage_fp16) {
+                    const uint16_t* k_src = ctx->kv->k_f16
+                        + ((size_t)ctx->L * ctx->kv->max_seq + t) * kv_dim
+                        + (size_t)kv_h * head_dim;
+                    for (int d = 0; d < head_dim; d++) k_scratch[d] = ib_fp16_to_fp32(k_src[d]);
+                    k_t = k_scratch;
+                } else {
+                    k_t = ctx->kv->k_f32 + ((size_t)ctx->L * ctx->kv->max_seq + t) * kv_dim
+                                         + (size_t)kv_h * head_dim;
+                }
+                sl->scores[t] = pq_dot_f32(qh, k_t, head_dim) * inv_sqrt;
+            }
+            ib_softmax_f32(sl->scores, sl->pos + 1);
+            float* outh = sl->xb2 + (size_t)h * head_dim;
+            memset(outh, 0, (size_t)head_dim * sizeof(float));
+            for (int t = 0; t <= sl->pos; t++) {
+                const float* v_t;
+                if (ctx->kv->storage_fp16) {
+                    const uint16_t* v_src = ctx->kv->v_f16
+                        + ((size_t)ctx->L * ctx->kv->max_seq + t) * kv_dim
+                        + (size_t)kv_h * head_dim;
+                    for (int d = 0; d < head_dim; d++) v_scratch[d] = ib_fp16_to_fp32(v_src[d]);
+                    v_t = v_scratch;
+                } else {
+                    v_t = ctx->kv->v_f32 + ((size_t)ctx->L * ctx->kv->max_seq + t) * kv_dim
+                                          + (size_t)kv_h * head_dim;
+                }
+                pq_accum_scaled_f32(outh, v_t, sl->scores[t], head_dim);
+            }
+        }
+        session_matmul_via(ctx->s, ctx->o_name, sl->xb2, sl->xb, &sl->sc);
+        ib_residual_add_f32(sl->x, sl->xb, hidden);
+
+        ib_rmsnorm_f32(sl->xb, sl->x, ctx->w_pn, hidden, ctx->eps);
+        if (ctx->fused_gu) {
+            session_matmul_via(ctx->s, ctx->gu_name, sl->xb, sl->gu_buf, &sl->sc);
+            memcpy(sl->gate, sl->gu_buf,         (size_t)inter * sizeof(float));
+            memcpy(sl->up,   sl->gu_buf + inter, (size_t)inter * sizeof(float));
+        } else {
+            session_matmul_via(ctx->s, ctx->gate_name, sl->xb, sl->gate, &sl->sc);
+            session_matmul_via(ctx->s, ctx->up_name, sl->xb, sl->up, &sl->sc);
+        }
+        ib_silu_gate_f32(sl->gate, sl->gate, sl->up, inter);
+        session_matmul_via(ctx->s, ctx->down_name, sl->gate, sl->mlp_out, &sl->sc);
+        ib_residual_add_f32(sl->x, sl->mlp_out, hidden);
+    }
+}
+
+/* Internal: forward_step_batch with optional per-slot logits output.
+ * per_slot_logits, if non-NULL, must have B * vocab fp32 floats.
+ * per_slot_hidden, if non-NULL, must have B * hidden fp32 floats —
+ * fills with post-final-norm hidden state for each slot, enabling
+ * lazy per-slot lm_head in spec-decode. */
+static int forward_step_batch_impl(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                       const int* tokens, int B, int pos_start,
+                                       float* hidden_last_out,
+                                       float* per_slot_logits,
+                                       float* per_slot_hidden);
+
+int ib_pq_forward_step_batch(ib_pq_session* s, ib_pq_kv_cache* kv,
+                               const int* tokens, int B, int pos_start,
+                               float* hidden_last_out) {
+    return forward_step_batch_impl(s, kv, tokens, B, pos_start,
+                                       hidden_last_out, NULL, NULL);
+}
+
+static int forward_step_batch_impl(ib_pq_session* s, ib_pq_kv_cache* kv,
+                                       const int* tokens, int B, int pos_start,
+                                       float* hidden_last_out,
+                                       float* per_slot_logits,
+                                       float* per_slot_hidden) {
+    if (!s || !kv || !tokens || B <= 0) return -1;
+    if (kv->storage_int8 || kv->storage_pyramid) {
+        /* int8 / pyramid KV paths use per-vector quantization (or NN
+         * encoding) that's awkward to write from multiple threads
+         * cleanly. Fall back to sequential. */
+        int rc = 0;
+        for (int b = 0; b < B && rc == 0; b++) {
+            float* hbuf = (b == B - 1) ? hidden_last_out : NULL;
+            rc = forward_step_internal_sc(s, kv, tokens[b], pos_start + b,
+                                            NULL, hbuf, NULL);
+        }
+        return rc;
+    }
+    if (B == 1) {
+        return forward_step_internal_sc(s, kv, tokens[0], pos_start,
+                                          NULL, hidden_last_out, NULL);
+    }
+
+    const char* cfg = ib_pq_session_config_json(s);
+    int n_layers = session_config_int(cfg, "num_layers", 0);
+    if (ib_draft_layer_cap > 0 && ib_draft_layer_cap < n_layers) {
+        n_layers = ib_draft_layer_cap;
+    }
+    int hidden   = session_config_int(cfg, "hidden_size", 0);
+    int n_heads  = session_config_int(cfg, "num_heads", 0);
+    int n_kv     = session_config_int(cfg, "num_kv_heads", n_heads);
+    int head_dim = session_config_int(cfg, "head_dim", hidden / n_heads);
+    int inter    = session_config_int(cfg, "intermediate_size", 0);
+    float eps    = session_config_float(cfg, "rms_norm_eps", 1e-5f);
+    float theta  = session_config_float(cfg, "rope_theta", 10000.0f);
+    int kv_dim   = n_kv * head_dim;
+    if (n_layers <= 0 || hidden <= 0) return -1;
+
+    /* Per-slot allocation. All slots own their state independently. */
+    int max_seq = kv->max_seq;
+    pq_batch_slot* slots = (pq_batch_slot*)calloc((size_t)B, sizeof(*slots));
+    if (!slots) return -1;
+    int max_K = 0, max_Kl2 = 0;
+    for (int i = 0; i < s->multi.n; i++) {
+        const ib_pq_lut_cache* c = s->mc->caches[i];
+        if (c->K > max_K) max_K = c->K;
+        if (c->n_levels == 2 && c->K_l2 > max_Kl2) max_Kl2 = c->K_l2;
+    }
+    int fused_qkv = (ib_pq_session_tensor_shape(s, "L0_qkv_proj", NULL, NULL) == 0);
+    int fused_gu  = (ib_pq_session_tensor_shape(s, "L0_gateup_proj", NULL, NULL) == 0);
+    int rc = 0;
+    for (int b = 0; b < B; b++) {
+        pq_batch_slot* sl = &slots[b];
+        sl->token_id = tokens[b];
+        sl->pos = pos_start + b;
+        sl->x       = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->xb      = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->xb2     = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->q       = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->k_now   = (float*)calloc((size_t)kv_dim, sizeof(float));
+        sl->v_now   = (float*)calloc((size_t)kv_dim, sizeof(float));
+        sl->gate    = (float*)calloc((size_t)inter,  sizeof(float));
+        sl->up      = (float*)calloc((size_t)inter,  sizeof(float));
+        sl->mlp_out = (float*)calloc((size_t)hidden, sizeof(float));
+        sl->scores  = (float*)calloc((size_t)(max_seq + 1), sizeof(float));
+        sl->sc.C1L  = (float*)malloc((size_t)max_K   * sizeof(float));
+        sl->sc.C1R  = (float*)malloc((size_t)max_K   * sizeof(float));
+        sl->sc.C2L  = (float*)malloc((size_t)max_Kl2 * sizeof(float));
+        sl->sc.C2R  = (float*)malloc((size_t)max_Kl2 * sizeof(float));
+        /* Bug fix: x_scratch must fit max tensor N across the model
+         * (down_proj N=inter > hidden), else session_matmul_with_scratch
+         * silently skips inv_act AWQ pre-scaling on tall tensors. */
+        int sc_x_n = hidden > inter ? hidden : inter;
+        sl->sc.x    = (float*)malloc((size_t)sc_x_n * sizeof(float));
+        sl->sc.x_n  = sc_x_n;
+        sl->qkv_buf = fused_qkv ? (float*)malloc((size_t)(hidden + 2*kv_dim) * sizeof(float)) : NULL;
+        sl->gu_buf  = fused_gu  ? (float*)malloc((size_t)(2 * inter) * sizeof(float)) : NULL;
+        if (!sl->x || !sl->xb || !sl->xb2 || !sl->q || !sl->k_now || !sl->v_now
+         || !sl->gate || !sl->up || !sl->mlp_out || !sl->scores
+         || !sl->sc.C1L || !sl->sc.C1R || !sl->sc.C2L || !sl->sc.C2R || !sl->sc.x
+         || (fused_qkv && !sl->qkv_buf) || (fused_gu && !sl->gu_buf)) {
+            rc = -1;
+        }
+        /* Embedding lookup. */
+        if (rc == 0 && embed_lookup(s, sl->token_id, sl->x, hidden) != 0) rc = -1;
+    }
+
+    if (rc == 0) {
+        pq_batch_ctx ctx = {0};
+        ctx.s = s; ctx.kv = kv; ctx.slots = slots; ctx.B = B;
+        ctx.hidden = hidden; ctx.n_heads = n_heads; ctx.n_kv = n_kv;
+        ctx.head_dim = head_dim; ctx.kv_dim = kv_dim; ctx.inter = inter;
+        ctx.eps = eps; ctx.theta = theta;
+        ctx.q_per_kv = n_heads / n_kv;
+        ctx.fused_qkv = fused_qkv;
+        ctx.fused_gu  = fused_gu;
+
+        for (int L = 0; L < n_layers; L++) {
+            ctx.L = L;
+            const float* w_in = NULL; const float* w_pn = NULL;
+            char buf[64];
+            snprintf(buf, sizeof(buf), "L%d_input_norm", L);
+            if (load_norm_weight(s, buf, &w_in, hidden) != 0) { rc = -1; break; }
+            snprintf(buf, sizeof(buf), "L%d_post_attn_norm", L);
+            if (load_norm_weight(s, buf, &w_pn, hidden) != 0) { rc = -1; break; }
+            ctx.w_in = w_in; ctx.w_pn = w_pn;
+            snprintf(ctx.q_name, sizeof(ctx.q_name), "L%d_q_proj", L);
+            snprintf(ctx.k_name, sizeof(ctx.k_name), "L%d_k_proj", L);
+            snprintf(ctx.v_name, sizeof(ctx.v_name), "L%d_v_proj", L);
+            snprintf(ctx.o_name, sizeof(ctx.o_name), "L%d_o_proj", L);
+            snprintf(ctx.gate_name, sizeof(ctx.gate_name), "L%d_gate_proj", L);
+            snprintf(ctx.up_name, sizeof(ctx.up_name), "L%d_up_proj", L);
+            snprintf(ctx.down_name, sizeof(ctx.down_name), "L%d_down_proj", L);
+            snprintf(ctx.qkv_name, sizeof(ctx.qkv_name), "L%d_qkv_proj", L);
+            snprintf(ctx.gu_name, sizeof(ctx.gu_name), "L%d_gateup_proj", L);
+
+            /* F1.c batched-within-matmul: hoist q/k/v/o/gate/up/down out
+             * of per-slot tasks and call the batched API once per matmul.
+             * Loads W rows once across B slots — ~1.8× speedup at B=8 on
+             * down_proj (validated standalone). */
+            static int f1c_enabled = -1;
+            if (f1c_enabled < 0) {
+                const char* env = getenv("IB_F1C_BATCH");
+                /* Default ON: bit-identical math, 1.1–1.5× prefill speedup. */
+                f1c_enabled = (env && atoi(env) == 0) ? 0 : 1;
+            }
+            if (f1c_enabled && B <= 16 && !ctx.fused_qkv && !ctx.fused_gu) {
+                /* Phase 1a: rmsnorm pre-attn (per slot, cheap, do inline). */
+                for (int b = 0; b < B; b++) {
+                    ib_rmsnorm_f32(ctx.slots[b].xb, ctx.slots[b].x,
+                                     ctx.w_in, hidden, ctx.eps);
+                }
+                /* Phase 1b: batched q/k/v matmul. */
+                const float* xb_ptrs[16]; float* q_ptrs[16];
+                float* k_ptrs[16]; float* v_ptrs[16];
+                for (int b = 0; b < B; b++) {
+                    xb_ptrs[b] = ctx.slots[b].xb;
+                    q_ptrs[b]  = ctx.slots[b].q;
+                    k_ptrs[b]  = ctx.slots[b].k_now;
+                    v_ptrs[b]  = ctx.slots[b].v_now;
+                }
+                ib_pq_session_matmul_batched(s, ctx.q_name, B, xb_ptrs, q_ptrs);
+                ib_pq_session_matmul_batched(s, ctx.k_name, B, xb_ptrs, k_ptrs);
+                ib_pq_session_matmul_batched(s, ctx.v_name, B, xb_ptrs, v_ptrs);
+                /* Phase 1c: rope + kv-write per slot. */
+                for (int b = 0; b < B; b++) {
+                    pq_batch_slot* sl = &ctx.slots[b];
+                    ib_rope_f32(sl->q,     ctx.n_heads, ctx.head_dim, sl->pos, ctx.theta);
+                    ib_rope_f32(sl->k_now, ctx.n_kv,    ctx.head_dim, sl->pos, ctx.theta);
+                    if (ctx.kv && !ctx.kv->storage_int8 && !ctx.kv->storage_fp16) {
+                        size_t off = ((size_t)ctx.L * ctx.kv->max_seq + sl->pos) * kv_dim;
+                        memcpy(ctx.kv->k_f32 + off, sl->k_now, (size_t)kv_dim * sizeof(float));
+                        memcpy(ctx.kv->v_f32 + off, sl->v_now, (size_t)kv_dim * sizeof(float));
+                    } else if (ctx.kv && ctx.kv->storage_fp16) {
+                        uint16_t* kp = ctx.kv->k_f16 + ((size_t)ctx.L * ctx.kv->max_seq + sl->pos) * kv_dim;
+                        uint16_t* vp = ctx.kv->v_f16 + ((size_t)ctx.L * ctx.kv->max_seq + sl->pos) * kv_dim;
+                        for (int d = 0; d < kv_dim; d++) {
+                            kp[d] = ib_fp32_to_fp16(sl->k_now[d]);
+                            vp[d] = ib_fp32_to_fp16(sl->v_now[d]);
+                        }
+                    }
+                }
+                /* Phase 2 bisect2: F1.c attention inline + PER-SLOT
+                 * session_matmul for o/gate/up/down (no batched matmul). */
+                {
+                    float k_scratch[256], v_scratch[256];
+                    int q_per_kv = ctx.q_per_kv;
+                    float inv_sqrt = 1.0f / sqrtf((float)head_dim);
+                    for (int b = 0; b < B; b++) {
+                        pq_batch_slot* sl = &ctx.slots[b];
+                        for (int h = 0; h < n_heads; h++) {
+                            int kv_h = h / q_per_kv;
+                            const float* qh = sl->q + (size_t)h * head_dim;
+                            for (int t = 0; t <= sl->pos; t++) {
+                                const float* k_t;
+                                if (ctx.kv->storage_fp16) {
+                                    const uint16_t* k_src = ctx.kv->k_f16
+                                        + ((size_t)ctx.L * ctx.kv->max_seq + t) * kv_dim
+                                        + (size_t)kv_h * head_dim;
+                                    for (int d = 0; d < head_dim; d++) k_scratch[d] = ib_fp16_to_fp32(k_src[d]);
+                                    k_t = k_scratch;
+                                } else {
+                                    k_t = ctx.kv->k_f32 + ((size_t)ctx.L * ctx.kv->max_seq + t) * kv_dim
+                                                          + (size_t)kv_h * head_dim;
+                                }
+                                sl->scores[t] = pq_dot_f32(qh, k_t, head_dim) * inv_sqrt;
+                            }
+                            ib_softmax_f32(sl->scores, sl->pos + 1);
+                            float* outh = sl->xb2 + (size_t)h * head_dim;
+                            memset(outh, 0, (size_t)head_dim * sizeof(float));
+                            for (int t = 0; t <= sl->pos; t++) {
+                                const float* v_t;
+                                if (ctx.kv->storage_fp16) {
+                                    const uint16_t* v_src = ctx.kv->v_f16
+                                        + ((size_t)ctx.L * ctx.kv->max_seq + t) * kv_dim
+                                        + (size_t)kv_h * head_dim;
+                                    for (int d = 0; d < head_dim; d++) v_scratch[d] = ib_fp16_to_fp32(v_src[d]);
+                                    v_t = v_scratch;
+                                } else {
+                                    v_t = ctx.kv->v_f32 + ((size_t)ctx.L * ctx.kv->max_seq + t) * kv_dim
+                                                          + (size_t)kv_h * head_dim;
+                                }
+                                pq_accum_scaled_f32(outh, v_t, sl->scores[t], head_dim);
+                            }
+                        }
+                    }
+                    /* Bisect 3: BATCHED o_proj, per-slot rest. */
+                    {
+                        const float* xb2_in[16]; float* xb_out[16];
+                        for (int b = 0; b < B; b++) {
+                            xb2_in[b] = ctx.slots[b].xb2;
+                            xb_out[b] = ctx.slots[b].xb;
+                        }
+                        ib_pq_session_matmul_batched(s, ctx.o_name, B, xb2_in, xb_out);
+                    }
+                    for (int b = 0; b < B; b++) {
+                        pq_batch_slot* sl = &ctx.slots[b];
+                        ib_residual_add_f32(sl->x, sl->xb, hidden);
+                        ib_rmsnorm_f32(sl->xb, sl->x, ctx.w_pn, hidden, ctx.eps);
+                    }
+                    /* Bisect 4: + batched gate, up. */
+                    {
+                        const float* xb_in[16]; float* gate_out[16]; float* up_out[16];
+                        for (int b = 0; b < B; b++) {
+                            xb_in[b]    = ctx.slots[b].xb;
+                            gate_out[b] = ctx.slots[b].gate;
+                            up_out[b]   = ctx.slots[b].up;
+                        }
+                        ib_pq_session_matmul_batched(s, ctx.gate_name, B, xb_in, gate_out);
+                        ib_pq_session_matmul_batched(s, ctx.up_name,   B, xb_in, up_out);
+                    }
+                    /* silu_gate per slot. */
+                    for (int b = 0; b < B; b++) {
+                        ib_silu_gate_f32(ctx.slots[b].gate, ctx.slots[b].gate,
+                                           ctx.slots[b].up, inter);
+                    }
+                    {
+                        const float* gate_in[16]; float* mlp_out[16];
+                        for (int b = 0; b < B; b++) {
+                            gate_in[b] = ctx.slots[b].gate;
+                            mlp_out[b] = ctx.slots[b].mlp_out;
+                        }
+                        ib_pq_session_matmul_batched(s, ctx.down_name, B, gate_in, mlp_out);
+                    }
+                    for (int b = 0; b < B; b++) {
+                        ib_residual_add_f32(ctx.slots[b].x, ctx.slots[b].mlp_out, hidden);
+                    }
+                }
+            } else {
+                /* PHASE 1: pre-attn (norm + qkv + RoPE + KV write). */
+                if (s->spin && s->n_threads > 1) {
+                    int chunk = (B + s->n_threads - 1) / s->n_threads;
+                    if (chunk < 1) chunk = 1;
+                    pq_spin_pool_run(s->spin, batch_pre_attn_task, &ctx, B, chunk);
+                } else {
+                    batch_pre_attn_task(&ctx, 0, 0, B);
+                }
+                /* PHASE 2: attn read + remainder. KV writes from PHASE 1 are
+                 * fully synchronized at this point (pool returned). */
+                if (s->spin && s->n_threads > 1) {
+                    int chunk = (B + s->n_threads - 1) / s->n_threads;
+                    if (chunk < 1) chunk = 1;
+                    pq_spin_pool_run(s->spin, batch_post_attn_task, &ctx, B, chunk);
+                } else {
+                    batch_post_attn_task(&ctx, 0, 0, B);
+                }
+            }
+        }
+        if (rc == 0) kv->length = pos_start + B;
+
+        if (rc == 0 && hidden_last_out) {
+            const float* w_final = NULL;
+            if (load_norm_weight(s, "final_norm", &w_final, hidden) != 0) rc = -1;
+            else {
+                ib_rmsnorm_f32(hidden_last_out, slots[B - 1].x, w_final, hidden, eps);
+            }
+        }
+        /* Per-slot final-norm hidden + optional batched lm_head. */
+        if (rc == 0 && (per_slot_logits || per_slot_hidden)) {
+            const float* w_final = NULL;
+            if (load_norm_weight(s, "final_norm", &w_final, hidden) != 0) rc = -1;
+            if (rc == 0) {
+                /* Norm into each slot's xb (or directly into per_slot_hidden). */
+                for (int b = 0; b < B; b++) {
+                    float* dst = per_slot_hidden
+                                  ? (per_slot_hidden + (size_t)b * hidden)
+                                  : slots[b].xb;
+                    ib_rmsnorm_f32(dst, slots[b].x, w_final, hidden, eps);
+                    if (per_slot_hidden) {
+                        /* Also keep a copy in slots[b].xb for legacy paths
+                         * (not strictly needed when only per_slot_hidden). */
+                    }
+                }
+            }
+            int vocab = session_config_int(cfg, "vocab_size", 0);
+            if (rc == 0 && per_slot_logits && vocab > 0) {
+                const float* in_arr[16]; float* out_arr_logits[16];
+                for (int b = 0; b < B; b++) {
+                    in_arr[b] = per_slot_hidden
+                                 ? (per_slot_hidden + (size_t)b * hidden)
+                                 : slots[b].xb;
+                    out_arr_logits[b] = per_slot_logits + (size_t)b * vocab;
+                }
+                ib_pq_session_matmul_batched(s, "lm_head", B, in_arr, out_arr_logits);
+            }
+        }
+    }
+
+    for (int b = 0; b < B; b++) {
+        pq_batch_slot* sl = &slots[b];
+        free(sl->x); free(sl->xb); free(sl->xb2); free(sl->q);
+        free(sl->k_now); free(sl->v_now);
+        free(sl->gate); free(sl->up); free(sl->mlp_out); free(sl->scores);
+        free(sl->sc.C1L); free(sl->sc.C1R); free(sl->sc.C2L); free(sl->sc.C2R);
+        free(sl->sc.x);
+        free(sl->qkv_buf); free(sl->gu_buf);
+    }
+    free(slots);
+    return rc;
+}
+
+int ib_pq_speculative_step(ib_pq_session* s, ib_pq_kv_cache* kv,
+                              const float* prev_logits, int pos, int K,
+                              const int* draft_tokens_in,
+                              int* out_tokens, int* out_n_accepted,
+                              float* next_logits) {
+    if (!s || !kv || !prev_logits || !out_tokens || !out_n_accepted
+     || !draft_tokens_in || K <= 0 || K > 16) return -1;
+    const char* cfg = ib_pq_session_config_json(s);
+    int vocab    = session_config_int(cfg, "vocab_size", 0);
+    int saved_len = kv->length;
+    /* Drafts come from caller (prompt lookup / n-gram / external model). */
+    int draft_tokens[16];
+    for (int i = 0; i < K; i++) draft_tokens[i] = draft_tokens_in[i];
+    int rc = 0;
+    /* Phase 2: batched verify (full layers).
+     * Inputs are d[0..K-1] at positions pos..pos+K-1. */
+    float* per_slot = (float*)malloc((size_t)K * vocab * sizeof(float));
+    if (!per_slot) return -1;
+    kv->length = saved_len;
+    rc = forward_step_batch_impl(s, kv, draft_tokens, K, pos, NULL, per_slot, NULL);
+    /* Phase 3: greedy acceptance.
+     * For i in [0, K):
+     *   prev = (i==0) ? prev_logits : per_slot_logits[i-1]
+     *   verifier_choice_for_pos_i = argmax(prev)
+     *   if verifier_choice == d[i]: accept d[i], continue.
+     *   else: emit verifier's choice (correction), stop.
+     * If all K accepted: emit one bonus token = argmax(per_slot_logits[K-1]). */
+    int n_acc = 0;
+    int rejected = 0;  /* 1 iff loop hit the mismatch branch */
+    if (rc == 0) {
+        const float* prev = prev_logits;
+        for (int i = 0; i < K; i++) {
+            int v_choice = 0; float bv = prev[0];
+            for (int v = 1; v < vocab; v++) { if (prev[v] > bv) { bv = prev[v]; v_choice = v; } }
+            if (v_choice == draft_tokens[i]) {
+                out_tokens[n_acc++] = draft_tokens[i];
+                prev = per_slot + (size_t)i * vocab;
+            } else {
+                out_tokens[n_acc++] = v_choice;
+                rejected = 1;
+                break;
+            }
+        }
+        if (getenv("IB_SPEC_TRACE")) {
+            fprintf(stderr, "[spec] pos=%d K=%d n_acc=%d  draft=", pos, K, n_acc);
+            for (int i = 0; i < K; i++) fprintf(stderr, "%d ", draft_tokens[i]);
+            fprintf(stderr, " out=");
+            for (int i = 0; i < n_acc; i++) fprintf(stderr, "%d ", out_tokens[i]);
+            int verifier_first_argmax = 0; float bv0 = per_slot[0];
+            for (int v = 1; v < vocab; v++) if (per_slot[v] > bv0) { bv0 = per_slot[v]; verifier_first_argmax = v; }
+            fprintf(stderr, " verif_slot0_argmax=%d  prev_argmax=%d\n",
+                    verifier_first_argmax, draft_tokens[0]);
+        }
+        kv->length = pos + n_acc;
+        /* next_logits: P(pos + n_acc).
+         * Full accept (n_acc == K): per_slot[K-1] is correct (sequence
+         *   matches verifier's input).
+         * Rejection at i (n_acc == i+1): per_slot[i] would be P based on
+         *   d[i] at slot i, but we replaced d[i] with correction c. KV
+         *   at pos+i is also stale. Run a refresh forward(c, pos+i) so
+         *   next_logits is correct AND KV is consistent. */
+        if (rc == 0 && next_logits) {
+            if (!rejected) {
+                /* Full accept: per_slot[K-1] is correct logits for next pos. */
+                memcpy(next_logits, per_slot + (size_t)(K - 1) * vocab,
+                       (size_t)vocab * sizeof(float));
+            } else {
+                /* n_acc-1 is the rejection index; out_tokens[n_acc-1] is the
+                 * correction. Run forward(correction, pos+n_acc-1). This
+                 * overwrites the stale KV write at that position with the
+                 * correct value and produces P(pos+n_acc). */
+                kv->length = pos + n_acc - 1;  /* roll back so forward fills pos+n_acc-1 */
+                rc = forward_step_internal_sc(s, kv, out_tokens[n_acc - 1],
+                                                  pos + n_acc - 1,
+                                                  next_logits, NULL, NULL);
+            }
+        }
+    }
+    *out_n_accepted = n_acc;
+    free(per_slot);
+    return rc;
+}
+
+int ib_pq_session_reconstruct_row(ib_pq_session* s, const char* name,
+                                    int row, float* out_row) {
+    if (!s || !name || !out_row) return -1;
+    int i = session_find_index(s, name);
+    if (i < 0) return -1;
+    const ib_pq_tensor* t = &s->multi.tensors[i];
+    const ib_pq_lut_cache* c = s->mc->caches[i];
+    if (row < 0 || row >= t->M) return -1;
+    int N = t->N, G = t->G, C = t->C;
+    int half = c->half;
+    int K = t->K, K_l2 = c->K_l2;
+    int has_l2 = (c->n_levels == 2);
+    int l2_packed = (K_l2 == 16);
+    int l2_idx_bytes = t->l2_idx_bytes > 0 ? t->l2_idx_bytes : 1;
+    size_t l2_stride = l2_packed
+        ? (size_t)((C + 1) / 2)
+        : (size_t)C * (size_t)l2_idx_bytes;
+
+    /* Initialize output to zero so outliers + chunks accumulate cleanly. */
+    memset(out_row, 0, (size_t)N * sizeof(float));
+
+    /* Walk chunks and place reconstructed half-values into the
+     * corresponding columns. inner_cols maps chunk position → original
+     * column index. Per row scale + outlier sidecar applied at end. */
+    float row_scale = ib_fp16_to_fp32(t->row_scale[row]);
+    for (int cc = 0; cc < C; cc++) {
+        int base = cc * G;
+        int i1l = t->indices_l1_l[(size_t)row * C + cc];
+        int i1r = t->indices_l1_r[(size_t)row * C + cc];
+        const float* eL = c->cb1l_fp32 + (size_t)i1l * half;
+        const float* eR = c->cb1r_fp32 + (size_t)i1r * half;
+        for (int j = 0; j < half; j++) {
+            int col_l = c->inner_cols[base + j];
+            int col_r = c->inner_cols[base + half + j];
+            out_row[col_l] = eL[j];
+            out_row[col_r] = eR[j];
+        }
+        if (has_l2) {
+            const uint8_t* il2l = t->indices_l2_l + (size_t)row * l2_stride;
+            const uint8_t* il2r = t->indices_l2_r + (size_t)row * l2_stride;
+            int i2l = pq_l2_idx_at(il2l, cc, l2_packed, l2_idx_bytes);
+            int i2r = pq_l2_idx_at(il2r, cc, l2_packed, l2_idx_bytes);
+            const float* eL2 = c->cb2l_fp32 + (size_t)i2l * half;
+            const float* eR2 = c->cb2r_fp32 + (size_t)i2r * half;
+            for (int j = 0; j < half; j++) {
+                int col_l = c->inner_cols[base + j];
+                int col_r = c->inner_cols[base + half + j];
+                out_row[col_l] += eL2[j];
+                out_row[col_r] += eR2[j];
+            }
+        }
+    }
+    /* Apply per-row scale to the reconstructed values. */
+    for (int n = 0; n < N; n++) out_row[n] *= row_scale;
+
+    /* Outlier columns: dequant int8 sidecar with per-column scale. */
+    if (t->n_outlier > 0) {
+        for (int j = 0; j < t->n_outlier; j++) {
+            int col = t->outlier_cols[j];
+            float os = ib_fp16_to_fp32(t->outlier_scale[j]);
+            float w = (float)t->outlier_sidecar[(size_t)row * t->n_outlier + j] * os;
+            out_row[col] = w;
+        }
+    }
+    return 0;
 }
