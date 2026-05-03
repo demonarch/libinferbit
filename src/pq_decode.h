@@ -102,6 +102,7 @@ typedef enum {
     IB_RAW_I16 = 3,
     IB_RAW_I8  = 4,
     IB_RAW_U8  = 5,
+    IB_RAW_U16 = 6,
 } ib_raw_dtype;
 
 typedef struct {
@@ -354,6 +355,14 @@ int  ib_pq_session_set_policy(ib_pq_session* s, const char* name, ib_pq_policy p
  */
 int  ib_pq_session_matmul(ib_pq_session* s, const char* name,
                            const float* x, float* out);
+
+/* F1.c batched: B inputs → B outputs through one matmul. Loads W once
+ * per row, fans across B slots. Currently only the INT4+SDOT path is
+ * truly batched; other backends fall back to per-slot calls. */
+int  ib_pq_session_matmul_batched(ib_pq_session* s, const char* name,
+                                    int B,
+                                    const float* const* x_arr,
+                                    float* const* out_arr);
 
 /* Top-K lm_head two-stage. K_top values in out_logits + ids, sorted desc. */
 int  ib_pq_session_lm_head_topk(ib_pq_session* s, const char* name,
