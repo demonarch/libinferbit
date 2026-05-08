@@ -57,6 +57,9 @@ set(INFERBIT_SOURCES
     src/cJSON.c
     src/pq_decode.c
     src/pq_kmeans.c
+    src/pqv2_kernel.c
+    src/pqv2_format.c
+    src/pqv2_model.c
 )
 
 # Determine target architecture
@@ -143,7 +146,8 @@ if(NOT WIN32)
 
     foreach(b bench_pq_decode bench_pq_ffn bench_pq_model_mlp
               bench_pq_real_model bench_pq_pathd bench_pq_q8lut
-              bench_pq_streaming bench_pq_dejavu bench_pq_bounded)
+              bench_pq_streaming bench_pq_dejavu bench_pq_bounded
+              bench_pqv2 test_pqv2_ibf test_pqv2_load)
         add_executable(${b} tests/${b}.c)
         target_link_libraries(${b} inferbit_static ${PLATFORM_LIBS})
         target_include_directories(${b} PRIVATE include src)

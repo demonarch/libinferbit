@@ -1,10 +1,13 @@
 #include "inferbit_internal.h"
+#include "pqv2_format.h"
 #include "platform.h"
 #include <stdlib.h>
 #include <string.h>
 
 /* Defined in ibf_loader.c */
 inferbit_model* ibf_load(const char* path, const inferbit_config* config);
+/* Defined in pqv2_model.c — detects IBF v6 magic, falls back to v5 */
+inferbit_model* pqv2_or_legacy_load(const char* path, const inferbit_config* config);
 
 /* ── Check file extension ───────────────────────────────────── */
 
@@ -34,13 +37,25 @@ inferbit_model* inferbit_load(const char* path, const inferbit_config* config) {
         return NULL;
     }
 
-    return ibf_load(path, config);
+    return pqv2_or_legacy_load(path, config);
 }
 
 /* ── Free ───────────────────────────────────────────────────── */
 
 void inferbit_free(inferbit_model* model) {
     if (!model) return;
+
+    /* IBF v6 backing — release before clearing weight_data so we don't
+     * double-free the mmap region (which is owned by the pqv2_file). */
+    if (model->pqv2_file_backing) {
+        ib_pqv2_file_free(model->pqv2_file_backing);
+        free(model->pqv2_file_backing);
+        model->pqv2_file_backing = NULL;
+        /* The IBF v6 path owns the mmap; skip the legacy unmap below. */
+        model->weight_data = NULL;
+        model->weight_data_mmap = false;
+        model->mmap_fd = -1;
+    }
 
     /* Unmap weight data */
     if (model->weight_data_mmap && model->weight_data) {

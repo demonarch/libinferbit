@@ -146,6 +146,21 @@ static void tensor_matmul(
     float* out, const float* input, int M, int N,
     float* scale_buf
 ) {
+    /* PQv2 dispatch — takes precedence when present. */
+    if (t->pq) {
+        const pqv2_t* pq = t->pq;
+        if (pq->K == 256) {
+            pqv2_matvec_tbl_int8_k256(pq, input, out);
+        } else if (pq->K == 128) {
+            pqv2_matvec_tbl_int8_k128(pq, input, out);
+        } else if (pq->K <= 64) {
+            pqv2_matvec_tbl_int8(pq, input, out);
+        } else {
+            pqv2_matvec_lut(pq, input, out);
+        }
+        return;
+    }
+
     const void* weights = tensor_data(m, t);
     const void* scales_raw = tensor_scales_raw(m, t);
 
@@ -209,6 +224,17 @@ static void tensor_matmul_batch(
         scales_to_fp32(scale_buf, scales_raw, M);
     } else {
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
+    }
+
+    /* PQv2: no batched path yet — dispatch each row sequentially.
+     * (PQv2 matvec is internally row-parallel; batching x's gives little
+     * extra win without a real GEMM-style PQv2 kernel.) */
+    if (t->pq) {
+        for (int b = 0; b < B; b++) {
+            tensor_matmul(m, t, out + (size_t)b * M, input + (size_t)b * N,
+                          M, N, scale_buf);
+        }
+        return;
     }
 
     if (t->bits == 4 && w4a8_enabled() && ib_kern.matmul_w4a8_batch && q_scratch && sa_scratch) {

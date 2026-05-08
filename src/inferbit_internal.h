@@ -67,6 +67,8 @@ typedef struct {
 
 /* ── Per-tensor metadata ────────────────────────────────────── */
 
+#include "pqv2_kernel.h"   /* pqv2_t */
+
 typedef struct {
     size_t offset;        /* Offset within weight data section */
     size_t size;          /* Size in bytes */
@@ -76,6 +78,10 @@ typedef struct {
     size_t scale_offset;  /* Offset of scale factors (0 = none) */
     size_t scale_size;    /* Size of scale data */
     bool   has_bias;
+    /* PQv2 dispatch: when non-NULL, matmul uses pqv2_matvec_*.
+     * Pointer is owned by the IBF v6 file backing (mmap or heap).
+     * NULL for legacy v5 / INT4 / INT8 / FP16 tensors. */
+    const pqv2_t* pq;
 } ib_tensor_meta;
 
 /* ── Per-layer metadata ─────────────────────────────────────── */
@@ -127,6 +133,12 @@ struct inferbit_model {
     size_t weight_data_size;
     bool   weight_data_mmap;     /* True if mmap'd, false if malloc'd */
     int    mmap_fd;              /* File descriptor if mmap'd */
+
+    /* IBF v6 PQv2 file backing (NULL for v5 / non-PQv2 models).
+     * When set, pq tensor metadata in ib_tensor_meta points into this
+     * file's mmap region; freed in inferbit_model_free.
+     * Stored as opaque void* to avoid pulling pqv2_format.h here. */
+    void*  pqv2_file_backing;
 
     /* KV cache (one per layer) */
     ib_kv_cache* kv_caches;

@@ -222,7 +222,9 @@ static int parse_header_json(const char* json_str_buf, size_t json_len,
 
 /* ── Allocate KV caches ─────────────────────────────────────── */
 
-static int alloc_kv_caches(inferbit_model* model, int context_length, int dynamic) {
+/* Exposed (was static) for PQv2 v6 loader to reuse. */
+int ib_alloc_kv_caches(inferbit_model* model, int context_length, int dynamic);
+int ib_alloc_kv_caches(inferbit_model* model, int context_length, int dynamic) {
     int num_layers  = model->header.num_layers;
     int num_kv_heads = model->header.num_kv_heads;
     int head_dim    = model->header.head_dim;
@@ -279,7 +281,8 @@ static int alloc_kv_caches(inferbit_model* model, int context_length, int dynami
 
 /* ── Allocate activation buffers ────────────────────────────── */
 
-static int alloc_buffers(inferbit_model* model) {
+int ib_alloc_buffers(inferbit_model* model);
+int ib_alloc_buffers(inferbit_model* model) {
     int h = model->header.hidden_size;
     int inter = model->header.intermediate_size;
     int vocab = model->header.vocab_size;
@@ -515,7 +518,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     model->num_threads = threads;
 
     /* Allocate KV caches */
-    if (alloc_kv_caches(model, ctx_len, kv_dynamic) != 0) {
+    if (ib_alloc_kv_caches(model, ctx_len, kv_dynamic) != 0) {
         ib_set_error("failed to allocate KV caches");
         ib_munmap(mapped, file_size);
         ib_close(fd);
@@ -525,7 +528,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     }
 
     /* Allocate activation buffers */
-    if (alloc_buffers(model) != 0) {
+    if (ib_alloc_buffers(model) != 0) {
         ib_set_error("failed to allocate activation buffers");
         /* TODO: proper cleanup of kv_caches */
         ib_munmap(mapped, file_size);
