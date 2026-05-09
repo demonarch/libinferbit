@@ -452,6 +452,17 @@ kernel void attn_scores_qk(
     scores[(size_t)h * seq_pos_p1 + t] = s * scale;
 }
 
+/* Element-wise add: a[i] += b[i]. Used for residual connections. */
+kernel void residual_add(
+    device       float *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    constant     uint  &N [[buffer(2)]],
+    uint                gid [[thread_position_in_grid]])
+{
+    if (gid >= N) return;
+    a[gid] += b[gid];
+}
+
 /* Attention weighted V: attn_out[h, d] = sum_t scores[h, t] * V_cache[t, kv_h, d]. */
 kernel void attn_weighted_v(
     device const float *scores      [[buffer(0)]],

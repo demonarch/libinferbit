@@ -194,6 +194,50 @@ int ib_metal_attention_block_fp16(ib_metal_ctx *ctx,
                                     int n_heads, int n_kv_heads,
                                     int head_dim, int seq_len, int pos);
 
+/* Element-wise residual: a[i] += b[i].  N-element fp32. */
+int ib_metal_residual_add(ib_metal_ctx *ctx,
+                            void *a_fp32, const void *b_fp32, int N);
+
+/* ── Command recorder ─────────────────────────────────────────────────
+ *
+ * The standalone ib_metal_* dispatchers each open a command buffer,
+ * encode one operation, commit, and waitUntilCompleted. Every commit/wait
+ * pays ~100-200µs of dispatch overhead on Apple Silicon; for tiny ops
+ * (rmsnorm at 2048, residual at 2048) this dominates total cost.
+ *
+ * The recorder lets callers assemble many kernels into ONE command
+ * buffer, paying the dispatch overhead exactly once. Pattern:
+ *
+ *   ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
+ *   ib_metal_rec_rmsnorm_fp16(r, ...);
+ *   ib_metal_rec_matmul_w4a8_fp32_in(r, ...);
+ *   ib_metal_rec_residual_add(r, ...);
+ *   ib_metal_recorder_commit(r);  // commits + waits + frees recorder
+ *
+ * Each rec_* call records one encoder into the shared cb and returns
+ * immediately. Encode order is the GPU dispatch order. */
+typedef struct ib_metal_recorder ib_metal_recorder;
+ib_metal_recorder *ib_metal_recorder_begin(ib_metal_ctx *ctx);
+int ib_metal_recorder_commit(ib_metal_recorder *rec);
+
+int ib_metal_rec_rmsnorm_fp16(ib_metal_recorder *rec,
+                                const void *x_fp32,
+                                const void *weight_fp16,
+                                void *out_fp32,
+                                int N, float eps);
+
+int ib_metal_rec_residual_add(ib_metal_recorder *rec,
+                                void *a_fp32, const void *b_fp32, int N);
+
+int ib_metal_rec_matmul_w4a8_fp32_in(ib_metal_recorder *rec,
+                                       const void *x_fp32,
+                                       const void *weights,
+                                       const void *w_scales,
+                                       void *out,
+                                       void *scratch_x_q,
+                                       void *scratch_x_scales,
+                                       int M, int N);
+
 #ifdef __cplusplus
 }
 #endif
