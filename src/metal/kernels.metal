@@ -111,6 +111,45 @@ kernel void matmul_w4a8(
     }
 }
 
+/* ── matmul_int8 (fp32 input × int8 weights × fp16 row scale) ────────
+ *
+ * Mirrors CPU `scalar_matmul_int8` exactly:
+ *   out[m] = scale[m] * sum_n (weights[m, n] * input[n])
+ * with weights int8, input fp32, scale fp16. NO per-group input
+ * quantization (different from w4a8 — INT8 weights are wider so the
+ * model uses fp32 × int8 directly).
+ *
+ * Tile: 1 SIMD group per output row. Each lane handles N/32 columns,
+ * accumulating in fp32. simd_sum reduction at the end.
+ */
+kernel void matmul_int8_fp32_in(
+    device const char   *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x         [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id     [[threadgroup_position_in_grid]],
+    uint                 tg_size   [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const char *row = weights + (size_t)m * N;
+    float lane_acc = 0.0f;
+    /* Lane k handles columns [k, k+32, k+64, ...]. */
+    for (uint n = simd_lane; n < N; n += 32u) {
+        lane_acc += (float)row[n] * x[n];
+    }
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[m] = total * (float)w_scales[m];
+    }
+}
+
 /* ── quantize_input_int8_g128 ────────────────────────────────────────
  *
  * fp32 → int8 quantization with per-group scale. Mirrors the CPU
@@ -446,6 +485,151 @@ kernel void attn_scores_qk(
         s += q_h[d] * k_t[d];
     }
     scores[(size_t)h * seq_pos_p1 + t] = s * scale;
+}
+
+/* ── INT8 KV cache (matches libinferbit kv_bits=8) ────────────────────
+ *
+ * Layout (mirrors forward.c::kv_cache_write_int8):
+ *   key_cache   int8[seq_len, n_kv_heads, head_dim]
+ *   value_cache int8[seq_len, n_kv_heads, head_dim]
+ *   key_scales  float[seq_len, n_kv_heads]
+ *   value_scales float[seq_len, n_kv_heads]
+ *
+ * Per-head per-position scale: scale = max(|x|) / 127, floor 1e-8.
+ */
+
+/* Write K, V at row `pos` with per-head INT8 quantization.
+ *
+ * One threadgroup per kv_head (grid=(n_kv_heads,1,1)). 32 threads/SIMD;
+ * each thread handles head_dim/32 elements (exact for head_dim multiple
+ * of 32 — the typical 64/96/128/256). simd_max across the SIMD gives
+ * the per-head max in one step.
+ */
+kernel void kv_cache_write_int8(
+    device const float *k          [[buffer(0)]],
+    device const float *v          [[buffer(1)]],
+    device       char  *k_cache    [[buffer(2)]],
+    device       char  *v_cache    [[buffer(3)]],
+    device       float *k_scales   [[buffer(4)]],
+    device       float *v_scales   [[buffer(5)]],
+    constant     uint  &pos        [[buffer(6)]],
+    constant     uint  &n_kv_heads [[buffer(7)]],
+    constant     uint  &head_dim   [[buffer(8)]],
+    uint                tg_id      [[threadgroup_position_in_grid]],
+    uint                lane       [[thread_index_in_simdgroup]])
+{
+    uint h = tg_id;
+    if (h >= n_kv_heads) return;
+
+    uint per_lane = (head_dim + 31u) / 32u;
+    /* Pass 1: each lane finds its own max over per_lane elements. */
+    float k_lmax = 0.0f, v_lmax = 0.0f;
+    for (uint i = 0; i < per_lane; i++) {
+        uint d = lane + i * 32u;
+        if (d < head_dim) {
+            float kv = k[h * head_dim + d];
+            float vv = v[h * head_dim + d];
+            float ka = fabs(kv); if (ka > k_lmax) k_lmax = ka;
+            float va = fabs(vv); if (va > v_lmax) v_lmax = va;
+        }
+    }
+    float k_max = simd_max(k_lmax);
+    float v_max = simd_max(v_lmax);
+    float k_scale = (k_max > 1e-8f) ? (k_max / 127.0f) : 1e-8f;
+    float v_scale = (v_max > 1e-8f) ? (v_max / 127.0f) : 1e-8f;
+    if (lane == 0) {
+        k_scales[(size_t)pos * n_kv_heads + h] = k_scale;
+        v_scales[(size_t)pos * n_kv_heads + h] = v_scale;
+    }
+    /* Pass 2: each lane quantizes its elements. */
+    uint kv_dim = n_kv_heads * head_dim;
+    float k_inv = 1.0f / k_scale;
+    float v_inv = 1.0f / v_scale;
+    for (uint i = 0; i < per_lane; i++) {
+        uint d = lane + i * 32u;
+        if (d < head_dim) {
+            float kv = k[h * head_dim + d];
+            float vv = v[h * head_dim + d];
+            int kq = (int)round(kv * k_inv);
+            int vq = (int)round(vv * v_inv);
+            kq = clamp(kq, -127, 127);
+            vq = clamp(vq, -127, 127);
+            size_t off = (size_t)pos * kv_dim + h * head_dim + d;
+            k_cache[off] = (char)kq;
+            v_cache[off] = (char)vq;
+        }
+    }
+}
+
+/* INT8 attention scores: scores[h, t] = (Q[h] · K_cache[t, kv_h]) * scale,
+ * where K is int8 with per-head scale. Same dispatch shape as
+ * attn_scores_qk (one thread per (h, t)).
+ */
+kernel void attn_scores_qk_int8(
+    device const float *q              [[buffer(0)]],
+    device const char  *k_cache        [[buffer(1)]],
+    device const float *k_scales       [[buffer(2)]],
+    device       float *scores         [[buffer(3)]],
+    constant     uint  &n_heads        [[buffer(4)]],
+    constant     uint  &n_kv_heads     [[buffer(5)]],
+    constant     uint  &head_dim       [[buffer(6)]],
+    constant     uint  &seq_pos_p1     [[buffer(7)]],
+    constant     float &scale          [[buffer(8)]],
+    uint                gid            [[thread_position_in_grid]])
+{
+    uint total = n_heads * seq_pos_p1;
+    if (gid >= total) return;
+    uint h = gid / seq_pos_p1;
+    uint t = gid - h * seq_pos_p1;
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_h = h / heads_per_kv;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    device const float *q_h = q + h * head_dim;
+    device const char  *k_t = k_cache + (size_t)t * kv_dim + kv_h * head_dim;
+    float k_scale = k_scales[(size_t)t * n_kv_heads + kv_h];
+    int int_acc = 0;
+    /* Sum int8 first (fits in int while head_dim <= ~256K), apply scale at end. */
+    for (uint d = 0; d < head_dim; d++) {
+        /* q is fp32; we can't accumulate as int. Do float accumulation. */
+        /* fall back to float dot, scaled at end. */
+    }
+    (void)int_acc;
+    float fl_acc = 0.0f;
+    for (uint d = 0; d < head_dim; d++) {
+        fl_acc += q_h[d] * (float)k_t[d];
+    }
+    scores[(size_t)h * seq_pos_p1 + t] = fl_acc * k_scale * scale;
+}
+
+/* INT8 weighted V: attn_out[h, d] = sum_t scores[h, t] * v_scales[t, kv_h] * V_cache[t, kv_h, d]. */
+kernel void attn_weighted_v_int8(
+    device const float *scores       [[buffer(0)]],
+    device const char  *v_cache      [[buffer(1)]],
+    device const float *v_scales     [[buffer(2)]],
+    device       float *attn_out     [[buffer(3)]],
+    constant     uint  &n_heads      [[buffer(4)]],
+    constant     uint  &n_kv_heads   [[buffer(5)]],
+    constant     uint  &head_dim     [[buffer(6)]],
+    constant     uint  &seq_pos_p1   [[buffer(7)]],
+    uint                gid          [[thread_position_in_grid]])
+{
+    uint total = n_heads * head_dim;
+    if (gid >= total) return;
+    uint h = gid / head_dim;
+    uint d = gid - h * head_dim;
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_h = h / heads_per_kv;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    device const float *s_row = scores + (size_t)h * seq_pos_p1;
+    float acc = 0.0f;
+    for (uint t = 0; t < seq_pos_p1; t++) {
+        float vs = v_scales[(size_t)t * n_kv_heads + kv_h];
+        char v_q = v_cache[(size_t)t * kv_dim + kv_h * head_dim + d];
+        acc += s_row[t] * vs * (float)v_q;
+    }
+    attn_out[(size_t)h * head_dim + d] = acc;
 }
 
 /* Element-wise add: a[i] += b[i]. Used for residual connections. */

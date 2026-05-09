@@ -117,6 +117,23 @@ int ib_metal_matmul_w4a8_fp32_in(ib_metal_ctx *ctx,
                                   void *scratch_x_scales,   /* float[N/128], or NULL */
                                   int M, int N);
 
+/* INT8-weight matmul: out[m] = scale[m] * sum_n (W[m,n] * x[n]).
+ *
+ * Mirrors the CPU `matmul_int8` kernel exactly.
+ *
+ *   weights   [M, N] int8  — full bytes, no packing
+ *   w_scales  [M]    half  — per-row weight scale (fp16)
+ *   x         [N]    float — fp32 activations (NOT quantized)
+ *   out       [M]    float
+ *
+ * Synchronous. Returns 0 on success, -1 on error. */
+int ib_metal_matmul_int8_fp32_in(ib_metal_ctx *ctx,
+                                   const void *x_fp32,
+                                   const void *weights,
+                                   const void *w_scales,
+                                   void *out,
+                                   int M, int N);
+
 /* RMSNorm with fp16 weight. Mirrors the CPU kernel exactly:
  *   out[i] = x[i] * weight[i] / sqrt(mean(x[i]^2) + eps)
  *
@@ -194,6 +211,23 @@ int ib_metal_attention_block_fp16(ib_metal_ctx *ctx,
                                     int n_heads, int n_kv_heads,
                                     int head_dim, int seq_len, int pos);
 
+/* INT8 KV variant: same semantics as fp16 attention block but the KV
+ * cache is stored as int8 weights with per-(pos, kv_head) fp32 scales,
+ * matching libinferbit's kv_bits=8 layout. The new K/V row at `pos` is
+ * quantized inside the kernel (using max(|x|)/127 per head). */
+int ib_metal_attention_block_int8(ib_metal_ctx *ctx,
+                                    const void *q_fp32,
+                                    const void *k_fp32,
+                                    const void *v_fp32,
+                                    void *k_cache_int8,
+                                    void *v_cache_int8,
+                                    void *k_scales_fp32,
+                                    void *v_scales_fp32,
+                                    void *scores_fp32,
+                                    void *attn_out_fp32,
+                                    int n_heads, int n_kv_heads,
+                                    int head_dim, int seq_len, int pos);
+
 /* Element-wise residual: a[i] += b[i].  N-element fp32. */
 int ib_metal_residual_add(ib_metal_ctx *ctx,
                             void *a_fp32, const void *b_fp32, int N);
@@ -238,6 +272,13 @@ int ib_metal_rec_matmul_w4a8_fp32_in(ib_metal_recorder *rec,
                                        void *scratch_x_scales,
                                        int M, int N);
 
+int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
+                                       const void *x_fp32,
+                                       const void *weights,
+                                       const void *w_scales,
+                                       void *out,
+                                       int M, int N);
+
 int ib_metal_rec_rope_inplace(ib_metal_recorder *rec,
                                 void *tensor_fp32,
                                 int n_heads, int head_dim,
@@ -265,6 +306,20 @@ int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
                                         const void *v_fp32,
                                         void *k_cache_fp16,
                                         void *v_cache_fp16,
+                                        void *scores_fp32,
+                                        void *attn_out_fp32,
+                                        int n_heads, int n_kv_heads,
+                                        int head_dim, int seq_len, int pos);
+
+/* INT8 KV variant of the attention block. */
+int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,
+                                        const void *q_fp32,
+                                        const void *k_fp32,
+                                        const void *v_fp32,
+                                        void *k_cache_int8,
+                                        void *v_cache_int8,
+                                        void *k_scales_fp32,
+                                        void *v_scales_fp32,
                                         void *scores_fp32,
                                         void *attn_out_fp32,
                                         int n_heads, int n_kv_heads,

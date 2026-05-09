@@ -274,6 +274,11 @@ if(IB_METAL_ENABLED)
     target_link_libraries(bench_metal_real_model inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(bench_metal_real_model PRIVATE src include)
     add_dependencies(bench_metal_real_model metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_matmul_int8 tests/test_metal_matmul_int8.c)
+    target_link_libraries(test_metal_matmul_int8 inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_matmul_int8 PRIVATE src)
+    add_dependencies(test_metal_matmul_int8 metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()
