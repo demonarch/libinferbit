@@ -232,6 +232,11 @@ if(IB_METAL_ENABLED)
     target_link_libraries(test_metal_softmax_embed inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(test_metal_softmax_embed PRIVATE src)
     add_dependencies(test_metal_softmax_embed metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_attention tests/test_metal_attention.c)
+    target_link_libraries(test_metal_attention inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_attention PRIVATE src)
+    add_dependencies(test_metal_attention metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()

@@ -393,3 +393,88 @@ kernel void embed_lookup_fp16(
     if (gid >= hidden) return;
     out[gid] = (float)embeddings[(size_t)token * hidden + gid];
 }
+
+/* ── KV cache + attention kernels (fp16 KV cache) ────────────────────
+ *
+ * KV cache layout: [seq_len, kv_dim] fp16 for both keys and values,
+ * where kv_dim = n_kv_heads * head_dim. Same layout the CPU
+ * kv_cache_write uses with kv_bits=16. Phase 5d will add INT8/INT4 KV.
+ */
+
+/* Write K, V at position `pos` into the cache (fp32 → fp16). */
+kernel void kv_cache_write_fp16(
+    device const float *k       [[buffer(0)]],
+    device const float *v       [[buffer(1)]],
+    device       half  *k_cache [[buffer(2)]],
+    device       half  *v_cache [[buffer(3)]],
+    constant     uint  &pos     [[buffer(4)]],
+    constant     uint  &kv_dim  [[buffer(5)]],
+    uint                gid     [[thread_position_in_grid]])
+{
+    if (gid >= kv_dim) return;
+    size_t off = (size_t)pos * kv_dim + gid;
+    k_cache[off] = (half)k[gid];
+    v_cache[off] = (half)v[gid];
+}
+
+/* Attention scores: scores[h, t] = (Q[h] · K_cache[t, kv_h]) * scale.
+ * Grid: (n_heads * (pos+1), 1, 1). Each thread does one head_dim dot.
+ *
+ *   q          [n_heads * head_dim] fp32
+ *   k_cache    [seq_len, n_kv_heads * head_dim] fp16
+ *   scores     [n_heads, pos+1] fp32
+ */
+kernel void attn_scores_qk(
+    device const float *q              [[buffer(0)]],
+    device const half  *k_cache        [[buffer(1)]],
+    device       float *scores         [[buffer(2)]],
+    constant     uint  &n_heads        [[buffer(3)]],
+    constant     uint  &n_kv_heads     [[buffer(4)]],
+    constant     uint  &head_dim       [[buffer(5)]],
+    constant     uint  &seq_pos_p1     [[buffer(6)]], /* pos+1 */
+    constant     float &scale          [[buffer(7)]],
+    uint                gid            [[thread_position_in_grid]])
+{
+    uint total = n_heads * seq_pos_p1;
+    if (gid >= total) return;
+    uint h = gid / seq_pos_p1;
+    uint t = gid - h * seq_pos_p1;
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_h = h / heads_per_kv;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    device const float *q_h = q + h * head_dim;
+    device const half  *k_t = k_cache + (size_t)t * kv_dim + kv_h * head_dim;
+    float s = 0.0f;
+    for (uint d = 0; d < head_dim; d++) {
+        s += q_h[d] * (float)k_t[d];
+    }
+    scores[(size_t)h * seq_pos_p1 + t] = s * scale;
+}
+
+/* Attention weighted V: attn_out[h, d] = sum_t scores[h, t] * V_cache[t, kv_h, d]. */
+kernel void attn_weighted_v(
+    device const float *scores      [[buffer(0)]],
+    device const half  *v_cache     [[buffer(1)]],
+    device       float *attn_out    [[buffer(2)]],
+    constant     uint  &n_heads     [[buffer(3)]],
+    constant     uint  &n_kv_heads  [[buffer(4)]],
+    constant     uint  &head_dim    [[buffer(5)]],
+    constant     uint  &seq_pos_p1  [[buffer(6)]],
+    uint                gid         [[thread_position_in_grid]])
+{
+    uint total = n_heads * head_dim;
+    if (gid >= total) return;
+    uint h = gid / head_dim;
+    uint d = gid - h * head_dim;
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_h = h / heads_per_kv;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    device const float *s_row = scores + (size_t)h * seq_pos_p1;
+    float acc = 0.0f;
+    for (uint t = 0; t < seq_pos_p1; t++) {
+        acc += s_row[t] * (float)v_cache[(size_t)t * kv_dim + kv_h * head_dim + d];
+    }
+    attn_out[(size_t)h * head_dim + d] = acc;
+}

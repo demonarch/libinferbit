@@ -166,6 +166,34 @@ int ib_metal_embed_lookup_fp16(ib_metal_ctx *ctx,
                                  int hidden,
                                  void *out_fp32);
 
+/* Full attention block on GPU. KV cache is fp16 layout [seq_len, kv_dim]
+ * for both keys and values. Writes K, V into the cache at `pos`, then
+ * computes scores, in-place softmax, and attention-weighted V — all
+ * inside ONE command buffer (one commit/wait).
+ *
+ *   q         [n_heads * head_dim]      fp32   pre-RoPE'd query
+ *   k         [n_kv_heads * head_dim]   fp32   pre-RoPE'd key
+ *   v         [n_kv_heads * head_dim]   fp32   value
+ *   k_cache   [seq_len, kv_dim]         fp16   in/out
+ *   v_cache   [seq_len, kv_dim]         fp16   in/out
+ *   scores    [n_heads, seq_len]        fp32   scratch (only [:, :pos+1] used)
+ *   attn_out  [n_heads * head_dim]      fp32   output
+ *
+ * `seq_len` is the cache stride; `pos` is the current token position
+ * (so we read/write rows 0..pos and the new row goes at pos).
+ *
+ * Returns 0 on success. Synchronous. */
+int ib_metal_attention_block_fp16(ib_metal_ctx *ctx,
+                                    const void *q_fp32,
+                                    const void *k_fp32,
+                                    const void *v_fp32,
+                                    void *k_cache_fp16,
+                                    void *v_cache_fp16,
+                                    void *scores_fp32,
+                                    void *attn_out_fp32,
+                                    int n_heads, int n_kv_heads,
+                                    int head_dim, int seq_len, int pos);
+
 #ifdef __cplusplus
 }
 #endif
