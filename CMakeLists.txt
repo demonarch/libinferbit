@@ -242,6 +242,21 @@ if(IB_METAL_ENABLED)
     target_link_libraries(bench_metal_recorder inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(bench_metal_recorder PRIVATE src)
     add_dependencies(bench_metal_recorder metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_layer tests/test_metal_layer.c)
+    target_link_libraries(test_metal_layer inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_layer PRIVATE src)
+    add_dependencies(test_metal_layer metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_layer_diag tests/test_metal_layer_diag.c)
+    target_link_libraries(test_metal_layer_diag inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_layer_diag PRIVATE src)
+    add_dependencies(test_metal_layer_diag metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_o_isolated tests/test_metal_o_isolated.c)
+    target_link_libraries(test_metal_o_isolated inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_o_isolated PRIVATE src)
+    add_dependencies(test_metal_o_isolated metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()

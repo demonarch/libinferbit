@@ -238,6 +238,38 @@ int ib_metal_rec_matmul_w4a8_fp32_in(ib_metal_recorder *rec,
                                        void *scratch_x_scales,
                                        int M, int N);
 
+int ib_metal_rec_rope_inplace(ib_metal_recorder *rec,
+                                void *tensor_fp32,
+                                int n_heads, int head_dim,
+                                int pos, float theta);
+
+int ib_metal_rec_silu_mul(ib_metal_recorder *rec,
+                            const void *gate_fp32,
+                            const void *up_fp32,
+                            void *out_fp32,
+                            int N);
+
+int ib_metal_rec_softmax_rows(ib_metal_recorder *rec,
+                                void *data_fp32,
+                                int n_rows, int row_len);
+
+int ib_metal_rec_embed_lookup_fp16(ib_metal_recorder *rec,
+                                     const void *embeddings_fp16,
+                                     int token, int hidden,
+                                     void *out_fp32);
+
+/* Records the full attention block (kv_write + scores + softmax + weighted_v). */
+int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
+                                        const void *q_fp32,
+                                        const void *k_fp32,
+                                        const void *v_fp32,
+                                        void *k_cache_fp16,
+                                        void *v_cache_fp16,
+                                        void *scores_fp32,
+                                        void *attn_out_fp32,
+                                        int n_heads, int n_kv_heads,
+                                        int head_dim, int seq_len, int pos);
+
 #ifdef __cplusplus
 }
 #endif
