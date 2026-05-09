@@ -155,7 +155,13 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
     b->head_dim     = m->header.head_dim;
     b->kv_dim       = b->n_kv_heads * b->head_dim;
     b->vocab        = m->header.vocab_size;
-    b->seq_len      = m->header.max_context_length;
+    /* Use the configured KV-cache capacity (set via
+     * inferbit_config_set_context_length), not the model's max — Llama-3
+     * IBFs can advertise max_context_length=131072 which would balloon
+     * the GPU KV cache to gigabytes. The CPU loader sizes its KV
+     * buffers identically. */
+    b->seq_len      = m->kv_caches ? m->kv_caches[0].capacity : m->header.max_context_length;
+    if (b->seq_len <= 0) b->seq_len = m->header.max_context_length;
     b->kv_bits      = m->header.kv_bits;
     b->rope_theta   = m->header.rope_theta;
     b->eps          = m->header.norm_epsilon;

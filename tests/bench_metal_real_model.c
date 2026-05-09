@@ -60,8 +60,10 @@ int main(int argc, char **argv) {
     int n_tokens = (argc > 2) ? atoi(argv[2]) : 20;
     int start_tok = (argc > 3) ? atoi(argv[3]) : 1;
 
-    /* Load model on CPU. */
+    /* Load model on CPU with a sane context cap — Llama-3 IBFs advertise
+     * max_context_length=131072 which would balloon KV cache buffers. */
     inferbit_config *cfg = inferbit_config_create();
+    inferbit_config_set_context_length(cfg, 1024);
     inferbit_model *m = inferbit_load(argv[1], cfg);
     if (!m) { fprintf(stderr, "load failed\n"); return 2; }
     int hidden = m->header.hidden_size;
