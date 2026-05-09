@@ -195,3 +195,65 @@ extern "C" int ib_metal_vec_mul2(ib_metal_ctx *ctx,
     }
     return 0;
 }
+
+extern "C" int ib_metal_matmul_w4a8(ib_metal_ctx *ctx,
+                                      const void *weights, const void *w_scales,
+                                      const void *x_q, const void *x_scales,
+                                      void *out,
+                                      int M, int N)
+{
+    if (!ctx || !weights || !w_scales || !x_q || !x_scales || !out) return -1;
+    if (M <= 0 || N <= 0) return -1;
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps = get_pipeline(ctx, "matmul_w4a8");
+        if (!ps) return -1;
+
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b_w  = pick(weights);
+        id<MTLBuffer> b_ws = pick(w_scales);
+        id<MTLBuffer> b_xq = pick(x_q);
+        id<MTLBuffer> b_xs = pick(x_scales);
+        id<MTLBuffer> b_out = pick(out);
+        if (!b_w || !b_ws || !b_xq || !b_xs || !b_out) {
+            fprintf(stderr, "Metal matmul_w4a8: a buffer was not registered with this ctx\n");
+            return -1;
+        }
+
+        uint M_u = (uint)M;
+        uint N_u = (uint)N;
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:b_w   offset:0 atIndex:0];
+        [enc setBuffer:b_ws  offset:0 atIndex:1];
+        [enc setBuffer:b_xq  offset:0 atIndex:2];
+        [enc setBuffer:b_xs  offset:0 atIndex:3];
+        [enc setBuffer:b_out offset:0 atIndex:4];
+        [enc setBytes:&M_u length:sizeof(M_u) atIndex:5];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:6];
+
+        /* Each output row is one SIMD group (32 threads).
+         * Pack 4 SIMD groups per threadgroup → 128 threads/TG.
+         * Total threadgroups = ceil(M / 4). */
+        const NSUInteger SIMDS_PER_TG = 4;
+        const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+        NSUInteger n_groups = (M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+        MTLSize grid_groups = MTLSizeMake(n_groups, 1, 1);
+        MTLSize tgsize      = MTLSizeMake(TG_THREADS, 1, 1);
+        [enc dispatchThreadgroups:grid_groups threadsPerThreadgroup:tgsize];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal matmul_w4a8: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+    }
+    return 0;
+}

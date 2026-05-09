@@ -55,6 +55,26 @@ void  ib_metal_free(ib_metal_ctx *ctx, void *buf);
 int ib_metal_vec_mul2(ib_metal_ctx *ctx,
                        const void *gpu_in, void *gpu_out, int n);
 
+/* INT4-weight × INT8-activation matmul. Mirrors the CPU `matmul_w4a8`
+ * kernel exactly — same packing, same scale model, same quality.
+ *
+ *   weights   [M, N/2] uint8  — packed nibbles (low nibble first), bias 8.
+ *   w_scales  [M]      half   — per-row weight scale (fp16).
+ *   x_q       [N]      int8   — quantized activation values.
+ *   x_scales  [N/IB_W4A8_GROUP] float — per-128-group activation scales.
+ *   out       [M]      float  — output: out[m] = sum_n W[m,n] * x[n].
+ *
+ * All buffer pointers must come from ib_metal_alloc on this context.
+ * Synchronous: command buffer waits for completion before returning.
+ * Returns 0 on success, -1 on error. */
+int ib_metal_matmul_w4a8(ib_metal_ctx *ctx,
+                          const void *weights,
+                          const void *w_scales,
+                          const void *x_q,
+                          const void *x_scales,
+                          void *out,
+                          int M, int N);
+
 #ifdef __cplusplus
 }
 #endif
