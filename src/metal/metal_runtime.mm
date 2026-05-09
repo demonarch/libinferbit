@@ -462,3 +462,98 @@ extern "C" int ib_metal_rmsnorm_fp16(ib_metal_ctx *ctx,
     }
     return 0;
 }
+
+extern "C" int ib_metal_silu_mul(ib_metal_ctx *ctx,
+                                   const void *gate_fp32,
+                                   const void *up_fp32,
+                                   void *out_fp32,
+                                   int N)
+{
+    if (!ctx || !gate_fp32 || !up_fp32 || !out_fp32 || N <= 0) return -1;
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps = get_pipeline(ctx, "silu_mul");
+        if (!ps) return -1;
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b_gate = pick(gate_fp32);
+        id<MTLBuffer> b_up   = pick(up_fp32);
+        id<MTLBuffer> b_out  = pick(out_fp32);
+        if (!b_gate || !b_up || !b_out) {
+            fprintf(stderr, "Metal silu_mul: buffer not registered\n");
+            return -1;
+        }
+
+        uint N_u = (uint)N;
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:b_gate offset:0 atIndex:0];
+        [enc setBuffer:b_up   offset:0 atIndex:1];
+        [enc setBuffer:b_out  offset:0 atIndex:2];
+        [enc setBytes:&N_u    length:sizeof(N_u) atIndex:3];
+
+        const NSUInteger TG = 256;
+        NSUInteger n_tg = ((NSUInteger)N + TG - 1) / TG;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal silu_mul: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+extern "C" int ib_metal_rope_inplace(ib_metal_ctx *ctx,
+                                       void *tensor_fp32,
+                                       int n_heads, int head_dim,
+                                       int pos, float theta)
+{
+    if (!ctx || !tensor_fp32 || n_heads <= 0 || head_dim <= 0) return -1;
+    if (head_dim & 1) return -1;  /* RoPE pairs require even head_dim. */
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps = get_pipeline(ctx, "rope_inplace");
+        if (!ps) return -1;
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b_t = pick(tensor_fp32);
+        if (!b_t) {
+            fprintf(stderr, "Metal rope: buffer not registered\n");
+            return -1;
+        }
+        uint nh = (uint)n_heads, hd = (uint)head_dim, p = (uint)pos;
+        float th = theta;
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:b_t  offset:0 atIndex:0];
+        [enc setBytes:&nh   length:sizeof(nh) atIndex:1];
+        [enc setBytes:&hd   length:sizeof(hd) atIndex:2];
+        [enc setBytes:&p    length:sizeof(p)  atIndex:3];
+        [enc setBytes:&th   length:sizeof(th) atIndex:4];
+
+        const NSUInteger TG = 64;
+        NSUInteger total = (NSUInteger)n_heads * (NSUInteger)(head_dim / 2);
+        NSUInteger n_tg = (total + TG - 1) / TG;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal rope: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+    }
+    return 0;
+}

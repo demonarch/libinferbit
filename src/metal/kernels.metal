@@ -238,3 +238,68 @@ kernel void rmsnorm_fp16(
         out[i] = x[i] * inv_rms * (float)weight[i];
     }
 }
+
+/* ── silu_mul ─────────────────────────────────────────────────────────
+ *
+ * out[i] = silu(gate[i]) * up[i]   where   silu(x) = x / (1 + exp(-x))
+ *
+ * Element-wise; one thread per element. Used in the FFN block:
+ *   ffn(x) = down_proj( silu(gate_proj(x)) * up_proj(x) )
+ * On TinyLlama the intermediate dim is 5632.
+ */
+kernel void silu_mul(
+    device const float *gate [[buffer(0)]],
+    device const float *up   [[buffer(1)]],
+    device       float *out  [[buffer(2)]],
+    constant     uint  &N    [[buffer(3)]],
+    uint                gid  [[thread_position_in_grid]])
+{
+    if (gid >= N) return;
+    float x = gate[gid];
+    float s = x / (1.0f + exp(-x));
+    out[gid] = s * up[gid];
+}
+
+/* ── rope_inplace ─────────────────────────────────────────────────────
+ *
+ * Llama-style interleaved RoPE applied IN-PLACE to a tensor laid out
+ * as [n_heads, head_dim]. Each pair (t[2i], t[2i+1]) inside a head is
+ * rotated by angle = pos / theta^(2i/head_dim).
+ *
+ *   tensor    [n_heads * head_dim]  fp32, in-place
+ *   pos                              token position
+ *   theta                            10000.0 for Llama
+ *
+ * One thread per pair: grid = n_heads * (head_dim / 2). Each thread
+ * loads its pair, rotates, writes back.
+ *
+ * NOTE: this kernel matches the CPU `scalar_rope` semantics exactly —
+ * the i in `2i/head_dim` is the index of the *pair*, so freq(pair i)
+ * = 1 / theta^(2i / head_dim). The CPU loop strides by 2 over a
+ * "i = 0..head_dim" range, which is the same thing.
+ */
+kernel void rope_inplace(
+    device       float *tensor   [[buffer(0)]],
+    constant     uint  &n_heads  [[buffer(1)]],
+    constant     uint  &head_dim [[buffer(2)]],
+    constant     uint  &pos      [[buffer(3)]],
+    constant     float &theta    [[buffer(4)]],
+    uint                gid      [[thread_position_in_grid]])
+{
+    uint half_hd = head_dim / 2u;
+    uint total = n_heads * half_hd;
+    if (gid >= total) return;
+    uint h    = gid / half_hd;
+    uint pair = gid - h * half_hd;
+    /* freq = 1 / theta^( (2*pair) / head_dim ) */
+    float exponent = (float)(2u * pair) / (float)head_dim;
+    float freq = pow(theta, -exponent);
+    float angle = (float)pos * freq;
+    float c = cos(angle), s = sin(angle);
+
+    uint base = h * head_dim + 2u * pair;
+    float v0 = tensor[base];
+    float v1 = tensor[base + 1u];
+    tensor[base]      = v0 * c - v1 * s;
+    tensor[base + 1u] = v0 * s + v1 * c;
+}

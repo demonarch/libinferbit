@@ -132,6 +132,26 @@ int ib_metal_rmsnorm_fp16(ib_metal_ctx *ctx,
                            void *out_fp32,
                            int N, float eps);
 
+/* SiLU-gated multiply: out[i] = silu(gate[i]) * up[i].
+ *   gate, up, out  [N]  fp32
+ * Buffers may alias (out can equal gate or up). Synchronous. */
+int ib_metal_silu_mul(ib_metal_ctx *ctx,
+                       const void *gate_fp32,
+                       const void *up_fp32,
+                       void *out_fp32,
+                       int N);
+
+/* In-place Llama-style interleaved RoPE applied to one tensor laid out
+ * as [n_heads, head_dim]. Caller dispatches twice (Q, K) for GQA.
+ *
+ *   tensor   fp32 buffer of size n_heads*head_dim, modified in place.
+ *   pos      token position.
+ *   theta    rope_theta (10000.0 for Llama). */
+int ib_metal_rope_inplace(ib_metal_ctx *ctx,
+                           void *tensor_fp32,
+                           int n_heads, int head_dim,
+                           int pos, float theta);
+
 #ifdef __cplusplus
 }
 #endif

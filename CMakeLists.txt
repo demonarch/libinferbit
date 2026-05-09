@@ -217,6 +217,16 @@ if(IB_METAL_ENABLED)
     target_link_libraries(test_metal_rmsnorm inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(test_metal_rmsnorm PRIVATE src)
     add_dependencies(test_metal_rmsnorm metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_silu_mul tests/test_metal_silu_mul.c)
+    target_link_libraries(test_metal_silu_mul inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_silu_mul PRIVATE src)
+    add_dependencies(test_metal_silu_mul metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_rope tests/test_metal_rope.c)
+    target_link_libraries(test_metal_rope inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_rope PRIVATE src)
+    add_dependencies(test_metal_rope metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()
