@@ -303,13 +303,19 @@ static ib_written_tensor write_quantized_tensor_ts_perm(
     int cols = ib_ts_tensor_shape(ts, shard, tensor_idx, 1);
     if (cols == 0) cols = 1;
 
-    /* Apply Q/K row permutation if requested (lossless rearrange). */
+    /* Apply Q/K row permutation if requested (lossless rearrange).
+     * Set IB_DISABLE_QK_PERM=1 to skip — diagnostic only; no model is
+     * known to require non-permuted Q/K weights at runtime. */
     void *perm_buf = NULL;
     const void *data = raw_data;
     if (qk_n_heads > 0 && head_dim > 0) {
-        perm_buf = permute_qk_rows_alloc(raw_data, dtype, rows, cols,
-                                            head_dim, qk_n_heads);
-        if (perm_buf) data = perm_buf;
+        const char *e = getenv("IB_DISABLE_QK_PERM");
+        int disabled = (e && e[0] && e[0] != '0');
+        if (!disabled) {
+            perm_buf = permute_qk_rows_alloc(raw_data, dtype, rows, cols,
+                                                head_dim, qk_n_heads);
+            if (perm_buf) data = perm_buf;
+        }
     }
 
     result.rows = rows;

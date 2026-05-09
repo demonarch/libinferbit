@@ -25,14 +25,17 @@ int main(int argc, char **argv) {
     printf("kv_bits:        %d\n", m->header.kv_bits);
     printf("default_bits:   %d\n", m->header.default_bits);
 
-    printf("\ntoken_embedding:  bits=%d  size=%zu  scale_size=%zu  pq=%s\n",
+    printf("\ntoken_embedding:  bits=%d  size=%zu  scale_size=%zu  off=0x%zx  pq=%s\n",
            m->token_embedding.bits, m->token_embedding.size,
-           m->token_embedding.scale_size, m->token_embedding.pq ? "yes" : "no");
+           m->token_embedding.scale_size, m->token_embedding.offset,
+           m->token_embedding.pq ? "yes" : "no");
     printf("output_norm:      bits=%d  size=%zu\n",
            m->output_norm.bits, m->output_norm.size);
-    printf("output_head:      bits=%d  size=%zu  scale_size=%zu  pq=%s\n",
+    printf("output_head:      bits=%d  size=%zu  scale_size=%zu  off=0x%zx  pq=%s  tied=%s\n",
            m->output_head.bits, m->output_head.size,
-           m->output_head.scale_size, m->output_head.pq ? "yes" : "no");
+           m->output_head.scale_size, m->output_head.offset,
+           m->output_head.pq ? "yes" : "no",
+           (m->output_head.offset == m->token_embedding.offset) ? "YES" : "no");
 
     if (m->header.num_layers > 0) {
         ib_layer_meta *L = &m->layers[0];

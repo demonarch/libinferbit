@@ -156,6 +156,27 @@ endif()
 # dlsym can resolve them. POSIX is unaffected (no-op there).
 set_target_properties(inferbit PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+# Auto-copy the freshly-built shared library into the inferbit-py package
+# so Python conversions can never silently use a stale dylib. This was
+# the root cause of a recent quality regression (TinyLlama IBF: PPL went
+# 7.23 → 1955 because the bundled dylib pre-dated the Q/K row permutation
+# fix — see f8b47b3). Failure to copy is a build error, not a warning.
+set(IB_PY_BUNDLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../inferbit-py/inferbit")
+if(EXISTS "${IB_PY_BUNDLE_DIR}")
+    if(APPLE)
+        set(IB_PY_BUNDLE_NAME "libinferbit.dylib")
+    elseif(WIN32)
+        set(IB_PY_BUNDLE_NAME "inferbit.dll")
+    else()
+        set(IB_PY_BUNDLE_NAME "libinferbit.so")
+    endif()
+    add_custom_command(TARGET inferbit POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "$<TARGET_FILE:inferbit>"
+            "${IB_PY_BUNDLE_DIR}/${IB_PY_BUNDLE_NAME}"
+        COMMENT "Updating bundled libinferbit shared lib in inferbit-py")
+endif()
+
 # Static library
 add_library(inferbit_static STATIC ${INFERBIT_SOURCES})
 target_include_directories(inferbit_static PUBLIC include)
@@ -279,6 +300,16 @@ if(IB_METAL_ENABLED)
     target_link_libraries(test_metal_matmul_int8 inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(test_metal_matmul_int8 PRIVATE src)
     add_dependencies(test_metal_matmul_int8 metal_kernels_header inferbit_static)
+
+    add_executable(bench_compare tests/bench_compare.c)
+    target_link_libraries(bench_compare inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_compare PRIVATE src include)
+    add_dependencies(bench_compare metal_kernels_header inferbit_static)
+
+    add_executable(bench_ppl_run tests/bench_ppl_run.c)
+    target_link_libraries(bench_ppl_run inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_ppl_run PRIVATE src include)
+    add_dependencies(bench_ppl_run metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()
