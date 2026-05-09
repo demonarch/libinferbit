@@ -102,11 +102,52 @@ else()
     set(PLATFORM_LIBS m)
 endif()
 
+# ── Apple Metal GPU support (optional) ───────────────────────────
+# Shader source lives in src/metal/kernels.metal. At build time we
+# embed it as a C string into kernels_metal_src.h via `xxd -i`, then
+# compile at runtime via [device newLibraryWithSource:]. This avoids
+# requiring full Xcode (the AOT `xcrun metal` toolchain) — only the
+# Command Line Tools are needed.
+#
+# Same pattern as llama.cpp / MLX / ggml on macOS.
+# Enable with -DIB_ENABLE_METAL=ON when configuring.
+option(IB_ENABLE_METAL "Build Apple Metal GPU backend" OFF)
+if(APPLE AND IB_ENABLE_METAL)
+    message(STATUS "Apple Metal backend: ENABLED (runtime shader compile)")
+    set(IB_METAL_ENABLED TRUE)
+    enable_language(OBJCXX)
+
+    set(METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/metal/kernels.metal)
+    set(METAL_HDR ${CMAKE_CURRENT_BINARY_DIR}/kernels_metal_src.h)
+    add_custom_command(
+        OUTPUT ${METAL_HDR}
+        COMMAND ${CMAKE_COMMAND} -E echo "/* auto-generated from kernels.metal */" > ${METAL_HDR}
+        COMMAND xxd -i -n ib_metal_kernels_src ${METAL_SRC} >> ${METAL_HDR}
+        # Append null-terminator macro so the C string is null-terminated for newLibraryWithSource
+        COMMAND ${CMAKE_COMMAND} -E echo "static const unsigned int ib_metal_kernels_src_len_z = ib_metal_kernels_src_len;" >> ${METAL_HDR}
+        DEPENDS ${METAL_SRC}
+        COMMENT "Embedding kernels.metal as C string"
+    )
+    add_custom_target(metal_kernels_header DEPENDS ${METAL_HDR})
+
+    # ObjC++ source — needs ARC + Metal/Foundation frameworks.
+    set_source_files_properties(src/metal/metal_runtime.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc -x objective-c++")
+    list(APPEND INFERBIT_SOURCES src/metal/metal_runtime.mm)
+    set(METAL_LINK_LIBS "-framework Metal" "-framework Foundation")
+    set(METAL_INCLUDES ${CMAKE_CURRENT_BINARY_DIR})
+    add_compile_definitions(IB_HAS_METAL=1)
+endif()
+
 # Shared library
 add_library(inferbit SHARED ${INFERBIT_SOURCES})
 target_include_directories(inferbit PUBLIC include)
 target_include_directories(inferbit PRIVATE src)
-target_link_libraries(inferbit ${PLATFORM_LIBS})
+target_link_libraries(inferbit ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+if(IB_METAL_ENABLED)
+    target_include_directories(inferbit PRIVATE ${METAL_INCLUDES})
+    add_dependencies(inferbit metal_kernels_header)
+endif()
 # On Windows, MSVC requires explicit dllexport for symbols to be visible
 # from the DLL. Internal headers (pq_decode.h, etc.) declare functions
 # without IB_API; auto-export all global symbols so Python ctypes /
@@ -117,7 +158,11 @@ set_target_properties(inferbit PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 add_library(inferbit_static STATIC ${INFERBIT_SOURCES})
 target_include_directories(inferbit_static PUBLIC include)
 target_include_directories(inferbit_static PRIVATE src)
-target_link_libraries(inferbit_static ${PLATFORM_LIBS})
+target_link_libraries(inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+if(IB_METAL_ENABLED)
+    target_include_directories(inferbit_static PRIVATE ${METAL_INCLUDES})
+    add_dependencies(inferbit_static metal_kernels_header)
+endif()
 set_target_properties(inferbit_static PROPERTIES OUTPUT_NAME inferbit)
 
 # Test executables
@@ -155,6 +200,13 @@ if(NOT WIN32)
         target_link_libraries(${b} inferbit_static ${PLATFORM_LIBS})
         target_include_directories(${b} PRIVATE include src)
     endforeach()
+endif()
+
+if(IB_METAL_ENABLED)
+    add_executable(test_metal_hello tests/test_metal_hello.c)
+    target_link_libraries(test_metal_hello inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_hello PRIVATE src)
+    add_dependencies(test_metal_hello metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()
