@@ -110,3 +110,65 @@ kernel void matmul_w4a8(
         out[m] = lane_acc * (float)w_scales[m];
     }
 }
+
+/* ── quantize_input_int8_g128 ────────────────────────────────────────
+ *
+ * fp32 → int8 quantization with per-group scale. Mirrors the CPU
+ * `ib_quantize_input_int8_g128`: groups of IB_W4A8_GROUP=128 elements
+ * get one fp32 scale (max|x| / 127), each element rounded into int8.
+ *
+ *   x:        float[N]      input fp32 activation values.
+ *   x_q:      int8[N]       quantized output.
+ *   x_scales: float[N/128]  per-group scale (max|x| / 127).
+ *
+ * Tiling: one threadgroup per group of 128 elements. Each thread of the
+ * group handles 4 elements. Reduction via simd_max in two steps for the
+ * 128-wide group. Stride 128: with simdgroup width 32, one threadgroup
+ * = 32 threads × 4 elements = 128.
+ */
+kernel void quantize_input_int8_g128(
+    device const float *x        [[buffer(0)]],
+    device       char  *x_q      [[buffer(1)]],
+    device       float *x_scales [[buffer(2)]],
+    constant     uint  &N        [[buffer(3)]],
+    uint                tg_id    [[threadgroup_position_in_grid]],
+    uint                lane     [[thread_index_in_threadgroup]])
+{
+    /* Group base: this threadgroup handles elements [tg_id*128 .. tg_id*128+128) */
+    int g_start = (int)tg_id * 128;
+    int g_end   = min(g_start + 128, (int)N);
+
+    /* Each lane handles 4 elements: indices g_start + lane*4 .. g_start + lane*4 + 3 */
+    int n0 = g_start + (int)lane * 4;
+    float v0 = (n0 + 0 < g_end) ? x[n0 + 0] : 0.0f;
+    float v1 = (n0 + 1 < g_end) ? x[n0 + 1] : 0.0f;
+    float v2 = (n0 + 2 < g_end) ? x[n0 + 2] : 0.0f;
+    float v3 = (n0 + 3 < g_end) ? x[n0 + 3] : 0.0f;
+
+    /* Per-lane local max (4 elements). */
+    float local_max = max(max(fabs(v0), fabs(v1)), max(fabs(v2), fabs(v3)));
+    /* Reduce across the simdgroup (32 threads). */
+    float group_max = simd_max(local_max);
+
+    /* Compute scale (lane 0 writes; all lanes use the same value via broadcast). */
+    float scale = (group_max > 1e-30f) ? (group_max / 127.0f) : 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    if (lane == 0) {
+        x_scales[tg_id] = scale;
+    }
+
+    /* Each lane quantizes its 4 elements. */
+    int q0 = (int)round(v0 * inv_scale);
+    int q1 = (int)round(v1 * inv_scale);
+    int q2 = (int)round(v2 * inv_scale);
+    int q3 = (int)round(v3 * inv_scale);
+    q0 = clamp(q0, -127, 127);
+    q1 = clamp(q1, -127, 127);
+    q2 = clamp(q2, -127, 127);
+    q3 = clamp(q3, -127, 127);
+    if (n0 + 0 < g_end) x_q[n0 + 0] = (char)q0;
+    if (n0 + 1 < g_end) x_q[n0 + 1] = (char)q1;
+    if (n0 + 2 < g_end) x_q[n0 + 2] = (char)q2;
+    if (n0 + 3 < g_end) x_q[n0 + 3] = (char)q3;
+}

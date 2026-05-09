@@ -116,6 +116,36 @@ int main(int argc, char **argv) {
         memcpy(&h_ws_fp32[i], &f, 4);
     }
 
+    /* Test the GPU input-quantizer against CPU reference. */
+    {
+        float *h_x_fp32 = malloc((size_t)N * sizeof(float));
+        for (int i = 0; i < N; i++) h_x_fp32[i] = ((float)h_xq[i]) * h_xs[i / IB_W4A8_GROUP];
+        signed char *cpu_xq = malloc((size_t)N);
+        float *cpu_xs = malloc((size_t)n_groups * sizeof(float));
+        ib_quantize_input_int8_g128(h_x_fp32, cpu_xq, cpu_xs, N);
+
+        void *gpu_x  = ib_metal_alloc(ctx, (size_t)N * sizeof(float), h_x_fp32);
+        void *gpu_xq2 = ib_metal_alloc(ctx, (size_t)N, NULL);
+        void *gpu_xs2 = ib_metal_alloc(ctx, (size_t)n_groups * sizeof(float), NULL);
+        if (ib_metal_quantize_input_int8_g128(ctx, gpu_x, gpu_xq2, gpu_xs2, N) != 0) {
+            printf("quantize kernel failed\n"); return 1;
+        }
+        signed char *gpu_xq_view = (signed char *)gpu_xq2;
+        float *gpu_xs_view = (float *)gpu_xs2;
+        int diff_q = 0, diff_s = 0;
+        for (int i = 0; i < N; i++) if (cpu_xq[i] != gpu_xq_view[i]) diff_q++;
+        for (int g = 0; g < n_groups; g++) {
+            float r = fabsf(cpu_xs[g] - gpu_xs_view[g]) / (fabsf(cpu_xs[g]) + 1e-30f);
+            if (r > 1e-5f) diff_s++;
+        }
+        printf("Quantizer correctness: %d/%d int8 mismatches, %d/%d scale mismatches\n",
+                diff_q, N, diff_s, n_groups);
+        ib_metal_free(ctx, gpu_x);
+        ib_metal_free(ctx, gpu_xq2);
+        ib_metal_free(ctx, gpu_xs2);
+        free(h_x_fp32); free(cpu_xq); free(cpu_xs);
+    }
+
     /* CPU reference: ib_kern.matmul_w4a8 */
     ib_kern.matmul_w4a8(cpu_out, h_w, h_ws_fp32, h_xq, h_xs, M, N);
 

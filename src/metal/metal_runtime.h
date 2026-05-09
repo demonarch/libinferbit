@@ -75,6 +75,21 @@ int ib_metal_matmul_w4a8(ib_metal_ctx *ctx,
                           void *out,
                           int M, int N);
 
+/* fp32 → int8 quantization with per-128-group scale. Mirrors the CPU
+ * `ib_quantize_input_int8_g128` exactly so chained Metal matmuls can
+ * use the quantized output without CPU round-trip.
+ *
+ *   x        [N]        float — fp32 activations
+ *   x_q      [N]        int8  — quantized output
+ *   x_scales [N/128]    float — per-group scale (max|x| / 127)
+ *
+ * N must be a multiple of 128 for clean tiling (else last group is short).
+ * Synchronous. Returns 0 on success. */
+int ib_metal_quantize_input_int8_g128(ib_metal_ctx *ctx,
+                                        const void *x,
+                                        void *x_q, void *x_scales,
+                                        int N);
+
 #ifdef __cplusplus
 }
 #endif

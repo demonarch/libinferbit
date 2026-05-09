@@ -196,6 +196,54 @@ extern "C" int ib_metal_vec_mul2(ib_metal_ctx *ctx,
     return 0;
 }
 
+extern "C" int ib_metal_quantize_input_int8_g128(ib_metal_ctx *ctx,
+                                                    const void *x,
+                                                    void *x_q, void *x_scales,
+                                                    int N)
+{
+    if (!ctx || !x || !x_q || !x_scales || N <= 0) return -1;
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps = get_pipeline(ctx, "quantize_input_int8_g128");
+        if (!ps) return -1;
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b_x  = pick(x);
+        id<MTLBuffer> b_xq = pick(x_q);
+        id<MTLBuffer> b_xs = pick(x_scales);
+        if (!b_x || !b_xq || !b_xs) {
+            fprintf(stderr, "Metal quantize: buffer not registered with this ctx\n");
+            return -1;
+        }
+        uint N_u = (uint)N;
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:b_x  offset:0 atIndex:0];
+        [enc setBuffer:b_xq offset:0 atIndex:1];
+        [enc setBuffer:b_xs offset:0 atIndex:2];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:3];
+
+        /* One threadgroup per group of 128 elements. 32 threads/TG
+         * (one SIMD group), each handling 4 elements. */
+        NSUInteger n_groups = (NSUInteger)((N + 127) / 128);
+        MTLSize grid = MTLSizeMake(n_groups, 1, 1);
+        MTLSize tgsize = MTLSizeMake(32, 1, 1);
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tgsize];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal quantize: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 extern "C" int ib_metal_matmul_w4a8(ib_metal_ctx *ctx,
                                       const void *weights, const void *w_scales,
                                       const void *x_q, const void *x_scales,
