@@ -141,22 +141,238 @@ static void embedding_lookup(const inferbit_model* m, int token_id, float* out) 
  * Handles bit-width dispatch and scale conversion.
  * `scale_buf` is a caller-provided temporary buffer of at least M floats.
  */
+static void pqv2_matvec_dispatch(const pqv2_t *t, const float *x, float *y) {
+    if (t->K == 256)      pqv2_matvec_tbl_int8_k256(t, x, y);
+    else if (t->K == 128) pqv2_matvec_tbl_int8_k128(t, x, y);
+    else if (t->K <= 64)  pqv2_matvec_tbl_int8(t, x, y);
+    else                  pqv2_matvec_lut(t, x, y);
+}
+
+/* Per-chunk threading: each worker processes a slice of chunks, accumulating
+ * into its own thread-local acc[M]. Main thread reduces across workers and
+ * applies row_scale + L2 contribution.
+ *
+ * Why per-chunk and not per-row: the kernel builds an LUT per (chunk, subchunk)
+ * that's INDEPENDENT of M but DEPENDS on x. Per-row threading would force
+ * each worker to redundantly rebuild every LUT (4× total LUT-build work).
+ * Per-chunk threading distributes LUT-build evenly with no redundancy. */
+typedef struct {
+    const pqv2_t *t;
+    const float  *x;
+    float        *acc_pool;
+    float        *acc_l2_pool;
+    uint32_t      M;
+    int           chunk_size;
+    int           n_slots;
+    float         skip_thresh;   /* 0 = no skip */
+} ib_pqv2_chunks_arg;
+
+static void ib_pqv2_chunks_task(void *arg, int tid, int start, int end) {
+    (void)tid;
+    const ib_pqv2_chunks_arg *a = (const ib_pqv2_chunks_arg*)arg;
+    int slot = start / a->chunk_size;
+    if (slot < 0) slot = 0;
+    if (slot >= a->n_slots) slot = a->n_slots - 1;
+    float *acc    = a->acc_pool    + (size_t)slot * a->M;
+    float *acc_l2 = a->acc_l2_pool ? a->acc_l2_pool + (size_t)slot * a->M : NULL;
+    if (a->skip_thresh > 0.0f) {
+        pqv2_acc_tbl_int8_k256_chunks_skip(a->t, a->x,
+                                              a->t->cb_fp32, a->t->l2_cb_fp32,
+                                              acc, acc_l2,
+                                              (uint32_t)start, (uint32_t)end,
+                                              a->skip_thresh);
+    } else {
+        pqv2_acc_tbl_int8_k256_chunks(a->t, a->x,
+                                        a->t->cb_fp32, a->t->l2_cb_fp32,
+                                        acc, acc_l2,
+                                        (uint32_t)start, (uint32_t)end);
+    }
+}
+
+/* Forward decl for the single-position threaded variant (defined below). */
+static void pqv2_threaded_matvec_k256(
+    const inferbit_model *m,
+    struct ib_thread_pool *tp, int n_threads,
+    const pqv2_t *t, const float *x, float *y);
+
+/* Batched-aware variant of the per-chunk threading. Same chunk-to-slot
+ * mapping as the single-position threaded path so each output position's
+ * fp32 summation order is bit-identical between single-token decode and
+ * spec verify. acc pool layout: [n_slots, B, M]. */
+typedef struct {
+    const pqv2_t *t;
+    const float  *x_batch;
+    int           B;
+    float        *acc_pool;
+    uint32_t      M;
+    int           chunk_size;
+    int           n_slots;
+} ib_pqv2_chunks_batch_arg;
+
+static void ib_pqv2_chunks_batch_task(void *arg, int tid, int start, int end) {
+    (void)tid;
+    const ib_pqv2_chunks_batch_arg *a = (const ib_pqv2_chunks_batch_arg*)arg;
+    int slot = start / a->chunk_size;
+    if (slot < 0) slot = 0;
+    if (slot >= a->n_slots) slot = a->n_slots - 1;
+    /* Slot owns a [B, M] block. */
+    float *acc = a->acc_pool + (size_t)slot * a->B * a->M;
+    pqv2_acc_tbl_int8_k256_chunks_batch(a->t, a->x_batch, a->B,
+                                          a->t->cb_fp32, acc,
+                                          (uint32_t)start, (uint32_t)end);
+}
+
+static void pqv2_threaded_matvec_k256_batch(
+    const inferbit_model *m,
+    struct ib_thread_pool *tp, int n_threads,
+    const pqv2_t *t, const float *x_batch, int B, float *y_batch)
+{
+    if (B <= 0) return;
+    if (B == 1) {
+        pqv2_threaded_matvec_k256(m, tp, n_threads, t, x_batch, y_batch);
+        return;
+    }
+    uint32_t M = t->M;
+    uint32_t n_chunks = t->N / t->G;
+    if (!tp || n_threads <= 1 || n_chunks < (uint32_t)n_threads ||
+        !t->cb_fp32 || t->K != 256 || B > 8) {
+        pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
+        return;
+    }
+    int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
+    int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
+    size_t pool_floats = (size_t)n_slots * B * M;
+    float *acc_pool = aligned_alloc(64,
+        (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+    if (!acc_pool) {
+        pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
+        return;
+    }
+    memset(acc_pool, 0, pool_floats * sizeof(float));
+    ib_pqv2_chunks_batch_arg arg = {
+        .t = t, .x_batch = x_batch, .B = B,
+        .acc_pool = acc_pool, .M = M,
+        .chunk_size = chunks_per_task, .n_slots = n_slots,
+    };
+    ib_pool_run(tp, ib_pqv2_chunks_batch_task, &arg,
+                 (int)n_chunks, chunks_per_task);
+
+    /* Reduce per-position: y[b,m] = (sum_s acc[s,b,m]) * row_scale[m].
+     * Slot order is fixed (s=0..n_slots-1) so this matches the
+     * single-position threaded reduction exactly when B=1. */
+    for (int b = 0; b < B; b++) {
+        float *yb = y_batch + (size_t)b * M;
+        for (uint32_t m = 0; m < M; m++) {
+            float a = 0.0f;
+            for (int s = 0; s < n_slots; s++) {
+                a += acc_pool[(size_t)s * B * M + (size_t)b * M + m];
+            }
+            float rs = pqv2_h2f(t->row_scale[m]);
+            yb[m] = a * rs;
+        }
+    }
+    free(acc_pool);
+}
+
+static void pqv2_threaded_matvec_k256(
+    const inferbit_model *m,
+    struct ib_thread_pool *tp, int n_threads,
+    const pqv2_t *t, const float *x, float *y)
+{
+    uint32_t M = t->M;
+    uint32_t n_chunks = t->N / t->G;
+    /* Bail out to single-thread when threading wouldn't pay off. */
+    if (!tp || n_threads <= 1 || n_chunks < (uint32_t)n_threads ||
+        !t->cb_fp32 || t->K != 256) {
+        pqv2_matvec_dispatch(t, x, y);
+        return;
+    }
+    int has_l2 = (t->l2_kind == 2 && t->l2_cb_fp32 && t->l2_K <= 64);
+    int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
+    int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
+    size_t pool_floats = (size_t)n_slots * M;
+    /* Use model-scope scratch to avoid per-call aligned_alloc. The
+     * scratch is sized for n_threads × max_M; fall back to a fresh
+     * malloc only if (somehow) the request exceeds that budget. */
+    float *acc_pool;
+    int acc_pool_owned = 0;
+    if (m && m->pqv2_thread_acc_pool && pool_floats <= m->pqv2_thread_acc_pool_floats) {
+        acc_pool = m->pqv2_thread_acc_pool;
+    } else {
+        acc_pool = aligned_alloc(64,
+            (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+        if (!acc_pool) { pqv2_matvec_dispatch(t, x, y); return; }
+        acc_pool_owned = 1;
+    }
+    memset(acc_pool, 0, pool_floats * sizeof(float));
+    float *acc_l2_pool = NULL;
+    int acc_l2_owned = 0;
+    if (has_l2) {
+        acc_l2_pool = aligned_alloc(64,
+            (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+        if (acc_l2_pool) {
+            memset(acc_l2_pool, 0, pool_floats * sizeof(float));
+            acc_l2_owned = 1;
+        }
+    }
+    /* Activation-aware skip: when IB_PQV2_SKIP env is set (e.g. "0.01"),
+     * skip (c,s) iters with max|x_slice| < ratio * max|x|. 1% threshold
+     * is essentially lossless on transformer activations. Skip rate
+     * naturally adapts: outlier-heavy early layers skip a lot, diffuse
+     * later layers skip little. */
+    float skip_thresh = 0.0f;
+    {
+        const char *env = getenv("IB_PQV2_SKIP");
+        if (env && env[0]) {
+            float ratio = (float)atof(env);
+            if (ratio > 0.0f && ratio < 1.0f) {
+                float xmax = 0.0f;
+                for (uint32_t i = 0; i < t->N; i++) {
+                    float v = x[i]; if (v < 0) v = -v;
+                    if (v > xmax) xmax = v;
+                }
+                skip_thresh = ratio * xmax;
+            }
+        }
+    }
+    ib_pqv2_chunks_arg arg = {
+        .t = t, .x = x,
+        .acc_pool = acc_pool, .acc_l2_pool = acc_l2_pool,
+        .M = M,
+        .chunk_size = chunks_per_task,
+        .n_slots = n_slots,
+        .skip_thresh = skip_thresh,
+    };
+    ib_pool_run(tp, ib_pqv2_chunks_task, &arg, (int)n_chunks, chunks_per_task);
+
+    /* Reduce: sum across deterministic slot order, then apply row_scale + L2 */
+    for (uint32_t m = 0; m < M; m++) {
+        float a = 0.0f, al2 = 0.0f;
+        for (int s = 0; s < n_slots; s++) {
+            a += acc_pool[(size_t)s * M + m];
+            if (acc_l2_pool) al2 += acc_l2_pool[(size_t)s * M + m];
+        }
+        float rs = pqv2_h2f(t->row_scale[m]);
+        y[m] = a * rs + al2;
+    }
+    if (acc_pool_owned) free(acc_pool);
+    if (acc_l2_owned) free(acc_l2_pool);
+}
+
 static void tensor_matmul(
     const inferbit_model* m, const ib_tensor_meta* t,
     float* out, const float* input, int M, int N,
     float* scale_buf
 ) {
-    /* PQv2 dispatch — takes precedence when present. */
+    /* PQv2 dispatch — takes precedence when present. Per-chunk threading
+     * for K=256; falls back to single-thread for other K or no pool. */
     if (t->pq) {
         const pqv2_t* pq = t->pq;
-        if (pq->K == 256) {
-            pqv2_matvec_tbl_int8_k256(pq, input, out);
-        } else if (pq->K == 128) {
-            pqv2_matvec_tbl_int8_k128(pq, input, out);
-        } else if (pq->K <= 64) {
-            pqv2_matvec_tbl_int8(pq, input, out);
+        if (pq->K == 256 && m->thread_pool && m->num_threads > 1) {
+            pqv2_threaded_matvec_k256(m, m->thread_pool, m->num_threads,
+                                        pq, input, out);
         } else {
-            pqv2_matvec_lut(pq, input, out);
+            pqv2_matvec_dispatch(pq, input, out);
         }
         return;
     }
@@ -226,10 +442,22 @@ static void tensor_matmul_batch(
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
     }
 
-    /* PQv2: no batched path yet — dispatch each row sequentially.
-     * (PQv2 matvec is internally row-parallel; batching x's gives little
-     * extra win without a real GEMM-style PQv2 kernel.) */
+    /* PQv2 batched path: per-chunk threading shared across B positions.
+     * Each chunk slot contributes to ALL B output positions, so weight
+     * reads are amortised across B. Same chunk-to-slot partition as
+     * the single-position threaded path → identical fp32 sum order. */
     if (t->pq) {
+        const pqv2_t* pq = t->pq;
+        if (pq->K == 256 && B >= 1 && B <= 8 &&
+            m->thread_pool && m->num_threads > 1) {
+            pqv2_threaded_matvec_k256_batch(m, m->thread_pool, m->num_threads,
+                                              pq, input, B, out);
+            return;
+        }
+        if (pq->K == 256 && B > 1 && B <= 8) {
+            pqv2_matvec_tbl_int8_k256_batch(pq, input, B, out);
+            return;
+        }
         for (int b = 0; b < B; b++) {
             tensor_matmul(m, t, out + (size_t)b * M, input + (size_t)b * N,
                           M, N, scale_buf);

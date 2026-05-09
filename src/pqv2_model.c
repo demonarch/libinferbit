@@ -19,18 +19,9 @@ int ib_alloc_buffers(inferbit_model* model);
 /* SIMD + thread pool — declared in inferbit_internal.h with the right
  * types (ib_simd_level, ib_thread_pool); already in scope. */
 
-static void fill_tinyllama_arch(ib_ibf_header* h) {
+static void fill_llama_defaults(ib_ibf_header* h) {
     memset(h, 0, sizeof(*h));
-    strncpy(h->name, "TinyLlama-1.1B-Chat-v1.0", sizeof(h->name) - 1);
     strncpy(h->architecture, "llama", sizeof(h->architecture) - 1);
-    h->num_layers          = 22;
-    h->hidden_size         = 2048;
-    h->num_heads           = 32;
-    h->num_kv_heads        = 4;
-    h->head_dim            = 64;
-    h->intermediate_size   = 5632;
-    h->vocab_size          = 32000;
-    h->max_context_length  = 2048;
     h->rope_theta          = 10000.0f;
     h->norm_epsilon        = 1e-5f;
     strncpy(h->norm_type,  "rmsnorm", sizeof(h->norm_type) - 1);
@@ -39,8 +30,72 @@ static void fill_tinyllama_arch(ib_ibf_header* h) {
     h->bos_token_id = 1;
     h->eos_token_id = 2;
     h->default_bits = 4;
-    h->kv_bits = 16;
+    /* KV cache bits: 16 (fp32) by default — quality-safe. Override via
+     * IB_PQV2_KV_BITS (4/8/16). INT4 only pays off at long context
+     * (≥1K tokens) where K/V cache memory traffic dominates attention. */
+    {
+        const char *kvb = getenv("IB_PQV2_KV_BITS");
+        h->kv_bits = (kvb && kvb[0]) ? atoi(kvb) : 16;
+        if (h->kv_bits != 16 && h->kv_bits != 8 && h->kv_bits != 4) h->kv_bits = 16;
+    }
     h->alignment = 64;
+    h->max_context_length  = 2048;
+}
+
+/* Detect architecture from PQv2 tensor shapes. We hardcode known
+ * LLaMA-family models by signature (q_proj M, hidden, n_layers).
+ * TODO: replace with a config blob in the IBF v6 header. */
+static int detect_arch_from_tensors(const ib_pqv2_file* f, ib_ibf_header* h) {
+    /* Find L0.self_attn.q_proj to read q_proj_M and hidden. */
+    int q_proj_M = 0, hidden = 0, n_layers = 0;
+    int v_proj_M = 0;
+    int gate_proj_M = 0;
+    for (int i = 0; i < f->n_tensors; i++) {
+        const ib_pqv2_named_tensor* nt = &f->tensors[i];
+        if (nt->kind != IB_PQV2_KIND_PQV2) continue;
+        int li;
+        char parent[32], proj[32];
+        if (sscanf(nt->name, "L%d.%31[^.].%31s", &li, parent, proj) != 3) continue;
+        if (li + 1 > n_layers) n_layers = li + 1;
+        if (li == 0 && strcmp(parent, "self_attn") == 0) {
+            if (strcmp(proj, "q_proj") == 0) {
+                q_proj_M = (int)nt->pq.M;
+                hidden   = (int)nt->pq.N;
+            } else if (strcmp(proj, "v_proj") == 0) {
+                v_proj_M = (int)nt->pq.M;
+            }
+        } else if (li == 0 && strcmp(parent, "mlp") == 0 &&
+                    strcmp(proj, "gate_proj") == 0) {
+            gate_proj_M = (int)nt->pq.M;
+        }
+    }
+    if (!q_proj_M || !hidden || !n_layers) return -1;
+
+    fill_llama_defaults(h);
+    h->hidden_size       = hidden;
+    h->num_layers        = n_layers;
+    h->num_heads         = q_proj_M / 64;          /* head_dim hardcoded 64 */
+    h->head_dim          = 64;
+    h->num_kv_heads      = v_proj_M ? (v_proj_M / 64) : h->num_heads;
+    h->intermediate_size = gate_proj_M ? gate_proj_M : (hidden * 4);
+
+    /* Vocab size — read from token_embedding raw blob. */
+    h->vocab_size = 32000;
+    for (int i = 0; i < f->n_tensors; i++) {
+        const ib_pqv2_named_tensor* nt = &f->tensors[i];
+        if (nt->kind == IB_PQV2_KIND_PQV2) continue;
+        if (strcmp(nt->name, "token_embedding") == 0) {
+            /* fp16 storage: bytes / (hidden * 2) = vocab_size */
+            h->vocab_size = (int)(nt->raw_size / ((size_t)hidden * 2));
+            break;
+        }
+    }
+
+    /* Pretty-print name for debugging. */
+    snprintf(h->name, sizeof(h->name),
+             "llama-%dL-%dH-%dheads-%dkv",
+             n_layers, hidden, h->num_heads, h->num_kv_heads);
+    return 0;
 }
 
 static void set_pq_meta(ib_tensor_meta* t, const pqv2_t* pq) {
@@ -83,7 +138,13 @@ static inferbit_model* pqv2_load_internal(const char* path,
         free(f);
         return NULL;
     }
-    fill_tinyllama_arch(&m->header);
+    if (detect_arch_from_tensors(f, &m->header) != 0) {
+        fprintf(stderr, "pqv2_load: cannot detect architecture from %s\n", path);
+        ib_pqv2_file_free(f);
+        free(f);
+        free(m);
+        return NULL;
+    }
     m->layers = calloc((size_t)m->header.num_layers, sizeof(ib_layer_meta));
     if (!m->layers) goto fail;
 
@@ -163,6 +224,28 @@ static inferbit_model* pqv2_load_internal(const char* path,
     ib_simd_level simd = ib_detect_simd();
     ib_init_kernels(simd);
     m->thread_pool = ib_pool_create(threads);
+
+    /* Pre-allocate threading scratch sized for the largest matvec
+     * across all PQv2 tensors × n_threads. Reused per matvec to avoid
+     * per-call aligned_alloc in the hot path. */
+    uint32_t max_M = 0;
+    for (int li = 0; li < m->header.num_layers; li++) {
+        ib_layer_meta *L = &m->layers[li];
+        const ib_tensor_meta *slots[7] = {
+            &L->q_proj, &L->k_proj, &L->v_proj, &L->o_proj,
+            &L->gate_proj, &L->up_proj, &L->down_proj,
+        };
+        for (int si = 0; si < 7; si++) {
+            if (slots[si]->pq && slots[si]->pq->M > max_M) max_M = slots[si]->pq->M;
+        }
+    }
+    if (max_M > 0) {
+        size_t n_threads_eff = (threads > 1) ? (size_t)threads : 1;
+        size_t pool_floats = n_threads_eff * (size_t)max_M;
+        size_t pool_bytes  = (pool_floats * sizeof(float) + 63) & ~(size_t)63;
+        m->pqv2_thread_acc_pool = aligned_alloc(64, pool_bytes);
+        m->pqv2_thread_acc_pool_floats = pool_floats;
+    }
     return m;
 
 fail:

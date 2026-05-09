@@ -726,44 +726,38 @@ static inline void build_lut_int8_k256(const float *cb, const float *xs,
     *lut_scale = sc;
 }
 
-void pqv2_matvec_tbl_int8_k256(const pqv2_t *t, const float *x, float *y) {
-    uint32_t M = t->M, G = t->G, K = t->K, ns = t->n_subchunks, half = t->half;
-    uint32_t n_chunks = t->N / G;
-    if (K != 256) { pqv2_matvec_lut(t, x, y); return; }
-
-    float *acc = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
-    memset(acc, 0, M * sizeof(float));
-    float *acc_l2 = NULL;
-    if (t->l2_kind == 2 && t->l2_K <= 64) {
-        acc_l2 = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
-        memset(acc_l2, 0, M * sizeof(float));
-    }
-    float *cb = malloc((size_t)ns * K * half * sizeof(float));
-    for (uint32_t s = 0; s < ns; s++)
-        for (uint32_t k = 0; k < K; k++) {
-            float sc = pqv2_h2f(t->cb_scale[s * K + k]);
-            const int8_t *q = &t->cb_q[(s * K + k) * half];
-            for (uint32_t h = 0; h < half; h++)
-                cb[(s * K + k) * half + h] = (float)q[h] * sc;
-        }
-    float *l2_cb = NULL;
-    if (acc_l2) {
-        l2_cb = malloc((size_t)ns * t->l2_K * half * sizeof(float));
-        for (uint32_t s = 0; s < ns; s++)
-            for (uint32_t k = 0; k < t->l2_K; k++) {
-                float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
-                const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
-                for (uint32_t h = 0; h < half; h++)
-                    l2_cb[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
-            }
-    }
+/* Chunk-range accumulator (K=256). Pure accumulation into caller-owned
+ * acc/acc_l2 over chunks [c_start, c_end). Caller must zero acc/acc_l2
+ * before the first call. cb and l2_cb must be precomputed fp32 codebooks
+ * (caller passes t->cb_fp32 / t->l2_cb_fp32 directly). */
+/* Internal: chunk-range accumulator with optional activation-skip.
+ * skip_thresh == 0  → no skip check, identical to original behavior.
+ * skip_thresh >  0  → bypass (c,s) iters with max|x_slice| < skip_thresh. */
+static void pqv2_acc_tbl_int8_k256_chunks_inner(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t c_start, uint32_t c_end,
+    float skip_thresh)
+{
+    uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half;
+    uint32_t G = t->G;
+    if (K != 256) return;
     int8_t lut[4][64] __attribute__((aligned(16)));
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float lut_scale, l2_lut_scale;
 
-    for (uint32_t c = 0; c < n_chunks; c++) {
+    for (uint32_t c = c_start; c < c_end; c++) {
         for (uint32_t s = 0; s < ns; s++) {
             const float *xs = &x[c * G + s * half];
+            if (skip_thresh > 0.0f) {
+                float xm = 0.0f;
+                for (uint32_t h = 0; h < half; h++) {
+                    float v = xs[h]; if (v < 0) v = -v;
+                    if (v > xm) xm = v;
+                }
+                if (xm < skip_thresh) continue;
+            }
             build_lut_int8_k256(&cb[(size_t)s * K * half], xs, half,
                                   lut, &lut_scale);
 #if defined(__ARM_NEON)
@@ -876,15 +870,520 @@ void pqv2_matvec_tbl_int8_k256(const pqv2_t *t, const float *x, float *y) {
 #endif
         }
     }
+}
+
+/* Public chunks accumulator (no skip, original API). */
+void pqv2_acc_tbl_int8_k256_chunks(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t c_start, uint32_t c_end)
+{
+    pqv2_acc_tbl_int8_k256_chunks_inner(t, x, cb, l2_cb, acc, acc_l2,
+                                          c_start, c_end, 0.0f);
+}
+
+/* Public skip-aware chunks accumulator. */
+void pqv2_acc_tbl_int8_k256_chunks_skip(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t c_start, uint32_t c_end,
+    float skip_thresh)
+{
+    pqv2_acc_tbl_int8_k256_chunks_inner(t, x, cb, l2_cb, acc, acc_l2,
+                                          c_start, c_end, skip_thresh);
+}
+
+/* Single-thread K=256 matvec: alloc scratch, accumulate over all chunks,
+ * apply row_scale + L2, write y. Threading lives outside the kernel
+ * (forward.c invokes pqv2_acc_tbl_int8_k256_chunks per worker). */
+void pqv2_matvec_tbl_int8_k256(const pqv2_t *t, const float *x, float *y) {
+    uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half;
+    uint32_t n_chunks = t->N / t->G;
+    if (K != 256) { pqv2_matvec_lut(t, x, y); return; }
+
+    float *acc = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
+    memset(acc, 0, M * sizeof(float));
+    float *acc_l2 = NULL;
+    if (t->l2_kind == 2 && t->l2_K <= 64) {
+        acc_l2 = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
+        memset(acc_l2, 0, M * sizeof(float));
+    }
+    /* fp32 codebook: precomputed by loader, decode locally if absent. */
+    const float *cb;
+    float *cb_local = NULL;
+    if (t->cb_fp32) {
+        cb = t->cb_fp32;
+    } else {
+        cb_local = malloc((size_t)ns * K * half * sizeof(float));
+        for (uint32_t s = 0; s < ns; s++)
+            for (uint32_t k = 0; k < K; k++) {
+                float sc = pqv2_h2f(t->cb_scale[s * K + k]);
+                const int8_t *q = &t->cb_q[(s * K + k) * half];
+                for (uint32_t h = 0; h < half; h++)
+                    cb_local[(s * K + k) * half + h] = (float)q[h] * sc;
+            }
+        cb = cb_local;
+    }
+    const float *l2_cb = NULL;
+    float *l2_cb_local = NULL;
+    if (acc_l2) {
+        if (t->l2_cb_fp32) {
+            l2_cb = t->l2_cb_fp32;
+        } else {
+            l2_cb_local = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+            for (uint32_t s = 0; s < ns; s++)
+                for (uint32_t k = 0; k < t->l2_K; k++) {
+                    float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
+                    const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+                    for (uint32_t h = 0; h < half; h++)
+                        l2_cb_local[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                }
+            l2_cb = l2_cb_local;
+        }
+    }
+
+    pqv2_acc_tbl_int8_k256_chunks(t, x, cb, l2_cb, acc, acc_l2, 0, n_chunks);
+
     for (uint32_t m = 0; m < M; m++) {
         float rs = pqv2_h2f(t->row_scale[m]);
         y[m] = acc[m] * rs + (acc_l2 ? acc_l2[m] : 0.0f);
     }
-    free(cb); if (l2_cb) free(l2_cb);
+    if (cb_local) free(cb_local);
+    if (l2_cb_local) free(l2_cb_local);
     free(acc); if (acc_l2) free(acc_l2);
 }
 
+#define IB_PQV2_BATCH_MAX 8
+
+/* Batched chunk-range accumulator (K=256). Pure accumulation into
+ * caller-owned acc[B*M] over chunks [c_start, c_end). Per-position
+ * summation order matches the single-position chunks variant exactly,
+ * so spec verify agrees bit-for-bit with single-token decode (when
+ * the threading uses the same chunk-to-slot partition).
+ *
+ * Just calls the single-position chunks function B times; the batched
+ * kernel I tried earlier (interleaved B-lane gathers) ran into NEON
+ * register pressure for B=4 and lost the win we expected. Per-position
+ * sequential calls are simpler and produce identical fp32 output. */
+void pqv2_acc_tbl_int8_k256_chunks_batch(
+    const pqv2_t *t, const float *x_batch, int B,
+    const float *cb,
+    float *acc_batch,
+    uint32_t c_start, uint32_t c_end)
+{
+    if (t->K != 256) return;
+    for (int b = 0; b < B; b++) {
+        const float *xb = x_batch + (size_t)b * t->N;
+        float *ab = acc_batch + (size_t)b * t->M;
+        pqv2_acc_tbl_int8_k256_chunks(t, xb, cb, NULL, ab, NULL,
+                                        c_start, c_end);
+    }
+}
+
+/* DERISK: K=256 single-position matvec with activation-aware skip.
+ * Identical to pqv2_matvec_tbl_int8_k256 but skips (c,s) iterations
+ * whose input slice has max|x| below skip_thresh. */
+void pqv2_matvec_tbl_int8_k256_skip(
+    const pqv2_t *t, const float *x, float *y,
+    float skip_thresh, double *out_skip_frac)
+{
+    if (t->K != 256 || !t->cb_fp32) {
+        pqv2_matvec_tbl_int8_k256(t, x, y);
+        if (out_skip_frac) *out_skip_frac = 0.0;
+        return;
+    }
+    uint32_t M = t->M, K = 256, ns = t->n_subchunks, half = t->half, G = t->G;
+    uint32_t n_chunks = t->N / G;
+    const float *cb = t->cb_fp32;
+    float *acc = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~(size_t)63);
+    memset(acc, 0, M * sizeof(float));
+    long n_skipped = 0;
+    long n_total = (long)n_chunks * (long)ns;
+#if defined(__ARM_NEON)
+    const uint8x16_t mask63 = vdupq_n_u8(63);
+    const uint8x16_t one_v  = vdupq_n_u8(1);
+    int8_t lut[4][64] __attribute__((aligned(16)));
+    float lut_scale;
+    for (uint32_t c = 0; c < n_chunks; c++) {
+        for (uint32_t s = 0; s < ns; s++) {
+            const float *xs = &x[c * G + s * half];
+            /* Activation magnitude check — skip if entire input slice
+             * is too small to contribute meaningfully. */
+            float xm = 0.0f;
+            for (uint32_t h = 0; h < half; h++) {
+                float v = xs[h]; if (v < 0) v = -v;
+                if (v > xm) xm = v;
+            }
+            if (xm < skip_thresh) { n_skipped++; continue; }
+            build_lut_int8_k256(&cb[(size_t)s * K * half], xs, half,
+                                  lut, &lut_scale);
+            int8x16x4_t bank0, bank1, bank2, bank3;
+            bank0.val[0] = vld1q_s8(&lut[0][0]);  bank0.val[1] = vld1q_s8(&lut[0][16]);
+            bank0.val[2] = vld1q_s8(&lut[0][32]); bank0.val[3] = vld1q_s8(&lut[0][48]);
+            bank1.val[0] = vld1q_s8(&lut[1][0]);  bank1.val[1] = vld1q_s8(&lut[1][16]);
+            bank1.val[2] = vld1q_s8(&lut[1][32]); bank1.val[3] = vld1q_s8(&lut[1][48]);
+            bank2.val[0] = vld1q_s8(&lut[2][0]);  bank2.val[1] = vld1q_s8(&lut[2][16]);
+            bank2.val[2] = vld1q_s8(&lut[2][32]); bank2.val[3] = vld1q_s8(&lut[2][48]);
+            bank3.val[0] = vld1q_s8(&lut[3][0]);  bank3.val[1] = vld1q_s8(&lut[3][16]);
+            bank3.val[2] = vld1q_s8(&lut[3][32]); bank3.val[3] = vld1q_s8(&lut[3][48]);
+            float32x4_t scl = vdupq_n_f32(lut_scale);
+            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            for (uint32_t m = 0; m + 16 <= M; m += 16) {
+                uint8x16_t i16 = vld1q_u8(&idx[m]);
+                uint8x16_t i6  = vandq_u8(i16, mask63);
+                uint8x16_t sel_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(i16, 6), one_v), one_v);
+                uint8x16_t sel_msb = vceqq_u8(vshrq_n_u8(i16, 7), one_v);
+                int8x16_t g0 = vqtbl4q_s8(bank0, i6);
+                int8x16_t g1 = vqtbl4q_s8(bank1, i6);
+                int8x16_t g2 = vqtbl4q_s8(bank2, i6);
+                int8x16_t g3 = vqtbl4q_s8(bank3, i6);
+                int8x16_t g  = vbslq_s8(sel_msb,
+                                          vbslq_s8(sel_lsb, g3, g2),
+                                          vbslq_s8(sel_lsb, g1, g0));
+                int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+                int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)));
+                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+                float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)));
+                vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), f0, scl));
+                vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), f1, scl));
+                vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
+                vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
+            }
+        }
+    }
+    for (uint32_t m = 0; m < M; m++) {
+        y[m] = acc[m] * pqv2_h2f(t->row_scale[m]);
+    }
 #else
+    pqv2_matvec_tbl_int8_k256(t, x, y);
+#endif
+    free(acc);
+    if (out_skip_frac) *out_skip_frac = (double)n_skipped / (double)n_total;
+}
+
+/* DERISK: K≤64 single-position matvec with activation-aware skip.
+ * Wraps pqv2_matvec_tbl_int8 by manually walking (c,s) and skipping. */
+void pqv2_matvec_tbl_int8_skip(
+    const pqv2_t *t, const float *x, float *y,
+    float skip_thresh, double *out_skip_frac)
+{
+    if (t->K > 64) { pqv2_matvec_tbl_int8(t, x, y); if (out_skip_frac) *out_skip_frac = 0.0; return; }
+    /* Lazy implementation: just walk the chunks directly with the same
+     * inner kernel as pqv2_matvec_tbl_int8 but with skip. Reuses the
+     * cb_fp32 if available. For K≤64 the build_lut + gather is much
+     * cheaper than K=256, so the relative speedup from skipping may
+     * be smaller. */
+    uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half, G = t->G;
+    uint32_t n_chunks = t->N / G;
+    const float *cb;
+    float *cb_local = NULL;
+    if (t->cb_fp32) cb = t->cb_fp32;
+    else {
+        cb_local = malloc((size_t)ns * K * half * sizeof(float));
+        for (uint32_t s = 0; s < ns; s++)
+            for (uint32_t k = 0; k < K; k++) {
+                float sc = pqv2_h2f(t->cb_scale[s * K + k]);
+                const int8_t *q = &t->cb_q[(s * K + k) * half];
+                for (uint32_t h = 0; h < half; h++)
+                    cb_local[(s * K + k) * half + h] = (float)q[h] * sc;
+            }
+        cb = cb_local;
+    }
+    float *acc = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~(size_t)63);
+    memset(acc, 0, M * sizeof(float));
+    long n_skipped = 0, n_total = (long)n_chunks * (long)ns;
+#if defined(__ARM_NEON)
+    int8_t lut_q[64] __attribute__((aligned(16)));
+    float lut_scale;
+    for (uint32_t c = 0; c < n_chunks; c++) {
+        for (uint32_t s = 0; s < ns; s++) {
+            const float *xs = &x[c * G + s * half];
+            float xm = 0.0f;
+            for (uint32_t h = 0; h < half; h++) {
+                float v = xs[h]; if (v < 0) v = -v; if (v > xm) xm = v;
+            }
+            if (xm < skip_thresh) { n_skipped++; continue; }
+            build_lut_int8(&cb[(size_t)s * K * half], xs, K, half,
+                            lut_q, &lut_scale);
+            int8x16x4_t tbl;
+            tbl.val[0] = vld1q_s8(&lut_q[0]);
+            tbl.val[1] = vld1q_s8(&lut_q[16]);
+            tbl.val[2] = vld1q_s8(&lut_q[32]);
+            tbl.val[3] = vld1q_s8(&lut_q[48]);
+            float32x4_t scl = vdupq_n_f32(lut_scale);
+            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            for (uint32_t m = 0; m + 16 <= M; m += 16) {
+                uint8x16_t i = vld1q_u8(&idx[m]);
+                int8x16_t g = vqtbl4q_s8(tbl, i);
+                int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+                int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)));
+                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+                float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)));
+                vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), f0, scl));
+                vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), f1, scl));
+                vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
+                vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
+            }
+        }
+    }
+    for (uint32_t m = 0; m < M; m++)
+        y[m] = acc[m] * pqv2_h2f(t->row_scale[m]);
+#else
+    pqv2_matvec_tbl_int8(t, x, y);
+#endif
+    free(acc); if (cb_local) free(cb_local);
+    if (out_skip_frac) *out_skip_frac = (double)n_skipped / (double)n_total;
+}
+
+/* DERISK: fp16-accumulator single-position kernel.
+ *
+ * Same loop structure as pqv2_matvec_tbl_int8_k256 but with acc as
+ * fp16 instead of fp32. The multiply by lut_scale is still fp32 (so
+ * we don't lose precision per iteration); only the accumulation is
+ * fp16. After the chunk loop, acc is promoted to fp32 and multiplied
+ * by row_scale.
+ *
+ * Memory savings: M halfs (2 bytes) instead of M floats (4 bytes) for
+ * acc — read+write per (c,s,m_tile) → halved traffic on the dominant
+ * memory stream. */
+void pqv2_matvec_tbl_int8_k256_fp16acc(
+    const pqv2_t *t, const float *x, float *y)
+{
+    if (t->K != 256) { pqv2_matvec_tbl_int8_k256(t, x, y); return; }
+    uint32_t M = t->M, K = 256, ns = t->n_subchunks, half = t->half, G = t->G;
+    uint32_t n_chunks = t->N / G;
+    if (M < 16 || (M % 16) != 0 || !t->cb_fp32) {
+        pqv2_matvec_tbl_int8_k256(t, x, y);
+        return;
+    }
+    const float *cb = t->cb_fp32;
+    /* fp16 acc: 2 bytes per element, half the traffic of fp32 acc. */
+    __fp16 *acc = aligned_alloc(64, ((size_t)M * sizeof(__fp16) + 63) & ~(size_t)63);
+    memset(acc, 0, M * sizeof(__fp16));
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    const uint8x16_t mask63 = vdupq_n_u8(63);
+    const uint8x16_t one_v  = vdupq_n_u8(1);
+    int8_t lut[4][64] __attribute__((aligned(16)));
+    float lut_scale;
+
+    for (uint32_t c = 0; c < n_chunks; c++) {
+        for (uint32_t s = 0; s < ns; s++) {
+            const float *xs = &x[c * G + s * half];
+            build_lut_int8_k256(&cb[(size_t)s * K * half], xs, half,
+                                  lut, &lut_scale);
+            int8x16x4_t bank0, bank1, bank2, bank3;
+            bank0.val[0] = vld1q_s8(&lut[0][0]);  bank0.val[1] = vld1q_s8(&lut[0][16]);
+            bank0.val[2] = vld1q_s8(&lut[0][32]); bank0.val[3] = vld1q_s8(&lut[0][48]);
+            bank1.val[0] = vld1q_s8(&lut[1][0]);  bank1.val[1] = vld1q_s8(&lut[1][16]);
+            bank1.val[2] = vld1q_s8(&lut[1][32]); bank1.val[3] = vld1q_s8(&lut[1][48]);
+            bank2.val[0] = vld1q_s8(&lut[2][0]);  bank2.val[1] = vld1q_s8(&lut[2][16]);
+            bank2.val[2] = vld1q_s8(&lut[2][32]); bank2.val[3] = vld1q_s8(&lut[2][48]);
+            bank3.val[0] = vld1q_s8(&lut[3][0]);  bank3.val[1] = vld1q_s8(&lut[3][16]);
+            bank3.val[2] = vld1q_s8(&lut[3][32]); bank3.val[3] = vld1q_s8(&lut[3][48]);
+            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            float32x4_t scl = vdupq_n_f32(lut_scale);
+            for (uint32_t m = 0; m + 16 <= M; m += 16) {
+                uint8x16_t i16 = vld1q_u8(&idx[m]);
+                uint8x16_t i6  = vandq_u8(i16, mask63);
+                uint8x16_t sel_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(i16, 6), one_v), one_v);
+                uint8x16_t sel_msb = vceqq_u8(vshrq_n_u8(i16, 7), one_v);
+                int8x16_t g0 = vqtbl4q_s8(bank0, i6);
+                int8x16_t g1 = vqtbl4q_s8(bank1, i6);
+                int8x16_t g2 = vqtbl4q_s8(bank2, i6);
+                int8x16_t g3 = vqtbl4q_s8(bank3, i6);
+                int8x16_t g  = vbslq_s8(sel_msb,
+                                          vbslq_s8(sel_lsb, g3, g2),
+                                          vbslq_s8(sel_lsb, g1, g0));
+                /* int8 → int16 → fp32 (scale) → fp16 narrow → accumulate. */
+                int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+                int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+                float32x4_t f0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))), scl);
+                float32x4_t f1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16))), scl);
+                float32x4_t f2 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))), scl);
+                float32x4_t f3 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16))), scl);
+                float16x4_t h0 = vcvt_f16_f32(f0);
+                float16x4_t h1 = vcvt_f16_f32(f1);
+                float16x4_t h2 = vcvt_f16_f32(f2);
+                float16x4_t h3 = vcvt_f16_f32(f3);
+                float16x8_t hlo = vcombine_f16(h0, h1);
+                float16x8_t hhi = vcombine_f16(h2, h3);
+                /* RMW fp16 acc — 16 lanes per iter as 2× 8-wide. */
+                float16x8_t alo = vld1q_f16(&acc[m + 0]);
+                float16x8_t ahi = vld1q_f16(&acc[m + 8]);
+                alo = vaddq_f16(alo, hlo);
+                ahi = vaddq_f16(ahi, hhi);
+                vst1q_f16(&acc[m + 0], alo);
+                vst1q_f16(&acc[m + 8], ahi);
+            }
+        }
+    }
+    /* Promote fp16 → fp32 and apply row_scale. */
+    for (uint32_t m = 0; m < M; m++) {
+        float a = (float)acc[m];
+        y[m] = a * pqv2_h2f(t->row_scale[m]);
+    }
+#else
+    pqv2_matvec_tbl_int8_k256(t, x, y);
+#endif
+    free(acc);
+}
+
+/* DERISK: GEMM-style B=4 K=256 matvec. Outer loop = row tiles of 16;
+ * inner loop = chunks × subchunks × 4 batch positions. Per (c,s):
+ * - read indices ONCE (16 bytes) — shared across all 4 positions
+ * - build 4 LUTs (one per position)
+ * - do 4 NEON gathers + FMAs into 4 separate acc reg sets
+ * Question: does index-read amortization actually win against
+ * unchanged 4× ALU work? */
+void pqv2_matvec_tbl_int8_k256_gemm_b4(
+    const pqv2_t *t, const float *x_batch, float *y_batch)
+{
+    if (t->K != 256) {
+        pqv2_matvec_tbl_int8_k256_batch(t, x_batch, 4, y_batch);
+        return;
+    }
+    uint32_t M = t->M, K = 256, ns = t->n_subchunks, half = t->half, G = t->G;
+    uint32_t n_chunks = t->N / G;
+    if (M < 16 || (M % 16) != 0 || !t->cb_fp32) {
+        pqv2_matvec_tbl_int8_k256_batch(t, x_batch, 4, y_batch);
+        return;
+    }
+    const float *cb = t->cb_fp32;
+    float *acc = aligned_alloc(64, ((size_t)4 * M * sizeof(float) + 63) & ~(size_t)63);
+    memset(acc, 0, (size_t)4 * M * sizeof(float));
+#if defined(__ARM_NEON)
+    const uint8x16_t mask63 = vdupq_n_u8(63);
+    const uint8x16_t one_v  = vdupq_n_u8(1);
+    int8_t lut[4][4][64] __attribute__((aligned(16)));
+    float lut_scale[4];
+
+    /* Correct loop order: build LUT once per (c,s), then sweep all m
+     * tiles for all 4 batch positions. acc lives in memory; the win
+     * vs sequential B=4 is that we read indices ONCE per (c,s,m_tile)
+     * (shared across all 4 positions) instead of 4× sequentially.
+     * Same acc memory traffic as sequential. */
+    for (uint32_t c = 0; c < n_chunks; c++) {
+        for (uint32_t s = 0; s < ns; s++) {
+            for (int b = 0; b < 4; b++) {
+                const float *xs = &x_batch[(size_t)b * t->N + c * G + s * half];
+                build_lut_int8_k256(&cb[(size_t)s * K * half], xs, half,
+                                      lut[b], &lut_scale[b]);
+            }
+            const uint8_t *idx_base = &t->indices[((size_t)c * ns + s) * M];
+            for (uint32_t m = 0; m + 16 <= M; m += 16) {
+                /* Read indices ONCE for this 16-row tile. */
+                uint8x16_t i16 = vld1q_u8(&idx_base[m]);
+                uint8x16_t i6  = vandq_u8(i16, mask63);
+                uint8x16_t sel_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(i16, 6), one_v), one_v);
+                uint8x16_t sel_msb = vceqq_u8(vshrq_n_u8(i16, 7), one_v);
+                /* For each position: load LUT, gather, RMW into acc[b][m..m+15]. */
+                for (int b = 0; b < 4; b++) {
+                    int8x16x4_t bank0, bank1, bank2, bank3;
+                    bank0.val[0] = vld1q_s8(&lut[b][0][0]);  bank0.val[1] = vld1q_s8(&lut[b][0][16]);
+                    bank0.val[2] = vld1q_s8(&lut[b][0][32]); bank0.val[3] = vld1q_s8(&lut[b][0][48]);
+                    bank1.val[0] = vld1q_s8(&lut[b][1][0]);  bank1.val[1] = vld1q_s8(&lut[b][1][16]);
+                    bank1.val[2] = vld1q_s8(&lut[b][1][32]); bank1.val[3] = vld1q_s8(&lut[b][1][48]);
+                    bank2.val[0] = vld1q_s8(&lut[b][2][0]);  bank2.val[1] = vld1q_s8(&lut[b][2][16]);
+                    bank2.val[2] = vld1q_s8(&lut[b][2][32]); bank2.val[3] = vld1q_s8(&lut[b][2][48]);
+                    bank3.val[0] = vld1q_s8(&lut[b][3][0]);  bank3.val[1] = vld1q_s8(&lut[b][3][16]);
+                    bank3.val[2] = vld1q_s8(&lut[b][3][32]); bank3.val[3] = vld1q_s8(&lut[b][3][48]);
+                    int8x16_t g0 = vqtbl4q_s8(bank0, i6);
+                    int8x16_t g1 = vqtbl4q_s8(bank1, i6);
+                    int8x16_t g2 = vqtbl4q_s8(bank2, i6);
+                    int8x16_t g3 = vqtbl4q_s8(bank3, i6);
+                    int8x16_t g  = vbslq_s8(sel_msb,
+                                              vbslq_s8(sel_lsb, g3, g2),
+                                              vbslq_s8(sel_lsb, g1, g0));
+                    int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+                    int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+                    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+                    float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)));
+                    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+                    float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)));
+                    float32x4_t scl = vdupq_n_f32(lut_scale[b]);
+                    float *ap = acc + (size_t)b * M + m;
+                    vst1q_f32(ap+ 0, vfmaq_f32(vld1q_f32(ap+ 0), f0, scl));
+                    vst1q_f32(ap+ 4, vfmaq_f32(vld1q_f32(ap+ 4), f1, scl));
+                    vst1q_f32(ap+ 8, vfmaq_f32(vld1q_f32(ap+ 8), f2, scl));
+                    vst1q_f32(ap+12, vfmaq_f32(vld1q_f32(ap+12), f3, scl));
+                }
+            }
+        }
+    }
+    /* Apply row_scale: y[b][m] = acc[b][m] * row_scale[m]. */
+    for (int b = 0; b < 4; b++) {
+        for (uint32_t m = 0; m < M; m++) {
+            float rs = pqv2_h2f(t->row_scale[m]);
+            y_batch[(size_t)b * M + m] = acc[(size_t)b * M + m] * rs;
+        }
+    }
+#else
+    pqv2_matvec_tbl_int8_k256_batch(t, x_batch, 4, y_batch);
+#endif
+    free(acc);
+}
+
+/* Batched K=256 matvec — single-thread reference. Threading lives in
+ * forward.c (pqv2_threaded_matvec_k256_batch). */
+void pqv2_matvec_tbl_int8_k256_batch(
+    const pqv2_t *t, const float *x_batch, int B, float *y_batch)
+{
+    if (B <= 0) return;
+    if (B == 1) { pqv2_matvec_tbl_int8_k256(t, x_batch, y_batch); return; }
+    for (int b = 0; b < B; b++) {
+        pqv2_matvec_tbl_int8_k256(t, x_batch + (size_t)b * t->N,
+                                    y_batch + (size_t)b * t->M);
+    }
+}
+
+#else
+void pqv2_matvec_tbl_int8_k256_skip(
+    const pqv2_t *t, const float *x, float *y, float st, double *of)
+{ (void)st; pqv2_matvec_tbl_int8_k256(t, x, y); if (of) *of = 0.0; }
+void pqv2_matvec_tbl_int8_skip(
+    const pqv2_t *t, const float *x, float *y, float st, double *of)
+{ (void)st; pqv2_matvec_tbl_int8(t, x, y); if (of) *of = 0.0; }
+void pqv2_matvec_tbl_int8_k256_fp16acc(
+    const pqv2_t *t, const float *x, float *y)
+{
+    pqv2_matvec_tbl_int8_k256(t, x, y);
+}
+void pqv2_matvec_tbl_int8_k256_gemm_b4(
+    const pqv2_t *t, const float *x_batch, float *y_batch)
+{
+    for (int b = 0; b < 4; b++)
+        pqv2_matvec_tbl_int8_k256(t, x_batch + (size_t)b * t->N,
+                                    y_batch + (size_t)b * t->M);
+}
+void pqv2_matvec_tbl_int8_k256_batch(
+    const pqv2_t *t, const float *x_batch, int B, float *y_batch)
+{
+    for (int b = 0; b < B; b++)
+        pqv2_matvec_tbl_int8_k256(t, x_batch + (size_t)b * t->N,
+                                    y_batch + (size_t)b * t->M);
+}
+void pqv2_acc_tbl_int8_k256_chunks(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t c_start, uint32_t c_end) {
+    (void)t; (void)x; (void)cb; (void)l2_cb;
+    (void)acc; (void)acc_l2; (void)c_start; (void)c_end;
+}
+void pqv2_acc_tbl_int8_k256_chunks_skip(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t c_start, uint32_t c_end, float skip_thresh) {
+    (void)skip_thresh;
+    pqv2_acc_tbl_int8_k256_chunks(t, x, cb, l2_cb, acc, acc_l2, c_start, c_end);
+}
 void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
     pqv2_matvec_lut(t, x, y);
 }

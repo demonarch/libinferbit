@@ -47,7 +47,27 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out) {
         out->l2_cb_scale = (const uint16_t *)(buf + cursor); cursor += l2s_bytes;
         out->l2_indices = (const uint8_t *)(buf + cursor);  cursor += idx_bytes;
     }
+    out->cb_fp32 = NULL;
+    out->l2_cb_fp32 = NULL;
     return 0;
+}
+
+/* Precompute fp32 codebooks once per tensor. Kernel uses them on every
+ * matvec call instead of re-decoding the int8 codebook each time. */
+static float* decode_codebook_fp32(const int8_t *cb_q, const uint16_t *cb_scale,
+                                     uint32_t ns, uint32_t K, uint32_t half) {
+    float *cb = aligned_alloc(64,
+        ((size_t)ns * K * half * sizeof(float) + 63) & ~(size_t)63);
+    if (!cb) return NULL;
+    for (uint32_t s = 0; s < ns; s++) {
+        for (uint32_t k = 0; k < K; k++) {
+            float sc = pqv2_h2f(cb_scale[s * K + k]);
+            const int8_t *q = &cb_q[(s * K + k) * half];
+            for (uint32_t h = 0; h < half; h++)
+                cb[(s * K + k) * half + h] = (float)q[h] * sc;
+        }
+    }
+    return cb;
 }
 
 int ib_pqv2_file_load(const char *path, ib_pqv2_file *out) {
@@ -94,6 +114,16 @@ int ib_pqv2_file_load(const char *path, ib_pqv2_file *out) {
 
         if (t->kind == IB_PQV2_KIND_PQV2) {
             if (parse_pqv2_blob(p + blob_off, (size_t)blob_size, &t->pq) != 0) goto fail;
+            /* Precompute fp32 codebooks so the hot kernel skips the
+             * int8→fp32 decode loop on every matvec call. */
+            t->pq.cb_fp32 = decode_codebook_fp32(
+                t->pq.cb_q, t->pq.cb_scale,
+                t->pq.n_subchunks, t->pq.K, t->pq.half);
+            if (t->pq.l2_kind == 2 && t->pq.l2_cb_q) {
+                t->pq.l2_cb_fp32 = decode_codebook_fp32(
+                    t->pq.l2_cb_q, t->pq.l2_cb_scale,
+                    t->pq.n_subchunks, t->pq.l2_K, t->pq.half);
+            }
         } else {
             t->raw_data = p + blob_off;
             t->raw_size = (size_t)blob_size;
@@ -108,7 +138,14 @@ fail:
 
 void ib_pqv2_file_free(ib_pqv2_file *f) {
     if (f->tensors) {
-        for (int i = 0; i < f->n_tensors; i++) free(f->tensors[i].name);
+        for (int i = 0; i < f->n_tensors; i++) {
+            ib_pqv2_named_tensor *t = &f->tensors[i];
+            free(t->name);
+            if (t->kind == IB_PQV2_KIND_PQV2) {
+                if (t->pq.cb_fp32)    free((void*)t->pq.cb_fp32);
+                if (t->pq.l2_cb_fp32) free((void*)t->pq.l2_cb_fp32);
+            }
+        }
         free(f->tensors);
     }
     if (f->_buffer) {

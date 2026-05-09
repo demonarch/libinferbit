@@ -56,6 +56,10 @@ void inferbit_free(inferbit_model* model) {
         model->weight_data_mmap = false;
         model->mmap_fd = -1;
     }
+    if (model->pqv2_thread_acc_pool) {
+        free(model->pqv2_thread_acc_pool);
+        model->pqv2_thread_acc_pool = NULL;
+    }
 
     /* Unmap weight data */
     if (model->weight_data_mmap && model->weight_data) {

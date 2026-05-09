@@ -33,6 +33,12 @@ typedef struct {
     const int8_t  *l2_cb_q;
     const uint16_t *l2_cb_scale;
     const uint8_t *l2_indices;
+
+    /* Pre-decoded fp32 codebooks. NULL = compute on the fly per matvec
+     * (legacy slow path). Set by the file loader once per tensor so the
+     * hot kernel skips the int8→fp32 decode loop on every call. */
+    const float *cb_fp32;        /* [n_subchunks * K * half] */
+    const float *l2_cb_fp32;     /* [n_subchunks * l2_K * half], NULL if no L2 */
 } pqv2_t;
 
 /* Load .pqv2 file into freshly-malloc'd buffers. Returns 0 on success.
@@ -62,6 +68,87 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y);
 /* NEON INT8-TBL variant for K=256 (4 banks of 64 entries each).
  * Uses the top 2 bits of the index to select bank, low 6 bits as offset. */
 void pqv2_matvec_tbl_int8_k256(const pqv2_t *t, const float *x, float *y);
+
+/* DERISK: K=256 matvec with activation-aware (chunk, subchunk) skipping.
+ * For each (c,s), if max|x[c*G+s*half .. c*G+(s+1)*half]| < skip_thresh,
+ * the entire (c,s) accumulation step is bypassed. Quality cost depends
+ * on threshold and input distribution. Returns the fraction of (c,s)
+ * blocks actually skipped via *out_skip_frac (or pass NULL to ignore). */
+void pqv2_matvec_tbl_int8_k256_skip(
+    const pqv2_t *t, const float *x, float *y,
+    float skip_thresh, double *out_skip_frac);
+
+/* DERISK: K≤64 matvec with same activation-aware skipping. */
+void pqv2_matvec_tbl_int8_skip(
+    const pqv2_t *t, const float *x, float *y,
+    float skip_thresh, double *out_skip_frac);
+
+/* DERISK: fp16-accumulator variant of K=256 single-position matvec.
+ * Halves acc memory traffic (M halfs vs M floats) and frees ~half the
+ * NEON registers used for acc. fp32 multiply by lut_scale, narrow to
+ * fp16 just before accumulation. Final output remains fp32. */
+void pqv2_matvec_tbl_int8_k256_fp16acc(
+    const pqv2_t *t, const float *x, float *y);
+
+/* DERISK: GEMM-style row-tiled batched matvec for K=256, B=4.
+ *
+ * Outer loop tiles 16 rows; persistent acc state in NEON regs across
+ * all (chunk, subchunk) iterations. Indices read ONCE per (c,s) and
+ * shared across the 4 batch positions — saves ~3/4 of indices traffic
+ * vs sequential B=4. Test whether memory-amortization beats the
+ * unchanged 4× compute work.
+ *
+ * x_batch[B, N], y_batch[B, M]. B is hardcoded 4. */
+void pqv2_matvec_tbl_int8_k256_gemm_b4(
+    const pqv2_t *t, const float *x_batch, float *y_batch);
+
+/* Batched K=256 matvec: process B input positions against the same W.
+ *
+ * x_batch:  [B, N]  row-major (per-position contiguous)
+ * y_batch:  [B, M]  row-major
+ *
+ * Reads weight indices ONCE per row and produces B partial sums per row,
+ * amortizing the dominant memory traffic across B positions. Used by
+ * speculative decoding's batched verify pass (B = K_draft, e.g. 4). */
+void pqv2_matvec_tbl_int8_k256_batch(
+    const pqv2_t *t, const float *x_batch, int B, float *y_batch);
+
+/* Per-chunk-range accumulation primitive for K=256.
+ *
+ * Accumulates contributions for chunks [c_start, c_end) into caller-owned
+ * `acc` (and `acc_l2` if non-NULL). Does NOT zero acc, NOT apply row_scale,
+ * NOT write to y. Caller provides cb and l2_cb as fp32 codebooks (or
+ * passes NULL for l2_cb when the tensor has no L2 stage).
+ *
+ * Used for chunk-parallel threading: each worker gets a chunk slice and
+ * accumulates into its own thread-local acc buffer; main thread reduces
+ * across workers and applies row_scale at the end. */
+void pqv2_acc_tbl_int8_k256_chunks(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t c_start, uint32_t c_end);
+
+/* Skip-aware chunk-range accumulator (K=256). Same as the plain chunks
+ * variant but bypasses (c,s) iterations whose input slice has
+ * max|x[c*G+s*half .. c*G+(s+1)*half]| < skip_thresh. Pass 0 to disable
+ * the skip check entirely. Caller still owns + zeroes acc. */
+void pqv2_acc_tbl_int8_k256_chunks_skip(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t c_start, uint32_t c_end,
+    float skip_thresh);
+
+/* Batched chunk-range accumulator: B input positions, B output accumulators.
+ * Same per-position summation order as the single-position chunks variant
+ * (so a B=1 call is bitwise-equivalent to pqv2_acc_tbl_int8_k256_chunks).
+ * acc_batch is laid out [B, M]. Caller zeroes acc and acc_l2 once. */
+void pqv2_acc_tbl_int8_k256_chunks_batch(
+    const pqv2_t *t, const float *x_batch, int B,
+    const float *cb,
+    float *acc_batch,
+    uint32_t c_start, uint32_t c_end);
 
 /* fp16 helpers (IEEE half) */
 float pqv2_h2f(uint16_t h);

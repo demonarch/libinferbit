@@ -140,6 +140,12 @@ struct inferbit_model {
      * Stored as opaque void* to avoid pulling pqv2_format.h here. */
     void*  pqv2_file_backing;
 
+    /* Pre-allocated PQv2 threading scratch — sized for n_threads × max_M.
+     * Used by pqv2_threaded_matvec_k256 to avoid aligned_alloc/free on
+     * every matvec call (~154 calls per token in the hot path). */
+    float *pqv2_thread_acc_pool;
+    size_t pqv2_thread_acc_pool_floats;
+
     /* KV cache (one per layer) */
     ib_kv_cache* kv_caches;
 
