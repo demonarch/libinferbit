@@ -117,6 +117,21 @@ int ib_metal_matmul_w4a8_fp32_in(ib_metal_ctx *ctx,
                                   void *scratch_x_scales,   /* float[N/128], or NULL */
                                   int M, int N);
 
+/* RMSNorm with fp16 weight. Mirrors the CPU kernel exactly:
+ *   out[i] = x[i] * weight[i] / sqrt(mean(x[i]^2) + eps)
+ *
+ *   x       [N]  fp32 input
+ *   weight  [N]  fp16 weight (matches IBF on-disk layout)
+ *   out     [N]  fp32 output (may equal x for in-place — they alias safely
+ *                because pass-2 reads x[i] and writes out[i] one-to-one).
+ *
+ * Single threadgroup per call. Synchronous. Returns 0 on success. */
+int ib_metal_rmsnorm_fp16(ib_metal_ctx *ctx,
+                           const void *x_fp32,
+                           const void *weight_fp16,
+                           void *out_fp32,
+                           int N, float eps);
+
 #ifdef __cplusplus
 }
 #endif

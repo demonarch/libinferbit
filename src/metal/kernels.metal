@@ -172,3 +172,69 @@ kernel void quantize_input_int8_g128(
     if (n0 + 2 < g_end) x_q[n0 + 2] = (char)q2;
     if (n0 + 3 < g_end) x_q[n0 + 3] = (char)q3;
 }
+
+/* ── rmsnorm_fp16 ─────────────────────────────────────────────────────
+ *
+ * out[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
+ * with `weight` stored as fp16 (same layout the IBF loader keeps).
+ *
+ * Single-threadgroup kernel: one dispatch per call (small reduction).
+ * Layout: 256 threads = 8 SIMD groups × 32 lanes. Each thread sweeps
+ * N/256 elements, accumulating x*x. Two-step reduction:
+ *   1) simd_sum within each SIMD group (32 lanes → 1 partial)
+ *   2) lane 0 of each SIMD writes to threadgroup memory; first SIMD
+ *      reads back, simd_sum across the 8 partials, broadcasts.
+ *
+ * Designed for N up to ~16384 with one threadgroup; for larger N we
+ * could do a two-pass tree reduction, but TinyLlama-class is well
+ * under that.
+ */
+kernel void rmsnorm_fp16(
+    device const float *x       [[buffer(0)]],
+    device const half  *weight  [[buffer(1)]],
+    device       float *out     [[buffer(2)]],
+    constant     uint  &N       [[buffer(3)]],
+    constant     float &eps     [[buffer(4)]],
+    uint                tid     [[thread_position_in_threadgroup]],
+    uint                lane    [[thread_index_in_simdgroup]],
+    uint                simd_id [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint TG_THREADS = 256;
+    constexpr uint NUM_SIMDS  = TG_THREADS / 32;
+
+    /* Pass 1: each thread sweeps its strided slice and computes sum-of-squares. */
+    float local_ss = 0.0f;
+    for (uint i = tid; i < N; i += TG_THREADS) {
+        float v = x[i];
+        local_ss += v * v;
+    }
+
+    /* Reduce across the SIMD group (32 lanes). */
+    float simd_ss = simd_sum(local_ss);
+
+    /* Cross-SIMD reduction via threadgroup memory. Lane 0 of each SIMD
+     * writes its partial; one SIMD reads back & reduces. */
+    threadgroup float partials[NUM_SIMDS];
+    if (lane == 0) {
+        partials[simd_id] = simd_ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* SIMD 0 takes ownership of the final reduction & broadcast. */
+    threadgroup float tg_inv_rms;
+    if (simd_id == 0) {
+        float v = (lane < NUM_SIMDS) ? partials[lane] : 0.0f;
+        float total = simd_sum(v);
+        if (lane == 0) {
+            float mean = total / (float)N;
+            tg_inv_rms = 1.0f / sqrt(mean + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = tg_inv_rms;
+
+    /* Pass 2: scale + multiply by fp16 weight. */
+    for (uint i = tid; i < N; i += TG_THREADS) {
+        out[i] = x[i] * inv_rms * (float)weight[i];
+    }
+}

@@ -212,6 +212,11 @@ if(IB_METAL_ENABLED)
     target_link_libraries(bench_metal_w4a8 inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(bench_metal_w4a8 PRIVATE src)
     add_dependencies(bench_metal_w4a8 metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_rmsnorm tests/test_metal_rmsnorm.c)
+    target_link_libraries(test_metal_rmsnorm inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_rmsnorm PRIVATE src)
+    add_dependencies(test_metal_rmsnorm metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()

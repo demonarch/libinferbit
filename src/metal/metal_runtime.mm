@@ -413,3 +413,52 @@ extern "C" int ib_metal_matmul_w4a8(ib_metal_ctx *ctx,
     }
     return 0;
 }
+
+extern "C" int ib_metal_rmsnorm_fp16(ib_metal_ctx *ctx,
+                                       const void *x_fp32,
+                                       const void *weight_fp16,
+                                       void *out_fp32,
+                                       int N, float eps)
+{
+    if (!ctx || !x_fp32 || !weight_fp16 || !out_fp32 || N <= 0) return -1;
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps = get_pipeline(ctx, "rmsnorm_fp16");
+        if (!ps) return -1;
+
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b_x   = pick(x_fp32);
+        id<MTLBuffer> b_w   = pick(weight_fp16);
+        id<MTLBuffer> b_out = pick(out_fp32);
+        if (!b_x || !b_w || !b_out) {
+            fprintf(stderr, "Metal rmsnorm: buffer not registered with ctx\n");
+            return -1;
+        }
+
+        uint N_u = (uint)N;
+        float eps_v = eps;
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:b_x   offset:0 atIndex:0];
+        [enc setBuffer:b_w   offset:0 atIndex:1];
+        [enc setBuffer:b_out offset:0 atIndex:2];
+        [enc setBytes:&N_u   length:sizeof(N_u)   atIndex:3];
+        [enc setBytes:&eps_v length:sizeof(eps_v) atIndex:4];
+        /* One threadgroup of 256 threads (8 SIMDs). */
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal rmsnorm: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+    }
+    return 0;
+}
