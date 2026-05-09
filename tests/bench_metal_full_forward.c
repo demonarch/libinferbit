@@ -94,14 +94,15 @@ int main(int argc, char **argv) {
     for (int i = 0; i < hidden; i++) x0[i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f);
 
     /* Pre-seed KV caches (per layer, independent rand). */
-    uint16_t **kc_seed = malloc((size_t)n_layers * sizeof(uint16_t*));
-    uint16_t **vc_seed = malloc((size_t)n_layers * sizeof(uint16_t*));
+    /* libinferbit kv_bits=16 stores fp32 (see ibf_loader.c). */
+    float **kc_seed = malloc((size_t)n_layers * sizeof(float*));
+    float **vc_seed = malloc((size_t)n_layers * sizeof(float*));
     for (int L = 0; L < n_layers; L++) {
-        kc_seed[L] = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
-        vc_seed[L] = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
+        kc_seed[L] = malloc((size_t)seq_len * kv_dim * sizeof(float));
+        vc_seed[L] = malloc((size_t)seq_len * kv_dim * sizeof(float));
         for (size_t i = 0; i < (size_t)seq_len * kv_dim; i++) {
-            kc_seed[L][i] = f32_to_fp16(((rand() & 0xFFFF) / 32767.0f - 0.5f));
-            vc_seed[L][i] = f32_to_fp16(((rand() & 0xFFFF) / 32767.0f - 0.5f));
+            kc_seed[L][i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f);
+            vc_seed[L][i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f);
         }
     }
 
@@ -137,8 +138,8 @@ int main(int argc, char **argv) {
     void **g_kc = malloc((size_t)n_layers * sizeof(void*));
     void **g_vc = malloc((size_t)n_layers * sizeof(void*));
     for (int L = 0; L < n_layers; L++) {
-        g_kc[L] = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(uint16_t), kc_seed[L]);
-        g_vc[L] = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(uint16_t), vc_seed[L]);
+        g_kc[L] = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(float), kc_seed[L]);
+        g_vc[L] = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(float), vc_seed[L]);
     }
 
     /* ── Bench: GPU full forward (n_layers in 1 cb). ───────────────── */
@@ -146,8 +147,8 @@ int main(int argc, char **argv) {
     for (int w = 0; w < 3; w++) {
         memcpy(g_x, x0, (size_t)hidden * sizeof(float));
         for (int L = 0; L < n_layers; L++) {
-            memcpy(g_kc[L], kc_seed[L], (size_t)seq_len * kv_dim * sizeof(uint16_t));
-            memcpy(g_vc[L], vc_seed[L], (size_t)seq_len * kv_dim * sizeof(uint16_t));
+            memcpy(g_kc[L], kc_seed[L], (size_t)seq_len * kv_dim * sizeof(float));
+            memcpy(g_vc[L], vc_seed[L], (size_t)seq_len * kv_dim * sizeof(float));
         }
         ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
         for (int L = 0; L < n_layers; L++) {
@@ -174,8 +175,8 @@ int main(int argc, char **argv) {
     for (int it = 0; it < iters; it++) {
         memcpy(g_x, x0, (size_t)hidden * sizeof(float));
         for (int L = 0; L < n_layers; L++) {
-            memcpy(g_kc[L], kc_seed[L], (size_t)seq_len * kv_dim * sizeof(uint16_t));
-            memcpy(g_vc[L], vc_seed[L], (size_t)seq_len * kv_dim * sizeof(uint16_t));
+            memcpy(g_kc[L], kc_seed[L], (size_t)seq_len * kv_dim * sizeof(float));
+            memcpy(g_vc[L], vc_seed[L], (size_t)seq_len * kv_dim * sizeof(float));
         }
         ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
         for (int L = 0; L < n_layers; L++) {
@@ -215,18 +216,18 @@ int main(int argc, char **argv) {
     int8_t *xqi = malloc((size_t)intermediate);
     float  *xsh = malloc((size_t)((hidden + 127) / 128) * sizeof(float));
     float  *xsi = malloc((size_t)((intermediate + 127) / 128) * sizeof(float));
-    uint16_t **cpu_kc = malloc((size_t)n_layers * sizeof(uint16_t*));
-    uint16_t **cpu_vc = malloc((size_t)n_layers * sizeof(uint16_t*));
+    float **cpu_kc = malloc((size_t)n_layers * sizeof(float*));
+    float **cpu_vc = malloc((size_t)n_layers * sizeof(float*));
     for (int L = 0; L < n_layers; L++) {
-        cpu_kc[L] = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
-        cpu_vc[L] = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
+        cpu_kc[L] = malloc((size_t)seq_len * kv_dim * sizeof(float));
+        cpu_vc[L] = malloc((size_t)seq_len * kv_dim * sizeof(float));
     }
 
     for (int w = 0; w < 3; w++) {
         memcpy(cpu_x, x0, (size_t)hidden * sizeof(float));
         for (int L = 0; L < n_layers; L++) {
-            memcpy(cpu_kc[L], kc_seed[L], (size_t)seq_len * kv_dim * sizeof(uint16_t));
-            memcpy(cpu_vc[L], vc_seed[L], (size_t)seq_len * kv_dim * sizeof(uint16_t));
+            memcpy(cpu_kc[L], kc_seed[L], (size_t)seq_len * kv_dim * sizeof(float));
+            memcpy(cpu_vc[L], vc_seed[L], (size_t)seq_len * kv_dim * sizeof(float));
         }
         for (int L = 0; L < n_layers; L++) {
             ib_kern.rmsnorm(cpu_xb, cpu_x, input_norm_f, eps, hidden);
@@ -256,16 +257,16 @@ int main(int argc, char **argv) {
             int p1 = pos + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
             for (int i = 0; i < kv_dim; i++) {
-                cpu_kc[L][(size_t)pos * kv_dim + i] = f32_to_fp16(cpu_k[i]);
-                cpu_vc[L][(size_t)pos * kv_dim + i] = f32_to_fp16(cpu_v[i]);
+                cpu_kc[L][(size_t)pos * kv_dim + i] = cpu_k[i];
+                cpu_vc[L][(size_t)pos * kv_dim + i] = cpu_v[i];
             }
             for (int h = 0; h < n_heads; h++) {
                 int kvh = h / (n_heads / n_kv_heads);
                 float *q_h = cpu_q + h * head_dim;
                 for (int t = 0; t <= pos; t++) {
-                    uint16_t *k_t = cpu_kc[L] + (size_t)t * kv_dim + kvh * head_dim;
+                    float *k_t = cpu_kc[L] + (size_t)t * kv_dim + kvh * head_dim;
                     float s = 0.0f;
-                    for (int d = 0; d < head_dim; d++) s += q_h[d] * ib_fp16_to_fp32(k_t[d]);
+                    for (int d = 0; d < head_dim; d++) s += q_h[d] * k_t[d];
                     cpu_scores[h * p1 + t] = s * scale;
                 }
             }
@@ -284,7 +285,7 @@ int main(int argc, char **argv) {
                 for (int d = 0; d < head_dim; d++) {
                     float acc = 0.0f;
                     for (int t = 0; t < p1; t++)
-                        acc += s[t] * ib_fp16_to_fp32(cpu_vc[L][(size_t)t * kv_dim + kvh * head_dim + d]);
+                        acc += s[t] * cpu_vc[L][(size_t)t * kv_dim + kvh * head_dim + d];
                     cpu_attnout[h * head_dim + d] = acc;
                 }
             }
@@ -305,8 +306,8 @@ int main(int argc, char **argv) {
     for (int it = 0; it < iters; it++) {
         memcpy(cpu_x, x0, (size_t)hidden * sizeof(float));
         for (int L = 0; L < n_layers; L++) {
-            memcpy(cpu_kc[L], kc_seed[L], (size_t)seq_len * kv_dim * sizeof(uint16_t));
-            memcpy(cpu_vc[L], vc_seed[L], (size_t)seq_len * kv_dim * sizeof(uint16_t));
+            memcpy(cpu_kc[L], kc_seed[L], (size_t)seq_len * kv_dim * sizeof(float));
+            memcpy(cpu_vc[L], vc_seed[L], (size_t)seq_len * kv_dim * sizeof(float));
         }
         for (int L = 0; L < n_layers; L++) {
             ib_kern.rmsnorm(cpu_xb, cpu_x, input_norm_f, eps, hidden);
@@ -335,16 +336,16 @@ int main(int argc, char **argv) {
             int p1 = pos + 1;
             float scale = 1.0f / sqrtf((float)head_dim);
             for (int i = 0; i < kv_dim; i++) {
-                cpu_kc[L][(size_t)pos * kv_dim + i] = f32_to_fp16(cpu_k[i]);
-                cpu_vc[L][(size_t)pos * kv_dim + i] = f32_to_fp16(cpu_v[i]);
+                cpu_kc[L][(size_t)pos * kv_dim + i] = cpu_k[i];
+                cpu_vc[L][(size_t)pos * kv_dim + i] = cpu_v[i];
             }
             for (int h = 0; h < n_heads; h++) {
                 int kvh = h / (n_heads / n_kv_heads);
                 float *q_h = cpu_q + h * head_dim;
                 for (int t = 0; t <= pos; t++) {
-                    uint16_t *k_t = cpu_kc[L] + (size_t)t * kv_dim + kvh * head_dim;
+                    float *k_t = cpu_kc[L] + (size_t)t * kv_dim + kvh * head_dim;
                     float s = 0.0f;
-                    for (int d = 0; d < head_dim; d++) s += q_h[d] * ib_fp16_to_fp32(k_t[d]);
+                    for (int d = 0; d < head_dim; d++) s += q_h[d] * k_t[d];
                     cpu_scores[h * p1 + t] = s * scale;
                 }
             }
@@ -363,7 +364,7 @@ int main(int argc, char **argv) {
                 for (int d = 0; d < head_dim; d++) {
                     float acc = 0.0f;
                     for (int t = 0; t < p1; t++)
-                        acc += s[t] * ib_fp16_to_fp32(cpu_vc[L][(size_t)t * kv_dim + kvh * head_dim + d]);
+                        acc += s[t] * cpu_vc[L][(size_t)t * kv_dim + kvh * head_dim + d];
                     cpu_attnout[h * head_dim + d] = acc;
                 }
             }

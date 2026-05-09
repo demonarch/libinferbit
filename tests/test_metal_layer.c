@@ -68,7 +68,7 @@ static void cpu_rope_inplace(float *t, int n_heads, int head_dim, int pos, float
 /* CPU attention-block reference matching the GPU fp16 version exactly. */
 static void cpu_attn_block_fp16(
     const float *q, const float *k, const float *v,
-    uint16_t *k_cache, uint16_t *v_cache,
+    float *k_cache, float *v_cache,
     float *scores, float *attn_out,
     int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos)
 {
@@ -84,8 +84,8 @@ static void cpu_attn_block_fp16(
      * before this CPU function runs (caller does this). So the cache row
      * here is read but never written. */
     for (int i = 0; i < kv_dim; i++) {
-        k_cache[(size_t)pos * kv_dim + i] = f32_to_fp16(k[i]);
-        v_cache[(size_t)pos * kv_dim + i] = f32_to_fp16(v[i]);
+        k_cache[(size_t)pos * kv_dim + i] = k[i];
+        v_cache[(size_t)pos * kv_dim + i] = v[i];
     }
     (void)k; (void)v;
 
@@ -93,9 +93,9 @@ static void cpu_attn_block_fp16(
         int kv_h = h / heads_per_kv;
         const float *q_h = q + h * head_dim;
         for (int t = 0; t <= pos; t++) {
-            const uint16_t *k_t = k_cache + (size_t)t * kv_dim + kv_h * head_dim;
+            const float *k_t = k_cache + (size_t)t * kv_dim + kv_h * head_dim;
             float s = 0.0f;
-            for (int d = 0; d < head_dim; d++) s += q_h[d] * ib_fp16_to_fp32(k_t[d]);
+            for (int d = 0; d < head_dim; d++) s += q_h[d] * k_t[d];
             scores[h * p1 + t] = s * scale;
         }
     }
@@ -114,8 +114,8 @@ static void cpu_attn_block_fp16(
         for (int d = 0; d < head_dim; d++) {
             float acc = 0.0f;
             for (int t = 0; t < p1; t++) {
-                const uint16_t *v_t = v_cache + (size_t)t * kv_dim + kv_h * head_dim + d;
-                acc += s_row[t] * ib_fp16_to_fp32(*v_t);
+                const float *v_t = v_cache + (size_t)t * kv_dim + kv_h * head_dim + d;
+                acc += s_row[t] * (*v_t);
             }
             attn_out[h * head_dim + d] = acc;
         }
@@ -189,11 +189,11 @@ int main(int argc, char **argv) {
 
     /* Pre-seeded KV cache (positions 0..pos-1) — both paths share via this same
      * uint16 array (already in fp16). */
-    uint16_t *kc_seed = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
-    uint16_t *vc_seed = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
+    float *kc_seed = malloc((size_t)seq_len * kv_dim * sizeof(float));
+    float *vc_seed = malloc((size_t)seq_len * kv_dim * sizeof(float));
     for (size_t i = 0; i < (size_t)seq_len * kv_dim; i++) {
-        kc_seed[i] = f32_to_fp16(((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f);
-        vc_seed[i] = f32_to_fp16(((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f);
+        kc_seed[i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f;
+        vc_seed[i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f;
     }
 
     /* ── CPU forward: ──────────────────────────────────────────────────────── */
@@ -211,12 +211,12 @@ int main(int argc, char **argv) {
     int8_t *cpu_xq_i   = malloc((size_t)intermediate);
     float  *cpu_xs_h   = malloc((size_t)((hidden + 127) / 128) * sizeof(float));
     float  *cpu_xs_i   = malloc((size_t)((intermediate + 127) / 128) * sizeof(float));
-    uint16_t *cpu_kc = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
-    uint16_t *cpu_vc = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
+    float *cpu_kc = malloc((size_t)seq_len * kv_dim * sizeof(float));
+    float *cpu_vc = malloc((size_t)seq_len * kv_dim * sizeof(float));
 
     memcpy(cpu_x, x0, (size_t)hidden * sizeof(float));
-    memcpy(cpu_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
-    memcpy(cpu_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
+    memcpy(cpu_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(float));
+    memcpy(cpu_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(float));
 
     /* CPU layer execution. */
     ib_kern.rmsnorm(cpu_xb, cpu_x, input_norm_f, eps, hidden);
@@ -267,8 +267,8 @@ int main(int argc, char **argv) {
     #undef UPLOAD_W
     void *gw_input_norm = ib_metal_alloc(ctx, (size_t)hidden * sizeof(uint16_t), input_norm_h);
     void *gw_post_norm  = ib_metal_alloc(ctx, (size_t)hidden * sizeof(uint16_t), post_norm_h);
-    void *g_kc          = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(uint16_t), kc_seed);
-    void *g_vc          = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(uint16_t), vc_seed);
+    void *g_kc          = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(float), kc_seed);
+    void *g_vc          = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(float), vc_seed);
 
     /* Build the layer once into a recorder, commit, copy out, compare. */
     ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
@@ -308,8 +308,8 @@ int main(int argc, char **argv) {
     /* GPU batched: reset x each iter, run one full layer in 1 cb. */
     for (int w = 0; w < 3; w++) {
         memcpy(g_x, x0, (size_t)hidden * sizeof(float));
-        memcpy(g_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
-        memcpy(g_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
+        memcpy(g_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(float));
+        memcpy(g_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(float));
         ib_metal_recorder *rr = ib_metal_recorder_begin(ctx);
         ib_metal_rec_rmsnorm_fp16(rr, g_x, gw_input_norm, g_xb, hidden, eps);
         ib_metal_rec_matmul_w4a8_fp32_in(rr, g_xb, gw_q_proj_w, gw_q_proj_s, g_q, g_xq, g_xs, hidden, hidden);
@@ -332,8 +332,8 @@ int main(int argc, char **argv) {
     double t0 = now_sec();
     for (int it = 0; it < iters; it++) {
         memcpy(g_x, x0, (size_t)hidden * sizeof(float));
-        memcpy(g_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
-        memcpy(g_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
+        memcpy(g_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(float));
+        memcpy(g_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(float));
         ib_metal_recorder *rr = ib_metal_recorder_begin(ctx);
         ib_metal_rec_rmsnorm_fp16(rr, g_x, gw_input_norm, g_xb, hidden, eps);
         ib_metal_rec_matmul_w4a8_fp32_in(rr, g_xb, gw_q_proj_w, gw_q_proj_s, g_q, g_xq, g_xs, hidden, hidden);
@@ -358,8 +358,8 @@ int main(int argc, char **argv) {
     /* CPU bench: full layer per iteration. */
     for (int w = 0; w < 3; w++) {
         memcpy(cpu_x, x0, (size_t)hidden * sizeof(float));
-        memcpy(cpu_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
-        memcpy(cpu_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
+        memcpy(cpu_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(float));
+        memcpy(cpu_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(float));
         ib_kern.rmsnorm(cpu_xb, cpu_x, input_norm_f, eps, hidden);
         cpu_matmul_w4a8_full(cpu_q, cpu_xb, q_proj_w, q_proj_sf, hidden, hidden, cpu_xq_h, cpu_xs_h);
         cpu_matmul_w4a8_full(cpu_k, cpu_xb, k_proj_w, k_proj_sf, kv_dim, hidden, cpu_xq_h, cpu_xs_h);
@@ -380,8 +380,8 @@ int main(int argc, char **argv) {
     t0 = now_sec();
     for (int it = 0; it < iters; it++) {
         memcpy(cpu_x, x0, (size_t)hidden * sizeof(float));
-        memcpy(cpu_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
-        memcpy(cpu_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(uint16_t));
+        memcpy(cpu_kc, kc_seed, (size_t)seq_len * kv_dim * sizeof(float));
+        memcpy(cpu_vc, vc_seed, (size_t)seq_len * kv_dim * sizeof(float));
         ib_kern.rmsnorm(cpu_xb, cpu_x, input_norm_f, eps, hidden);
         cpu_matmul_w4a8_full(cpu_q, cpu_xb, q_proj_w, q_proj_sf, hidden, hidden, cpu_xq_h, cpu_xs_h);
         cpu_matmul_w4a8_full(cpu_k, cpu_xb, k_proj_w, k_proj_sf, kv_dim, hidden, cpu_xq_h, cpu_xs_h);

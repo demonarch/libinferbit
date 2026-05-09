@@ -133,7 +133,9 @@ if(APPLE AND IB_ENABLE_METAL)
     # ObjC++ source — needs ARC + Metal/Foundation frameworks.
     set_source_files_properties(src/metal/metal_runtime.mm PROPERTIES
         COMPILE_FLAGS "-fobjc-arc -x objective-c++")
-    list(APPEND INFERBIT_SOURCES src/metal/metal_runtime.mm)
+    set_source_files_properties(src/metal/metal_model.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc -x objective-c++")
+    list(APPEND INFERBIT_SOURCES src/metal/metal_runtime.mm src/metal/metal_model.mm)
     set(METAL_LINK_LIBS "-framework Metal" "-framework Foundation")
     set(METAL_INCLUDES ${CMAKE_CURRENT_BINARY_DIR})
     add_compile_definitions(IB_HAS_METAL=1)
@@ -262,6 +264,16 @@ if(IB_METAL_ENABLED)
     target_link_libraries(bench_metal_full_forward inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(bench_metal_full_forward PRIVATE src)
     add_dependencies(bench_metal_full_forward metal_kernels_header inferbit_static)
+
+    add_executable(inspect_ibf tests/inspect_ibf.c)
+    target_link_libraries(inspect_ibf inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(inspect_ibf PRIVATE src include)
+    add_dependencies(inspect_ibf inferbit_static)
+
+    add_executable(bench_metal_real_model tests/bench_metal_real_model.c)
+    target_link_libraries(bench_metal_real_model inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_metal_real_model PRIVATE src include)
+    add_dependencies(bench_metal_real_model metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()

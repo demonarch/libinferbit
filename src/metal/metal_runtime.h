@@ -270,6 +270,38 @@ int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
                                         int n_heads, int n_kv_heads,
                                         int head_dim, int seq_len, int pos);
 
+/* ── Real-model integration (Phase 7) ───────────────────────────────
+ *
+ * Upload an IBF-loaded model's weights into GPU buffers, then run the
+ * per-token forward (all layers + final norm + lm_head) inside ONE
+ * MTLCommandBuffer per call.
+ *
+ * Currently requires a uniformly-INT4 IBF: all matmul tensors bits=4
+ * (q/k/v/o_proj, gate/up/down_proj, output_head), norms bits=16,
+ * kv_bits=16. Embedding can be any bits (decoded on CPU per token).
+ *
+ * `model` is a libinferbit-loaded `inferbit_model*` (opaque here to
+ * keep the header free of internal types). */
+typedef struct ib_metal_model_buffers ib_metal_model_buffers;
+
+ib_metal_model_buffers *ib_metal_upload_model(ib_metal_ctx *ctx,
+                                                const void *inferbit_model);
+void ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *bufs);
+
+/* Forward one token. `cpu_embed_in` is fp32[hidden] — the result of
+ * the CPU-side embedding lookup for the current token. `pos` is the
+ * absolute token position. `logits_out` receives fp32[vocab].
+ * Returns 0 on success. */
+int ib_metal_forward_token(ib_metal_ctx *ctx,
+                            ib_metal_model_buffers *bufs,
+                            const float *cpu_embed_in,
+                            int pos,
+                            float *logits_out);
+
+/* Resets every layer's KV cache write position back to 0 — used between
+ * generation runs that don't share a prefix. */
+void ib_metal_reset_kv(ib_metal_model_buffers *bufs);
+
 #ifdef __cplusplus
 }
 #endif

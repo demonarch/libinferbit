@@ -32,7 +32,7 @@ static uint16_t f32_to_fp16(float f) {
  * exactly what the GPU kernels do. */
 static void cpu_attn_block_fp16(
     const float *q, const float *k, const float *v,
-    uint16_t *k_cache, uint16_t *v_cache,   /* in/out, [seq_len, kv_dim] */
+    float *k_cache, float *v_cache,   /* in/out, [seq_len, kv_dim] (fp32 to match libinferbit kv_bits=16) */
     float *scores_scratch,                   /* [n_heads, pos+1] */
     float *attn_out,
     int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos)
@@ -42,10 +42,11 @@ static void cpu_attn_block_fp16(
     int p1 = pos + 1;
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    /* 1. Write K, V (fp32 → fp16) at row `pos` of the cache. */
+    /* 1. Write K, V at row `pos` of the cache (libinferbit kv_bits=16
+     * stores fp32 — see ibf_loader.c line 240-241 — so no truncation). */
     for (int i = 0; i < kv_dim; i++) {
-        k_cache[(size_t)pos * kv_dim + i] = f32_to_fp16(k[i]);
-        v_cache[(size_t)pos * kv_dim + i] = f32_to_fp16(v[i]);
+        k_cache[(size_t)pos * kv_dim + i] = k[i];
+        v_cache[(size_t)pos * kv_dim + i] = v[i];
     }
 
     /* 2. Scores: scores[h, t] = (Q[h] · K_cache[t, kv_h]) * scale. */
@@ -53,10 +54,10 @@ static void cpu_attn_block_fp16(
         int kv_h = h / heads_per_kv;
         const float *q_h = q + h * head_dim;
         for (int t = 0; t <= pos; t++) {
-            const uint16_t *k_t = k_cache + (size_t)t * kv_dim + kv_h * head_dim;
+            const float *k_t = k_cache + (size_t)t * kv_dim + kv_h * head_dim;
             float s = 0.0f;
             for (int d = 0; d < head_dim; d++) {
-                s += q_h[d] * ib_fp16_to_fp32(k_t[d]);
+                s += q_h[d] * k_t[d];
             }
             scores_scratch[h * p1 + t] = s * scale;
         }
@@ -80,8 +81,8 @@ static void cpu_attn_block_fp16(
         for (int d = 0; d < head_dim; d++) {
             float acc = 0.0f;
             for (int t = 0; t < p1; t++) {
-                const uint16_t *v_t = v_cache + (size_t)t * kv_dim + kv_h * head_dim + d;
-                acc += s_row[t] * ib_fp16_to_fp32(*v_t);
+                const float *v_t = v_cache + (size_t)t * kv_dim + kv_h * head_dim + d;
+                acc += s_row[t] * (*v_t);
             }
             attn_out[h * head_dim + d] = acc;
         }
@@ -110,28 +111,27 @@ int main(int argc, char **argv) {
     float    *h_q = malloc((size_t)n_q_dim * sizeof(float));
     float    *h_k = malloc((size_t)kv_dim  * sizeof(float));
     float    *h_v = malloc((size_t)kv_dim  * sizeof(float));
-    uint16_t *h_kc = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
-    uint16_t *h_vc = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
-    float    *cpu_scores = malloc((size_t)n_heads * p1 * sizeof(float));
-    float    *cpu_out    = malloc((size_t)n_q_dim * sizeof(float));
-    float    *gpu_out    = malloc((size_t)n_q_dim * sizeof(float));
+    float *h_kc = malloc((size_t)seq_len * kv_dim * sizeof(float));
+    float *h_vc = malloc((size_t)seq_len * kv_dim * sizeof(float));
+    float *cpu_scores = malloc((size_t)n_heads * p1 * sizeof(float));
+    float *cpu_out    = malloc((size_t)n_q_dim * sizeof(float));
+    float *gpu_out    = malloc((size_t)n_q_dim * sizeof(float));
 
     for (int i = 0; i < n_q_dim; i++) h_q[i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f;
     for (int i = 0; i < kv_dim;  i++) h_k[i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f;
     for (int i = 0; i < kv_dim;  i++) h_v[i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f;
-    /* Seed KV cache with random fp16 values for positions 0..pos-1.
-     * The slot at `pos` will be overwritten by both backends. */
+    /* Seed KV cache (fp32 — matches kv_bits=16 storage in libinferbit). */
     for (size_t i = 0; i < (size_t)seq_len * kv_dim; i++) {
-        h_kc[i] = f32_to_fp16(((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f);
-        h_vc[i] = f32_to_fp16(((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f);
+        h_kc[i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f;
+        h_vc[i] = ((rand() & 0xFFFF) / 32767.0f - 0.5f) * 2.0f;
     }
 
     /* CPU reference: take a copy of the cache so the GPU run sees the
      * identical prefix (the CPU run will mutate row `pos`). */
-    uint16_t *cpu_kc = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
-    uint16_t *cpu_vc = malloc((size_t)seq_len * kv_dim * sizeof(uint16_t));
-    memcpy(cpu_kc, h_kc, (size_t)seq_len * kv_dim * sizeof(uint16_t));
-    memcpy(cpu_vc, h_vc, (size_t)seq_len * kv_dim * sizeof(uint16_t));
+    float *cpu_kc = malloc((size_t)seq_len * kv_dim * sizeof(float));
+    float *cpu_vc = malloc((size_t)seq_len * kv_dim * sizeof(float));
+    memcpy(cpu_kc, h_kc, (size_t)seq_len * kv_dim * sizeof(float));
+    memcpy(cpu_vc, h_vc, (size_t)seq_len * kv_dim * sizeof(float));
     cpu_attn_block_fp16(h_q, h_k, h_v, cpu_kc, cpu_vc, cpu_scores, cpu_out,
                         n_heads, n_kv_heads, head_dim, seq_len, pos);
 
@@ -139,8 +139,8 @@ int main(int argc, char **argv) {
     void *g_q  = ib_metal_alloc(ctx, (size_t)n_q_dim * sizeof(float),  h_q);
     void *g_k  = ib_metal_alloc(ctx, (size_t)kv_dim  * sizeof(float),  h_k);
     void *g_v  = ib_metal_alloc(ctx, (size_t)kv_dim  * sizeof(float),  h_v);
-    void *g_kc = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(uint16_t), h_kc);
-    void *g_vc = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(uint16_t), h_vc);
+    void *g_kc = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(float), h_kc);
+    void *g_vc = ib_metal_alloc(ctx, (size_t)seq_len * kv_dim * sizeof(float), h_vc);
     void *g_s  = ib_metal_alloc(ctx, (size_t)n_heads * seq_len * sizeof(float), NULL);
     void *g_o  = ib_metal_alloc(ctx, (size_t)n_q_dim * sizeof(float), NULL);
 
