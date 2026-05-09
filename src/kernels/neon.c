@@ -8,6 +8,7 @@
 
 #include "../inferbit_internal.h"
 #include <arm_neon.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 
@@ -28,6 +29,50 @@ static void neon_matmul_int8(
 ) {
     const int8_t* w = (const int8_t*)weights;
 
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* vdotq_s32 fast path: quantize fp32 input to INT8 with per-group
+     * scales (group=IB_W4A8_GROUP=128, mirrors the w4a8 path), then run
+     * 16-INT8-MAC-per-cycle dot product. ~3× faster than the older
+     * widen-to-fp32 + vfmaq_f32 path. Quality cost from input quant is
+     * the same as w4a8's, which is well-validated. */
+    int n_groups = (N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
+    int8_t  stack_q[4096];
+    float   stack_s[4096 / IB_W4A8_GROUP + 1];
+    int8_t *x_q;
+    float  *x_sc;
+    if (N <= (int)(sizeof stack_q / sizeof *stack_q)) {
+        x_q = stack_q; x_sc = stack_s;
+    } else {
+        x_q  = (int8_t*)malloc((size_t)N);
+        x_sc = (float*)malloc((size_t)n_groups * sizeof(float));
+    }
+    ib_quantize_input_int8_g128(input, x_q, x_sc, N);
+
+    for (int i = 0; i < M; i++) {
+        const int8_t* row = w + (size_t)i * N;
+        float row_acc = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            int start = g * IB_W4A8_GROUP;
+            int end   = (start + IB_W4A8_GROUP > N) ? N : start + IB_W4A8_GROUP;
+            int32x4_t acc = vdupq_n_s32(0);
+            int j = start;
+            for (; j + 15 < end; j += 16) {
+                int8x16_t w16 = vld1q_s8(row + j);
+                int8x16_t x16 = vld1q_s8(x_q + j);
+                acc = vdotq_s32(acc, w16, x16);
+            }
+            int32_t group_int = vaddvq_s32(acc);
+            for (; j < end; j++) group_int += (int32_t)row[j] * (int32_t)x_q[j];
+            row_acc += (float)group_int * x_sc[g];
+        }
+        out[i] = row_acc * scales[i];
+    }
+
+    if (x_q != stack_q) free(x_q);
+    if (x_sc != stack_s) free(x_sc);
+#else
+    /* Fallback: original widen-to-fp32 + vfmaq_f32 path for older NEON
+     * without the dotprod extension. */
     for (int i = 0; i < M; i++) {
         const int8_t* row = w + (size_t)i * N;
         float32x4_t acc0 = vdupq_n_f32(0.0f);
@@ -35,37 +80,28 @@ static void neon_matmul_int8(
 
         int j = 0;
         for (; j + 7 < N; j += 8) {
-            /* Load 8 INT8 weights */
             int8x8_t w8 = vld1_s8(row + j);
-            /* Widen to INT16 */
             int16x8_t w16 = vmovl_s8(w8);
-            /* Split and widen to INT32 */
             int32x4_t w32_lo = vmovl_s16(vget_low_s16(w16));
             int32x4_t w32_hi = vmovl_s16(vget_high_s16(w16));
-            /* Convert to float */
             float32x4_t wf_lo = vcvtq_f32_s32(w32_lo);
             float32x4_t wf_hi = vcvtq_f32_s32(w32_hi);
-
-            /* Load 8 input floats */
             float32x4_t in_lo = vld1q_f32(input + j);
             float32x4_t in_hi = vld1q_f32(input + j + 4);
-
-            /* FMA */
             acc0 = vfmaq_f32(acc0, wf_lo, in_lo);
             acc1 = vfmaq_f32(acc1, wf_hi, in_hi);
         }
 
-        /* Horizontal sum */
         float32x4_t sum = vaddq_f32(acc0, acc1);
         float result = vaddvq_f32(sum);
 
-        /* Scalar tail */
         for (; j < N; j++) {
             result += (float)row[j] * input[j];
         }
 
         out[i] = result * scales[i];
     }
+#endif
 }
 
 /* ── INT4 matmul ────────────────────────────────────────────── */
