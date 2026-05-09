@@ -257,6 +257,11 @@ if(IB_METAL_ENABLED)
     target_link_libraries(test_metal_o_isolated inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(test_metal_o_isolated PRIVATE src)
     add_dependencies(test_metal_o_isolated metal_kernels_header inferbit_static)
+
+    add_executable(bench_metal_full_forward tests/bench_metal_full_forward.c)
+    target_link_libraries(bench_metal_full_forward inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_metal_full_forward PRIVATE src)
+    add_dependencies(bench_metal_full_forward metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()
