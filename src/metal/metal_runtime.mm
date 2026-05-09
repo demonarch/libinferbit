@@ -557,3 +557,84 @@ extern "C" int ib_metal_rope_inplace(ib_metal_ctx *ctx,
     }
     return 0;
 }
+
+extern "C" int ib_metal_softmax_rows(ib_metal_ctx *ctx,
+                                       void *data_fp32,
+                                       int n_rows, int row_len)
+{
+    if (!ctx || !data_fp32 || n_rows <= 0 || row_len <= 0) return -1;
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps = get_pipeline(ctx, "softmax_rows");
+        if (!ps) return -1;
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b = pick(data_fp32);
+        if (!b) {
+            fprintf(stderr, "Metal softmax: buffer not registered\n");
+            return -1;
+        }
+        uint rl = (uint)row_len;
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:b offset:0 atIndex:0];
+        [enc setBytes:&rl length:sizeof(rl) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal softmax: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+extern "C" int ib_metal_embed_lookup_fp16(ib_metal_ctx *ctx,
+                                            const void *embeddings_fp16,
+                                            int token,
+                                            int hidden,
+                                            void *out_fp32)
+{
+    if (!ctx || !embeddings_fp16 || !out_fp32 || hidden <= 0 || token < 0) return -1;
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps = get_pipeline(ctx, "embed_lookup_fp16");
+        if (!ps) return -1;
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b_emb = pick(embeddings_fp16);
+        id<MTLBuffer> b_out = pick(out_fp32);
+        if (!b_emb || !b_out) {
+            fprintf(stderr, "Metal embed: buffer not registered\n");
+            return -1;
+        }
+        uint t = (uint)token, h = (uint)hidden;
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:b_emb offset:0 atIndex:0];
+        [enc setBytes:&t length:sizeof(t) atIndex:1];
+        [enc setBytes:&h length:sizeof(h) atIndex:2];
+        [enc setBuffer:b_out offset:0 atIndex:3];
+        const NSUInteger TG = 256;
+        NSUInteger n_tg = ((NSUInteger)hidden + TG - 1) / TG;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal embed: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+    }
+    return 0;
+}

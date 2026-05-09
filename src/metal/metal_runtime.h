@@ -152,6 +152,20 @@ int ib_metal_rope_inplace(ib_metal_ctx *ctx,
                            int n_heads, int head_dim,
                            int pos, float theta);
 
+/* In-place softmax over n_rows rows of length row_len. Numerically
+ * stable (subtracts row max). One threadgroup per row. */
+int ib_metal_softmax_rows(ib_metal_ctx *ctx,
+                            void *data_fp32,
+                            int n_rows, int row_len);
+
+/* Embedding lookup: out[i] = embeddings[token, i] (fp16→fp32). One
+ * dispatch per token; for prefill, caller loops or batches in cb. */
+int ib_metal_embed_lookup_fp16(ib_metal_ctx *ctx,
+                                 const void *embeddings_fp16,
+                                 int token,
+                                 int hidden,
+                                 void *out_fp32);
+
 #ifdef __cplusplus
 }
 #endif

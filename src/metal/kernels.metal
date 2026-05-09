@@ -303,3 +303,93 @@ kernel void rope_inplace(
     tensor[base]      = v0 * c - v1 * s;
     tensor[base + 1u] = v0 * s + v1 * c;
 }
+
+/* ── softmax_row ──────────────────────────────────────────────────────
+ *
+ * In-place softmax over a single row of N elements. One threadgroup per
+ * call (256 threads). Three-pass via threadgroup memory:
+ *   1) per-thread local max → simd_max → cross-SIMD max
+ *   2) per-thread sum(exp(x - max)) → simd_sum → cross-SIMD sum
+ *   3) per-thread divide by sum
+ * Numerically stable thanks to the max subtraction.
+ *
+ * For batches (e.g. attention scores: n_heads × seq_len rows), use
+ * `softmax_rows` below with grid = (n_rows, 1, 1).
+ */
+kernel void softmax_rows(
+    device       float *data    [[buffer(0)]],
+    constant     uint  &row_len [[buffer(1)]],
+    uint                tg_id   [[threadgroup_position_in_grid]],
+    uint                tid     [[thread_position_in_threadgroup]],
+    uint                lane    [[thread_index_in_simdgroup]],
+    uint                simd_id [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint TG_THREADS = 256;
+    constexpr uint NUM_SIMDS  = TG_THREADS / 32;
+
+    device float *row = data + (size_t)tg_id * row_len;
+
+    /* Pass 1: max */
+    float local_max = -INFINITY;
+    for (uint i = tid; i < row_len; i += TG_THREADS) {
+        float v = row[i];
+        if (v > local_max) local_max = v;
+    }
+    float simd_m = simd_max(local_max);
+    threadgroup float partials[NUM_SIMDS];
+    if (lane == 0) partials[simd_id] = simd_m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float tg_max;
+    if (simd_id == 0) {
+        float v = (lane < NUM_SIMDS) ? partials[lane] : -INFINITY;
+        float total = simd_max(v);
+        if (lane == 0) tg_max = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float row_max = tg_max;
+
+    /* Pass 2: sum(exp(x - max)) — write exp results back into row first
+     * to avoid recomputing exp() in pass 3. */
+    float local_sum = 0.0f;
+    for (uint i = tid; i < row_len; i += TG_THREADS) {
+        float e = exp(row[i] - row_max);
+        row[i] = e;
+        local_sum += e;
+    }
+    float simd_s = simd_sum(local_sum);
+    if (lane == 0) partials[simd_id] = simd_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float tg_inv_sum;
+    if (simd_id == 0) {
+        float v = (lane < NUM_SIMDS) ? partials[lane] : 0.0f;
+        float total = simd_sum(v);
+        if (lane == 0) tg_inv_sum = 1.0f / total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = tg_inv_sum;
+
+    /* Pass 3: normalize */
+    for (uint i = tid; i < row_len; i += TG_THREADS) {
+        row[i] *= inv_sum;
+    }
+}
+
+/* ── embed_lookup_fp16 ────────────────────────────────────────────────
+ *
+ * Copy a row from the embedding matrix into the hidden buffer, with
+ * fp16→fp32 conversion. One thread per element of the hidden dim.
+ *
+ *   embeddings  [vocab, hidden]  fp16
+ *   token                          token id
+ *   out         [hidden]         fp32
+ */
+kernel void embed_lookup_fp16(
+    device const half  *embeddings [[buffer(0)]],
+    constant     uint  &token      [[buffer(1)]],
+    constant     uint  &hidden     [[buffer(2)]],
+    device       float *out        [[buffer(3)]],
+    uint                gid        [[thread_position_in_grid]])
+{
+    if (gid >= hidden) return;
+    out[gid] = (float)embeddings[(size_t)token * hidden + gid];
+}
