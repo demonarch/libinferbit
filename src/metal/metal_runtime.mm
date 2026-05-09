@@ -244,6 +244,114 @@ extern "C" int ib_metal_quantize_input_int8_g128(ib_metal_ctx *ctx,
     return 0;
 }
 
+extern "C" int ib_metal_matmul_w4a8_fp32_in(ib_metal_ctx *ctx,
+                                              const void *x_fp32,
+                                              const void *weights,
+                                              const void *w_scales,
+                                              void *out,
+                                              void *scratch_x_q,
+                                              void *scratch_x_scales,
+                                              int M, int N)
+{
+    if (!ctx || !x_fp32 || !weights || !w_scales || !out) return -1;
+    if (M <= 0 || N <= 0) return -1;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps_q  = get_pipeline(ctx, "quantize_input_int8_g128");
+        id<MTLComputePipelineState> ps_mm = get_pipeline(ctx, "matmul_w4a8");
+        if (!ps_q || !ps_mm) return -1;
+
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b_x   = pick(x_fp32);
+        id<MTLBuffer> b_w   = pick(weights);
+        id<MTLBuffer> b_ws  = pick(w_scales);
+        id<MTLBuffer> b_out = pick(out);
+        if (!b_x || !b_w || !b_ws || !b_out) {
+            fprintf(stderr, "Metal fused: buffer not registered with ctx\n");
+            return -1;
+        }
+
+        /* Allocate temp scratch if caller didn't provide. */
+        int n_groups = (N + 127) / 128;
+        bool own_xq = false, own_xs = false;
+        id<MTLBuffer> b_xq, b_xs;
+        if (scratch_x_q) {
+            b_xq = pick(scratch_x_q);
+        } else {
+            b_xq = [ctx->device newBufferWithLength:(NSUInteger)N
+                                              options:MTLResourceStorageModeShared];
+            own_xq = true;
+        }
+        if (scratch_x_scales) {
+            b_xs = pick(scratch_x_scales);
+        } else {
+            b_xs = [ctx->device newBufferWithLength:(NSUInteger)n_groups * sizeof(float)
+                                              options:MTLResourceStorageModeShared];
+            own_xs = true;
+        }
+        if (!b_xq || !b_xs) {
+            fprintf(stderr, "Metal fused: scratch alloc failed\n");
+            return -1;
+        }
+
+        /* Single command buffer with TWO encoders → one commit/wait. */
+        uint M_u = (uint)M;
+        uint N_u = (uint)N;
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+
+        /* Encoder 1: quantize_input_int8_g128 */
+        id<MTLComputeCommandEncoder> enc1 = [cb computeCommandEncoder];
+        [enc1 setComputePipelineState:ps_q];
+        [enc1 setBuffer:b_x  offset:0 atIndex:0];
+        [enc1 setBuffer:b_xq offset:0 atIndex:1];
+        [enc1 setBuffer:b_xs offset:0 atIndex:2];
+        [enc1 setBytes:&N_u length:sizeof(N_u) atIndex:3];
+        {
+            NSUInteger nq = (NSUInteger)((N + 127) / 128);
+            [enc1 dispatchThreadgroups:MTLSizeMake(nq, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+        [enc1 endEncoding];
+
+        /* Encoder 2: matmul_w4a8 */
+        id<MTLComputeCommandEncoder> enc2 = [cb computeCommandEncoder];
+        [enc2 setComputePipelineState:ps_mm];
+        [enc2 setBuffer:b_w   offset:0 atIndex:0];
+        [enc2 setBuffer:b_ws  offset:0 atIndex:1];
+        [enc2 setBuffer:b_xq  offset:0 atIndex:2];
+        [enc2 setBuffer:b_xs  offset:0 atIndex:3];
+        [enc2 setBuffer:b_out offset:0 atIndex:4];
+        [enc2 setBytes:&M_u length:sizeof(M_u) atIndex:5];
+        [enc2 setBytes:&N_u length:sizeof(N_u) atIndex:6];
+        {
+            const NSUInteger SIMDS_PER_TG = 4;
+            const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+            NSUInteger n_tg = (M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+            [enc2 dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+        }
+        [enc2 endEncoding];
+
+        /* ONE commit/wait for both kernels. */
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal fused: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            if (own_xq) b_xq = nil;
+            if (own_xs) b_xs = nil;
+            return -1;
+        }
+        /* Caller-owned scratch isn't freed here; transient ARC handles ours. */
+        (void)own_xq; (void)own_xs;
+    }
+    return 0;
+}
+
 extern "C" int ib_metal_matmul_w4a8(ib_metal_ctx *ctx,
                                       const void *weights, const void *w_scales,
                                       const void *x_q, const void *x_scales,

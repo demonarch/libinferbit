@@ -184,20 +184,67 @@ int main(int argc, char **argv) {
     }
     double t_gpu = (now_sec() - t0) / iters * 1000.0;
 
+    /* Time GPU fused (quant + matmul in ONE command buffer). Fair comparison
+     * vs CPU: include both quantize and matmul work in the timed loop. */
+    float *h_x_fp32_for_fused = malloc((size_t)N * sizeof(float));
+    for (int i = 0; i < N; i++)
+        h_x_fp32_for_fused[i] = ((float)h_xq[i]) * h_xs[i / IB_W4A8_GROUP];
+    void *gpu_x_fp32 = ib_metal_alloc(ctx, (size_t)N * sizeof(float), h_x_fp32_for_fused);
+    void *gpu_xq_scratch = ib_metal_alloc(ctx, (size_t)N, NULL);
+    void *gpu_xs_scratch = ib_metal_alloc(ctx, (size_t)n_groups * sizeof(float), NULL);
+    /* warmup */
+    for (int i = 0; i < 5; i++) {
+        ib_metal_matmul_w4a8_fp32_in(ctx, gpu_x_fp32, gpu_w, gpu_ws, gpu_out,
+                                       gpu_xq_scratch, gpu_xs_scratch, M, N);
+    }
+    t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        ib_metal_matmul_w4a8_fp32_in(ctx, gpu_x_fp32, gpu_w, gpu_ws, gpu_out,
+                                       gpu_xq_scratch, gpu_xs_scratch, M, N);
+    }
+    double t_gpu_fused = (now_sec() - t0) / iters * 1000.0;
+
+    /* CPU equivalent (full path): quantize + matmul */
+    int8_t *cpu_xq_buf = malloc((size_t)N);
+    float  *cpu_xs_buf = malloc((size_t)n_groups * sizeof(float));
+    /* warmup */
+    for (int i = 0; i < 5; i++) {
+        ib_quantize_input_int8_g128(h_x_fp32_for_fused, cpu_xq_buf, cpu_xs_buf, N);
+        ib_kern.matmul_w4a8(cpu_out, h_w, h_ws_fp32, cpu_xq_buf, cpu_xs_buf, M, N);
+    }
+    t0 = now_sec();
+    for (int i = 0; i < iters; i++) {
+        ib_quantize_input_int8_g128(h_x_fp32_for_fused, cpu_xq_buf, cpu_xs_buf, N);
+        ib_kern.matmul_w4a8(cpu_out, h_w, h_ws_fp32, cpu_xq_buf, cpu_xs_buf, M, N);
+    }
+    double t_cpu_full = (now_sec() - t0) / iters * 1000.0;
+
     double bw_cpu = ((double)w_bytes / 1e9) / (t_cpu * 1e-3);
     double bw_gpu = ((double)w_bytes / 1e9) / (t_gpu * 1e-3);
+    double bw_gpu_fused = ((double)w_bytes / 1e9) / (t_gpu_fused * 1e-3);
+    double bw_cpu_full  = ((double)w_bytes / 1e9) / (t_cpu_full  * 1e-3);
     printf("\n=== matmul_w4a8 (M=%d N=%d, %d iters) ===\n", M, N, iters);
-    printf("  CPU NEON (vdotq+w4a8):   %7.4f ms/call  (%.2f GB/s)\n", t_cpu, bw_cpu);
-    printf("  Metal GPU (matmul_w4a8): %7.4f ms/call  (%.2f GB/s)\n", t_gpu, bw_gpu);
-    printf("  Metal/CPU ratio:         %.3f%s\n", t_gpu / t_cpu,
+    printf("  [matmul-only, pre-quantized x_q]\n");
+    printf("    CPU NEON (vdotq+w4a8):   %7.4f ms/call  (%.2f GB/s)\n", t_cpu, bw_cpu);
+    printf("    Metal GPU (matmul_w4a8): %7.4f ms/call  (%.2f GB/s)\n", t_gpu, bw_gpu);
+    printf("    Metal/CPU ratio:         %.3f%s\n", t_gpu / t_cpu,
             t_gpu < t_cpu ? "  (Metal faster)" : "  (CPU faster)");
+    printf("  [full path, fp32 input → quantize → matmul]\n");
+    printf("    CPU full path:           %7.4f ms/call  (%.2f GB/s)\n", t_cpu_full, bw_cpu_full);
+    printf("    Metal fused (1 cb):      %7.4f ms/call  (%.2f GB/s)\n", t_gpu_fused, bw_gpu_fused);
+    printf("    Metal/CPU ratio:         %.3f%s\n", t_gpu_fused / t_cpu_full,
+            t_gpu_fused < t_cpu_full ? "  (Metal faster)" : "  (CPU faster)");
 
     free(h_w); free(h_ws); free(h_xq); free(h_xs); free(h_ws_fp32); free(cpu_out);
+    free(h_x_fp32_for_fused); free(cpu_xq_buf); free(cpu_xs_buf);
     ib_metal_free(ctx, gpu_w);
     ib_metal_free(ctx, gpu_ws);
     ib_metal_free(ctx, gpu_xq);
     ib_metal_free(ctx, gpu_xs);
     ib_metal_free(ctx, gpu_out);
+    ib_metal_free(ctx, gpu_x_fp32);
+    ib_metal_free(ctx, gpu_xq_scratch);
+    ib_metal_free(ctx, gpu_xs_scratch);
     ib_metal_destroy(ctx);
     return 0;
 }

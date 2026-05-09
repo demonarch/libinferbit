@@ -90,6 +90,33 @@ int ib_metal_quantize_input_int8_g128(ib_metal_ctx *ctx,
                                         void *x_q, void *x_scales,
                                         int N);
 
+/* Fused fp32-input matmul: quantize → matmul, both in ONE command buffer.
+ *
+ * This is the drop-in replacement for `tensor_matmul` on the GPU side.
+ * The intermediate x_q + x_scales buffers are allocated once (or reused)
+ * via ctx and released back to the buffer pool afterward.
+ *
+ * Eliminates the per-kernel dispatch overhead that Phase 2's microbench
+ * identified as the bottleneck for TinyLlama-class workloads — both
+ * kernels submit as ONE GPU command, paying only one cb commit/wait.
+ *
+ *   x        [N]      fp32 input  (GPU buffer)
+ *   weights  [M, N/2] uint8       (GPU buffer)
+ *   w_scales [M]      half        (GPU buffer)
+ *   out      [M]      fp32 output (GPU buffer)
+ *
+ * `scratch_x_q` and `scratch_x_scales` may be NULL — the function will
+ * allocate them internally and release. Pass non-NULL caller-owned
+ * buffers for repeated calls to avoid allocation overhead. */
+int ib_metal_matmul_w4a8_fp32_in(ib_metal_ctx *ctx,
+                                  const void *x_fp32,
+                                  const void *weights,
+                                  const void *w_scales,
+                                  void *out,
+                                  void *scratch_x_q,        /* int8[N], or NULL */
+                                  void *scratch_x_scales,   /* float[N/128], or NULL */
+                                  int M, int N);
+
 #ifdef __cplusplus
 }
 #endif
