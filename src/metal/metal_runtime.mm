@@ -1171,6 +1171,78 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
     return 0;
 }
 
+/* Same shape as ib_metal_rec_matmul_w4a8_blk32_batched_fp32_in but uses
+ * the tiled-kernel pipeline that loads each weight row into threadgroup
+ * memory once and shares it across TILE_B SIMD groups. */
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_tiled_fp32_in(ib_metal_recorder *rec,
+                                                                      const void *x_fp32,
+                                                                      const void *weights,
+                                                                      const void *w_scales,
+                                                                      void *out,
+                                                                      void *scratch_x_q,
+                                                                      void *scratch_x_scales,
+                                                                      int B, int M, int N)
+{
+    if (!rec || !x_fp32 || !weights || !w_scales || !out
+        || !scratch_x_q || !scratch_x_scales || B <= 0 || M <= 0 || N <= 0) return -1;
+    if ((N % 32) != 0 || (N % 128) != 0) return -1;
+    id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128_batched");
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, "matmul_w4a8_blk32_batched_tiled");
+    if (!ps_q || !ps_mm) return -1;
+
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
+    id<MTLBuffer> b_ws  = rec_pick(rec->ctx, w_scales);
+    id<MTLBuffer> b_out = rec_pick(rec->ctx, out);
+    id<MTLBuffer> b_xq  = rec_pick(rec->ctx, scratch_x_q);
+    id<MTLBuffer> b_xs  = rec_pick(rec->ctx, scratch_x_scales);
+    if (!b_x || !b_w || !b_ws || !b_out || !b_xq || !b_xs) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, B_u = (uint)B;
+    /* Quantize the B input rows. */
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_q];
+        [enc setBuffer:b_x  offset:0 atIndex:0];
+        [enc setBuffer:b_xq offset:0 atIndex:1];
+        [enc setBuffer:b_xs offset:0 atIndex:2];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:3];
+        [enc setBytes:&B_u length:sizeof(B_u) atIndex:4];
+        NSUInteger nq = (NSUInteger)((N + 127) / 128);
+        [enc dispatchThreadgroups:MTLSizeMake(nq, (NSUInteger)B, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+    }
+    /* Tiled matmul — must match MMW4A8_TILE_B in kernels.metal. */
+    {
+        const NSUInteger TILE_B = 16;
+        const NSUInteger TG_THREADS = TILE_B * 32;
+        NSUInteger n_tg_y = ((NSUInteger)B + TILE_B - 1) / TILE_B;
+
+        /* Threadgroup memory layout: weights (N/2 bytes) + scales (N/32 half).
+         * Round each up to 16-byte alignment to keep Metal happy. */
+        NSUInteger tg_w_bytes  = ((NSUInteger)N / 2 + 15) & ~(NSUInteger)15;
+        NSUInteger tg_ws_bytes = ((NSUInteger)N / 32 * sizeof(uint16_t) + 15) & ~(NSUInteger)15;
+
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_mm];
+        [enc setBuffer:b_w   offset:0 atIndex:0];
+        [enc setBuffer:b_ws  offset:0 atIndex:1];
+        [enc setBuffer:b_xq  offset:0 atIndex:2];
+        [enc setBuffer:b_xs  offset:0 atIndex:3];
+        [enc setBuffer:b_out offset:0 atIndex:4];
+        [enc setBytes:&M_u length:sizeof(M_u) atIndex:5];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:6];
+        [enc setBytes:&B_u length:sizeof(B_u) atIndex:7];
+        [enc setThreadgroupMemoryLength:tg_w_bytes  atIndex:0];
+        [enc setThreadgroupMemoryLength:tg_ws_bytes atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M, n_tg_y, 1)
+              threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+        [enc endEncoding];
+    }
+    return 0;
+}
+
 extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_fp32_in(ib_metal_recorder *rec,
                                                                 const void *x_fp32,
                                                                 const void *weights,

@@ -260,6 +260,95 @@ kernel void matmul_w4a8_blk32_batched(
     }
 }
 
+/* matmul_w4a8_blk32_batched_tiled — weight-sharing variant of the
+ * batched matmul. Big idea: load the weight row + scales for a single
+ * output `m` into threadgroup memory ONCE, then have multiple SIMD
+ * groups within the threadgroup re-use those weights for different
+ * tokens. Each SIMDgroup handles one (b, m) output cell.
+ *
+ * Tile geometry:
+ *   threadgroup = TILE_B SIMDgroups × 32 lanes  (512 threads at TILE_B=16)
+ *   grid        = (M, ceil(B/TILE_B), 1)
+ *   threadgroup memory: weight row (N/2 bytes) + scales (N/32 fp16) ≈
+ *     up to ~10 KB for the 8B down_proj — well under the 32 KB limit.
+ *
+ * The weight bandwidth reduction is the main lever: the unbatched +
+ * non-tiled batched kernels load the same weight bytes B times (once
+ * per (b, m) SIMDgroup). This kernel loads them once per TILE_B
+ * SIMDgroups → TILE_B× weight-bandwidth reduction.
+ */
+#define MMW4A8_TILE_B 16
+kernel void matmul_w4a8_blk32_batched_tiled(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const char   *x_q       [[buffer(2)]],
+    device const float  *x_scales  [[buffer(3)]],
+    device       float  *out       [[buffer(4)]],
+    constant     uint   &M         [[buffer(5)]],
+    constant     uint   &N         [[buffer(6)]],
+    constant     uint   &B         [[buffer(7)]],
+    threadgroup uchar   *tg_w      [[threadgroup(0)]],
+    threadgroup half    *tg_ws     [[threadgroup(1)]],
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]],
+    uint2                tid2      [[thread_position_in_threadgroup]])
+{
+    uint m = tg_id.x;
+    uint b = tg_id.y * MMW4A8_TILE_B + simd_id;
+    if (m >= M) return;
+
+    uint tid = tid2.x;
+    constexpr uint TG_THREADS = MMW4A8_TILE_B * 32u;
+    uint w_bytes = N / 2u;
+    uint n_w_blocks = N / 32u;
+
+    /* Cooperative load: pull weight row + scales for this m into TG mem. */
+    device const uchar *src_w  = weights  + (size_t)m * w_bytes;
+    device const half  *src_ws = w_scales + (size_t)m * n_w_blocks;
+    for (uint i = tid; i < w_bytes;    i += TG_THREADS) tg_w[i]  = src_w[i];
+    for (uint i = tid; i < n_w_blocks; i += TG_THREADS) tg_ws[i] = src_ws[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* SIMD groups beyond B exit (they did help with the cooperative
+     * load, so they had to participate). */
+    if (b >= B) return;
+
+    device const char  *x_q_row = x_q      + (size_t)b * N;
+    device const float *x_s_row = x_scales + (size_t)b * (N / 128u);
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+        float a_scale = x_s_row[g];
+        float group_partial = 0.0f;
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)tg_ws[wb_idx];
+
+            int n = blk_start + (int)simd_lane;
+            int lane_int = 0;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = tg_w[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                lane_int = w * (int)x_q_row[n];
+            }
+            int block_int = simd_sum(lane_int);
+            group_partial += (float)block_int * w_scale;
+        }
+        lane_acc += group_partial * a_scale;
+    }
+
+    if (simd_lane == 0) {
+        out[(size_t)b * M + m] = lane_acc;
+    }
+}
+
 /* Batched activation quantizer: takes B fp32 rows of length N, produces
  * B int8 rows + B float scale rows of length N/128. Tile: each
  * threadgroup handles one (b, group) cell with the same internal

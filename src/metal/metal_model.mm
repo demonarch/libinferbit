@@ -533,7 +533,15 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
 
 /* Records ONE batched matmul into the recorder, picking the kernel
  * based on the tensor's bit width AND blk32-ness. xq/xs scratch is
- * only used for INT4 (w4a8) variants. Mirrors rec_matmul above. */
+ * only used for INT4 (w4a8) variants. Mirrors rec_matmul above.
+ *
+ * The blk32 path uses the non-tiled variant by default. The tiled
+ * variant (weight row loaded to threadgroup memory once and shared
+ * across TILE_B SIMD groups) is available via IB_PREFILL_TILED=1 but
+ * empirically gives no speedup on Apple M4 — the L1 cache already
+ * deduplicates same-row weight loads across SIMD groups in the same
+ * threadgroup, so explicit shared memory just adds barrier overhead.
+ * Kept around because it may help on other Apple GPUs / batch sizes. */
 static int rec_matmul_batched(ib_metal_recorder *r,
                                 int bits, int blk32,
                                 const void *x_fp32,
@@ -543,6 +551,15 @@ static int rec_matmul_batched(ib_metal_recorder *r,
 {
     if (bits == 4) {
         if (blk32) {
+            static int tiled_setting = -1;
+            if (tiled_setting < 0) {
+                const char *env = getenv("IB_PREFILL_TILED");
+                tiled_setting = (env && env[0] == '1') ? 1 : 0;
+            }
+            if (tiled_setting) {
+                return ib_metal_rec_matmul_w4a8_blk32_batched_tiled_fp32_in(
+                    r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
+            }
             return ib_metal_rec_matmul_w4a8_blk32_batched_fp32_in(
                 r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
         }

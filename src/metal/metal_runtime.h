@@ -307,6 +307,19 @@ int ib_metal_rec_matmul_w4a8_blk32_batched_fp32_in(ib_metal_recorder *rec,
                                                      void *scratch_x_scales,
                                                      int B, int M, int N);
 
+/* Tiled variant: weights for each output row are loaded into
+ * threadgroup memory once and shared across TILE_B (=16) SIMD groups
+ * within the threadgroup. ~TILE_B× weight bandwidth reduction over
+ * the non-tiled batched kernel. Same arg shapes. */
+int ib_metal_rec_matmul_w4a8_blk32_batched_tiled_fp32_in(ib_metal_recorder *rec,
+                                                           const void *x_fp32,
+                                                           const void *weights,
+                                                           const void *w_scales_blk32,
+                                                           void *out,
+                                                           void *scratch_x_q,
+                                                           void *scratch_x_scales,
+                                                           int B, int M, int N);
+
 int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
                                        const void *x_fp32,
                                        const void *weights,
