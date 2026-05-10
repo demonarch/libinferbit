@@ -1869,6 +1869,154 @@ extern "C" int ib_metal_rec_rope_inplace(ib_metal_recorder *rec,
     return 0;
 }
 
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_qkv_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *q_w, const void *q_s,
+    const void *k_w, const void *k_s,
+    const void *v_w, const void *v_s,
+    void *q_out, void *k_out, void *v_out,
+    int M_Q, int M_KV, int N)
+{
+    if (!rec || !x_fp32 || !q_w || !q_s || !k_w || !k_s || !v_w || !v_s
+        || !q_out || !k_out || !v_out
+        || M_Q <= 0 || M_KV <= 0 || N <= 0) return -1;
+    if ((N % 32) != 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_w4a8_blk32_dr_a32_qkv");
+    if (!ps) return -1;
+    id<MTLBuffer> b_qw  = rec_pick(rec->ctx, q_w);
+    id<MTLBuffer> b_qs  = rec_pick(rec->ctx, q_s);
+    id<MTLBuffer> b_kw  = rec_pick(rec->ctx, k_w);
+    id<MTLBuffer> b_ks  = rec_pick(rec->ctx, k_s);
+    id<MTLBuffer> b_vw  = rec_pick(rec->ctx, v_w);
+    id<MTLBuffer> b_vs  = rec_pick(rec->ctx, v_s);
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_q   = rec_pick(rec->ctx, q_out);
+    id<MTLBuffer> b_k   = rec_pick(rec->ctx, k_out);
+    id<MTLBuffer> b_v   = rec_pick(rec->ctx, v_out);
+    if (!b_qw || !b_qs || !b_kw || !b_ks || !b_vw || !b_vs
+        || !b_x || !b_q || !b_k || !b_v) return -1;
+    uint M_Q_u = (uint)M_Q, M_KV_u = (uint)M_KV, N_u = (uint)N;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_qw  offset:0 atIndex:0];
+    [enc setBuffer:b_qs  offset:0 atIndex:1];
+    [enc setBuffer:b_kw  offset:0 atIndex:2];
+    [enc setBuffer:b_ks  offset:0 atIndex:3];
+    [enc setBuffer:b_vw  offset:0 atIndex:4];
+    [enc setBuffer:b_vs  offset:0 atIndex:5];
+    [enc setBuffer:b_x   offset:0 atIndex:6];
+    [enc setBuffer:b_q   offset:0 atIndex:7];
+    [enc setBuffer:b_k   offset:0 atIndex:8];
+    [enc setBuffer:b_v   offset:0 atIndex:9];
+    [enc setBytes:&M_Q_u  length:sizeof(M_Q_u)  atIndex:10];
+    [enc setBytes:&M_KV_u length:sizeof(M_KV_u) atIndex:11];
+    [enc setBytes:&N_u    length:sizeof(N_u)    atIndex:12];
+    const NSUInteger SIMDS_PER_TG = 4;
+    const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+    NSUInteger M_total = (NSUInteger)M_Q + 2 * (NSUInteger)M_KV;
+    NSUInteger n_tg = (M_total + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *gate_w, const void *gate_s,
+    const void *up_w,   const void *up_s,
+    void *gate_out, void *up_out,
+    int M, int N)
+{
+    if (!rec || !x_fp32 || !gate_w || !gate_s || !up_w || !up_s
+        || !gate_out || !up_out || M <= 0 || N <= 0) return -1;
+    if ((N % 32) != 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_w4a8_blk32_dr_a32_gateup");
+    if (!ps) return -1;
+    id<MTLBuffer> b_gw  = rec_pick(rec->ctx, gate_w);
+    id<MTLBuffer> b_gs  = rec_pick(rec->ctx, gate_s);
+    id<MTLBuffer> b_uw  = rec_pick(rec->ctx, up_w);
+    id<MTLBuffer> b_us  = rec_pick(rec->ctx, up_s);
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_g   = rec_pick(rec->ctx, gate_out);
+    id<MTLBuffer> b_u   = rec_pick(rec->ctx, up_out);
+    if (!b_gw || !b_gs || !b_uw || !b_us || !b_x || !b_g || !b_u) return -1;
+    uint M_u = (uint)M, N_u = (uint)N;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_gw  offset:0 atIndex:0];
+    [enc setBuffer:b_gs  offset:0 atIndex:1];
+    [enc setBuffer:b_uw  offset:0 atIndex:2];
+    [enc setBuffer:b_us  offset:0 atIndex:3];
+    [enc setBuffer:b_x   offset:0 atIndex:4];
+    [enc setBuffer:b_g   offset:0 atIndex:5];
+    [enc setBuffer:b_u   offset:0 atIndex:6];
+    [enc setBytes:&M_u length:sizeof(M_u) atIndex:7];
+    [enc setBytes:&N_u length:sizeof(N_u) atIndex:8];
+    const NSUInteger SIMDS_PER_TG = 4;
+    const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+    NSUInteger M_total = 2 * (NSUInteger)M;
+    NSUInteger n_tg = (M_total + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_matmul_int8_fp32_in_qkv(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *q_w, const void *q_s,
+    const void *k_w, const void *k_s,
+    const void *v_w, const void *v_s,
+    void *q_out, void *k_out, void *v_out,
+    int M_Q, int M_KV, int N)
+{
+    if (!rec || !x_fp32 || !q_w || !q_s || !k_w || !k_s || !v_w || !v_s
+        || !q_out || !k_out || !v_out
+        || M_Q <= 0 || M_KV <= 0 || N <= 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_int8_fp32_in_qkv");
+    if (!ps) return -1;
+    id<MTLBuffer> b_qw  = rec_pick(rec->ctx, q_w);
+    id<MTLBuffer> b_qs  = rec_pick(rec->ctx, q_s);
+    id<MTLBuffer> b_kw  = rec_pick(rec->ctx, k_w);
+    id<MTLBuffer> b_ks  = rec_pick(rec->ctx, k_s);
+    id<MTLBuffer> b_vw  = rec_pick(rec->ctx, v_w);
+    id<MTLBuffer> b_vs  = rec_pick(rec->ctx, v_s);
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_q   = rec_pick(rec->ctx, q_out);
+    id<MTLBuffer> b_k   = rec_pick(rec->ctx, k_out);
+    id<MTLBuffer> b_v   = rec_pick(rec->ctx, v_out);
+    if (!b_qw || !b_qs || !b_kw || !b_ks || !b_vw || !b_vs
+        || !b_x || !b_q || !b_k || !b_v) return -1;
+    uint M_Q_u = (uint)M_Q, M_KV_u = (uint)M_KV, N_u = (uint)N;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_qw  offset:0 atIndex:0];
+    [enc setBuffer:b_qs  offset:0 atIndex:1];
+    [enc setBuffer:b_kw  offset:0 atIndex:2];
+    [enc setBuffer:b_ks  offset:0 atIndex:3];
+    [enc setBuffer:b_vw  offset:0 atIndex:4];
+    [enc setBuffer:b_vs  offset:0 atIndex:5];
+    [enc setBuffer:b_x   offset:0 atIndex:6];
+    [enc setBuffer:b_q   offset:0 atIndex:7];
+    [enc setBuffer:b_k   offset:0 atIndex:8];
+    [enc setBuffer:b_v   offset:0 atIndex:9];
+    [enc setBytes:&M_Q_u  length:sizeof(M_Q_u)  atIndex:10];
+    [enc setBytes:&M_KV_u length:sizeof(M_KV_u) atIndex:11];
+    [enc setBytes:&N_u    length:sizeof(N_u)    atIndex:12];
+    const NSUInteger SIMDS_PER_TG = 4;
+    const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+    NSUInteger M_total = (NSUInteger)M_Q + 2 * (NSUInteger)M_KV;
+    NSUInteger n_tg = (M_total + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
 extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_add_fp32_in(
     ib_metal_recorder *rec,
     const void *x_fp32,

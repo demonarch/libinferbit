@@ -451,6 +451,49 @@ int ib_metal_rec_matmul_w4a8_blk32_dr_a32_add_fp32_in(ib_metal_recorder *rec,
                                                        void *out,
                                                        int M, int N);
 
+/* Q/K/V fused matmul: one Metal dispatch computes all three projections.
+ * INT4 blk32 variant. Output partitioning by row: [Q M_Q rows][K M_KV
+ * rows][V M_KV rows]. */
+int ib_metal_rec_matmul_w4a8_blk32_dr_a32_qkv_fp32_in(ib_metal_recorder *rec,
+                                                       const void *x_fp32,
+                                                       const void *q_w,
+                                                       const void *q_s,
+                                                       const void *k_w,
+                                                       const void *k_s,
+                                                       const void *v_w,
+                                                       const void *v_s,
+                                                       void *q_out,
+                                                       void *k_out,
+                                                       void *v_out,
+                                                       int M_Q, int M_KV, int N);
+
+/* INT8 variant of the Q/K/V fused matmul (for mixed-precision IBFs
+ * with INT8 q/k/v). Same arg order, weights/scales as INT8 + fp16. */
+int ib_metal_rec_matmul_int8_fp32_in_qkv(ib_metal_recorder *rec,
+                                           const void *x_fp32,
+                                           const void *q_w,
+                                           const void *q_s,
+                                           const void *k_w,
+                                           const void *k_s,
+                                           const void *v_w,
+                                           const void *v_s,
+                                           void *q_out,
+                                           void *k_out,
+                                           void *v_out,
+                                           int M_Q, int M_KV, int N);
+
+/* Gate + Up fused matmul (INT4 blk32). 2 matmuls with same input and
+ * same M into one dispatch. */
+int ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(ib_metal_recorder *rec,
+                                                          const void *x_fp32,
+                                                          const void *gate_w,
+                                                          const void *gate_s,
+                                                          const void *up_w,
+                                                          const void *up_s,
+                                                          void *gate_out,
+                                                          void *up_out,
+                                                          int M, int N);
+
 int ib_metal_rec_softmax_rows(ib_metal_recorder *rec,
                                 void *data_fp32,
                                 int n_rows, int row_len);

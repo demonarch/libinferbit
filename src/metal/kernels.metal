@@ -386,6 +386,93 @@ kernel void matmul_w4a8_blk32_dr_a32_add(
     }
 }
 
+/* matmul_w4a8_blk32_dr_a32_qkv — Q/K/V fused matmul.
+ *
+ * Computes Q, K, V projections in one Metal dispatch. The three
+ * matmuls share the same input activation x but use different weight
+ * + scale buffers and write to different output buffers.
+ *
+ * Output layout: rows 0..M_Q-1 → Q[m], M_Q..M_Q+M_KV-1 → K[m-M_Q],
+ *                M_Q+M_KV..M_Q+2*M_KV-1 → V[m-M_Q-M_KV].
+ *
+ * Each SIMDgroup handles one output row m and picks the correct
+ * (weights, scales, out, local_m) tuple based on m's range. The
+ * branching is per-SG (uniform across the SG's 32 lanes) so no lane
+ * divergence inside an SG.
+ *
+ * Saves 2 Metal dispatches per layer for prefill+decode w4a8 models.
+ */
+kernel void matmul_w4a8_blk32_dr_a32_qkv(
+    device const uchar  *w_q       [[buffer(0)]],
+    device const half   *ws_q      [[buffer(1)]],
+    device const uchar  *w_k       [[buffer(2)]],
+    device const half   *ws_k      [[buffer(3)]],
+    device const uchar  *w_v       [[buffer(4)]],
+    device const half   *ws_v      [[buffer(5)]],
+    device const float  *x         [[buffer(6)]],
+    device       float  *q         [[buffer(7)]],
+    device       float  *k         [[buffer(8)]],
+    device       float  *v         [[buffer(9)]],
+    constant     uint   &M_Q       [[buffer(10)]],
+    constant     uint   &M_KV      [[buffer(11)]],
+    constant     uint   &N         [[buffer(12)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    uint M_total = M_Q + 2u * M_KV;
+    if (m >= M_total) return;
+
+    device const uchar *weights;
+    device const half  *w_scales;
+    device       float *out;
+    uint local_m;
+
+    if (m < M_Q) {
+        weights = w_q;  w_scales = ws_q;  out = q;
+        local_m = m;
+    } else if (m < M_Q + M_KV) {
+        weights = w_k;  w_scales = ws_k;  out = k;
+        local_m = m - M_Q;
+    } else {
+        weights = w_v;  w_scales = ws_v;  out = v;
+        local_m = m - M_Q - M_KV;
+    }
+
+    device const uchar *row = weights + (size_t)local_m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)local_m * n_w_blocks;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+
+            int n = blk_start + (int)simd_lane;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                lane_acc += (float)w * w_scale * x[n];
+            }
+        }
+    }
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[local_m] = total;
+    }
+}
+
 /* matmul_w4a8_blk32_dr_a32_silu — fuses silu_mul into the down_proj
  * matmul. Reads `gate` and `up` activations directly (both fp32),
  * computes silu(gate[k]) * up[k] inline for each K element used in the
@@ -1219,6 +1306,127 @@ kernel void matmul_int8_fp32_in(
     float total = simd_sum(lane_acc);
     if (simd_lane == 0) {
         out[m] = total * (float)w_scales[m];
+    }
+}
+
+/* matmul_w4a8_blk32_dr_a32_gateup — gate + up fused matmul.
+ * Two matmuls with the same input x (post-attn rmsnorm output) and same
+ * output dim. Output rows 0..M-1 → gate[m], M..2M-1 → up[m-M]. */
+kernel void matmul_w4a8_blk32_dr_a32_gateup(
+    device const uchar  *w_gate    [[buffer(0)]],
+    device const half   *ws_gate   [[buffer(1)]],
+    device const uchar  *w_up      [[buffer(2)]],
+    device const half   *ws_up     [[buffer(3)]],
+    device const float  *x         [[buffer(4)]],
+    device       float  *gate      [[buffer(5)]],
+    device       float  *up        [[buffer(6)]],
+    constant     uint   &M         [[buffer(7)]],
+    constant     uint   &N         [[buffer(8)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= 2u * M) return;
+
+    device const uchar *weights;
+    device const half  *w_scales;
+    device       float *out;
+    uint local_m;
+
+    if (m < M) {
+        weights = w_gate; w_scales = ws_gate; out = gate; local_m = m;
+    } else {
+        weights = w_up;   w_scales = ws_up;   out = up;   local_m = m - M;
+    }
+
+    device const uchar *row = weights + (size_t)local_m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)local_m * n_w_blocks;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+
+            int n = blk_start + (int)simd_lane;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                lane_acc += (float)w * w_scale * x[n];
+            }
+        }
+    }
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[local_m] = total;
+    }
+}
+
+/* matmul_int8_fp32_in_qkv — INT8 Q/K/V fused matmul.
+ * Mirrors matmul_w4a8_blk32_dr_a32_qkv but for INT8 weights.
+ * Used when q/k/v projections are stored as INT8 (mixed-precision IBFs
+ * like TinyLlama: INT8 q/k/v/embed/lm_head + INT4 blk32 FFN).
+ *
+ * Same output partitioning: rows 0..M_Q-1 → Q, then K then V. */
+kernel void matmul_int8_fp32_in_qkv(
+    device const char   *w_q       [[buffer(0)]],
+    device const half   *ws_q      [[buffer(1)]],
+    device const char   *w_k       [[buffer(2)]],
+    device const half   *ws_k      [[buffer(3)]],
+    device const char   *w_v       [[buffer(4)]],
+    device const half   *ws_v      [[buffer(5)]],
+    device const float  *x         [[buffer(6)]],
+    device       float  *q         [[buffer(7)]],
+    device       float  *k         [[buffer(8)]],
+    device       float  *v         [[buffer(9)]],
+    constant     uint   &M_Q       [[buffer(10)]],
+    constant     uint   &M_KV      [[buffer(11)]],
+    constant     uint   &N         [[buffer(12)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    uint M_total = M_Q + 2u * M_KV;
+    if (m >= M_total) return;
+
+    device const char  *weights;
+    device const half  *w_scales;
+    device       float *out;
+    uint local_m;
+
+    if (m < M_Q) {
+        weights = w_q;  w_scales = ws_q;  out = q;
+        local_m = m;
+    } else if (m < M_Q + M_KV) {
+        weights = w_k;  w_scales = ws_k;  out = k;
+        local_m = m - M_Q;
+    } else {
+        weights = w_v;  w_scales = ws_v;  out = v;
+        local_m = m - M_Q - M_KV;
+    }
+
+    device const char *row = weights + (size_t)local_m * N;
+    float lane_acc = 0.0f;
+    for (uint n = simd_lane; n < N; n += 32u) {
+        lane_acc += (float)row[n] * x[n];
+    }
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[local_m] = total * (float)w_scales[local_m];
     }
 }
 

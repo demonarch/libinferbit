@@ -497,9 +497,36 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
     for (int L = 0; L < b->num_layers; L++) {
         struct layer_bufs *lb = &b->layers[L];
         ib_metal_rec_rmsnorm_fp16(r, b->x, lb->input_norm, b->xb, hidden, eps);
-        rec_matmul(r, lb->q_bits, lb->q_blk32, b->xb, lb->q_w, lb->q_s, b->q, b->xq, b->xs, hidden, hidden);
-        rec_matmul(r, lb->k_bits, lb->k_blk32, b->xb, lb->k_w, lb->k_s, b->k, b->xq, b->xs, kv_dim, hidden);
-        rec_matmul(r, lb->v_bits, lb->v_blk32, b->xb, lb->v_w, lb->v_s, b->v, b->xq, b->xs, kv_dim, hidden);
+        /* Try fused Q+K+V matmul (one dispatch instead of three).
+         * Requires all three to be the same kernel family (all INT4
+         * blk32 or all INT8) and same N. Falls back to 3 separate
+         * matmuls otherwise. */
+        int rc_qkv = -1;
+        int qh = b->n_heads * b->head_dim;
+        if (lb->q_bits == 4 && lb->q_blk32
+            && lb->k_bits == 4 && lb->k_blk32
+            && lb->v_bits == 4 && lb->v_blk32) {
+            rc_qkv = ib_metal_rec_matmul_w4a8_blk32_dr_a32_qkv_fp32_in(r,
+                b->xb,
+                lb->q_w, lb->q_s,
+                lb->k_w, lb->k_s,
+                lb->v_w, lb->v_s,
+                b->q, b->k, b->v,
+                qh, kv_dim, hidden);
+        } else if (lb->q_bits == 8 && lb->k_bits == 8 && lb->v_bits == 8) {
+            rc_qkv = ib_metal_rec_matmul_int8_fp32_in_qkv(r,
+                b->xb,
+                lb->q_w, lb->q_s,
+                lb->k_w, lb->k_s,
+                lb->v_w, lb->v_s,
+                b->q, b->k, b->v,
+                qh, kv_dim, hidden);
+        }
+        if (rc_qkv != 0) {
+            rec_matmul(r, lb->q_bits, lb->q_blk32, b->xb, lb->q_w, lb->q_s, b->q, b->xq, b->xs, hidden, hidden);
+            rec_matmul(r, lb->k_bits, lb->k_blk32, b->xb, lb->k_w, lb->k_s, b->k, b->xq, b->xs, kv_dim, hidden);
+            rec_matmul(r, lb->v_bits, lb->v_blk32, b->xb, lb->v_w, lb->v_s, b->v, b->xq, b->xs, kv_dim, hidden);
+        }
         ib_metal_rec_rope_inplace(r, b->q, nh,  hd, pos, th);
         ib_metal_rec_rope_inplace(r, b->k, nkh, hd, pos, th);
         if (b->kv_bits == 16) {
@@ -529,8 +556,21 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
             }
         }
         ib_metal_rec_rmsnorm_fp16(r, b->x, lb->post_norm, b->xb, hidden, eps);
-        rec_matmul(r, lb->gate_bits, lb->gate_blk32, b->xb, lb->gate_w, lb->gate_s, b->hb,  b->xq, b->xs, inter, hidden);
-        rec_matmul(r, lb->up_bits,   lb->up_blk32,   b->xb, lb->up_w,   lb->up_s,   b->hb2, b->xq, b->xs, inter, hidden);
+        /* Try fused gate+up matmul. */
+        int rc_gu = -1;
+        if (lb->gate_bits == 4 && lb->gate_blk32
+            && lb->up_bits == 4 && lb->up_blk32) {
+            rc_gu = ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(r,
+                b->xb,
+                lb->gate_w, lb->gate_s,
+                lb->up_w,   lb->up_s,
+                b->hb, b->hb2,
+                inter, hidden);
+        }
+        if (rc_gu != 0) {
+            rec_matmul(r, lb->gate_bits, lb->gate_blk32, b->xb, lb->gate_w, lb->gate_s, b->hb,  b->xq, b->xs, inter, hidden);
+            rec_matmul(r, lb->up_bits,   lb->up_blk32,   b->xb, lb->up_w,   lb->up_s,   b->hb2, b->xq, b->xs, inter, hidden);
+        }
         /* Silu+down fusion (IB_DECODE_FUSE_SILU=1) tried but slower
          * (-17%) — redundant exp() across 512 TGs costs more than the
          * saved dispatch. Available for benchmarking. */
