@@ -428,6 +428,29 @@ int ib_metal_rec_silu_mul(ib_metal_recorder *rec,
                             void *out_fp32,
                             int N);
 
+/* Fused silu_mul + W4A8 blk32 matmul (for decode down_proj). Reads gate
+ * and up activations directly (fp32), computes silu(gate[k]) * up[k]
+ * inline and dots against the INT4 weight row. Saves one Metal dispatch
+ * per layer. M/N constraints same as the unfused matmul. */
+int ib_metal_rec_matmul_w4a8_blk32_dr_a32_silu_fp32_in(ib_metal_recorder *rec,
+                                                         const void *gate_fp32,
+                                                         const void *up_fp32,
+                                                         const void *weights,
+                                                         const void *w_scales,
+                                                         void *out,
+                                                         int M, int N);
+
+/* Fused residual-add variant of W4A8 blk32 matmul: writes
+ * out[m] = out[m] + dot_product instead of overwriting. Used to fuse
+ * the post-matmul residual_add. Same buffer layout as _a32 but `out`
+ * must already hold the residual value. */
+int ib_metal_rec_matmul_w4a8_blk32_dr_a32_add_fp32_in(ib_metal_recorder *rec,
+                                                       const void *x_fp32,
+                                                       const void *weights,
+                                                       const void *w_scales,
+                                                       void *out,
+                                                       int M, int N);
+
 int ib_metal_rec_softmax_rows(ib_metal_recorder *rec,
                                 void *data_fp32,
                                 int n_rows, int row_len);

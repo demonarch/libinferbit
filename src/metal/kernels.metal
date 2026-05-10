@@ -333,6 +333,120 @@ kernel void matmul_w4a8_blk32_dr_a32(
     }
 }
 
+/* matmul_w4a8_blk32_dr_a32_add — like _dr_a32 but accumulates into out
+ * (out[m] = out[m] + dot_product) instead of overwriting. Used to fuse
+ * the post-attention / post-FFN residual_add into o_proj and down_proj.
+ * Single writer per m (no race), safe RMW. Saves one residual_add
+ * dispatch per layer.
+ */
+kernel void matmul_w4a8_blk32_dr_a32_add(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x         [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const uchar *row = weights + (size_t)m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)m * n_w_blocks;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+
+            int n = blk_start + (int)simd_lane;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                lane_acc += (float)w * w_scale * x[n];
+            }
+        }
+    }
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[m] = out[m] + total;            /* fused residual add */
+    }
+}
+
+/* matmul_w4a8_blk32_dr_a32_silu — fuses silu_mul into the down_proj
+ * matmul. Reads `gate` and `up` activations directly (both fp32),
+ * computes silu(gate[k]) * up[k] inline for each K element used in the
+ * dot product. Saves one Metal dispatch per layer (the explicit
+ * silu_mul kernel).
+ *
+ * Same buffer layout / dispatch geometry as matmul_w4a8_blk32_dr_a32
+ * but takes TWO activation buffers (gate, up) instead of one.
+ */
+kernel void matmul_w4a8_blk32_dr_a32_silu(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *gate      [[buffer(2)]],
+    device const float  *up        [[buffer(3)]],
+    device       float  *out       [[buffer(4)]],
+    constant     uint   &M         [[buffer(5)]],
+    constant     uint   &N         [[buffer(6)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const uchar *row = weights + (size_t)m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)m * n_w_blocks;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+
+            int n = blk_start + (int)simd_lane;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                float g_val = gate[n];
+                float u_val = up[n];
+                float silu = g_val / (1.0f + exp(-g_val));
+                float x_eff = silu * u_val;
+                lane_acc += (float)w * w_scale * x_eff;
+            }
+        }
+    }
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[m] = total;
+    }
+}
+
 kernel void matmul_w4a8_blk32_batched(
     device const uchar  *weights   [[buffer(0)]],
     device const half   *w_scales  [[buffer(1)]],

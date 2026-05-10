@@ -514,14 +514,49 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
                                                 b->scores, b->attn_out,
                                                 nh, nkh, hd, sl, pos);
         }
-        rec_matmul(r, lb->o_bits, lb->o_blk32, b->attn_out, lb->o_w, lb->o_s, b->xb2, b->xq, b->xs, hidden, hidden);
-        ib_metal_rec_residual_add(r, b->x, b->xb2, hidden);
+        /* Try fused o_proj+residual: matmul writes x += attn_out·o_w.
+         * Saves one residual_add dispatch per layer. Falls back to the
+         * 2-step path for non-blk32 IBFs. */
+        {
+            int rc_o = -1;
+            if (lb->o_bits == 4 && lb->o_blk32) {
+                rc_o = ib_metal_rec_matmul_w4a8_blk32_dr_a32_add_fp32_in(
+                    r, b->attn_out, lb->o_w, lb->o_s, b->x, hidden, hidden);
+            }
+            if (rc_o != 0) {
+                rec_matmul(r, lb->o_bits, lb->o_blk32, b->attn_out, lb->o_w, lb->o_s, b->xb2, b->xq, b->xs, hidden, hidden);
+                ib_metal_rec_residual_add(r, b->x, b->xb2, hidden);
+            }
+        }
         ib_metal_rec_rmsnorm_fp16(r, b->x, lb->post_norm, b->xb, hidden, eps);
         rec_matmul(r, lb->gate_bits, lb->gate_blk32, b->xb, lb->gate_w, lb->gate_s, b->hb,  b->xq, b->xs, inter, hidden);
         rec_matmul(r, lb->up_bits,   lb->up_blk32,   b->xb, lb->up_w,   lb->up_s,   b->hb2, b->xq, b->xs, inter, hidden);
-        ib_metal_rec_silu_mul(r, b->hb, b->hb2, b->hb, inter);
-        rec_matmul(r, lb->down_bits, lb->down_blk32, b->hb, lb->down_w, lb->down_s, b->xb, b->xq, b->xs, hidden, inter);
-        ib_metal_rec_residual_add(r, b->x, b->xb, hidden);
+        /* Silu+down fusion (IB_DECODE_FUSE_SILU=1) tried but slower
+         * (-17%) — redundant exp() across 512 TGs costs more than the
+         * saved dispatch. Available for benchmarking. */
+        static int fuse_silu_setting = -1;
+        if (fuse_silu_setting < 0) {
+            const char *env = getenv("IB_DECODE_FUSE_SILU");
+            fuse_silu_setting = (env && env[0] == '1') ? 1 : 0;
+        }
+        int fused_rc = -1;
+        if (fuse_silu_setting && lb->down_bits == 4 && lb->down_blk32) {
+            fused_rc = ib_metal_rec_matmul_w4a8_blk32_dr_a32_silu_fp32_in(
+                r, b->hb, b->hb2, lb->down_w, lb->down_s, b->xb, hidden, inter);
+        }
+        if (fused_rc != 0) {
+            ib_metal_rec_silu_mul(r, b->hb, b->hb2, b->hb, inter);
+            /* Fused down_proj+residual: writes x += hb·down_w. */
+            int rc_d = -1;
+            if (lb->down_bits == 4 && lb->down_blk32) {
+                rc_d = ib_metal_rec_matmul_w4a8_blk32_dr_a32_add_fp32_in(
+                    r, b->hb, lb->down_w, lb->down_s, b->x, hidden, inter);
+            }
+            if (rc_d != 0) {
+                rec_matmul(r, lb->down_bits, lb->down_blk32, b->hb, lb->down_w, lb->down_s, b->xb, b->xq, b->xs, hidden, inter);
+                ib_metal_rec_residual_add(r, b->x, b->xb, hidden);
+            }
+        }
     }
     ib_metal_rec_rmsnorm_fp16(r, b->x, b->output_norm, b->xb, hidden, eps);
     rec_matmul(r, b->output_head_bits, b->output_head_blk32, b->xb,
