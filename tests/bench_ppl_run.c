@@ -110,6 +110,7 @@ int main(int argc, char **argv) {
         if (!ctx) { fprintf(stderr, "metal init failed\n"); return 5; }
         gbufs = ib_metal_upload_model(ctx, m);
         if (!gbufs) { fprintf(stderr, "metal upload failed\n"); return 6; }
+        if (getenv("IB_STRIP_MMAP")) ib_metal_strip_cpu_mmap(m);
     }
 
     float *logits = malloc((size_t)vocab * sizeof(float));

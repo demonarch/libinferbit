@@ -134,6 +134,13 @@ struct inferbit_model {
     bool   weight_data_mmap;     /* True if mmap'd, false if malloc'd */
     int    mmap_fd;              /* File descriptor if mmap'd */
 
+    /* Set after ib_metal_strip_cpu_mmap: a malloc'd buffer holding the
+     * embedding tensor's bytes that survive the original mmap being unmapped.
+     * weight_data points into this buffer (with the embedding offset baked in
+     * so cpu_embed_lookup keeps working). model_free is responsible for
+     * free()-ing this buffer when set. */
+    void*  embed_strip_buffer;
+
     /* IBF v6 PQv2 file backing (NULL for v5 / non-PQv2 models).
      * When set, pq tensor metadata in ib_tensor_meta points into this
      * file's mmap region; freed in inferbit_model_free.

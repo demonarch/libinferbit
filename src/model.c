@@ -80,6 +80,15 @@ void inferbit_free(inferbit_model* model) {
         }
     }
 
+    /* Stripped-mmap path: weight_data is now an offset into a malloc'd
+     * embedding-only buffer (set by ib_metal_strip_cpu_mmap). Free the
+     * buffer rather than munmap'ing. */
+    if (model->embed_strip_buffer) {
+        free(model->embed_strip_buffer);
+        model->embed_strip_buffer = NULL;
+        model->weight_data = NULL;
+    }
+
     /* Destroy thread pool */
     ib_pool_destroy(model->thread_pool);
 

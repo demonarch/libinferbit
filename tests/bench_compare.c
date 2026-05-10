@@ -109,6 +109,13 @@ int main(int argc, char **argv) {
         if (!ctx) { fprintf(stderr, "Metal not available\n"); return 3; }
         gbufs = ib_metal_upload_model(ctx, m);
         if (!gbufs) { fprintf(stderr, "GPU upload failed\n"); return 4; }
+        /* Opt-in via env var: ib_metal_strip_cpu_mmap drops the mmap and
+         * keeps only the embedding bytes. On macOS this momentarily holds
+         * mmap+Metal+embed at once, so /usr/bin/time -l peak RSS goes UP
+         * by ~embedding_size, but steady-state RSS during a long inference
+         * run drops by ~file_size. Off by default to keep the bench's peak
+         * metric clean; flip via IB_STRIP_MMAP=1. */
+        if (getenv("IB_STRIP_MMAP")) ib_metal_strip_cpu_mmap(m);
     }
 
     /* ── Warmup (post-load, mirrors llama-bench default) ─────────── */

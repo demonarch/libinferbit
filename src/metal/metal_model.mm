@@ -14,6 +14,7 @@
  */
 #include "metal_runtime.h"
 #include "../inferbit_internal.h"
+#include "../platform.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -22,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 /* Per-layer GPU buffer set. Each weight tensor's (bits, is_blk32) pair
  * is recorded so the forward dispatcher can pick the right kernel. */
@@ -112,14 +115,58 @@ static int model_is_supported(const inferbit_model *m, char *err, size_t err_sz)
     return 1;
 }
 
+/* After a tensor's bytes have been memcpy'd into a Metal buffer, the source
+ * mmap pages are no longer needed for GPU forward. madvise(MADV_DONTNEED) on
+ * the page-aligned interior of the source range tells the kernel those pages
+ * can be reclaimed — so the process never holds both the mmap pages AND the
+ * Metal buffer for the same tensor at once, capping peak RSS during upload
+ * at ~1× file size + 1 working tensor instead of ~2× file size.
+ *
+ * Safety: align inward (lo rounded up, hi rounded down) so we never touch
+ * pages that may contain bytes belonging to neighbouring tensors. Skip
+ * ranges smaller than one page after alignment.
+ */
+static void release_mmap_range(const void *src, size_t len) {
+    if (!src || len == 0) return;
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) return;
+    uintptr_t lo = (uintptr_t)src;
+    uintptr_t hi = lo + len;
+    uintptr_t lo_aligned = (lo + (uintptr_t)pg - 1) & ~((uintptr_t)pg - 1);
+    uintptr_t hi_aligned = hi & ~((uintptr_t)pg - 1);
+    if (hi_aligned <= lo_aligned) return;
+    /* macOS notes: MADV_DONTNEED is mostly advisory and rarely reduces RSS.
+     * MADV_FREE_REUSABLE is the Darwin pattern that actually returns pages
+     * to the OS (used by malloc internals). For file-backed PROT_READ
+     * mappings the kernel may map MADV_FREE → MADV_FREE_REUSABLE
+     * internally, but call the more aggressive form explicitly. */
+    size_t len_a = hi_aligned - lo_aligned;
+    void *addr = (void*)lo_aligned;
+    /* Note: on macOS, MADV_FREE on a PROT_READ file-backed mapping returns 0
+     * but the kernel only reclaims pages under memory pressure — peak RSS
+     * (high-water mark from /usr/bin/time -l) does not drop. On Linux,
+     * MADV_DONTNEED reclaims immediately. Try Linux-style first, then fall
+     * back to Darwin's softer hints. */
+#if defined(MADV_DONTNEED)
+    if (madvise(addr, len_a, MADV_DONTNEED) == 0) return;
+#endif
+#if defined(MADV_FREE)
+    madvise(addr, len_a, MADV_FREE);
+#endif
+}
+
 static void upload_w_pair(ib_metal_ctx *ctx, const inferbit_model *m,
                            const ib_tensor_meta *t,
                            void **out_w, void **out_s)
 {
     const uint8_t *base = (const uint8_t *)m->weight_data;
-    *out_w = ib_metal_alloc(ctx, t->size, base + t->offset);
+    const uint8_t *w_src = base + t->offset;
+    *out_w = ib_metal_alloc(ctx, t->size, w_src);
+    release_mmap_range(w_src, t->size);
     if (t->scale_size > 0) {
-        *out_s = ib_metal_alloc(ctx, t->scale_size, base + t->scale_offset);
+        const uint8_t *s_src = base + t->scale_offset;
+        *out_s = ib_metal_alloc(ctx, t->scale_size, s_src);
+        release_mmap_range(s_src, t->scale_size);
     } else {
         *out_s = NULL;
     }
@@ -129,7 +176,9 @@ static void upload_norm(ib_metal_ctx *ctx, const inferbit_model *m,
                          const ib_tensor_meta *t, void **out)
 {
     const uint8_t *base = (const uint8_t *)m->weight_data;
-    *out = ib_metal_alloc(ctx, t->size, base + t->offset);
+    const uint8_t *src = base + t->offset;
+    *out = ib_metal_alloc(ctx, t->size, src);
+    release_mmap_range(src, t->size);
 }
 
 extern "C" ib_metal_model_buffers *
@@ -231,6 +280,74 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
     b->logits   = ib_metal_alloc(ctx, (size_t)b->vocab * sizeof(float), NULL);
 
     return b;
+}
+
+/* Strip the original mmap'd IBF down to just the token-embedding bytes.
+ * Used after ib_metal_upload_model when running GPU-only — every other
+ * weight tensor lives on the GPU side at this point, so the rest of the
+ * mmap is dead weight (peak RSS of file_size + Metal_buffer_size).
+ *
+ * Approach (works on both Linux and macOS, unlike madvise):
+ *   1. Compute the byte-extent the embedding occupies in the IBF
+ *      (data range + scale range, taking the union).
+ *   2. malloc a buffer of that extent and memcpy the bytes out.
+ *   3. Rebind model->weight_data so the existing offset arithmetic
+ *      (cpu_embed_lookup uses base + token_embedding.offset) still resolves
+ *      to the right address inside the new buffer.
+ *   4. munmap the original IBF and close the fd.
+ *
+ * Caller MUST be done reading any non-embedding tensor through model->
+ * weight_data after this call. The GPU forward path is fine — it only
+ * touches GPU buffers post-upload.
+ */
+extern "C" int
+ib_metal_strip_cpu_mmap(void *model_handle)
+{
+    if (!model_handle) return -1;
+    inferbit_model *m = (inferbit_model *)model_handle;
+    if (!m->weight_data_mmap || !m->weight_data) return 0; /* nothing to do */
+
+    const ib_tensor_meta *e = &m->token_embedding;
+    size_t lo = e->offset;
+    size_t hi = e->offset + e->size;
+    if (e->scale_size > 0) {
+        if (e->scale_offset < lo) lo = e->scale_offset;
+        size_t s_hi = e->scale_offset + e->scale_size;
+        if (s_hi > hi) hi = s_hi;
+    }
+    size_t extent = hi - lo;
+    if (extent == 0) return -1;
+
+    uint8_t *buf = (uint8_t *)malloc(extent);
+    if (!buf) return -1;
+
+    const uint8_t *src = (const uint8_t *)m->weight_data + lo;
+    memcpy(buf, src, extent);
+
+    /* Compute mmap base + size for the upcoming munmap, while the original
+     * mapping is still live (we need m->weight_data and mmap_fd). */
+    size_t weight_offset = m->header.weight_data_offset;
+    void *base = (uint8_t *)m->weight_data - weight_offset;
+    size_t mmap_size = 0;
+    if (m->mmap_fd >= 0) {
+        ib_struct_stat st;
+        if (ib_fstat(m->mmap_fd, &st) == 0) mmap_size = (size_t)st.st_size;
+    }
+
+    /* Rebind: new_weight_data + e->offset must equal &buf[e->offset - lo].
+     * So new_weight_data = buf - lo. */
+    m->embed_strip_buffer = buf;
+    m->weight_data = (uint8_t *)buf - lo;
+    m->weight_data_mmap = false;
+
+    if (mmap_size > 0) {
+        ib_munmap(base, mmap_size);
+    }
+    if (m->mmap_fd >= 0) {
+        ib_close(m->mmap_fd);
+        m->mmap_fd = -1;
+    }
+    return (int)extent;
 }
 
 extern "C" void

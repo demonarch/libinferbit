@@ -365,6 +365,16 @@ ib_metal_model_buffers *ib_metal_upload_model(ib_metal_ctx *ctx,
                                                 const void *inferbit_model);
 void ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *bufs);
 
+/* After ib_metal_upload_model has placed every weight tensor on the GPU,
+ * the only thing the CPU still needs from the IBF mmap is the token
+ * embedding (used by cpu_embed_lookup). This function copies the embedding
+ * bytes into a small malloc'd buffer, rebinds model->weight_data, and
+ * munmaps the original IBF — capping CPU peak RSS at the embedding size.
+ * Returns the number of bytes copied (>0) on success, 0 if not mmap'd
+ * (no-op), or -1 on failure. Caller must NOT use any non-embedding tensor
+ * via model->weight_data after this call. */
+int ib_metal_strip_cpu_mmap(void *inferbit_model);
+
 /* Forward one token. `cpu_embed_in` is fp32[hidden] — the result of
  * the CPU-side embedding lookup for the current token. `pos` is the
  * absolute token position. `logits_out` receives fp32[vocab].
