@@ -215,9 +215,9 @@ kernel void matmul_w4a8_blk32_batched(
     uint                 simd_lane  [[thread_index_in_simdgroup]],
     uint                 simd_id    [[simdgroup_index_in_threadgroup]],
     uint2                tg_id      [[threadgroup_position_in_grid]],
-    uint                 tg_size    [[threads_per_threadgroup]])
+    uint2                tg_size    [[threads_per_threadgroup]])
 {
-    uint simdgroups_per_tg = tg_size / 32u;
+    uint simdgroups_per_tg = tg_size.x / 32u;
     uint m = tg_id.x * simdgroups_per_tg + simd_id;
     uint b = tg_id.y;
     if (m >= M || b >= B) return;

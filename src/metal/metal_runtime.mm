@@ -976,6 +976,33 @@ static id<MTLBuffer> rec_pick(ib_metal_ctx *ctx, const void *p) {
     return it == ctx->buffers.end() ? nil : it->second;
 }
 
+/* Range-aware lookup: if `p` is the exact base of a registered MTLBuffer,
+ * returns offset 0. Otherwise scans for a buffer whose [base, base+len)
+ * range contains `p` and returns the byte offset.
+ *
+ * This lets recorders accept derived pointers like `q_buf + b * row_size`
+ * without the caller needing to know the underlying buffer. The cost is
+ * a linear scan over registered buffers — fine because per-recorder-call
+ * lookup count is small (≤ 10) and total buffer count is ~ layers × 7
+ * which fits in cache. Returns nil + offset 0 on miss. */
+static id<MTLBuffer> rec_pick_off(ib_metal_ctx *ctx, const void *p,
+                                    NSUInteger *out_offset) {
+    if (out_offset) *out_offset = 0;
+    if (!p) return nil;
+    auto it = ctx->buffers.find((void *)p);
+    if (it != ctx->buffers.end()) return it->second;
+    uintptr_t pp = (uintptr_t)p;
+    for (auto &kv : ctx->buffers) {
+        uintptr_t base = (uintptr_t)kv.first;
+        NSUInteger len = [kv.second length];
+        if (pp >= base && pp < base + len) {
+            if (out_offset) *out_offset = (NSUInteger)(pp - base);
+            return kv.second;
+        }
+    }
+    return nil;
+}
+
 extern "C" int ib_metal_rec_rmsnorm_fp16(ib_metal_recorder *rec,
                                            const void *x_fp32,
                                            const void *weight_fp16,
@@ -985,17 +1012,18 @@ extern "C" int ib_metal_rec_rmsnorm_fp16(ib_metal_recorder *rec,
     if (!rec || !x_fp32 || !weight_fp16 || !out_fp32 || N <= 0) return -1;
     id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "rmsnorm_fp16");
     if (!ps) return -1;
-    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
-    id<MTLBuffer> b_w   = rec_pick(rec->ctx, weight_fp16);
-    id<MTLBuffer> b_out = rec_pick(rec->ctx, out_fp32);
+    NSUInteger ox = 0, ow = 0, oo = 0;
+    id<MTLBuffer> b_x   = rec_pick_off(rec->ctx, x_fp32, &ox);
+    id<MTLBuffer> b_w   = rec_pick_off(rec->ctx, weight_fp16, &ow);
+    id<MTLBuffer> b_out = rec_pick_off(rec->ctx, out_fp32, &oo);
     if (!b_x || !b_w || !b_out) return -1;
     uint N_u = (uint)N;
     float eps_v = eps;
     id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
     [enc setComputePipelineState:ps];
-    [enc setBuffer:b_x   offset:0 atIndex:0];
-    [enc setBuffer:b_w   offset:0 atIndex:1];
-    [enc setBuffer:b_out offset:0 atIndex:2];
+    [enc setBuffer:b_x   offset:ox atIndex:0];
+    [enc setBuffer:b_w   offset:ow atIndex:1];
+    [enc setBuffer:b_out offset:oo atIndex:2];
     [enc setBytes:&N_u   length:sizeof(N_u)   atIndex:3];
     [enc setBytes:&eps_v length:sizeof(eps_v) atIndex:4];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
@@ -1010,14 +1038,15 @@ extern "C" int ib_metal_rec_residual_add(ib_metal_recorder *rec,
     if (!rec || !a_fp32 || !b_fp32 || N <= 0) return -1;
     id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "residual_add");
     if (!ps) return -1;
-    id<MTLBuffer> b_a = rec_pick(rec->ctx, a_fp32);
-    id<MTLBuffer> b_b = rec_pick(rec->ctx, b_fp32);
+    NSUInteger oa = 0, ob = 0;
+    id<MTLBuffer> b_a = rec_pick_off(rec->ctx, a_fp32, &oa);
+    id<MTLBuffer> b_b = rec_pick_off(rec->ctx, b_fp32, &ob);
     if (!b_a || !b_b) return -1;
     uint N_u = (uint)N;
     id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
     [enc setComputePipelineState:ps];
-    [enc setBuffer:b_a offset:0 atIndex:0];
-    [enc setBuffer:b_b offset:0 atIndex:1];
+    [enc setBuffer:b_a offset:oa atIndex:0];
+    [enc setBuffer:b_b offset:ob atIndex:1];
     [enc setBytes:&N_u length:sizeof(N_u) atIndex:2];
     const NSUInteger TG = 256;
     NSUInteger n_tg = ((NSUInteger)N + TG - 1) / TG;
@@ -1245,13 +1274,14 @@ extern "C" int ib_metal_rec_rope_inplace(ib_metal_recorder *rec,
     if (head_dim & 1) return -1;
     id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "rope_inplace");
     if (!ps) return -1;
-    id<MTLBuffer> b_t = rec_pick(rec->ctx, tensor_fp32);
+    NSUInteger ot = 0;
+    id<MTLBuffer> b_t = rec_pick_off(rec->ctx, tensor_fp32, &ot);
     if (!b_t) return -1;
     uint nh = (uint)n_heads, hd = (uint)head_dim, p = (uint)pos;
     float th = theta;
     id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
     [enc setComputePipelineState:ps];
-    [enc setBuffer:b_t  offset:0 atIndex:0];
+    [enc setBuffer:b_t  offset:ot atIndex:0];
     [enc setBytes:&nh length:sizeof(nh) atIndex:1];
     [enc setBytes:&hd length:sizeof(hd) atIndex:2];
     [enc setBytes:&p  length:sizeof(p)  atIndex:3];
@@ -1274,16 +1304,17 @@ extern "C" int ib_metal_rec_silu_mul(ib_metal_recorder *rec,
     if (!rec || !gate_fp32 || !up_fp32 || !out_fp32 || N <= 0) return -1;
     id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "silu_mul");
     if (!ps) return -1;
-    id<MTLBuffer> b_g = rec_pick(rec->ctx, gate_fp32);
-    id<MTLBuffer> b_u = rec_pick(rec->ctx, up_fp32);
-    id<MTLBuffer> b_o = rec_pick(rec->ctx, out_fp32);
+    NSUInteger og = 0, ou = 0, oo = 0;
+    id<MTLBuffer> b_g = rec_pick_off(rec->ctx, gate_fp32, &og);
+    id<MTLBuffer> b_u = rec_pick_off(rec->ctx, up_fp32, &ou);
+    id<MTLBuffer> b_o = rec_pick_off(rec->ctx, out_fp32, &oo);
     if (!b_g || !b_u || !b_o) return -1;
     uint N_u = (uint)N;
     id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
     [enc setComputePipelineState:ps];
-    [enc setBuffer:b_g offset:0 atIndex:0];
-    [enc setBuffer:b_u offset:0 atIndex:1];
-    [enc setBuffer:b_o offset:0 atIndex:2];
+    [enc setBuffer:b_g offset:og atIndex:0];
+    [enc setBuffer:b_u offset:ou atIndex:1];
+    [enc setBuffer:b_o offset:oo atIndex:2];
     [enc setBytes:&N_u length:sizeof(N_u) atIndex:3];
     const NSUInteger TG = 256;
     NSUInteger n_tg = ((NSUInteger)N + TG - 1) / TG;
@@ -1363,13 +1394,14 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
     id<MTLComputePipelineState> ps_wv    = get_pipeline(rec->ctx, "attn_weighted_v");
     if (!ps_write || !ps_score || !ps_smax || !ps_wv) return -1;
 
-    id<MTLBuffer> b_q  = rec_pick(rec->ctx, q_fp32);
-    id<MTLBuffer> b_k  = rec_pick(rec->ctx, k_fp32);
-    id<MTLBuffer> b_v  = rec_pick(rec->ctx, v_fp32);
-    id<MTLBuffer> b_kc = rec_pick(rec->ctx, k_cache_fp16);
-    id<MTLBuffer> b_vc = rec_pick(rec->ctx, v_cache_fp16);
-    id<MTLBuffer> b_s  = rec_pick(rec->ctx, scores_fp32);
-    id<MTLBuffer> b_o  = rec_pick(rec->ctx, attn_out_fp32);
+    NSUInteger oq=0, ok=0, ov=0, okc=0, ovc=0, os=0, oo=0;
+    id<MTLBuffer> b_q  = rec_pick_off(rec->ctx, q_fp32, &oq);
+    id<MTLBuffer> b_k  = rec_pick_off(rec->ctx, k_fp32, &ok);
+    id<MTLBuffer> b_v  = rec_pick_off(rec->ctx, v_fp32, &ov);
+    id<MTLBuffer> b_kc = rec_pick_off(rec->ctx, k_cache_fp16, &okc);
+    id<MTLBuffer> b_vc = rec_pick_off(rec->ctx, v_cache_fp16, &ovc);
+    id<MTLBuffer> b_s  = rec_pick_off(rec->ctx, scores_fp32, &os);
+    id<MTLBuffer> b_o  = rec_pick_off(rec->ctx, attn_out_fp32, &oo);
     if (!b_q || !b_k || !b_v || !b_kc || !b_vc || !b_s || !b_o) return -1;
 
     uint nh = (uint)n_heads, nkh = (uint)n_kv_heads, hd = (uint)head_dim;
@@ -1381,10 +1413,10 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_write];
-        [enc setBuffer:b_k  offset:0 atIndex:0];
-        [enc setBuffer:b_v  offset:0 atIndex:1];
-        [enc setBuffer:b_kc offset:0 atIndex:2];
-        [enc setBuffer:b_vc offset:0 atIndex:3];
+        [enc setBuffer:b_k  offset:ok  atIndex:0];
+        [enc setBuffer:b_v  offset:ov  atIndex:1];
+        [enc setBuffer:b_kc offset:okc atIndex:2];
+        [enc setBuffer:b_vc offset:ovc atIndex:3];
         [enc setBytes:&p length:sizeof(p) atIndex:4];
         [enc setBytes:&kv_dim length:sizeof(kv_dim) atIndex:5];
         const NSUInteger TG = 64;
@@ -1397,9 +1429,9 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_score];
-        [enc setBuffer:b_q  offset:0 atIndex:0];
-        [enc setBuffer:b_kc offset:0 atIndex:1];
-        [enc setBuffer:b_s  offset:0 atIndex:2];
+        [enc setBuffer:b_q  offset:oq  atIndex:0];
+        [enc setBuffer:b_kc offset:okc atIndex:1];
+        [enc setBuffer:b_s  offset:os  atIndex:2];
         [enc setBytes:&nh length:sizeof(nh) atIndex:3];
         [enc setBytes:&nkh length:sizeof(nkh) atIndex:4];
         [enc setBytes:&hd length:sizeof(hd) atIndex:5];
@@ -1416,7 +1448,7 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_smax];
-        [enc setBuffer:b_s offset:0 atIndex:0];
+        [enc setBuffer:b_s offset:os atIndex:0];
         [enc setBytes:&p1 length:sizeof(p1) atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nh, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1426,9 +1458,9 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_wv];
-        [enc setBuffer:b_s  offset:0 atIndex:0];
-        [enc setBuffer:b_vc offset:0 atIndex:1];
-        [enc setBuffer:b_o  offset:0 atIndex:2];
+        [enc setBuffer:b_s  offset:os  atIndex:0];
+        [enc setBuffer:b_vc offset:ovc atIndex:1];
+        [enc setBuffer:b_o  offset:oo  atIndex:2];
         [enc setBytes:&nh length:sizeof(nh) atIndex:3];
         [enc setBytes:&nkh length:sizeof(nkh) atIndex:4];
         [enc setBytes:&hd length:sizeof(hd) atIndex:5];
@@ -1469,15 +1501,16 @@ extern "C" int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,
     id<MTLComputePipelineState> ps_wv    = get_pipeline(rec->ctx, "attn_weighted_v_int8");
     if (!ps_write || !ps_score || !ps_smax || !ps_wv) return -1;
 
-    id<MTLBuffer> b_q  = rec_pick(rec->ctx, q_fp32);
-    id<MTLBuffer> b_k  = rec_pick(rec->ctx, k_fp32);
-    id<MTLBuffer> b_v  = rec_pick(rec->ctx, v_fp32);
-    id<MTLBuffer> b_kc = rec_pick(rec->ctx, k_cache_int8);
-    id<MTLBuffer> b_vc = rec_pick(rec->ctx, v_cache_int8);
-    id<MTLBuffer> b_ks = rec_pick(rec->ctx, k_scales_fp32);
-    id<MTLBuffer> b_vs = rec_pick(rec->ctx, v_scales_fp32);
-    id<MTLBuffer> b_s  = rec_pick(rec->ctx, scores_fp32);
-    id<MTLBuffer> b_o  = rec_pick(rec->ctx, attn_out_fp32);
+    NSUInteger oq=0, ok=0, ov=0, okc=0, ovc=0, oks=0, ovs=0, os=0, oo=0;
+    id<MTLBuffer> b_q  = rec_pick_off(rec->ctx, q_fp32, &oq);
+    id<MTLBuffer> b_k  = rec_pick_off(rec->ctx, k_fp32, &ok);
+    id<MTLBuffer> b_v  = rec_pick_off(rec->ctx, v_fp32, &ov);
+    id<MTLBuffer> b_kc = rec_pick_off(rec->ctx, k_cache_int8, &okc);
+    id<MTLBuffer> b_vc = rec_pick_off(rec->ctx, v_cache_int8, &ovc);
+    id<MTLBuffer> b_ks = rec_pick_off(rec->ctx, k_scales_fp32, &oks);
+    id<MTLBuffer> b_vs = rec_pick_off(rec->ctx, v_scales_fp32, &ovs);
+    id<MTLBuffer> b_s  = rec_pick_off(rec->ctx, scores_fp32, &os);
+    id<MTLBuffer> b_o  = rec_pick_off(rec->ctx, attn_out_fp32, &oo);
     if (!b_q || !b_k || !b_v || !b_kc || !b_vc || !b_ks || !b_vs || !b_s || !b_o) return -1;
 
     uint nh = (uint)n_heads, nkh = (uint)n_kv_heads, hd = (uint)head_dim;
@@ -1487,12 +1520,12 @@ extern "C" int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_write];
-        [enc setBuffer:b_k  offset:0 atIndex:0];
-        [enc setBuffer:b_v  offset:0 atIndex:1];
-        [enc setBuffer:b_kc offset:0 atIndex:2];
-        [enc setBuffer:b_vc offset:0 atIndex:3];
-        [enc setBuffer:b_ks offset:0 atIndex:4];
-        [enc setBuffer:b_vs offset:0 atIndex:5];
+        [enc setBuffer:b_k  offset:ok  atIndex:0];
+        [enc setBuffer:b_v  offset:ov  atIndex:1];
+        [enc setBuffer:b_kc offset:okc atIndex:2];
+        [enc setBuffer:b_vc offset:ovc atIndex:3];
+        [enc setBuffer:b_ks offset:oks atIndex:4];
+        [enc setBuffer:b_vs offset:ovs atIndex:5];
         [enc setBytes:&p   length:sizeof(p)   atIndex:6];
         [enc setBytes:&nkh length:sizeof(nkh) atIndex:7];
         [enc setBytes:&hd  length:sizeof(hd)  atIndex:8];
@@ -1503,10 +1536,10 @@ extern "C" int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_score];
-        [enc setBuffer:b_q  offset:0 atIndex:0];
-        [enc setBuffer:b_kc offset:0 atIndex:1];
-        [enc setBuffer:b_ks offset:0 atIndex:2];
-        [enc setBuffer:b_s  offset:0 atIndex:3];
+        [enc setBuffer:b_q  offset:oq  atIndex:0];
+        [enc setBuffer:b_kc offset:okc atIndex:1];
+        [enc setBuffer:b_ks offset:oks atIndex:2];
+        [enc setBuffer:b_s  offset:os  atIndex:3];
         [enc setBytes:&nh length:sizeof(nh) atIndex:4];
         [enc setBytes:&nkh length:sizeof(nkh) atIndex:5];
         [enc setBytes:&hd length:sizeof(hd) atIndex:6];
@@ -1522,7 +1555,7 @@ extern "C" int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_smax];
-        [enc setBuffer:b_s offset:0 atIndex:0];
+        [enc setBuffer:b_s offset:os atIndex:0];
         [enc setBytes:&p1 length:sizeof(p1) atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nh, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -1531,10 +1564,10 @@ extern "C" int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_wv];
-        [enc setBuffer:b_s  offset:0 atIndex:0];
-        [enc setBuffer:b_vc offset:0 atIndex:1];
-        [enc setBuffer:b_vs offset:0 atIndex:2];
-        [enc setBuffer:b_o  offset:0 atIndex:3];
+        [enc setBuffer:b_s  offset:os  atIndex:0];
+        [enc setBuffer:b_vc offset:ovc atIndex:1];
+        [enc setBuffer:b_vs offset:ovs atIndex:2];
+        [enc setBuffer:b_o  offset:oo  atIndex:3];
         [enc setBytes:&nh length:sizeof(nh) atIndex:4];
         [enc setBytes:&nkh length:sizeof(nkh) atIndex:5];
         [enc setBytes:&hd length:sizeof(hd) atIndex:6];
