@@ -1361,6 +1361,119 @@ kernel void attn_scores_qk(
     scores[(size_t)h * seq_pos_p1 + t] = s * scale;
 }
 
+/* ── Batched attention sub-kernels (fp16-KV path) ─────────────────────
+ *
+ * Used by ib_metal_rec_attention_block_fp16_batched in the prefill
+ * forward. Same arithmetic as the single-position variants but each
+ * dispatch handles all B prefill positions in one go, eliminating
+ * ~2700 per-position dispatches per TinyLlama prefill.
+ *
+ * Layout conventions:
+ *   q, k, v          float[B][n_heads*head_dim] (or kv_dim for k/v)
+ *   k_cache, v_cache float[seq_len][kv_dim]      (kv_bits=16 actually fp32)
+ *   scores           float[B][n_heads][max_score_len]
+ *   attn_out         float[B][n_heads*head_dim]
+ *
+ * Causal masking: position b in batch sees only j ∈ [0, start_pos+b].
+ * Scoring kernel writes -INFINITY to invalid (j > start_pos+b) so
+ * softmax gives 0 for those positions.
+ */
+
+/* Batched KV write: B positions written starting at start_pos. */
+kernel void kv_cache_write_fp16_batched(
+    device const float *k         [[buffer(0)]],
+    device const float *v         [[buffer(1)]],
+    device       float *k_cache   [[buffer(2)]],
+    device       float *v_cache   [[buffer(3)]],
+    constant     uint  &start_pos [[buffer(4)]],
+    constant     uint  &kv_dim    [[buffer(5)]],
+    uint2               gid2      [[thread_position_in_grid]])
+{
+    uint d = gid2.x;
+    uint b = gid2.y;
+    if (d >= kv_dim) return;
+    size_t cache_off = (size_t)(start_pos + b) * kv_dim + d;
+    size_t src_off   = (size_t)b * kv_dim + d;
+    k_cache[cache_off] = k[src_off];
+    v_cache[cache_off] = v[src_off];
+}
+
+/* Batched scores with causal masking. Grid: (max_j+1, n_heads, B). */
+kernel void attn_scores_qk_batched(
+    device const float *q              [[buffer(0)]],
+    device const float *k_cache        [[buffer(1)]],
+    device       float *scores         [[buffer(2)]],
+    constant     uint  &n_heads        [[buffer(3)]],
+    constant     uint  &n_kv_heads     [[buffer(4)]],
+    constant     uint  &head_dim       [[buffer(5)]],
+    constant     uint  &max_score_len  [[buffer(6)]],   /* row length = start_pos + B */
+    constant     uint  &start_pos      [[buffer(7)]],
+    constant     float &scale          [[buffer(8)]],
+    uint3               gid3           [[thread_position_in_grid]])
+{
+    uint t = gid3.x;
+    uint h = gid3.y;
+    uint b = gid3.z;
+    if (t >= max_score_len || h >= n_heads) return;
+
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_h = h / heads_per_kv;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    /* Per-(b, h) row in scores buffer. */
+    size_t row_off = ((size_t)b * (size_t)n_heads + (size_t)h) * (size_t)max_score_len;
+
+    uint causal_limit = start_pos + b;        /* position b sees [0, start_pos+b] */
+    if (t > causal_limit) {
+        scores[row_off + t] = -INFINITY;
+        return;
+    }
+
+    device const float *q_h = q + (size_t)b * (size_t)n_heads * (size_t)head_dim + (size_t)h * head_dim;
+    device const float *k_t = k_cache + (size_t)t * kv_dim + (size_t)kv_h * head_dim;
+    float s = 0.0f;
+    for (uint d = 0; d < head_dim; d++) {
+        s += q_h[d] * k_t[d];
+    }
+    scores[row_off + t] = s * scale;
+}
+
+/* Batched weighted_v. Grid: (head_dim, n_heads, B). */
+kernel void attn_weighted_v_batched(
+    device const float *scores         [[buffer(0)]],
+    device const float *v_cache        [[buffer(1)]],
+    device       float *attn_out       [[buffer(2)]],
+    constant     uint  &n_heads        [[buffer(3)]],
+    constant     uint  &n_kv_heads     [[buffer(4)]],
+    constant     uint  &head_dim       [[buffer(5)]],
+    constant     uint  &max_score_len  [[buffer(6)]],
+    constant     uint  &start_pos      [[buffer(7)]],
+    uint3               gid3           [[thread_position_in_grid]])
+{
+    uint d = gid3.x;
+    uint h = gid3.y;
+    uint b = gid3.z;
+    if (d >= head_dim || h >= n_heads) return;
+
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_h = h / heads_per_kv;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    /* Sum over valid positions only — masked positions had -inf, so
+     * softmax made them 0 already, but summing them anyway is wasted
+     * work for long sequences. Hard cap at causal_limit+1. */
+    uint causal_limit_p1 = start_pos + b + 1u;
+    size_t s_row_off = ((size_t)b * (size_t)n_heads + (size_t)h) * (size_t)max_score_len;
+    device const float *s_row = scores + s_row_off;
+
+    float acc = 0.0f;
+    for (uint t = 0; t < causal_limit_p1; t++) {
+        acc += s_row[t] * v_cache[(size_t)t * kv_dim + (size_t)kv_h * head_dim + d];
+    }
+    attn_out[(size_t)b * (size_t)n_heads * (size_t)head_dim
+              + (size_t)h * head_dim + d] = acc;
+}
+
 /* ── INT8 KV cache (matches libinferbit kv_bits=8) ────────────────────
  *
  * Layout (mirrors forward.c::kv_cache_write_int8):

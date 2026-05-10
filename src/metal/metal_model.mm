@@ -102,6 +102,7 @@ struct ib_metal_model_buffers {
     void *hb2_b;     /* [b_max][intermediate]      fp32 */
     void *xq_b;      /* [b_max][max_in]            int8 */
     void *xs_b;      /* [b_max][max_in/128]        fp32 */
+    void *scores_b;  /* [b_max][n_heads][seq_len]  fp32 — batched-attn scratch */
 };
 
 /* Verifies the IBF is in a layout the GPU dispatcher supports. */
@@ -320,6 +321,8 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
         b->hb2_b      = ib_metal_alloc(ctx, bm * I  * sizeof(float), NULL);
         b->xq_b       = ib_metal_alloc(ctx, bm * (size_t)max_n, NULL);
         b->xs_b       = ib_metal_alloc(ctx, bm * (size_t)xs_groups * sizeof(float), NULL);
+        b->scores_b   = ib_metal_alloc(ctx,
+            bm * (size_t)b->n_heads * (size_t)b->seq_len * sizeof(float), NULL);
     }
 
     return b;
@@ -422,6 +425,7 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     FR(b->q_b); FR(b->k_b); FR(b->v_b); FR(b->attn_out_b);
     FR(b->hb_b); FR(b->hb2_b);
     FR(b->xq_b); FR(b->xs_b);
+    FR(b->scores_b);
     free(b);
     #undef FR
 }
@@ -668,23 +672,24 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         ib_metal_rec_rope_inplace_batched(r, b->q_b, B, nh,  hd, start_pos, th);
         ib_metal_rec_rope_inplace_batched(r, b->k_b, B, nkh, hd, start_pos, th);
 
-        /* Per-token attention block (KV cache fill at distinct positions;
-         * causal scoring against [0..pos]). Attention is hard to batch
-         * cleanly because each position attends to a different prefix. */
-        for (int bb = 0; bb < B; bb++) {
-            int pos = start_pos + bb;
-            float *q_row = ROW_F(b->q_b, bb, qh);
-            float *k_row = ROW_F(b->k_b, bb, kv_dim);
-            float *v_row = ROW_F(b->v_b, bb, kv_dim);
-            float *attn_out_row = ROW_F(b->attn_out_b, bb, qh);
-
-            if (b->kv_bits == 16) {
-                ib_metal_rec_attention_block_fp16(r,
-                    q_row, k_row, v_row,
-                    lb->k_cache, lb->v_cache,
-                    b->scores, attn_out_row,
-                    nh, nkh, hd, sl, pos);
-            } else {
+        if (b->kv_bits == 16) {
+            /* Batched fp16-KV attention: 4 dispatches per layer total
+             * (vs 4*B in the per-position fallback). Causal mask is
+             * handled inside the scores kernel. */
+            ib_metal_rec_attention_block_fp16_batched(r,
+                b->q_b, b->k_b, b->v_b,
+                lb->k_cache, lb->v_cache,
+                b->scores_b, b->attn_out_b,
+                B, nh, nkh, hd, sl, start_pos);
+        } else {
+            /* INT8 KV: batched path not implemented yet, fall back to
+             * per-position loop. */
+            for (int bb = 0; bb < B; bb++) {
+                int pos = start_pos + bb;
+                float *q_row = ROW_F(b->q_b, bb, qh);
+                float *k_row = ROW_F(b->k_b, bb, kv_dim);
+                float *v_row = ROW_F(b->v_b, bb, kv_dim);
+                float *attn_out_row = ROW_F(b->attn_out_b, bb, qh);
                 ib_metal_rec_attention_block_int8(r,
                     q_row, k_row, v_row,
                     lb->k_cache, lb->v_cache,

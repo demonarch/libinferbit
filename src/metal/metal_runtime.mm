@@ -1843,6 +1843,118 @@ extern "C" int ib_metal_rec_embed_lookup_fp16(ib_metal_recorder *rec,
     return 0;
 }
 
+/* Batched fp16-KV attention block: runs B prefill positions through
+ * kv_write → scores → softmax → weighted_v in 4 dispatches total
+ * (vs. 4×B in the per-position variant). Causal masking is handled by
+ * the scores kernel writing -INFINITY to invalid (j > start_pos+b)
+ * entries; softmax then produces 0 for those.
+ *
+ *   q, k, v       : float[B][n_heads*head_dim] (k/v use kv_dim cols)
+ *   k_cache,v_cache: float[seq_len][kv_dim]
+ *   scores        : float[B][n_heads][max_score_len]  (max_score_len = start_pos+B)
+ *   attn_out      : float[B][n_heads*head_dim]
+ */
+extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
+                                                            const void *q_fp32,
+                                                            const void *k_fp32,
+                                                            const void *v_fp32,
+                                                            void *k_cache_fp16,
+                                                            void *v_cache_fp16,
+                                                            void *scores_fp32,
+                                                            void *attn_out_fp32,
+                                                            int B, int n_heads, int n_kv_heads,
+                                                            int head_dim, int seq_len, int start_pos)
+{
+    if (!rec) return -1;
+    if (!q_fp32 || !k_fp32 || !v_fp32 || !k_cache_fp16 || !v_cache_fp16
+        || !scores_fp32 || !attn_out_fp32) return -1;
+    if (B <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return -1;
+    if (start_pos < 0 || start_pos + B > seq_len) return -1;
+    if (n_heads % n_kv_heads != 0) return -1;
+
+    id<MTLComputePipelineState> ps_write = get_pipeline(rec->ctx, "kv_cache_write_fp16_batched");
+    id<MTLComputePipelineState> ps_score = get_pipeline(rec->ctx, "attn_scores_qk_batched");
+    id<MTLComputePipelineState> ps_smax  = get_pipeline(rec->ctx, "softmax_rows");
+    id<MTLComputePipelineState> ps_wv    = get_pipeline(rec->ctx, "attn_weighted_v_batched");
+    if (!ps_write || !ps_score || !ps_smax || !ps_wv) return -1;
+
+    NSUInteger oq=0, ok=0, ov=0, okc=0, ovc=0, os=0, oo=0;
+    id<MTLBuffer> b_q  = rec_pick_off(rec->ctx, q_fp32, &oq);
+    id<MTLBuffer> b_k  = rec_pick_off(rec->ctx, k_fp32, &ok);
+    id<MTLBuffer> b_v  = rec_pick_off(rec->ctx, v_fp32, &ov);
+    id<MTLBuffer> b_kc = rec_pick_off(rec->ctx, k_cache_fp16, &okc);
+    id<MTLBuffer> b_vc = rec_pick_off(rec->ctx, v_cache_fp16, &ovc);
+    id<MTLBuffer> b_s  = rec_pick_off(rec->ctx, scores_fp32, &os);
+    id<MTLBuffer> b_o  = rec_pick_off(rec->ctx, attn_out_fp32, &oo);
+    if (!b_q || !b_k || !b_v || !b_kc || !b_vc || !b_s || !b_o) return -1;
+
+    uint B_u = (uint)B, nh = (uint)n_heads, nkh = (uint)n_kv_heads;
+    uint hd = (uint)head_dim, sp = (uint)start_pos;
+    uint max_score_len = sp + B_u;
+    uint kv_dim = nkh * hd;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    /* 1. KV write (B positions in parallel) */
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_write];
+        [enc setBuffer:b_k  offset:ok  atIndex:0];
+        [enc setBuffer:b_v  offset:ov  atIndex:1];
+        [enc setBuffer:b_kc offset:okc atIndex:2];
+        [enc setBuffer:b_vc offset:ovc atIndex:3];
+        [enc setBytes:&sp     length:sizeof(sp)     atIndex:4];
+        [enc setBytes:&kv_dim length:sizeof(kv_dim) atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(kv_dim, (NSUInteger)B, 1)
+           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+    }
+    /* 2. Scores with causal masking */
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_score];
+        [enc setBuffer:b_q  offset:oq  atIndex:0];
+        [enc setBuffer:b_kc offset:okc atIndex:1];
+        [enc setBuffer:b_s  offset:os  atIndex:2];
+        [enc setBytes:&nh length:sizeof(nh) atIndex:3];
+        [enc setBytes:&nkh length:sizeof(nkh) atIndex:4];
+        [enc setBytes:&hd length:sizeof(hd) atIndex:5];
+        [enc setBytes:&max_score_len length:sizeof(max_score_len) atIndex:6];
+        [enc setBytes:&sp length:sizeof(sp) atIndex:7];
+        [enc setBytes:&scale length:sizeof(scale) atIndex:8];
+        [enc dispatchThreads:MTLSizeMake(max_score_len, nh, (NSUInteger)B)
+           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+    }
+    /* 3. Softmax over (B*n_heads) rows of length max_score_len */
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_smax];
+        [enc setBuffer:b_s offset:os atIndex:0];
+        [enc setBytes:&max_score_len length:sizeof(max_score_len) atIndex:1];
+        NSUInteger n_rows = (NSUInteger)B * nh;
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    /* 4. Weighted V (B*n_heads*head_dim cells) */
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_wv];
+        [enc setBuffer:b_s  offset:os  atIndex:0];
+        [enc setBuffer:b_vc offset:ovc atIndex:1];
+        [enc setBuffer:b_o  offset:oo  atIndex:2];
+        [enc setBytes:&nh length:sizeof(nh) atIndex:3];
+        [enc setBytes:&nkh length:sizeof(nkh) atIndex:4];
+        [enc setBytes:&hd length:sizeof(hd) atIndex:5];
+        [enc setBytes:&max_score_len length:sizeof(max_score_len) atIndex:6];
+        [enc setBytes:&sp length:sizeof(sp) atIndex:7];
+        [enc dispatchThreads:MTLSizeMake(hd, nh, (NSUInteger)B)
+           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [enc endEncoding];
+    }
+    return 0;
+}
+
 extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
                                                    const void *q_fp32,
                                                    const void *k_fp32,

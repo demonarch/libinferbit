@@ -438,6 +438,21 @@ int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
                                         int n_heads, int n_kv_heads,
                                         int head_dim, int seq_len, int pos);
 
+/* Batched fp16-KV attention: runs B prefill positions in 4 dispatches
+ * (vs. 4×B in the per-position variant). Causal mask handled internally.
+ * q/k/v are [B][...]; scores is [B][n_heads][start_pos+B]; attn_out is
+ * [B][n_heads*head_dim]. */
+int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
+                                                const void *q_fp32,
+                                                const void *k_fp32,
+                                                const void *v_fp32,
+                                                void *k_cache_fp16,
+                                                void *v_cache_fp16,
+                                                void *scores_fp32,
+                                                void *attn_out_fp32,
+                                                int B, int n_heads, int n_kv_heads,
+                                                int head_dim, int seq_len, int start_pos);
+
 /* INT8 KV variant of the attention block. */
 int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,
                                         const void *q_fp32,
