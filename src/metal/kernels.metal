@@ -1738,6 +1738,43 @@ kernel void rope_inplace(
     tensor[base + 1u] = v0 * s + v1 * c;
 }
 
+/* Fused Q+K rope: applies RoPE to both Q and K in one dispatch.
+ * Grid: (max_pairs, 2, 1) — z=0 is Q (n_heads pairs), z=1 is K
+ * (n_kv_heads pairs). The kernel branches on gid.y to pick the right
+ * tensor + head count. Saves 1 Metal dispatch per layer. */
+kernel void rope_inplace_qk(
+    device       float *q          [[buffer(0)]],
+    device       float *k          [[buffer(1)]],
+    constant     uint  &n_q_heads  [[buffer(2)]],
+    constant     uint  &n_kv_heads [[buffer(3)]],
+    constant     uint  &head_dim   [[buffer(4)]],
+    constant     uint  &pos        [[buffer(5)]],
+    constant     float &theta      [[buffer(6)]],
+    uint2               gid2       [[thread_position_in_grid]])
+{
+    uint half_hd = head_dim / 2u;
+    uint pair_gid = gid2.x;
+    uint which = gid2.y;          /* 0 = Q, 1 = K */
+
+    uint nh = (which == 0u) ? n_q_heads : n_kv_heads;
+    uint total = nh * half_hd;
+    if (pair_gid >= total) return;
+
+    uint h    = pair_gid / half_hd;
+    uint pair = pair_gid - h * half_hd;
+    float exponent = (float)(2u * pair) / (float)head_dim;
+    float freq = pow(theta, -exponent);
+    float angle = (float)pos * freq;
+    float c = cos(angle), s = sin(angle);
+
+    device float *tensor = (which == 0u) ? q : k;
+    uint base = h * head_dim + 2u * pair;
+    float v0 = tensor[base];
+    float v1 = tensor[base + 1u];
+    tensor[base]      = v0 * c - v1 * s;
+    tensor[base + 1u] = v0 * s + v1 * c;
+}
+
 /* Batched RoPE: each row b at absolute position start_pos + b. Grid:
  * (n_pairs, B, 1). tensor is laid out as [B][n_heads * head_dim]. */
 kernel void rope_inplace_batched(

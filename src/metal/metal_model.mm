@@ -527,8 +527,7 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
             rec_matmul(r, lb->k_bits, lb->k_blk32, b->xb, lb->k_w, lb->k_s, b->k, b->xq, b->xs, kv_dim, hidden);
             rec_matmul(r, lb->v_bits, lb->v_blk32, b->xb, lb->v_w, lb->v_s, b->v, b->xq, b->xs, kv_dim, hidden);
         }
-        ib_metal_rec_rope_inplace(r, b->q, nh,  hd, pos, th);
-        ib_metal_rec_rope_inplace(r, b->k, nkh, hd, pos, th);
+        ib_metal_rec_rope_inplace_qk(r, b->q, b->k, nh, nkh, hd, pos, th);
         if (b->kv_bits == 16) {
             ib_metal_rec_attention_block_fp16(r, b->q, b->k, b->v,
                                                 lb->k_cache, lb->v_cache,

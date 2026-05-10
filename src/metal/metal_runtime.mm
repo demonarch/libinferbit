@@ -1839,6 +1839,42 @@ extern "C" int ib_metal_rec_matmul_int8_fp32_in_batched(ib_metal_recorder *rec,
     return 0;
 }
 
+extern "C" int ib_metal_rec_rope_inplace_qk(ib_metal_recorder *rec,
+                                              void *q_fp32, void *k_fp32,
+                                              int n_q_heads, int n_kv_heads,
+                                              int head_dim,
+                                              int pos, float theta)
+{
+    if (!rec || !q_fp32 || !k_fp32
+        || n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0) return -1;
+    if (head_dim & 1) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "rope_inplace_qk");
+    if (!ps) return -1;
+    NSUInteger oq = 0, ok = 0;
+    id<MTLBuffer> b_q = rec_pick_off(rec->ctx, q_fp32, &oq);
+    id<MTLBuffer> b_k = rec_pick_off(rec->ctx, k_fp32, &ok);
+    if (!b_q || !b_k) return -1;
+    uint nqh = (uint)n_q_heads, nkh = (uint)n_kv_heads, hd = (uint)head_dim;
+    uint p = (uint)pos;
+    float th = theta;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_q offset:oq atIndex:0];
+    [enc setBuffer:b_k offset:ok atIndex:1];
+    [enc setBytes:&nqh length:sizeof(nqh) atIndex:2];
+    [enc setBytes:&nkh length:sizeof(nkh) atIndex:3];
+    [enc setBytes:&hd  length:sizeof(hd)  atIndex:4];
+    [enc setBytes:&p   length:sizeof(p)   atIndex:5];
+    [enc setBytes:&th  length:sizeof(th)  atIndex:6];
+    /* Pad x-dim to max(nqh, nkh)*half_hd so K's dispatch isn't truncated. */
+    NSUInteger nh_max = (NSUInteger)((nqh > nkh) ? nqh : nkh);
+    NSUInteger total_pairs = nh_max * (NSUInteger)(head_dim / 2);
+    [enc dispatchThreads:MTLSizeMake(total_pairs, 2, 1)
+       threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
 extern "C" int ib_metal_rec_rope_inplace(ib_metal_recorder *rec,
                                            void *tensor_fp32,
                                            int n_heads, int head_dim,

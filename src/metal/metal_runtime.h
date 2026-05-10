@@ -422,6 +422,14 @@ int ib_metal_rec_rope_inplace(ib_metal_recorder *rec,
                                 int n_heads, int head_dim,
                                 int pos, float theta);
 
+/* Fused Q+K RoPE: applies the in-place rotation to both Q and K in
+ * one Metal dispatch. Saves 1 dispatch per layer. */
+int ib_metal_rec_rope_inplace_qk(ib_metal_recorder *rec,
+                                   void *q_fp32, void *k_fp32,
+                                   int n_q_heads, int n_kv_heads,
+                                   int head_dim,
+                                   int pos, float theta);
+
 int ib_metal_rec_silu_mul(ib_metal_recorder *rec,
                             const void *gate_fp32,
                             const void *up_fp32,
