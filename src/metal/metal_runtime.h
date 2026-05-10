@@ -314,6 +314,14 @@ int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
                                        void *out,
                                        int M, int N);
 
+/* Batched INT8 matmul. x is fp32[B][N], out is fp32[B][M]. */
+int ib_metal_rec_matmul_int8_fp32_in_batched(ib_metal_recorder *rec,
+                                               const void *x_fp32,
+                                               const void *weights,
+                                               const void *w_scales,
+                                               void *out,
+                                               int B, int M, int N);
+
 int ib_metal_rec_rope_inplace(ib_metal_recorder *rec,
                                 void *tensor_fp32,
                                 int n_heads, int head_dim,
@@ -397,6 +405,31 @@ int ib_metal_forward_token(ib_metal_ctx *ctx,
                             const float *cpu_embed_in,
                             int pos,
                             float *logits_out);
+
+/* Batched prefill forward: runs B tokens through all layers in a single
+ * command buffer, batching the per-layer matmuls (Q/K/V/O/gate/up/down)
+ * across all B tokens to amortize weight-load bandwidth. Per-token ops
+ * (RMSNorm/RoPE/attention/residual/silu) still run in a recorded loop
+ * — they're cheap per call and need per-position state.
+ *
+ * Inputs:
+ *   cpu_embeds_in : float[B][hidden] — CPU-side embedding lookups
+ *   start_pos     : absolute position of token 0 (KV cache slot)
+ *   last_logits_out: float[vocab] — only the last token's logits are
+ *                    materialized (typical prefill use case)
+ *
+ * Constraints (current MVP):
+ *   - All q/k/v/o/gate/up/down + output_head must be INT4 blk32. Returns
+ *     -2 if any tensor is per-row INT4 or INT8 — caller should fall back
+ *     to ib_metal_forward_token.
+ *   - B must be ≤ bufs->b_max (set via IB_PREFILL_BMAX env at upload).
+ *
+ * Returns 0 on success, -1 on hard error, -2 if model layout incompatible. */
+int ib_metal_forward_prefill(ib_metal_ctx *ctx,
+                              ib_metal_model_buffers *bufs,
+                              const float *cpu_embeds_in,
+                              int n_tokens, int start_pos,
+                              float *last_logits_out);
 
 /* Resets every layer's KV cache write position back to 0 — used between
  * generation runs that don't share a prefix. */

@@ -118,14 +118,35 @@ int main(int argc, char **argv) {
         if (getenv("IB_STRIP_MMAP")) ib_metal_strip_cpu_mmap(m);
     }
 
+    /* Opt-in batched prefill (Item 2 from the future-work list).
+     * Off by default to keep existing tests deterministic; flip
+     * IB_PREFILL_BATCH=1 in the env to use ib_metal_forward_prefill. */
+    int use_batched_prefill = (use_gpu && getenv("IB_PREFILL_BATCH") != NULL);
+    float *embed_batch = NULL;
+    if (use_batched_prefill) {
+        embed_batch = malloc((size_t)prompt_tokens * hidden * sizeof(float));
+    }
+
     /* ── Warmup (post-load, mirrors llama-bench default) ─────────── */
     float *logits = malloc((size_t)vocab * sizeof(float));
     inferbit_kv_clear(m);
     if (use_gpu) ib_metal_reset_kv(gbufs);
     if (use_gpu) {
-        for (int i = 0; i < prompt_tokens; i++) {
-            cpu_embed_lookup(m, prompt[i], embed_buf);
-            ib_metal_forward_token(ctx, gbufs, embed_buf, i, logits);
+        if (use_batched_prefill) {
+            for (int i = 0; i < prompt_tokens; i++)
+                cpu_embed_lookup(m, prompt[i], embed_batch + (size_t)i * hidden);
+            int rc = ib_metal_forward_prefill(ctx, gbufs, embed_batch,
+                                                prompt_tokens, 0, logits);
+            if (rc == -2) {
+                fprintf(stderr, "warn: model not blk32-only; falling back to per-token\n");
+                use_batched_prefill = 0;
+            }
+        }
+        if (!use_batched_prefill) {
+            for (int i = 0; i < prompt_tokens; i++) {
+                cpu_embed_lookup(m, prompt[i], embed_buf);
+                ib_metal_forward_token(ctx, gbufs, embed_buf, i, logits);
+            }
         }
     } else {
         ib_forward(m, prompt, prompt_tokens, logits);
@@ -136,9 +157,16 @@ int main(int argc, char **argv) {
     /* ── Prefill (TTFT timer) ──────────────────────────────────────── */
     double t0 = now_sec();
     if (use_gpu) {
-        for (int i = 0; i < prompt_tokens; i++) {
-            cpu_embed_lookup(m, prompt[i], embed_buf);
-            ib_metal_forward_token(ctx, gbufs, embed_buf, i, logits);
+        if (use_batched_prefill) {
+            for (int i = 0; i < prompt_tokens; i++)
+                cpu_embed_lookup(m, prompt[i], embed_batch + (size_t)i * hidden);
+            ib_metal_forward_prefill(ctx, gbufs, embed_batch,
+                                       prompt_tokens, 0, logits);
+        } else {
+            for (int i = 0; i < prompt_tokens; i++) {
+                cpu_embed_lookup(m, prompt[i], embed_buf);
+                ib_metal_forward_token(ctx, gbufs, embed_buf, i, logits);
+            }
         }
     } else {
         ib_forward(m, prompt, prompt_tokens, logits);
@@ -183,6 +211,7 @@ int main(int argc, char **argv) {
     printf("\n");
 
     free(prompt); free(logits); free(generated); free(embed_buf);
+    if (embed_batch) free(embed_batch);
     if (use_gpu) {
         ib_metal_release_model(ctx, gbufs);
         ib_metal_destroy(ctx);

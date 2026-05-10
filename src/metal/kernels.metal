@@ -347,6 +347,41 @@ kernel void matmul_int8_fp32_in(
     }
 }
 
+/* Batched variant: takes B fp32 input rows of length N, outputs B fp32
+ * rows of length M. Same SIMDgroup-per-(b, m) tile as the blk32 batched
+ * matmul. Used when prefill has mixed-precision IBFs (INT8 q/k/v + INT4
+ * blk32 FFN) so the INT8 path can also batch. */
+kernel void matmul_int8_fp32_in_batched(
+    device const char   *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x         [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    constant     uint   &B         [[buffer(6)]],
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]],
+    uint2                tg_size   [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size.x / 32u;
+    uint m = tg_id.x * simdgroups_per_tg + simd_id;
+    uint b = tg_id.y;
+    if (m >= M || b >= B) return;
+
+    device const char  *row   = weights + (size_t)m * N;
+    device const float *x_row = x       + (size_t)b * N;
+
+    float lane_acc = 0.0f;
+    for (uint n = simd_lane; n < N; n += 32u) {
+        lane_acc += (float)row[n] * x_row[n];
+    }
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[(size_t)b * M + m] = total * (float)w_scales[m];
+    }
+}
+
 /* ── quantize_input_int8_g128 ────────────────────────────────────────
  *
  * fp32 → int8 quantization with per-group scale. Mirrors the CPU

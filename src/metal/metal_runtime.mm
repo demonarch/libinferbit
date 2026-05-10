@@ -1241,25 +1241,63 @@ extern "C" int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
         || M <= 0 || N <= 0) return -1;
     id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_int8_fp32_in");
     if (!ps) return -1;
-    id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
-    id<MTLBuffer> b_ws  = rec_pick(rec->ctx, w_scales);
-    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
-    id<MTLBuffer> b_out = rec_pick(rec->ctx, out);
+    NSUInteger ow=0, ows=0, ox=0, oo=0;
+    id<MTLBuffer> b_w   = rec_pick_off(rec->ctx, weights,  &ow);
+    id<MTLBuffer> b_ws  = rec_pick_off(rec->ctx, w_scales, &ows);
+    id<MTLBuffer> b_x   = rec_pick_off(rec->ctx, x_fp32,   &ox);
+    id<MTLBuffer> b_out = rec_pick_off(rec->ctx, out,      &oo);
     if (!b_w || !b_ws || !b_x || !b_out) return -1;
 
     uint M_u = (uint)M, N_u = (uint)N;
     id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
     [enc setComputePipelineState:ps];
-    [enc setBuffer:b_w   offset:0 atIndex:0];
-    [enc setBuffer:b_ws  offset:0 atIndex:1];
-    [enc setBuffer:b_x   offset:0 atIndex:2];
-    [enc setBuffer:b_out offset:0 atIndex:3];
+    [enc setBuffer:b_w   offset:ow  atIndex:0];
+    [enc setBuffer:b_ws  offset:ows atIndex:1];
+    [enc setBuffer:b_x   offset:ox  atIndex:2];
+    [enc setBuffer:b_out offset:oo  atIndex:3];
     [enc setBytes:&M_u   length:sizeof(M_u) atIndex:4];
     [enc setBytes:&N_u   length:sizeof(N_u) atIndex:5];
     const NSUInteger SIMDS_PER_TG = 4;
     const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
     NSUInteger n_tg = (M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
     [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_matmul_int8_fp32_in_batched(ib_metal_recorder *rec,
+                                                          const void *x_fp32,
+                                                          const void *weights,
+                                                          const void *w_scales,
+                                                          void *out,
+                                                          int B, int M, int N)
+{
+    if (!rec || !x_fp32 || !weights || !w_scales || !out
+        || B <= 0 || M <= 0 || N <= 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_int8_fp32_in_batched");
+    if (!ps) return -1;
+    NSUInteger ow=0, ows=0, ox=0, oo=0;
+    id<MTLBuffer> b_w   = rec_pick_off(rec->ctx, weights,  &ow);
+    id<MTLBuffer> b_ws  = rec_pick_off(rec->ctx, w_scales, &ows);
+    id<MTLBuffer> b_x   = rec_pick_off(rec->ctx, x_fp32,   &ox);
+    id<MTLBuffer> b_out = rec_pick_off(rec->ctx, out,      &oo);
+    if (!b_w || !b_ws || !b_x || !b_out) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, B_u = (uint)B;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_w   offset:ow  atIndex:0];
+    [enc setBuffer:b_ws  offset:ows atIndex:1];
+    [enc setBuffer:b_x   offset:ox  atIndex:2];
+    [enc setBuffer:b_out offset:oo  atIndex:3];
+    [enc setBytes:&M_u   length:sizeof(M_u) atIndex:4];
+    [enc setBytes:&N_u   length:sizeof(N_u) atIndex:5];
+    [enc setBytes:&B_u   length:sizeof(B_u) atIndex:6];
+    const NSUInteger SIMDS_PER_TG = 4;
+    const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+    NSUInteger n_tg_x = (M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg_x, (NSUInteger)B, 1)
           threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
     [enc endEncoding];
     return 0;

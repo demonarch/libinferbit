@@ -85,6 +85,23 @@ struct ib_metal_model_buffers {
     void *xq;
     void *xs;
     void *logits;
+
+    /* Batched prefill scratch — sized for up to b_max tokens at once.
+     * Layout for each is row-major [b][hidden_or_inter]: row b at byte
+     * offset b * row_bytes. Allocated lazily on first ib_metal_forward_
+     * prefill call (or at upload if IB_PREFILL_PREALLOC is set). */
+    int   b_max;
+    void *x_b;       /* [b_max][hidden]            fp32 */
+    void *xb_b;      /* [b_max][hidden]            fp32 */
+    void *xb2_b;     /* [b_max][hidden]            fp32 */
+    void *q_b;       /* [b_max][n_heads*head_dim]  fp32 */
+    void *k_b;       /* [b_max][kv_dim]            fp32 */
+    void *v_b;       /* [b_max][kv_dim]            fp32 */
+    void *attn_out_b;/* [b_max][n_heads*head_dim]  fp32 */
+    void *hb_b;      /* [b_max][intermediate]      fp32 */
+    void *hb2_b;     /* [b_max][intermediate]      fp32 */
+    void *xq_b;      /* [b_max][max_in]            int8 */
+    void *xs_b;      /* [b_max][max_in/128]        fp32 */
 };
 
 /* Verifies the IBF is in a layout the GPU dispatcher supports. */
@@ -279,6 +296,32 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
     b->xs       = ib_metal_alloc(ctx, (size_t)xs_groups * sizeof(float), NULL);
     b->logits   = ib_metal_alloc(ctx, (size_t)b->vocab * sizeof(float), NULL);
 
+    /* Prefill batched scratch. B_max chosen to comfortably cover prompts
+     * up to a few hundred tokens on the M4 — total scratch is ~B_max ×
+     * (5*hidden + 2*kv_dim + 2*intermediate) × 4 bytes; ~30 MB for the
+     * 8B model at B_max=128, ~5 MB for TinyLlama. Tunable via
+     * IB_PREFILL_BMAX env var. */
+    {
+        const char *bmax_env = getenv("IB_PREFILL_BMAX");
+        b->b_max = bmax_env ? atoi(bmax_env) : 128;
+        if (b->b_max < 1) b->b_max = 128;
+        size_t bm = (size_t)b->b_max;
+        size_t H  = (size_t)b->hidden, I = (size_t)b->intermediate;
+        size_t QH = (size_t)b->n_heads * b->head_dim;
+        size_t KV = (size_t)b->kv_dim;
+        b->x_b        = ib_metal_alloc(ctx, bm * H  * sizeof(float), NULL);
+        b->xb_b       = ib_metal_alloc(ctx, bm * H  * sizeof(float), NULL);
+        b->xb2_b      = ib_metal_alloc(ctx, bm * H  * sizeof(float), NULL);
+        b->q_b        = ib_metal_alloc(ctx, bm * QH * sizeof(float), NULL);
+        b->k_b        = ib_metal_alloc(ctx, bm * KV * sizeof(float), NULL);
+        b->v_b        = ib_metal_alloc(ctx, bm * KV * sizeof(float), NULL);
+        b->attn_out_b = ib_metal_alloc(ctx, bm * QH * sizeof(float), NULL);
+        b->hb_b       = ib_metal_alloc(ctx, bm * I  * sizeof(float), NULL);
+        b->hb2_b      = ib_metal_alloc(ctx, bm * I  * sizeof(float), NULL);
+        b->xq_b       = ib_metal_alloc(ctx, bm * (size_t)max_n, NULL);
+        b->xs_b       = ib_metal_alloc(ctx, bm * (size_t)xs_groups * sizeof(float), NULL);
+    }
+
     return b;
 }
 
@@ -375,6 +418,10 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     FR(b->q); FR(b->k); FR(b->v); FR(b->attn_out);
     FR(b->hb); FR(b->hb2); FR(b->scores);
     FR(b->xq); FR(b->xs); FR(b->logits);
+    FR(b->x_b); FR(b->xb_b); FR(b->xb2_b);
+    FR(b->q_b); FR(b->k_b); FR(b->v_b); FR(b->attn_out_b);
+    FR(b->hb_b); FR(b->hb2_b);
+    FR(b->xq_b); FR(b->xs_b);
     free(b);
     #undef FR
 }
@@ -482,4 +529,190 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
 
     memcpy(logits_out, b->logits, (size_t)b->vocab * sizeof(float));
     return 0;
+}
+
+/* Records ONE batched matmul into the recorder, picking the kernel
+ * based on the tensor's bit width AND blk32-ness. xq/xs scratch is
+ * only used for INT4 (w4a8) variants. Mirrors rec_matmul above. */
+static int rec_matmul_batched(ib_metal_recorder *r,
+                                int bits, int blk32,
+                                const void *x_fp32,
+                                const void *weights, const void *w_scales,
+                                void *out, void *xq, void *xs,
+                                int B, int M, int N)
+{
+    if (bits == 4) {
+        if (blk32) {
+            return ib_metal_rec_matmul_w4a8_blk32_batched_fp32_in(
+                r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
+        }
+        /* TODO: per-row INT4 batched matmul. Today fall through. */
+        return -1;
+    } else if (bits == 8) {
+        return ib_metal_rec_matmul_int8_fp32_in_batched(
+            r, x_fp32, weights, w_scales, out, B, M, N);
+    }
+    return -1;
+}
+
+/* Helper: prefill currently supports INT4-blk32 and INT8 per-layer
+ * tensors (mixed OK). Output head is unrestricted (it runs only on the
+ * last token, so batching isn't needed there). Returns 0 if any layer
+ * tensor is per-row INT4 — that variant doesn't have a batched kernel
+ * yet, caller should fall back to per-token. */
+static int model_supports_batched_prefill(const ib_metal_model_buffers *b) {
+    for (int L = 0; L < b->num_layers; L++) {
+        const struct layer_bufs *lb = &b->layers[L];
+        #define CHK(NAME) do { \
+            int bits = lb->NAME##_bits; \
+            int blk32 = lb->NAME##_blk32; \
+            if (bits != 8 && !(bits == 4 && blk32)) return 0; \
+        } while (0)
+        CHK(q); CHK(k); CHK(v); CHK(o); CHK(gate); CHK(up); CHK(down);
+        #undef CHK
+    }
+    return 1;
+}
+
+extern "C" int
+ib_metal_forward_prefill(ib_metal_ctx *ctx,
+                          ib_metal_model_buffers *b,
+                          const float *cpu_embeds_in,
+                          int n_tokens, int start_pos,
+                          float *last_logits_out)
+{
+    if (!ctx || !b || !cpu_embeds_in || !last_logits_out) return -1;
+    if (n_tokens < 1 || n_tokens > b->b_max) return -1;
+    if (start_pos < 0 || start_pos + n_tokens > b->seq_len) return -1;
+    if (!model_supports_batched_prefill(b)) return -2;
+
+    int hidden = b->hidden;
+    int inter  = b->intermediate;
+    int kv_dim = b->kv_dim;
+    int qh     = b->n_heads * b->head_dim;
+    int nh     = b->n_heads;
+    int nkh    = b->n_kv_heads;
+    int hd     = b->head_dim;
+    float th   = b->rope_theta;
+    float eps  = b->eps;
+    int sl     = b->seq_len;
+    int B      = n_tokens;
+
+    /* Copy embeddings into the batched x buffer (host-visible Shared mode). */
+    memcpy(b->x_b, cpu_embeds_in, (size_t)B * hidden * sizeof(float));
+
+    ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
+    if (!r) return -1;
+
+    #define ROW_F(buf, n, dim) ((float*)(buf) + (size_t)(n) * (dim))
+
+    for (int L = 0; L < b->num_layers; L++) {
+        struct layer_bufs *lb = &b->layers[L];
+
+        /* Per-token pre-attention RMSNorm: x_b -> xb_b */
+        for (int bb = 0; bb < B; bb++) {
+            ib_metal_rec_rmsnorm_fp16(r,
+                ROW_F(b->x_b, bb, hidden), lb->input_norm,
+                ROW_F(b->xb_b, bb, hidden),
+                hidden, eps);
+        }
+
+        /* Batched Q/K/V matmul (INT4 blk32 or INT8) */
+        rec_matmul_batched(r, lb->q_bits, lb->q_blk32, b->xb_b,
+            lb->q_w, lb->q_s, b->q_b, b->xq_b, b->xs_b, B, qh, hidden);
+        rec_matmul_batched(r, lb->k_bits, lb->k_blk32, b->xb_b,
+            lb->k_w, lb->k_s, b->k_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
+        rec_matmul_batched(r, lb->v_bits, lb->v_blk32, b->xb_b,
+            lb->v_w, lb->v_s, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
+
+        /* Per-token RoPE + attention block (KV cache fill at distinct
+         * positions; causal scoring against [0..pos]). */
+        for (int bb = 0; bb < B; bb++) {
+            int pos = start_pos + bb;
+            float *q_row = ROW_F(b->q_b, bb, qh);
+            float *k_row = ROW_F(b->k_b, bb, kv_dim);
+            float *v_row = ROW_F(b->v_b, bb, kv_dim);
+            float *attn_out_row = ROW_F(b->attn_out_b, bb, qh);
+
+            ib_metal_rec_rope_inplace(r, q_row, nh,  hd, pos, th);
+            ib_metal_rec_rope_inplace(r, k_row, nkh, hd, pos, th);
+
+            if (b->kv_bits == 16) {
+                ib_metal_rec_attention_block_fp16(r,
+                    q_row, k_row, v_row,
+                    lb->k_cache, lb->v_cache,
+                    b->scores, attn_out_row,
+                    nh, nkh, hd, sl, pos);
+            } else {
+                ib_metal_rec_attention_block_int8(r,
+                    q_row, k_row, v_row,
+                    lb->k_cache, lb->v_cache,
+                    lb->k_scales, lb->v_scales,
+                    b->scores, attn_out_row,
+                    nh, nkh, hd, sl, pos);
+            }
+        }
+
+        /* Batched O matmul: attn_out_b -> xb2_b */
+        rec_matmul_batched(r, lb->o_bits, lb->o_blk32, b->attn_out_b,
+            lb->o_w, lb->o_s, b->xb2_b, b->xq_b, b->xs_b, B, hidden, qh);
+
+        /* Per-token residual: x_b += xb2_b */
+        for (int bb = 0; bb < B; bb++) {
+            ib_metal_rec_residual_add(r,
+                ROW_F(b->x_b, bb, hidden),
+                ROW_F(b->xb2_b, bb, hidden),
+                hidden);
+        }
+
+        /* Per-token post-attn RMSNorm: x_b -> xb_b */
+        for (int bb = 0; bb < B; bb++) {
+            ib_metal_rec_rmsnorm_fp16(r,
+                ROW_F(b->x_b, bb, hidden), lb->post_norm,
+                ROW_F(b->xb_b, bb, hidden),
+                hidden, eps);
+        }
+
+        /* Batched gate / up matmul */
+        rec_matmul_batched(r, lb->gate_bits, lb->gate_blk32, b->xb_b,
+            lb->gate_w, lb->gate_s, b->hb_b,  b->xq_b, b->xs_b, B, inter, hidden);
+        rec_matmul_batched(r, lb->up_bits, lb->up_blk32, b->xb_b,
+            lb->up_w,   lb->up_s,   b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden);
+
+        /* Per-token silu_mul: hb_b = silu(hb_b) * hb2_b */
+        for (int bb = 0; bb < B; bb++) {
+            float *gate_row = ROW_F(b->hb_b,  bb, inter);
+            float *up_row   = ROW_F(b->hb2_b, bb, inter);
+            ib_metal_rec_silu_mul(r, gate_row, up_row, gate_row, inter);
+        }
+
+        /* Batched down matmul: hb_b -> xb_b */
+        rec_matmul_batched(r, lb->down_bits, lb->down_blk32, b->hb_b,
+            lb->down_w, lb->down_s, b->xb_b, b->xq_b, b->xs_b, B, hidden, inter);
+
+        /* Per-token residual: x_b += xb_b */
+        for (int bb = 0; bb < B; bb++) {
+            ib_metal_rec_residual_add(r,
+                ROW_F(b->x_b, bb, hidden),
+                ROW_F(b->xb_b, bb, hidden),
+                hidden);
+        }
+    }
+
+    /* Final RMSNorm + output_head only on the last token (typical
+     * prefill: caller wants logits for next-token prediction). Reuse
+     * the per-token scratch (b->xb, b->logits) since we only need one. */
+    ib_metal_rec_rmsnorm_fp16(r,
+        ROW_F(b->x_b, B - 1, hidden), b->output_norm,
+        b->xb, hidden, eps);
+    rec_matmul(r, b->output_head_bits, b->output_head_blk32, b->xb,
+                b->output_head_w, b->output_head_s,
+                b->logits, b->xq, b->xs, b->vocab, hidden);
+
+    int rc = ib_metal_recorder_commit(r);
+    if (rc != 0) return rc;
+
+    memcpy(last_logits_out, b->logits, (size_t)b->vocab * sizeof(float));
+    return 0;
+    #undef ROW_F
 }
