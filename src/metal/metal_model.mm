@@ -566,10 +566,15 @@ static int rec_matmul_batched(ib_metal_recorder *r,
                 else variant = 0;
             }
             if (variant == 2) {
-                /* Prefer the 4-SIMDgroup tg variant (bigger tile, more
-                 * dequant amortization). Fall back to 1-SG simdmat if
-                 * B or M isn't divisible by 16. */
-                int rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg_fp32_in(
+                /* Try simdmat variants in descending tile size — bigger
+                 * tile = more dequant amortization, but needs M & B
+                 * divisible by tile dim. Falls through if shape doesn't
+                 * fit any simdmat variant. */
+                int rc;
+                rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(
+                    r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
+                if (rc == 0) return 0;
+                rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg_fp32_in(
                     r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
                 if (rc == 0) return 0;
                 rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_fp32_in(

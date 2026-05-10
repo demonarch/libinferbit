@@ -346,6 +346,17 @@ int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg_fp32_in(ib_metal_recorder 
                                                                 void *scratch_x_scales,
                                                                 int B, int M, int N);
 
+/* 16-SIMDgroup variant: 32x32 output tile per threadgroup, 4x4
+ * sub-tile grid. Requires B%32==0, M%32==0, N%128==0. */
+int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(ib_metal_recorder *rec,
+                                                                  const void *x_fp32,
+                                                                  const void *weights,
+                                                                  const void *w_scales_blk32,
+                                                                  void *out,
+                                                                  void *scratch_x_q,
+                                                                  void *scratch_x_scales,
+                                                                  int B, int M, int N);
+
 int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
                                        const void *x_fp32,
                                        const void *weights,
