@@ -1232,6 +1232,49 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg64_fp32_in(ib_me
     return 0;
 }
 
+/* Fused fp32-input variant of tg32: reads fp32 activations directly,
+ * skipping the separate INT8 quantize pass. Saves one dispatch per
+ * matmul + the INT8 scratch round-trip. Requires B%32==0, M%32==0. */
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_a16_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *weights,
+    const void *w_scales,
+    void *out,
+    int B, int M, int N)
+{
+    if (!rec || !x_fp32 || !weights || !w_scales || !out
+        || B <= 0 || M <= 0 || N <= 0) return -1;
+    if ((N % 128) != 0 || (M % 32) != 0 || (B % 32) != 0) return -2;
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, "matmul_w4a8_blk32_batched_simdmat_tg32_a16");
+    if (!ps_mm) return -1;
+
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
+    id<MTLBuffer> b_ws  = rec_pick(rec->ctx, w_scales);
+    id<MTLBuffer> b_out = rec_pick(rec->ctx, out);
+    if (!b_x || !b_w || !b_ws || !b_out) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, B_u = (uint)B;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps_mm];
+    [enc setBuffer:b_w   offset:0 atIndex:0];
+    [enc setBuffer:b_ws  offset:0 atIndex:1];
+    [enc setBuffer:b_x   offset:0 atIndex:2];
+    [enc setBuffer:b_out offset:0 atIndex:3];
+    [enc setBytes:&M_u length:sizeof(M_u) atIndex:4];
+    [enc setBytes:&N_u length:sizeof(N_u) atIndex:5];
+    [enc setBytes:&B_u length:sizeof(B_u) atIndex:6];
+    NSUInteger tg_w_bytes = 32 * 128 * sizeof(uint16_t);
+    NSUInteger tg_a_bytes = 32 * 128 * sizeof(uint16_t);
+    [enc setThreadgroupMemoryLength:tg_w_bytes atIndex:0];
+    [enc setThreadgroupMemoryLength:tg_a_bytes atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M / 32, (NSUInteger)B / 32, 1)
+          threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
 /* 16-SIMDgroup tg-shared simdmat variant: 32×32 output tile per TG. */
 extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(ib_metal_recorder *rec,
                                                                              const void *x_fp32,

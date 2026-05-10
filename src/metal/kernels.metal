@@ -577,6 +577,107 @@ kernel void matmul_w4a8_blk32_batched_simdmat_tg(
     simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
 }
 
+/* matmul_w4a8_blk32_batched_simdmat_tg32_a16 — fused-input variant:
+ * reads fp32 activations directly and converts to fp16 in TG memory,
+ * skipping the separate INT8 quantize pass + INT8 scratch round-trip.
+ *
+ * Same tile/dispatch geometry as the regular tg32 kernel. Saves one
+ * Metal dispatch + one scratch round-trip per matmul. The W path is
+ * unchanged (still INT4 + per-block scales → fp16 in TG).
+ */
+constant constexpr int SDMT32A16_M_BLOCK = 32;
+constant constexpr int SDMT32A16_B_BLOCK = 32;
+constant constexpr int SDMT32A16_K_TILE  = 128;
+
+kernel void matmul_w4a8_blk32_batched_simdmat_tg32_a16(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x_fp32    [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    constant     uint   &B         [[buffer(6)]],
+    threadgroup half    *tg_W_fp16 [[threadgroup(0)]],   /* [32][128] */
+    threadgroup half    *tg_A_fp16 [[threadgroup(1)]],   /* [32][128] */
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]])
+{
+    uint tg_lane = simd_id * 32u + simd_lane;
+    constexpr uint TG_THREADS = 16u * 32u;
+
+    uint m_off = simd_id & 3u;
+    uint b_off = simd_id >> 2;
+
+    uint m_base = tg_id.x * SDMT32A16_M_BLOCK;
+    uint b_base = tg_id.y * SDMT32A16_B_BLOCK;
+    if (m_base >= M || b_base >= B) return;
+
+    uint my_m_base = m_base + m_off * 8u;
+    uint my_b_base = b_base + b_off * 8u;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint n_groups = N / SDMT32A16_K_TILE;
+    uint w_row_bytes     = N / 2u;
+    uint w_scale_per_row = N / 32u;
+
+    for (uint g = 0; g < n_groups; g++) {
+        uint k_start = g * SDMT32A16_K_TILE;
+
+        for (uint i = tg_lane; i < SDMT32A16_M_BLOCK * SDMT32A16_K_TILE; i += TG_THREADS) {
+            uint m_local = i / SDMT32A16_K_TILE;
+            uint k_local = i % SDMT32A16_K_TILE;
+            uint m_global = m_base + m_local;
+            uint k_global = k_start + k_local;
+
+            half v = (half)0;
+            if (m_global < M && k_global < N) {
+                size_t byte_off = (size_t)m_global * w_row_bytes + (k_global / 2u);
+                uchar byte = weights[byte_off];
+                int w_int = (k_global & 1u) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                              : ((int)(byte & 0x0F) - 8);
+                uint wb_idx = k_global / 32u;
+                half w_scale = w_scales[m_global * w_scale_per_row + wb_idx];
+                v = (half)w_int * w_scale;
+            }
+            tg_W_fp16[i] = v;
+        }
+
+        /* Read activations as fp32 → directly convert to fp16 in TG mem. */
+        for (uint i = tg_lane; i < SDMT32A16_B_BLOCK * SDMT32A16_K_TILE; i += TG_THREADS) {
+            uint b_local = i / SDMT32A16_K_TILE;
+            uint k_local = i % SDMT32A16_K_TILE;
+            uint b_global = b_base + b_local;
+            uint k_global = k_start + k_local;
+
+            half v = (half)0;
+            if (b_global < B && k_global < N) {
+                v = (half)x_fp32[(size_t)b_global * N + k_global];
+            }
+            tg_A_fp16[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *A_base = tg_A_fp16 + (size_t)(b_off * 8u) * SDMT32A16_K_TILE;
+        threadgroup const half *W_base = tg_W_fp16 + (size_t)(m_off * 8u) * SDMT32A16_K_TILE;
+
+        for (uint k_sub = 0; k_sub < SDMT32A16_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32A16_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32A16_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
+}
+
 /* matmul_w4a8_blk32_batched_simdmat_tg32 — 16-SIMDgroup variant of the
  * tg-shared simdmat kernel. 32×32 output tile per threadgroup, 4×4
  * sub-tile grid of 8×8 simdgroup matrices. Trades fewer threadgroups

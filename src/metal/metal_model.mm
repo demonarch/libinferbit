@@ -570,11 +570,24 @@ static int rec_matmul_batched(ib_metal_recorder *r,
                 else variant = 0;
             }
             if (variant == 2) {
-                /* tg32 (32×32 / 16 SGs) is the sweet spot on M4 —
-                 * bigger (tg64) is consistently slower (more SG
-                 * contention + lower occupancy). Try tg32 first, then
-                 * smaller tiles for shapes that don't fit. */
+                /* tg32 with INT8 activation quantize (16 SGs / 32×32
+                 * tile) is the empirical sweet spot on M4. The a16
+                 * variant (fused fp32 input, no INT8 quantize pass)
+                 * was tried but is marginally slower — the 4× extra
+                 * fp32 activation bandwidth costs more than the saved
+                 * dispatch. Available as IB_PREFILL_A16=1 for
+                 * benchmarking. */
+                static int a16_setting = -1;
+                if (a16_setting < 0) {
+                    const char *env = getenv("IB_PREFILL_A16");
+                    a16_setting = (env && env[0] == '1') ? 1 : 0;
+                }
                 int rc;
+                if (a16_setting) {
+                    rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_a16_fp32_in(
+                        r, x_fp32, weights, w_scales, out, B, M, N);
+                    if (rc == 0) return 0;
+                }
                 rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(
                     r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
                 if (rc == 0) return 0;
