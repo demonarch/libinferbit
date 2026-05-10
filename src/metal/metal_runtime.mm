@@ -1164,7 +1164,16 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
         [enc setBuffer:b_out offset:0 atIndex:3];
         [enc setBytes:&M_u length:sizeof(M_u) atIndex:4];
         [enc setBytes:&N_u length:sizeof(N_u) atIndex:5];
-        const NSUInteger SIMDS_PER_TG = 4;
+        /* SIMDS_PER_TG=4 is the proven baseline. A sweep over 4/8/16/32
+         * was inconclusive (within ~1.5% noise on all 3 GPU blk32 cells).
+         * Override via IB_DECODE_SIMDS=N for future tuning. */
+        static int simds_setting = 0;
+        if (simds_setting == 0) {
+            const char *env = getenv("IB_DECODE_SIMDS");
+            simds_setting = env ? atoi(env) : 4;
+            if (simds_setting < 1 || simds_setting > 32) simds_setting = 4;
+        }
+        const NSUInteger SIMDS_PER_TG = (NSUInteger)simds_setting;
         const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
         NSUInteger n_tg = (M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
