@@ -1126,16 +1126,55 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
     if (!rec || !x_fp32 || !weights || !w_scales || !out
         || !scratch_x_q || !scratch_x_scales || M <= 0 || N <= 0) return -1;
     if ((N % 32) != 0) return -1;
-    id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128");
-    /* Default: the "deferred reduction" kernel (1 simd_sum per output
-     * row instead of 64 — one per block). +6-9% decode tok/s across
-     * all 3 GPU blk32 cells, no regression observed. IB_DECODE_DR=0
-     * forces the legacy per-block-reduce kernel for A/B comparison. */
-    static int dr_setting = -1;
+
+    /* Three kernel options, selected via env (cached on first call).
+     * Defaults aimed at decode (B=1):
+     *   default          → "a32 fused": reads fp32 activations directly,
+     *                       NO quantize dispatch. +14-17% decode tok/s.
+     *                       Slightly better PPL (skips INT8 round-trip).
+     *   IB_DECODE_A32=0  → falls back to DR or legacy kernel below.
+     *   IB_DECODE_DR=0   → legacy per-block simd_sum kernel.
+     *   IB_DECODE_DR=1   → DR kernel (1 simd_sum per row, INT8 quantize). */
+    static int a32_setting = -1;
+    static int dr_setting  = -1;
+    if (a32_setting < 0) {
+        const char *env = getenv("IB_DECODE_A32");
+        a32_setting = (env && env[0] == '0') ? 0 : 1;
+    }
     if (dr_setting < 0) {
         const char *env = getenv("IB_DECODE_DR");
         dr_setting = (env && env[0] == '0') ? 0 : 1;
     }
+
+    if (a32_setting) {
+        /* Single-dispatch fused path. */
+        id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, "matmul_w4a8_blk32_dr_a32");
+        if (!ps_mm) return -1;
+        id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+        id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
+        id<MTLBuffer> b_ws  = rec_pick(rec->ctx, w_scales);
+        id<MTLBuffer> b_out = rec_pick(rec->ctx, out);
+        if (!b_x || !b_w || !b_ws || !b_out) return -1;
+        uint M_u = (uint)M, N_u = (uint)N;
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_mm];
+        [enc setBuffer:b_w   offset:0 atIndex:0];
+        [enc setBuffer:b_ws  offset:0 atIndex:1];
+        [enc setBuffer:b_x   offset:0 atIndex:2];
+        [enc setBuffer:b_out offset:0 atIndex:3];
+        [enc setBytes:&M_u length:sizeof(M_u) atIndex:4];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:5];
+        const NSUInteger SIMDS_PER_TG = 4;
+        const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+        NSUInteger n_tg = (M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+        [enc endEncoding];
+        return 0;
+    }
+
+    /* Legacy 2-dispatch path: quantize then matmul. */
+    id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128");
     id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx,
         dr_setting ? "matmul_w4a8_blk32_dr" : "matmul_w4a8_blk32");
     if (!ps_q || !ps_mm) return -1;

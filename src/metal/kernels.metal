@@ -269,6 +269,70 @@ kernel void matmul_w4a8_blk32_dr(
     }
 }
 
+/* matmul_w4a8_blk32_dr_a32 — fused-input decode kernel.
+ *
+ * Skips the separate quantize_input_int8_g128 dispatch entirely:
+ * reads activations directly as fp32 and folds the multiply into the
+ * deferred-reduction accumulator. The per-128-group INT8 activation
+ * scale isn't needed because the activation never gets quantized.
+ *
+ * Mathematically equivalent to the int8-quantized path up to the
+ * single-precision rounding of the activation (the quantize+dequant
+ * round-trip in the int8 path introduces its own quantization noise;
+ * skipping it should actually IMPROVE precision slightly).
+ *
+ * Same dispatch shape as matmul_w4a8_blk32. The recorder skips the
+ * quantize kernel, saving one Metal dispatch per matmul → ~154
+ * dispatches per token for a 22-layer model.
+ */
+kernel void matmul_w4a8_blk32_dr_a32(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x         [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const uchar *row = weights + (size_t)m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)m * n_w_blocks;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+
+            int n = blk_start + (int)simd_lane;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                /* (fp32 x) * (int4 w decoded) * (per-block w_scale) */
+                lane_acc += (float)w * w_scale * x[n];
+            }
+        }
+    }
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[m] = total;
+    }
+}
+
 kernel void matmul_w4a8_blk32_batched(
     device const uchar  *weights   [[buffer(0)]],
     device const half   *w_scales  [[buffer(1)]],
