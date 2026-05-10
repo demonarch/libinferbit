@@ -1127,7 +1127,17 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
         || !scratch_x_q || !scratch_x_scales || M <= 0 || N <= 0) return -1;
     if ((N % 32) != 0) return -1;
     id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128");
-    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, "matmul_w4a8_blk32");
+    /* Default: the "deferred reduction" kernel (1 simd_sum per output
+     * row instead of 64 — one per block). +6-9% decode tok/s across
+     * all 3 GPU blk32 cells, no regression observed. IB_DECODE_DR=0
+     * forces the legacy per-block-reduce kernel for A/B comparison. */
+    static int dr_setting = -1;
+    if (dr_setting < 0) {
+        const char *env = getenv("IB_DECODE_DR");
+        dr_setting = (env && env[0] == '0') ? 0 : 1;
+    }
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx,
+        dr_setting ? "matmul_w4a8_blk32_dr" : "matmul_w4a8_blk32");
     if (!ps_q || !ps_mm) return -1;
 
     id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);

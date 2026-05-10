@@ -204,6 +204,71 @@ kernel void matmul_w4a8_blk32(
  * level for typical prefill batch sizes (B=8..64), and explicit
  * sharing adds complexity for marginal gain at this batch range.
  */
+/* matmul_w4a8_blk32_dr — "deferred reduction" decode variant.
+ *
+ * Standard matmul_w4a8_blk32 does a simd_sum per 32-element block:
+ *   per row, 16 groups × 4 blocks = 64 simd_sum reductions.
+ * This kernel collapses to ONE simd_sum at the end of the row by
+ * folding the per-block weight scale and per-group activation scale
+ * into a per-lane fp32 partial accumulation:
+ *   lane_acc += (float)(w_int * x_int) * w_scale * a_scale
+ * Only one simd_sum at row end → 63 fewer reductions per matmul row.
+ *
+ * Same dispatch shape as matmul_w4a8_blk32. Used for decode (B=1)
+ * where the simd_sum cost is on the hot critical path.
+ */
+kernel void matmul_w4a8_blk32_dr(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const char   *x_q       [[buffer(2)]],
+    device const float  *x_scales  [[buffer(3)]],
+    device       float  *out       [[buffer(4)]],
+    constant     uint   &M         [[buffer(5)]],
+    constant     uint   &N         [[buffer(6)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const uchar *row = weights + (size_t)m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)m * n_w_blocks;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+        float a_scale = x_scales[g];
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+            float combined = w_scale * a_scale;
+
+            int n = blk_start + (int)simd_lane;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                int prod = w * (int)x_q[n];
+                lane_acc += (float)prod * combined;
+            }
+        }
+    }
+
+    /* Single cross-lane reduction at row end. */
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[m] = total;
+    }
+}
+
 kernel void matmul_w4a8_blk32_batched(
     device const uchar  *weights   [[buffer(0)]],
     device const half   *w_scales  [[buffer(1)]],
