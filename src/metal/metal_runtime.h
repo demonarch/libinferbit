@@ -294,6 +294,19 @@ int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
                                              void *scratch_x_scales,
                                              int M, int N);
 
+/* Batched W4A8 blk32 matmul. x_fp32 is fp32[B][N], out is fp32[B][M].
+ * scratch_x_q is char[B][N], scratch_x_scales is fp32[B][N/128]. Same
+ * weight + scale layout as the unbatched variant. Single-pipeline
+ * dispatch quantizes all B rows then runs the batched matmul. */
+int ib_metal_rec_matmul_w4a8_blk32_batched_fp32_in(ib_metal_recorder *rec,
+                                                     const void *x_fp32,
+                                                     const void *weights,
+                                                     const void *w_scales_blk32,
+                                                     void *out,
+                                                     void *scratch_x_q,
+                                                     void *scratch_x_scales,
+                                                     int B, int M, int N);
+
 int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
                                        const void *x_fp32,
                                        const void *weights,

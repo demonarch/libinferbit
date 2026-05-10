@@ -181,6 +181,133 @@ kernel void matmul_w4a8_blk32(
     }
 }
 
+/* ── matmul_w4a8_blk32_batched ────────────────────────────────────────
+ *
+ * Batched prefill variant: takes B activation rows (B = batch size /
+ * prefill token count) instead of one. Output shape is [B, M].
+ *
+ * Layout convention (matches CPU code, row-major, no padding):
+ *   x_q       : char[B][N]        (N int8 activations per token)
+ *   x_scales  : float[B][N/128]   (per-128-group activation scale)
+ *   out       : float[B][M]
+ *
+ * Tile: one SIMD group per (b, m) output cell. Total dispatched SIMD
+ * groups = B * M, organised as B in the .y dimension and M in the .x
+ * dimension of the threadgroup grid. Each cell does the same per-row
+ * inner loop as `matmul_w4a8_blk32`.
+ *
+ * Weight reuse across tokens is implicit via Metal's L1/L2 cache: SIMD
+ * groups with the same m but different b read the same weight bytes
+ * back-to-back. We don't hand-roll threadgroup-memory sharing because
+ * the simple version is already memory-bandwidth-bound at the GPU
+ * level for typical prefill batch sizes (B=8..64), and explicit
+ * sharing adds complexity for marginal gain at this batch range.
+ */
+kernel void matmul_w4a8_blk32_batched(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const char   *x_q       [[buffer(2)]],
+    device const float  *x_scales  [[buffer(3)]],
+    device       float  *out       [[buffer(4)]],
+    constant     uint   &M         [[buffer(5)]],
+    constant     uint   &N         [[buffer(6)]],
+    constant     uint   &B         [[buffer(7)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id.x * simdgroups_per_tg + simd_id;
+    uint b = tg_id.y;
+    if (m >= M || b >= B) return;
+
+    device const uchar *row = weights + (size_t)m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half  *row_scales = w_scales + (size_t)m * n_w_blocks;
+    device const char  *x_q_row    = x_q      + (size_t)b * N;
+    device const float *x_s_row    = x_scales + (size_t)b * (N / 128u);
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+        float a_scale = x_s_row[g];
+        float group_partial = 0.0f;
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+
+            int n = blk_start + (int)simd_lane;
+            int lane_int = 0;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                lane_int = w * (int)x_q_row[n];
+            }
+            int block_int = simd_sum(lane_int);
+            group_partial += (float)block_int * w_scale;
+        }
+        lane_acc += group_partial * a_scale;
+    }
+
+    if (simd_lane == 0) {
+        out[(size_t)b * M + m] = lane_acc;
+    }
+}
+
+/* Batched activation quantizer: takes B fp32 rows of length N, produces
+ * B int8 rows + B float scale rows of length N/128. Tile: each
+ * threadgroup handles one (b, group) cell with the same internal
+ * structure as quantize_input_int8_g128. */
+kernel void quantize_input_int8_g128_batched(
+    device const float *x        [[buffer(0)]],
+    device       char  *x_q      [[buffer(1)]],
+    device       float *x_scales [[buffer(2)]],
+    constant     uint  &N        [[buffer(3)]],
+    constant     uint  &B        [[buffer(4)]],
+    uint2               tg_id    [[threadgroup_position_in_grid]],
+    uint                lane     [[thread_index_in_threadgroup]])
+{
+    uint b = tg_id.y;
+    if (b >= B) return;
+
+    device const float *x_row    = x        + (size_t)b * N;
+    device       char  *xq_row   = x_q      + (size_t)b * N;
+    device       float *xs_row   = x_scales + (size_t)b * (N / 128u);
+
+    int g_start = (int)tg_id.x * 128;
+    int g_end   = min(g_start + 128, (int)N);
+
+    int n0 = g_start + (int)lane * 4;
+    float v0 = (n0 + 0 < g_end) ? x_row[n0 + 0] : 0.0f;
+    float v1 = (n0 + 1 < g_end) ? x_row[n0 + 1] : 0.0f;
+    float v2 = (n0 + 2 < g_end) ? x_row[n0 + 2] : 0.0f;
+    float v3 = (n0 + 3 < g_end) ? x_row[n0 + 3] : 0.0f;
+
+    float local_max = max(max(fabs(v0), fabs(v1)), max(fabs(v2), fabs(v3)));
+    float group_max = simd_max(local_max);
+    float scale = (group_max > 1e-30f) ? (group_max / 127.0f) : 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    if (lane == 0) {
+        xs_row[tg_id.x] = scale;
+    }
+
+    int q0 = clamp((int)round(v0 * inv_scale), -127, 127);
+    int q1 = clamp((int)round(v1 * inv_scale), -127, 127);
+    int q2 = clamp((int)round(v2 * inv_scale), -127, 127);
+    int q3 = clamp((int)round(v3 * inv_scale), -127, 127);
+    if (n0 + 0 < g_end) xq_row[n0 + 0] = (char)q0;
+    if (n0 + 1 < g_end) xq_row[n0 + 1] = (char)q1;
+    if (n0 + 2 < g_end) xq_row[n0 + 2] = (char)q2;
+    if (n0 + 3 < g_end) xq_row[n0 + 3] = (char)q3;
+}
+
 /* ── matmul_int8 (fp32 input × int8 weights × fp16 row scale) ────────
  *
  * Mirrors CPU `scalar_matmul_int8` exactly:
