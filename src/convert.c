@@ -349,22 +349,40 @@ static ib_written_tensor write_quantized_tensor_ts_perm(
     } else if (bits == 4) {
         size_t w_size = (size_t)rows * cols / 2;
         uint8_t* qw = malloc(w_size);
-        uint16_t* scales = malloc(rows * sizeof(uint16_t));
 
-        ib_quantize_int4(qw, scales, data, dtype, rows, cols);
-
-        fwrite(qw, 1, w_size, f);
-        result.weight_size = w_size;
-        *offset += w_size;
-
-        *offset = write_aligned(f, *offset);
-        result.scale_offset = *offset;
-        result.scale_size = rows * 2;
-        fwrite(scales, 2, rows, f);
-        *offset += result.scale_size;
-
+        /* Per-block-32 INT4 (opt-in via IB_INT4_BLK32=1, requires cols%32==0).
+         * Stores M*(N/32) fp16 scales instead of M. Closes the per-row
+         * outlier-clipping quality gap on Llama-3-class models. */
+        const char *e_blk = getenv("IB_INT4_BLK32");
+        int use_blk32 = (e_blk && e_blk[0] && e_blk[0] != '0' && (cols % 32 == 0));
+        if (use_blk32) {
+            int n_blocks = cols / 32;
+            size_t scale_count = (size_t)rows * n_blocks;
+            uint16_t* scales = malloc(scale_count * sizeof(uint16_t));
+            ib_quantize_int4_blk32(qw, scales, data, dtype, rows, cols);
+            fwrite(qw, 1, w_size, f);
+            result.weight_size = w_size;
+            *offset += w_size;
+            *offset = write_aligned(f, *offset);
+            result.scale_offset = *offset;
+            result.scale_size = scale_count * 2;
+            fwrite(scales, 2, scale_count, f);
+            *offset += result.scale_size;
+            free(scales);
+        } else {
+            uint16_t* scales = malloc(rows * sizeof(uint16_t));
+            ib_quantize_int4(qw, scales, data, dtype, rows, cols);
+            fwrite(qw, 1, w_size, f);
+            result.weight_size = w_size;
+            *offset += w_size;
+            *offset = write_aligned(f, *offset);
+            result.scale_offset = *offset;
+            result.scale_size = rows * 2;
+            fwrite(scales, 2, rows, f);
+            *offset += result.scale_size;
+            free(scales);
+        }
         free(qw);
-        free(scales);
     } else if (bits == 2) {
         size_t w_size = (size_t)rows * cols / 4;
         uint8_t* qw = malloc(w_size);

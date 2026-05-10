@@ -380,11 +380,43 @@ static void tensor_matmul(
     const void* weights = tensor_data(m, t);
     const void* scales_raw = tensor_scales_raw(m, t);
 
-    if (scales_raw) {
+    /* Detect per-block-32 INT4 scaling: scale_size > rows*2 ⇒ N/32 fp16
+     * scales per row instead of one. Triggered by IB_INT4_BLK32 at convert
+     * time. The new kernel handles a flat fp32 buffer of M*(N/32) scales. */
+    int is_blk32_int4 = (t->bits == 4 && t->scale_size > (size_t)M * 2);
+    float *blk32_scales = NULL;
+    int n_w_blocks = 0;
+    if (is_blk32_int4) {
+        n_w_blocks = N / 32;
+        size_t total = (size_t)M * (size_t)n_w_blocks;
+        blk32_scales = (float*)malloc(total * sizeof(float));
+        if (blk32_scales) scales_to_fp32(blk32_scales, scales_raw, (int)total);
+        else is_blk32_int4 = 0;   /* fall back if alloc failed */
+    } else if (scales_raw) {
         scales_to_fp32(scale_buf, scales_raw, M);
     } else {
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
     }
+
+    if (is_blk32_int4 && ib_kern.matmul_w4a8_blk32) {
+        /* Per-block-32 INT4 path: quantize input as usual, dispatch to the
+         * blk32-aware kernel. No batched/parallel wrapper for now — the
+         * scalar kernel is single-threaded. */
+        int8_t stack_q[4096];
+        float  stack_s[4096 / IB_W4A8_GROUP + 1];
+        int n_groups = (N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
+        int8_t* q_buf = (N <= 4096) ? stack_q : (int8_t*)malloc((size_t)N);
+        float*  s_buf = (n_groups <= (int)(sizeof stack_s / sizeof *stack_s))
+                        ? stack_s
+                        : (float*)malloc((size_t)n_groups * sizeof(float));
+        ib_quantize_input_int8_g128(input, q_buf, s_buf, N);
+        ib_kern.matmul_w4a8_blk32(out, weights, blk32_scales, q_buf, s_buf, M, N);
+        if (q_buf != stack_q) free(q_buf);
+        if (s_buf != stack_s) free(s_buf);
+        free(blk32_scales);
+        return;
+    }
+    if (blk32_scales) free(blk32_scales);
 
     if (t->bits == 4 && w4a8_enabled() && ib_kern.matmul_w4a8) {
         /* Quantize input to INT8 per-group (IB_W4A8_GROUP elements per

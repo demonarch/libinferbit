@@ -263,6 +263,21 @@ typedef struct {
         const int8_t* input, const float* scales_a, int M, int N
     );
 
+    /* W4A8 with per-32-element block scales on the WEIGHT side.
+     *
+     * scales_w has length M*(N/32) (one fp32 per 32 weight elements per row),
+     * vs the per-row scales_w[M] used by matmul_w4a8 above. Activation
+     * grouping is unchanged (per-IB_W4A8_GROUP=128). N must be a multiple
+     * of 32 (and IB_W4A8_GROUP must be a multiple of 32 — currently 128/32=4).
+     *
+     * Used to close the per-row outlier-clipping quality gap on Llama-3-class
+     * models where late-layer outliers spoil per-row scaling. May be NULL
+     * on backends that don't yet support it; callers should fall back. */
+    void (*matmul_w4a8_blk32)(
+        float* out, const void* weights, const float* scales_w_per_block,
+        const int8_t* input, const float* scales_a, int M, int N
+    );
+
     /* W4A8 batched matmul: same as above, but amortizes weight loads across
      * B independent activation vectors.
      *
@@ -419,6 +434,10 @@ void ib_quantize_int8(int8_t* out, uint16_t* scales, const void* src,
                       const char* dtype, int rows, int cols);
 void ib_quantize_int4(uint8_t* out, uint16_t* scales, const void* src,
                       const char* dtype, int rows, int cols);
+/* INT4 with per-32-element block scales. cols must be a multiple of 32.
+ * Output scale array is [rows * (cols/32)] fp16. */
+void ib_quantize_int4_blk32(uint8_t* out, uint16_t* scales, const void* src,
+                             const char* dtype, int rows, int cols);
 void ib_quantize_int2(uint8_t* out, uint16_t* scales, const void* src,
                       const char* dtype, int rows, int cols);
 void ib_copy_norm_fp16(uint16_t* out, const void* src, const char* dtype, int size);
