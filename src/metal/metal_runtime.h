@@ -334,6 +334,18 @@ int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_fp32_in(ib_metal_recorder *re
                                                             void *scratch_x_scales,
                                                             int B, int M, int N);
 
+/* 4-SIMDgroup variant of simdmat: 16x16 output tile per threadgroup
+ * with cooperative W/A dequant shared by 4 SIMD groups. Requires
+ * B%16==0, M%16==0, N%128==0. */
+int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg_fp32_in(ib_metal_recorder *rec,
+                                                                const void *x_fp32,
+                                                                const void *weights,
+                                                                const void *w_scales_blk32,
+                                                                void *out,
+                                                                void *scratch_x_q,
+                                                                void *scratch_x_scales,
+                                                                int B, int M, int N);
+
 int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
                                        const void *x_fp32,
                                        const void *weights,

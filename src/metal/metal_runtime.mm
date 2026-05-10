@@ -1171,6 +1171,70 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
     return 0;
 }
 
+/* 4-SIMDgroup tg-shared variant of the simdmat kernel: each
+ * threadgroup computes a 16×16 output tile via 4 parallel SIMD groups
+ * (2×2 sub-tile grid), sharing a single co-loaded W+A dequant pair.
+ * Requires B%16==0, M%16==0, N%128==0; returns -2 on shape mismatch. */
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg_fp32_in(ib_metal_recorder *rec,
+                                                                           const void *x_fp32,
+                                                                           const void *weights,
+                                                                           const void *w_scales,
+                                                                           void *out,
+                                                                           void *scratch_x_q,
+                                                                           void *scratch_x_scales,
+                                                                           int B, int M, int N)
+{
+    if (!rec || !x_fp32 || !weights || !w_scales || !out
+        || !scratch_x_q || !scratch_x_scales || B <= 0 || M <= 0 || N <= 0) return -1;
+    if ((N % 128) != 0 || (M % 16) != 0 || (B % 16) != 0) return -2;
+    id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128_batched");
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, "matmul_w4a8_blk32_batched_simdmat_tg");
+    if (!ps_q || !ps_mm) return -1;
+
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
+    id<MTLBuffer> b_ws  = rec_pick(rec->ctx, w_scales);
+    id<MTLBuffer> b_out = rec_pick(rec->ctx, out);
+    id<MTLBuffer> b_xq  = rec_pick(rec->ctx, scratch_x_q);
+    id<MTLBuffer> b_xs  = rec_pick(rec->ctx, scratch_x_scales);
+    if (!b_x || !b_w || !b_ws || !b_out || !b_xq || !b_xs) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, B_u = (uint)B;
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_q];
+        [enc setBuffer:b_x  offset:0 atIndex:0];
+        [enc setBuffer:b_xq offset:0 atIndex:1];
+        [enc setBuffer:b_xs offset:0 atIndex:2];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:3];
+        [enc setBytes:&B_u length:sizeof(B_u) atIndex:4];
+        NSUInteger nq = (NSUInteger)((N + 127) / 128);
+        [enc dispatchThreadgroups:MTLSizeMake(nq, (NSUInteger)B, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+    }
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_mm];
+        [enc setBuffer:b_w   offset:0 atIndex:0];
+        [enc setBuffer:b_ws  offset:0 atIndex:1];
+        [enc setBuffer:b_xq  offset:0 atIndex:2];
+        [enc setBuffer:b_xs  offset:0 atIndex:3];
+        [enc setBuffer:b_out offset:0 atIndex:4];
+        [enc setBytes:&M_u length:sizeof(M_u) atIndex:5];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:6];
+        [enc setBytes:&B_u length:sizeof(B_u) atIndex:7];
+        NSUInteger tg_w_bytes = 16 * 128 * sizeof(uint16_t);
+        NSUInteger tg_a_bytes = 16 * 128 * sizeof(uint16_t);
+        [enc setThreadgroupMemoryLength:tg_w_bytes atIndex:0];
+        [enc setThreadgroupMemoryLength:tg_a_bytes atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M / 16, (NSUInteger)B / 16, 1)
+              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+    }
+    return 0;
+}
+
 /* Same shape as ib_metal_rec_matmul_w4a8_blk32_batched_fp32_in but uses
  * Apple's simdgroup_matrix_multiply hardware unit. Requires B and M
  * each be multiples of 8 (single-tile dispatch, no edge handling). */

@@ -566,10 +566,16 @@ static int rec_matmul_batched(ib_metal_recorder *r,
                 else variant = 0;
             }
             if (variant == 2) {
-                int rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_fp32_in(
+                /* Prefer the 4-SIMDgroup tg variant (bigger tile, more
+                 * dequant amortization). Fall back to 1-SG simdmat if
+                 * B or M isn't divisible by 16. */
+                int rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg_fp32_in(
+                    r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
+                if (rc == 0) return 0;
+                rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_fp32_in(
                     r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
                 if (rc != -2) return rc;
-                /* simdmat refused (B or M not multiple of 8) — fall back. */
+                /* All simdmat variants refused — fall back to non-tiled. */
             }
             if (variant == 1) {
                 return ib_metal_rec_matmul_w4a8_blk32_batched_tiled_fp32_in(
