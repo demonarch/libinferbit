@@ -510,6 +510,55 @@ kernel void rmsnorm_fp16(
     }
 }
 
+/* Batched RMSNorm: one threadgroup per row, B rows total. Each row uses
+ * its own x[b][:] and out[b][:] slice; weight[:] is shared. */
+kernel void rmsnorm_fp16_batched(
+    device const float *x       [[buffer(0)]],
+    device const half  *weight  [[buffer(1)]],
+    device       float *out     [[buffer(2)]],
+    constant     uint  &N       [[buffer(3)]],
+    constant     float &eps     [[buffer(4)]],
+    uint2               tid2    [[thread_position_in_threadgroup]],
+    uint                lane    [[thread_index_in_simdgroup]],
+    uint                simd_id [[simdgroup_index_in_threadgroup]],
+    uint2               tg_id   [[threadgroup_position_in_grid]])
+{
+    constexpr uint TG_THREADS = 256;
+    constexpr uint NUM_SIMDS  = TG_THREADS / 32;
+    uint tid = tid2.x;
+    uint b   = tg_id.y;
+
+    device const float *x_row   = x   + (size_t)b * N;
+    device       float *out_row = out + (size_t)b * N;
+
+    float local_ss = 0.0f;
+    for (uint i = tid; i < N; i += TG_THREADS) {
+        float v = x_row[i];
+        local_ss += v * v;
+    }
+    float simd_ss = simd_sum(local_ss);
+
+    threadgroup float partials[NUM_SIMDS];
+    if (lane == 0) partials[simd_id] = simd_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float tg_inv_rms;
+    if (simd_id == 0) {
+        float v = (lane < NUM_SIMDS) ? partials[lane] : 0.0f;
+        float total = simd_sum(v);
+        if (lane == 0) {
+            float mean = total / (float)N;
+            tg_inv_rms = 1.0f / sqrt(mean + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = tg_inv_rms;
+
+    for (uint i = tid; i < N; i += TG_THREADS) {
+        out_row[i] = x_row[i] * inv_rms * (float)weight[i];
+    }
+}
+
 /* ── silu_mul ─────────────────────────────────────────────────────────
  *
  * out[i] = silu(gate[i]) * up[i]   where   silu(x) = x / (1 + exp(-x))
@@ -529,6 +578,37 @@ kernel void silu_mul(
     float x = gate[gid];
     float s = x / (1.0f + exp(-x));
     out[gid] = s * up[gid];
+}
+
+/* Batched silu_mul. Grid: (N_chunked, B, 1) threadgroups. */
+kernel void silu_mul_batched(
+    device const float *gate  [[buffer(0)]],
+    device const float *up    [[buffer(1)]],
+    device       float *out   [[buffer(2)]],
+    constant     uint  &N     [[buffer(3)]],
+    uint2               gid2  [[thread_position_in_grid]])
+{
+    uint n = gid2.x;
+    uint b = gid2.y;
+    if (n >= N) return;
+    size_t i = (size_t)b * N + n;
+    float x = gate[i];
+    float s = x / (1.0f + exp(-x));
+    out[i] = s * up[i];
+}
+
+/* Batched residual_add: a[b][:] += b_in[b][:] for B rows of length N. */
+kernel void residual_add_batched(
+    device       float *a     [[buffer(0)]],
+    device const float *b_in  [[buffer(1)]],
+    constant     uint  &N     [[buffer(2)]],
+    uint2               gid2  [[thread_position_in_grid]])
+{
+    uint n = gid2.x;
+    uint bb = gid2.y;
+    if (n >= N) return;
+    size_t i = (size_t)bb * N + n;
+    a[i] += b_in[i];
 }
 
 /* ── rope_inplace ─────────────────────────────────────────────────────
@@ -569,6 +649,37 @@ kernel void rope_inplace(
     float c = cos(angle), s = sin(angle);
 
     uint base = h * head_dim + 2u * pair;
+    float v0 = tensor[base];
+    float v1 = tensor[base + 1u];
+    tensor[base]      = v0 * c - v1 * s;
+    tensor[base + 1u] = v0 * s + v1 * c;
+}
+
+/* Batched RoPE: each row b at absolute position start_pos + b. Grid:
+ * (n_pairs, B, 1). tensor is laid out as [B][n_heads * head_dim]. */
+kernel void rope_inplace_batched(
+    device       float *tensor    [[buffer(0)]],
+    constant     uint  &n_heads   [[buffer(1)]],
+    constant     uint  &head_dim  [[buffer(2)]],
+    constant     uint  &start_pos [[buffer(3)]],
+    constant     float &theta     [[buffer(4)]],
+    uint2               gid2      [[thread_position_in_grid]])
+{
+    uint half_hd = head_dim / 2u;
+    uint total_pairs = n_heads * half_hd;
+    uint pair_idx = gid2.x;
+    uint b        = gid2.y;
+    if (pair_idx >= total_pairs) return;
+
+    uint h    = pair_idx / half_hd;
+    uint pair = pair_idx - h * half_hd;
+    float exponent = (float)(2u * pair) / (float)head_dim;
+    float freq = pow(theta, -exponent);
+    float angle = (float)(start_pos + b) * freq;
+    float c = cos(angle), s = sin(angle);
+
+    size_t row_off = (size_t)b * (size_t)n_heads * (size_t)head_dim;
+    size_t base = row_off + (size_t)(h * head_dim + 2u * pair);
     float v0 = tensor[base];
     float v1 = tensor[base + 1u];
     tensor[base]      = v0 * c - v1 * s;

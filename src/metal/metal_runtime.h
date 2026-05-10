@@ -322,6 +322,29 @@ int ib_metal_rec_matmul_int8_fp32_in_batched(ib_metal_recorder *rec,
                                                void *out,
                                                int B, int M, int N);
 
+/* Batched per-row ops: B rows, length N (or kv_dim/intermediate). */
+int ib_metal_rec_rmsnorm_fp16_batched(ib_metal_recorder *rec,
+                                        const void *x_fp32,
+                                        const void *weight_fp16,
+                                        void *out_fp32,
+                                        int B, int N, float eps);
+
+int ib_metal_rec_residual_add_batched(ib_metal_recorder *rec,
+                                        void *a_fp32, const void *b_fp32,
+                                        int B, int N);
+
+int ib_metal_rec_silu_mul_batched(ib_metal_recorder *rec,
+                                    const void *gate_fp32,
+                                    const void *up_fp32,
+                                    void *out_fp32,
+                                    int B, int N);
+
+/* Batched RoPE: row b uses position (start_pos + b). */
+int ib_metal_rec_rope_inplace_batched(ib_metal_recorder *rec,
+                                        void *tensor_fp32,
+                                        int B, int n_heads, int head_dim,
+                                        int start_pos, float theta);
+
 int ib_metal_rec_rope_inplace(ib_metal_recorder *rec,
                                 void *tensor_fp32,
                                 int n_heads, int head_dim,

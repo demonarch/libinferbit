@@ -1266,6 +1266,118 @@ extern "C" int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
     return 0;
 }
 
+extern "C" int ib_metal_rec_rmsnorm_fp16_batched(ib_metal_recorder *rec,
+                                                   const void *x_fp32,
+                                                   const void *weight_fp16,
+                                                   void *out_fp32,
+                                                   int B, int N, float eps)
+{
+    if (!rec || !x_fp32 || !weight_fp16 || !out_fp32 || B <= 0 || N <= 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "rmsnorm_fp16_batched");
+    if (!ps) return -1;
+    NSUInteger ox=0, ow=0, oo=0;
+    id<MTLBuffer> b_x   = rec_pick_off(rec->ctx, x_fp32, &ox);
+    id<MTLBuffer> b_w   = rec_pick_off(rec->ctx, weight_fp16, &ow);
+    id<MTLBuffer> b_out = rec_pick_off(rec->ctx, out_fp32, &oo);
+    if (!b_x || !b_w || !b_out) return -1;
+    uint N_u = (uint)N;
+    float eps_v = eps;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_x   offset:ox atIndex:0];
+    [enc setBuffer:b_w   offset:ow atIndex:1];
+    [enc setBuffer:b_out offset:oo atIndex:2];
+    [enc setBytes:&N_u   length:sizeof(N_u)   atIndex:3];
+    [enc setBytes:&eps_v length:sizeof(eps_v) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(1, (NSUInteger)B, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_residual_add_batched(ib_metal_recorder *rec,
+                                                   void *a_fp32, const void *b_fp32,
+                                                   int B, int N)
+{
+    if (!rec || !a_fp32 || !b_fp32 || B <= 0 || N <= 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "residual_add_batched");
+    if (!ps) return -1;
+    NSUInteger oa=0, ob=0;
+    id<MTLBuffer> b_a = rec_pick_off(rec->ctx, a_fp32, &oa);
+    id<MTLBuffer> b_b = rec_pick_off(rec->ctx, b_fp32, &ob);
+    if (!b_a || !b_b) return -1;
+    uint N_u = (uint)N;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_a offset:oa atIndex:0];
+    [enc setBuffer:b_b offset:ob atIndex:1];
+    [enc setBytes:&N_u length:sizeof(N_u) atIndex:2];
+    const NSUInteger TG = 256;
+    NSUInteger n_tg_x = ((NSUInteger)N + TG - 1) / TG;
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)N, (NSUInteger)B, 1)
+       threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+    (void)n_tg_x;
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_silu_mul_batched(ib_metal_recorder *rec,
+                                               const void *gate_fp32,
+                                               const void *up_fp32,
+                                               void *out_fp32,
+                                               int B, int N)
+{
+    if (!rec || !gate_fp32 || !up_fp32 || !out_fp32 || B <= 0 || N <= 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "silu_mul_batched");
+    if (!ps) return -1;
+    NSUInteger og=0, ou=0, oo=0;
+    id<MTLBuffer> b_g = rec_pick_off(rec->ctx, gate_fp32, &og);
+    id<MTLBuffer> b_u = rec_pick_off(rec->ctx, up_fp32, &ou);
+    id<MTLBuffer> b_o = rec_pick_off(rec->ctx, out_fp32, &oo);
+    if (!b_g || !b_u || !b_o) return -1;
+    uint N_u = (uint)N;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_g offset:og atIndex:0];
+    [enc setBuffer:b_u offset:ou atIndex:1];
+    [enc setBuffer:b_o offset:oo atIndex:2];
+    [enc setBytes:&N_u length:sizeof(N_u) atIndex:3];
+    const NSUInteger TG = 256;
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)N, (NSUInteger)B, 1)
+       threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_rope_inplace_batched(ib_metal_recorder *rec,
+                                                   void *tensor_fp32,
+                                                   int B, int n_heads, int head_dim,
+                                                   int start_pos, float theta)
+{
+    if (!rec || !tensor_fp32 || B <= 0 || n_heads <= 0 || head_dim <= 0) return -1;
+    if (head_dim & 1) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "rope_inplace_batched");
+    if (!ps) return -1;
+    NSUInteger ot = 0;
+    id<MTLBuffer> b_t = rec_pick_off(rec->ctx, tensor_fp32, &ot);
+    if (!b_t) return -1;
+    uint nh = (uint)n_heads, hd = (uint)head_dim, sp = (uint)start_pos;
+    float th = theta;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_t  offset:ot atIndex:0];
+    [enc setBytes:&nh length:sizeof(nh) atIndex:1];
+    [enc setBytes:&hd length:sizeof(hd) atIndex:2];
+    [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+    [enc setBytes:&th length:sizeof(th) atIndex:4];
+    NSUInteger total_pairs = (NSUInteger)n_heads * (NSUInteger)(head_dim / 2);
+    const NSUInteger TG = 64;
+    [enc dispatchThreads:MTLSizeMake(total_pairs, (NSUInteger)B, 1)
+       threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
 extern "C" int ib_metal_rec_matmul_int8_fp32_in_batched(ib_metal_recorder *rec,
                                                           const void *x_fp32,
                                                           const void *weights,

@@ -609,13 +609,9 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
     for (int L = 0; L < b->num_layers; L++) {
         struct layer_bufs *lb = &b->layers[L];
 
-        /* Per-token pre-attention RMSNorm: x_b -> xb_b */
-        for (int bb = 0; bb < B; bb++) {
-            ib_metal_rec_rmsnorm_fp16(r,
-                ROW_F(b->x_b, bb, hidden), lb->input_norm,
-                ROW_F(b->xb_b, bb, hidden),
-                hidden, eps);
-        }
+        /* Pre-attention RMSNorm (batched): x_b -> xb_b */
+        ib_metal_rec_rmsnorm_fp16_batched(r,
+            b->x_b, lb->input_norm, b->xb_b, B, hidden, eps);
 
         /* Batched Q/K/V matmul (INT4 blk32 or INT8) */
         rec_matmul_batched(r, lb->q_bits, lb->q_blk32, b->xb_b,
@@ -625,17 +621,19 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         rec_matmul_batched(r, lb->v_bits, lb->v_blk32, b->xb_b,
             lb->v_w, lb->v_s, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
 
-        /* Per-token RoPE + attention block (KV cache fill at distinct
-         * positions; causal scoring against [0..pos]). */
+        /* Batched RoPE: each row b at pos = start_pos + b */
+        ib_metal_rec_rope_inplace_batched(r, b->q_b, B, nh,  hd, start_pos, th);
+        ib_metal_rec_rope_inplace_batched(r, b->k_b, B, nkh, hd, start_pos, th);
+
+        /* Per-token attention block (KV cache fill at distinct positions;
+         * causal scoring against [0..pos]). Attention is hard to batch
+         * cleanly because each position attends to a different prefix. */
         for (int bb = 0; bb < B; bb++) {
             int pos = start_pos + bb;
             float *q_row = ROW_F(b->q_b, bb, qh);
             float *k_row = ROW_F(b->k_b, bb, kv_dim);
             float *v_row = ROW_F(b->v_b, bb, kv_dim);
             float *attn_out_row = ROW_F(b->attn_out_b, bb, qh);
-
-            ib_metal_rec_rope_inplace(r, q_row, nh,  hd, pos, th);
-            ib_metal_rec_rope_inplace(r, k_row, nkh, hd, pos, th);
 
             if (b->kv_bits == 16) {
                 ib_metal_rec_attention_block_fp16(r,
@@ -657,21 +655,12 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         rec_matmul_batched(r, lb->o_bits, lb->o_blk32, b->attn_out_b,
             lb->o_w, lb->o_s, b->xb2_b, b->xq_b, b->xs_b, B, hidden, qh);
 
-        /* Per-token residual: x_b += xb2_b */
-        for (int bb = 0; bb < B; bb++) {
-            ib_metal_rec_residual_add(r,
-                ROW_F(b->x_b, bb, hidden),
-                ROW_F(b->xb2_b, bb, hidden),
-                hidden);
-        }
+        /* Batched residual: x_b += xb2_b */
+        ib_metal_rec_residual_add_batched(r, b->x_b, b->xb2_b, B, hidden);
 
-        /* Per-token post-attn RMSNorm: x_b -> xb_b */
-        for (int bb = 0; bb < B; bb++) {
-            ib_metal_rec_rmsnorm_fp16(r,
-                ROW_F(b->x_b, bb, hidden), lb->post_norm,
-                ROW_F(b->xb_b, bb, hidden),
-                hidden, eps);
-        }
+        /* Batched post-attn RMSNorm: x_b -> xb_b */
+        ib_metal_rec_rmsnorm_fp16_batched(r,
+            b->x_b, lb->post_norm, b->xb_b, B, hidden, eps);
 
         /* Batched gate / up matmul */
         rec_matmul_batched(r, lb->gate_bits, lb->gate_blk32, b->xb_b,
@@ -679,24 +668,15 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         rec_matmul_batched(r, lb->up_bits, lb->up_blk32, b->xb_b,
             lb->up_w,   lb->up_s,   b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden);
 
-        /* Per-token silu_mul: hb_b = silu(hb_b) * hb2_b */
-        for (int bb = 0; bb < B; bb++) {
-            float *gate_row = ROW_F(b->hb_b,  bb, inter);
-            float *up_row   = ROW_F(b->hb2_b, bb, inter);
-            ib_metal_rec_silu_mul(r, gate_row, up_row, gate_row, inter);
-        }
+        /* Batched silu_mul: hb_b = silu(hb_b) * hb2_b */
+        ib_metal_rec_silu_mul_batched(r, b->hb_b, b->hb2_b, b->hb_b, B, inter);
 
         /* Batched down matmul: hb_b -> xb_b */
         rec_matmul_batched(r, lb->down_bits, lb->down_blk32, b->hb_b,
             lb->down_w, lb->down_s, b->xb_b, b->xq_b, b->xs_b, B, hidden, inter);
 
-        /* Per-token residual: x_b += xb_b */
-        for (int bb = 0; bb < B; bb++) {
-            ib_metal_rec_residual_add(r,
-                ROW_F(b->x_b, bb, hidden),
-                ROW_F(b->xb_b, bb, hidden),
-                hidden);
-        }
+        /* Batched residual: x_b += xb_b */
+        ib_metal_rec_residual_add_batched(r, b->x_b, b->xb_b, B, hidden);
     }
 
     /* Final RMSNorm + output_head only on the last token (typical
