@@ -353,6 +353,96 @@ extern "C" int ib_metal_matmul_w4a8_fp32_in(ib_metal_ctx *ctx,
     return 0;
 }
 
+extern "C" int ib_metal_matmul_w4a8_blk32_fp32_in(ib_metal_ctx *ctx,
+                                                    const void *x_fp32,
+                                                    const void *weights,
+                                                    const void *w_scales,
+                                                    void *out,
+                                                    void *scratch_x_q,
+                                                    void *scratch_x_scales,
+                                                    int M, int N)
+{
+    if (!ctx || !x_fp32 || !weights || !w_scales || !out) return -1;
+    if (M <= 0 || N <= 0 || (N % 32) != 0) return -1;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> ps_q  = get_pipeline(ctx, "quantize_input_int8_g128");
+        id<MTLComputePipelineState> ps_mm = get_pipeline(ctx, "matmul_w4a8_blk32");
+        if (!ps_q || !ps_mm) return -1;
+
+        auto pick = [&](const void *p) -> id<MTLBuffer> {
+            auto it = ctx->buffers.find((void *)p);
+            return it == ctx->buffers.end() ? nil : it->second;
+        };
+        id<MTLBuffer> b_x   = pick(x_fp32);
+        id<MTLBuffer> b_w   = pick(weights);
+        id<MTLBuffer> b_ws  = pick(w_scales);
+        id<MTLBuffer> b_out = pick(out);
+        if (!b_x || !b_w || !b_ws || !b_out) {
+            fprintf(stderr, "Metal blk32: buffer not registered with ctx\n");
+            return -1;
+        }
+
+        int n_groups = (N + 127) / 128;
+        bool own_xq = false, own_xs = false;
+        id<MTLBuffer> b_xq, b_xs;
+        if (scratch_x_q) b_xq = pick(scratch_x_q);
+        else { b_xq = [ctx->device newBufferWithLength:(NSUInteger)N
+                                                   options:MTLResourceStorageModeShared]; own_xq = true; }
+        if (scratch_x_scales) b_xs = pick(scratch_x_scales);
+        else { b_xs = [ctx->device newBufferWithLength:(NSUInteger)n_groups * sizeof(float)
+                                                   options:MTLResourceStorageModeShared]; own_xs = true; }
+        if (!b_xq || !b_xs) return -1;
+
+        uint M_u = (uint)M;
+        uint N_u = (uint)N;
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+
+        id<MTLComputeCommandEncoder> enc1 = [cb computeCommandEncoder];
+        [enc1 setComputePipelineState:ps_q];
+        [enc1 setBuffer:b_x  offset:0 atIndex:0];
+        [enc1 setBuffer:b_xq offset:0 atIndex:1];
+        [enc1 setBuffer:b_xs offset:0 atIndex:2];
+        [enc1 setBytes:&N_u length:sizeof(N_u) atIndex:3];
+        {
+            NSUInteger nq = (NSUInteger)((N + 127) / 128);
+            [enc1 dispatchThreadgroups:MTLSizeMake(nq, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+        [enc1 endEncoding];
+
+        id<MTLComputeCommandEncoder> enc2 = [cb computeCommandEncoder];
+        [enc2 setComputePipelineState:ps_mm];
+        [enc2 setBuffer:b_w   offset:0 atIndex:0];
+        [enc2 setBuffer:b_ws  offset:0 atIndex:1];
+        [enc2 setBuffer:b_xq  offset:0 atIndex:2];
+        [enc2 setBuffer:b_xs  offset:0 atIndex:3];
+        [enc2 setBuffer:b_out offset:0 atIndex:4];
+        [enc2 setBytes:&M_u length:sizeof(M_u) atIndex:5];
+        [enc2 setBytes:&N_u length:sizeof(N_u) atIndex:6];
+        {
+            const NSUInteger SIMDS_PER_TG = 4;
+            const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+            NSUInteger n_tg = (M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+            [enc2 dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+        }
+        [enc2 endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "Metal blk32: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            if (own_xq) b_xq = nil;
+            if (own_xs) b_xs = nil;
+            return -1;
+        }
+        (void)own_xq; (void)own_xs;
+    }
+    return 0;
+}
+
 extern "C" int ib_metal_matmul_w4a8(ib_metal_ctx *ctx,
                                       const void *weights, const void *w_scales,
                                       const void *x_q, const void *x_scales,
@@ -975,6 +1065,63 @@ extern "C" int ib_metal_rec_matmul_w4a8_fp32_in(ib_metal_recorder *rec,
         [enc endEncoding];
     }
     /* Encoder 2: matmul_w4a8 */
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_mm];
+        [enc setBuffer:b_w   offset:0 atIndex:0];
+        [enc setBuffer:b_ws  offset:0 atIndex:1];
+        [enc setBuffer:b_xq  offset:0 atIndex:2];
+        [enc setBuffer:b_xs  offset:0 atIndex:3];
+        [enc setBuffer:b_out offset:0 atIndex:4];
+        [enc setBytes:&M_u length:sizeof(M_u) atIndex:5];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:6];
+        const NSUInteger SIMDS_PER_TG = 4;
+        const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+        NSUInteger n_tg = (M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+        [enc endEncoding];
+    }
+    return 0;
+}
+
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
+                                                        const void *x_fp32,
+                                                        const void *weights,
+                                                        const void *w_scales,
+                                                        void *out,
+                                                        void *scratch_x_q,
+                                                        void *scratch_x_scales,
+                                                        int M, int N)
+{
+    if (!rec || !x_fp32 || !weights || !w_scales || !out
+        || !scratch_x_q || !scratch_x_scales || M <= 0 || N <= 0) return -1;
+    if ((N % 32) != 0) return -1;
+    id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128");
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, "matmul_w4a8_blk32");
+    if (!ps_q || !ps_mm) return -1;
+
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
+    id<MTLBuffer> b_ws  = rec_pick(rec->ctx, w_scales);
+    id<MTLBuffer> b_out = rec_pick(rec->ctx, out);
+    id<MTLBuffer> b_xq  = rec_pick(rec->ctx, scratch_x_q);
+    id<MTLBuffer> b_xs  = rec_pick(rec->ctx, scratch_x_scales);
+    if (!b_x || !b_w || !b_ws || !b_out || !b_xq || !b_xs) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N;
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_q];
+        [enc setBuffer:b_x  offset:0 atIndex:0];
+        [enc setBuffer:b_xq offset:0 atIndex:1];
+        [enc setBuffer:b_xs offset:0 atIndex:2];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:3];
+        NSUInteger nq = (NSUInteger)((N + 127) / 128);
+        [enc dispatchThreadgroups:MTLSizeMake(nq, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+    }
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_mm];

@@ -23,16 +23,16 @@
 #include <string.h>
 #include <math.h>
 
-/* Per-layer GPU buffer set. Each weight tensor's bits is recorded so the
- * forward dispatcher can pick the right kernel per matmul. */
+/* Per-layer GPU buffer set. Each weight tensor's (bits, is_blk32) pair
+ * is recorded so the forward dispatcher can pick the right kernel. */
 struct layer_bufs {
-    void *q_w, *q_s;     int q_bits;
-    void *k_w, *k_s;     int k_bits;
-    void *v_w, *v_s;     int v_bits;
-    void *o_w, *o_s;     int o_bits;
-    void *gate_w, *gate_s;  int gate_bits;
-    void *up_w,   *up_s;    int up_bits;
-    void *down_w, *down_s;  int down_bits;
+    void *q_w, *q_s;     int q_bits;     int q_blk32;
+    void *k_w, *k_s;     int k_bits;     int k_blk32;
+    void *v_w, *v_s;     int v_bits;     int v_blk32;
+    void *o_w, *o_s;     int o_bits;     int o_blk32;
+    void *gate_w, *gate_s;  int gate_bits;  int gate_blk32;
+    void *up_w,   *up_s;    int up_bits;    int up_blk32;
+    void *down_w, *down_s;  int down_bits;  int down_blk32;
     void *input_norm;
     void *post_norm;
     /* KV cache: layout depends on kv_bits.
@@ -66,6 +66,7 @@ struct ib_metal_model_buffers {
     void *output_head_w;
     void *output_head_s;
     int   output_head_bits;
+    int   output_head_blk32;
 
     /* State buffers (reused across layers). */
     void *x;
@@ -182,13 +183,17 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
     for (int L = 0; L < b->num_layers; L++) {
         const ib_layer_meta *lm = &m->layers[L];
         struct layer_bufs *lb = &b->layers[L];
-        upload_w_pair(ctx, m, &lm->q_proj,    &lb->q_w,    &lb->q_s);    lb->q_bits    = lm->q_proj.bits;
-        upload_w_pair(ctx, m, &lm->k_proj,    &lb->k_w,    &lb->k_s);    lb->k_bits    = lm->k_proj.bits;
-        upload_w_pair(ctx, m, &lm->v_proj,    &lb->v_w,    &lb->v_s);    lb->v_bits    = lm->v_proj.bits;
-        upload_w_pair(ctx, m, &lm->o_proj,    &lb->o_w,    &lb->o_s);    lb->o_bits    = lm->o_proj.bits;
-        upload_w_pair(ctx, m, &lm->gate_proj, &lb->gate_w, &lb->gate_s); lb->gate_bits = lm->gate_proj.bits;
-        upload_w_pair(ctx, m, &lm->up_proj,   &lb->up_w,   &lb->up_s);   lb->up_bits   = lm->up_proj.bits;
-        upload_w_pair(ctx, m, &lm->down_proj, &lb->down_w, &lb->down_s); lb->down_bits = lm->down_proj.bits;
+        /* For each INT4 weight tensor, detect per-block-32 layout via
+         * scale_size > rows * 2. shape[0] is the row count. */
+        #define IS_BLK32(t) ((t).bits == 4 && (t).scale_size > (size_t)(t).shape[0] * 2)
+        upload_w_pair(ctx, m, &lm->q_proj,    &lb->q_w,    &lb->q_s);    lb->q_bits    = lm->q_proj.bits;    lb->q_blk32    = IS_BLK32(lm->q_proj);
+        upload_w_pair(ctx, m, &lm->k_proj,    &lb->k_w,    &lb->k_s);    lb->k_bits    = lm->k_proj.bits;    lb->k_blk32    = IS_BLK32(lm->k_proj);
+        upload_w_pair(ctx, m, &lm->v_proj,    &lb->v_w,    &lb->v_s);    lb->v_bits    = lm->v_proj.bits;    lb->v_blk32    = IS_BLK32(lm->v_proj);
+        upload_w_pair(ctx, m, &lm->o_proj,    &lb->o_w,    &lb->o_s);    lb->o_bits    = lm->o_proj.bits;    lb->o_blk32    = IS_BLK32(lm->o_proj);
+        upload_w_pair(ctx, m, &lm->gate_proj, &lb->gate_w, &lb->gate_s); lb->gate_bits = lm->gate_proj.bits; lb->gate_blk32 = IS_BLK32(lm->gate_proj);
+        upload_w_pair(ctx, m, &lm->up_proj,   &lb->up_w,   &lb->up_s);   lb->up_bits   = lm->up_proj.bits;   lb->up_blk32   = IS_BLK32(lm->up_proj);
+        upload_w_pair(ctx, m, &lm->down_proj, &lb->down_w, &lb->down_s); lb->down_bits = lm->down_proj.bits; lb->down_blk32 = IS_BLK32(lm->down_proj);
+        #undef IS_BLK32
         upload_norm  (ctx, m, &lm->input_norm,     &lb->input_norm);
         upload_norm  (ctx, m, &lm->post_attn_norm, &lb->post_norm);
         lb->k_cache = ib_metal_alloc(ctx, kv_bytes_per_layer, NULL);
@@ -206,6 +211,8 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
     upload_norm(ctx, m, &m->output_norm, &b->output_norm);
     upload_w_pair(ctx, m, &m->output_head, &b->output_head_w, &b->output_head_s);
     b->output_head_bits = m->output_head.bits;
+    b->output_head_blk32 = (m->output_head.bits == 4 &&
+                             m->output_head.scale_size > (size_t)m->output_head.shape[0] * 2);
 
     int max_n = b->intermediate > b->hidden ? b->intermediate : b->hidden;
     int xs_groups = (max_n + 127) / 128;
@@ -271,15 +278,20 @@ ib_metal_reset_kv(ib_metal_model_buffers *b)
 }
 
 /* Records ONE matmul into the recorder, picking the kernel based on
- * the tensor's bit width. xq/xs scratch is only used for INT4 (w4a8). */
+ * the tensor's bit width AND blk32-ness. xq/xs scratch is only used
+ * for INT4 (w4a8) variants. */
 static int rec_matmul(ib_metal_recorder *r,
-                       int bits,
+                       int bits, int blk32,
                        const void *x_fp32,
                        const void *weights, const void *w_scales,
                        void *out, void *xq, void *xs,
                        int M, int N)
 {
     if (bits == 4) {
+        if (blk32) {
+            return ib_metal_rec_matmul_w4a8_blk32_fp32_in(
+                r, x_fp32, weights, w_scales, out, xq, xs, M, N);
+        }
         return ib_metal_rec_matmul_w4a8_fp32_in(r, x_fp32, weights, w_scales,
                                                   out, xq, xs, M, N);
     } else if (bits == 8) {
@@ -317,9 +329,9 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
     for (int L = 0; L < b->num_layers; L++) {
         struct layer_bufs *lb = &b->layers[L];
         ib_metal_rec_rmsnorm_fp16(r, b->x, lb->input_norm, b->xb, hidden, eps);
-        rec_matmul(r, lb->q_bits, b->xb, lb->q_w, lb->q_s, b->q, b->xq, b->xs, hidden, hidden);
-        rec_matmul(r, lb->k_bits, b->xb, lb->k_w, lb->k_s, b->k, b->xq, b->xs, kv_dim, hidden);
-        rec_matmul(r, lb->v_bits, b->xb, lb->v_w, lb->v_s, b->v, b->xq, b->xs, kv_dim, hidden);
+        rec_matmul(r, lb->q_bits, lb->q_blk32, b->xb, lb->q_w, lb->q_s, b->q, b->xq, b->xs, hidden, hidden);
+        rec_matmul(r, lb->k_bits, lb->k_blk32, b->xb, lb->k_w, lb->k_s, b->k, b->xq, b->xs, kv_dim, hidden);
+        rec_matmul(r, lb->v_bits, lb->v_blk32, b->xb, lb->v_w, lb->v_s, b->v, b->xq, b->xs, kv_dim, hidden);
         ib_metal_rec_rope_inplace(r, b->q, nh,  hd, pos, th);
         ib_metal_rec_rope_inplace(r, b->k, nkh, hd, pos, th);
         if (b->kv_bits == 16) {
@@ -334,17 +346,17 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
                                                 b->scores, b->attn_out,
                                                 nh, nkh, hd, sl, pos);
         }
-        rec_matmul(r, lb->o_bits, b->attn_out, lb->o_w, lb->o_s, b->xb2, b->xq, b->xs, hidden, hidden);
+        rec_matmul(r, lb->o_bits, lb->o_blk32, b->attn_out, lb->o_w, lb->o_s, b->xb2, b->xq, b->xs, hidden, hidden);
         ib_metal_rec_residual_add(r, b->x, b->xb2, hidden);
         ib_metal_rec_rmsnorm_fp16(r, b->x, lb->post_norm, b->xb, hidden, eps);
-        rec_matmul(r, lb->gate_bits, b->xb, lb->gate_w, lb->gate_s, b->hb,  b->xq, b->xs, inter, hidden);
-        rec_matmul(r, lb->up_bits,   b->xb, lb->up_w,   lb->up_s,   b->hb2, b->xq, b->xs, inter, hidden);
+        rec_matmul(r, lb->gate_bits, lb->gate_blk32, b->xb, lb->gate_w, lb->gate_s, b->hb,  b->xq, b->xs, inter, hidden);
+        rec_matmul(r, lb->up_bits,   lb->up_blk32,   b->xb, lb->up_w,   lb->up_s,   b->hb2, b->xq, b->xs, inter, hidden);
         ib_metal_rec_silu_mul(r, b->hb, b->hb2, b->hb, inter);
-        rec_matmul(r, lb->down_bits, b->hb, lb->down_w, lb->down_s, b->xb, b->xq, b->xs, hidden, inter);
+        rec_matmul(r, lb->down_bits, lb->down_blk32, b->hb, lb->down_w, lb->down_s, b->xb, b->xq, b->xs, hidden, inter);
         ib_metal_rec_residual_add(r, b->x, b->xb, hidden);
     }
     ib_metal_rec_rmsnorm_fp16(r, b->x, b->output_norm, b->xb, hidden, eps);
-    rec_matmul(r, b->output_head_bits, b->xb,
+    rec_matmul(r, b->output_head_bits, b->output_head_blk32, b->xb,
                 b->output_head_w, b->output_head_s,
                 b->logits, b->xq, b->xs, b->vocab, hidden);
 

@@ -359,6 +359,80 @@ static void neon_matmul_w4a8(
     }
 }
 
+/* W4A8 with per-32-element block weight scales.
+ *
+ * scales_w has length M*(N/32) (one fp32 per 32 weight elements per row).
+ * Activation grouping (128) is unchanged. Inside each 128-element
+ * activation group there are 4 weight blocks of 32; we reduce each
+ * block's int32 dot product to scalar, multiply by its block scale,
+ * accumulate as fp32, then scale by the per-group activation scale.
+ *
+ * Same vdotq fast path as neon_matmul_w4a8; ~+10% per-row overhead from
+ * the extra horizontal reduction per 32 elements (scalar vaddvq_s32 +
+ * fmul + fadd × 4 per group), well worth the +5 dB SNR / -25% PPL win.
+ */
+#if IB_HAS_DOTPROD
+IB_DOTPROD_NOINLINE
+#endif
+static void neon_matmul_w4a8_blk32(
+    float* out, const void* weights, const float* scales_w_blk32,
+    const int8_t* input, const float* scales_a, int M, int N
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+    const int G_a = IB_W4A8_GROUP;        /* 128 */
+    const int n_w_blocks = N / 32;
+    const int groups = N / G_a;
+
+    for (int i = 0; i < M; i++) {
+        const uint8_t* row = w + (size_t)i * (N / 2);
+        const float* row_scales = scales_w_blk32 + (size_t)i * n_w_blocks;
+        float row_acc = 0.0f;
+
+        for (int g = 0; g < groups; g++) {
+            const int j0 = g * G_a;
+            float group_partial = 0.0f;
+
+            /* 4 weight blocks of 32 within this 128-element activation group. */
+            for (int k = 0; k < G_a; k += 32) {
+                const int j = j0 + k;
+                const int wb_idx = j / 32;
+                const float w_scale = row_scales[wb_idx];
+
+                uint8x16_t packed = vld1q_u8(row + j / 2);
+                uint8x16_t lo_u8 = vandq_u8(packed, mask_lo);
+                uint8x16_t hi_u8 = vshrq_n_u8(packed, 4);
+                int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias);
+                int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias);
+                int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8);
+
+                int8x16_t a0 = vld1q_s8(input + j);
+                int8x16_t a1 = vld1q_s8(input + j + 16);
+
+                int32x4_t acc = vdupq_n_s32(0);
+#if IB_HAS_DOTPROD
+                acc = vdotq_s32(acc, zipped.val[0], a0);
+                acc = vdotq_s32(acc, zipped.val[1], a1);
+#else
+                int16x8_t p0 = vmull_s8(vget_low_s8(zipped.val[0]), vget_low_s8(a0));
+                p0 = vmlal_s8(p0, vget_high_s8(zipped.val[0]), vget_high_s8(a0));
+                int16x8_t p1 = vmull_s8(vget_low_s8(zipped.val[1]), vget_low_s8(a1));
+                p1 = vmlal_s8(p1, vget_high_s8(zipped.val[1]), vget_high_s8(a1));
+                acc = vpadalq_s16(acc, p0);
+                acc = vpadalq_s16(acc, p1);
+#endif
+                int32_t sum = vaddvq_s32(acc);
+                group_partial += (float)sum * w_scale;
+            }
+            row_acc += group_partial * scales_a[g];
+        }
+
+        /* Caller guarantees N % IB_W4A8_GROUP == 0 (and N % 32 == 0). */
+        out[i] = row_acc;
+    }
+}
+
 /* ── W4A8 batched matmul (shared weights across B activation vectors) ─
  *
  * Weights are loaded once per row and applied against B independent
@@ -698,6 +772,7 @@ void ib_init_kernels_neon(ib_kernels* kern) {
     kern->matmul_int8 = neon_matmul_int8;
     kern->matmul_w4a8 = neon_matmul_w4a8;
     kern->matmul_w4a8_batch = neon_matmul_w4a8_batch;
+    kern->matmul_w4a8_blk32 = neon_matmul_w4a8_blk32;
     kern->matmul_int8_batch = neon_matmul_int8_batch;
     kern->rmsnorm     = neon_rmsnorm;
     kern->rope        = neon_rope;

@@ -111,6 +111,76 @@ kernel void matmul_w4a8(
     }
 }
 
+/* matmul_w4a8 with per-32-element block weight scales.
+ *
+ * w_scales is M*(N/32) fp16 values (vs M for matmul_w4a8 above).
+ * Activation grouping (IB_W4A8_GROUP=128) is unchanged. Each 128-element
+ * activation group contains 4 weight blocks of 32; each block has its
+ * own scale.
+ *
+ * Tile layout: 1 SIMD group per output row, 32 lanes per SIMD group. For
+ * each group's 4 weight blocks (b=0..3) we have the 32 lanes process 1
+ * element each (32 elements = one block exactly), simd_sum reduces to
+ * scalar, multiply by w_scale, accumulate as fp32. After 4 blocks:
+ * group_partial * a_scale → row accumulator.
+ *
+ * Same memory layout for weights as matmul_w4a8 (uchar packed nibbles).
+ */
+kernel void matmul_w4a8_blk32(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],   /* length M*(N/32) */
+    device const char   *x_q       [[buffer(2)]],
+    device const float  *x_scales  [[buffer(3)]],
+    device       float  *out       [[buffer(4)]],
+    constant     uint   &M         [[buffer(5)]],
+    constant     uint   &N         [[buffer(6)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const uchar *row = weights + (size_t)m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)m * n_w_blocks;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+        float a_scale = x_scales[g];
+        float group_partial = 0.0f;
+
+        /* 4 weight blocks per 128-element activation group. */
+        for (int b = 0; b < 4; b++) {
+            int blk_start = g_start + b * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+
+            /* Each of 32 lanes processes 1 element of this block. */
+            int n = blk_start + (int)simd_lane;
+            int lane_int = 0;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                lane_int = w * (int)x_q[n];
+            }
+            int block_int = simd_sum(lane_int);
+            group_partial += (float)block_int * w_scale;
+        }
+        lane_acc += group_partial * a_scale;
+    }
+
+    if (simd_lane == 0) {
+        out[m] = lane_acc;
+    }
+}
+
 /* ── matmul_int8 (fp32 input × int8 weights × fp16 row scale) ────────
  *
  * Mirrors CPU `scalar_matmul_int8` exactly:

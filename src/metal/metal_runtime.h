@@ -117,6 +117,19 @@ int ib_metal_matmul_w4a8_fp32_in(ib_metal_ctx *ctx,
                                   void *scratch_x_scales,   /* float[N/128], or NULL */
                                   int M, int N);
 
+/* W4A8 with per-32-element block weight scales. w_scales is fp16 with
+ * length M*(N/32). Same input quantization (per-128 INT8) as the
+ * per-row variant. Closes the per-row outlier-clipping PPL gap on
+ * Llama-3-class models. */
+int ib_metal_matmul_w4a8_blk32_fp32_in(ib_metal_ctx *ctx,
+                                         const void *x_fp32,
+                                         const void *weights,
+                                         const void *w_scales_blk32,
+                                         void *out,
+                                         void *scratch_x_q,
+                                         void *scratch_x_scales,
+                                         int M, int N);
+
 /* INT8-weight matmul: out[m] = scale[m] * sum_n (W[m,n] * x[n]).
  *
  * Mirrors the CPU `matmul_int8` kernel exactly.
@@ -271,6 +284,15 @@ int ib_metal_rec_matmul_w4a8_fp32_in(ib_metal_recorder *rec,
                                        void *scratch_x_q,
                                        void *scratch_x_scales,
                                        int M, int N);
+
+int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
+                                             const void *x_fp32,
+                                             const void *weights,
+                                             const void *w_scales_blk32,
+                                             void *out,
+                                             void *scratch_x_q,
+                                             void *scratch_x_scales,
+                                             int M, int N);
 
 int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
                                        const void *x_fp32,
