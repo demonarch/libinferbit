@@ -320,6 +320,20 @@ int ib_metal_rec_matmul_w4a8_blk32_batched_tiled_fp32_in(ib_metal_recorder *rec,
                                                            void *scratch_x_scales,
                                                            int B, int M, int N);
 
+/* simdgroup_matrix variant: uses Apple Silicon's 8x8 fp16 matrix
+ * multiply intrinsic. Cooperatively dequants W (INT4 → fp16) and A
+ * (INT8 → fp16) tiles into threadgroup memory, then runs hardware
+ * matrix multiplies with fp32 accumulators. Requires B%8==0, M%8==0,
+ * N%128==0. Returns -2 if shape doesn't fit. */
+int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_fp32_in(ib_metal_recorder *rec,
+                                                            const void *x_fp32,
+                                                            const void *weights,
+                                                            const void *w_scales_blk32,
+                                                            void *out,
+                                                            void *scratch_x_q,
+                                                            void *scratch_x_scales,
+                                                            int B, int M, int N);
+
 int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
                                        const void *x_fp32,
                                        const void *weights,

@@ -551,12 +551,27 @@ static int rec_matmul_batched(ib_metal_recorder *r,
 {
     if (bits == 4) {
         if (blk32) {
-            static int tiled_setting = -1;
-            if (tiled_setting < 0) {
-                const char *env = getenv("IB_PREFILL_TILED");
-                tiled_setting = (env && env[0] == '1') ? 1 : 0;
+            /* Variant selection (read once, cached):
+             *   IB_PREFILL_SIMDMAT=1 → simdgroup_matrix kernel (Apple's
+             *     8x8 fp16 matrix-multiply hardware intrinsic)
+             *   IB_PREFILL_TILED=1   → threadgroup-memory tiled kernel
+             *   default              → non-tiled batched kernel
+             * Precedence: SIMDMAT > TILED > default. */
+            static int variant = -2;
+            if (variant == -2) {
+                const char *simd_env  = getenv("IB_PREFILL_SIMDMAT");
+                const char *tiled_env = getenv("IB_PREFILL_TILED");
+                if (simd_env && simd_env[0] == '1') variant = 2;
+                else if (tiled_env && tiled_env[0] == '1') variant = 1;
+                else variant = 0;
             }
-            if (tiled_setting) {
+            if (variant == 2) {
+                int rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_fp32_in(
+                    r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
+                if (rc != -2) return rc;
+                /* simdmat refused (B or M not multiple of 8) — fall back. */
+            }
+            if (variant == 1) {
                 return ib_metal_rec_matmul_w4a8_blk32_batched_tiled_fp32_in(
                     r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
             }

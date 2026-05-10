@@ -3,6 +3,7 @@
  * [device newLibraryWithSource:].
  */
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 /* Hello-world kernel — out[i] = in[i] * 2.0
@@ -347,6 +348,117 @@ kernel void matmul_w4a8_blk32_batched_tiled(
     if (simd_lane == 0) {
         out[(size_t)b * M + m] = lane_acc;
     }
+}
+
+/* matmul_w4a8_blk32_batched_simdmat — uses Apple Silicon's
+ * simdgroup_matrix_multiply hardware intrinsic.
+ *
+ * Each threadgroup (1 SIMDgroup = 32 lanes) computes an 8×8 output
+ * tile out[b_base..b_base+8][m_base..m_base+8]. The K dimension is
+ * processed in chunks of K_TILE=128 (one full activation group):
+ *   1) Cooperatively dequant 8×128 weight rows to fp16 in TG memory,
+ *      applying per-32-element block scales.
+ *   2) Cooperatively dequant 8×128 activation rows to fp16, applying
+ *      the per-128-element group scale.
+ *   3) Run 16 sub-matmuls of K=8 each via simdgroup_multiply_accumulate.
+ *
+ * The accumulator stays in fp32 for numerical stability. Output is
+ * written back as fp32 to out[B][M] row-major.
+ *
+ * Grid: (M/8, B/8, 1) threadgroups. M and B must be multiples of 8.
+ */
+constant constexpr int SDM_M_TILE = 8;
+constant constexpr int SDM_B_TILE = 8;
+constant constexpr int SDM_K_TILE = 128;   /* IB_W4A8_GROUP */
+
+kernel void matmul_w4a8_blk32_batched_simdmat(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const char   *x_q       [[buffer(2)]],
+    device const float  *x_scales  [[buffer(3)]],
+    device       float  *out       [[buffer(4)]],
+    constant     uint   &M         [[buffer(5)]],
+    constant     uint   &N         [[buffer(6)]],
+    constant     uint   &B         [[buffer(7)]],
+    threadgroup half    *tg_W_fp16 [[threadgroup(0)]],   /* [SDM_M_TILE][SDM_K_TILE] */
+    threadgroup half    *tg_A_fp16 [[threadgroup(1)]],   /* [SDM_B_TILE][SDM_K_TILE] */
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]])
+{
+    uint m_base = tg_id.x * SDM_M_TILE;
+    uint b_base = tg_id.y * SDM_B_TILE;
+    if (m_base >= M || b_base >= B) return;
+
+    /* Accumulator: 8x8 fp32 output tile (rows=b, cols=m). */
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint n_groups = N / SDM_K_TILE;
+    uint w_row_bytes = N / 2u;
+    uint w_scale_per_row = N / 32u;
+
+    for (uint g = 0; g < n_groups; g++) {
+        uint k_start = g * SDM_K_TILE;
+
+        /* ── Dequant W tile (8×128 fp16) ── */
+        for (uint i = simd_lane; i < SDM_M_TILE * SDM_K_TILE; i += 32u) {
+            uint m_local = i / SDM_K_TILE;
+            uint k_local = i % SDM_K_TILE;
+            uint m_global = m_base + m_local;
+            uint k_global = k_start + k_local;
+
+            half v = (half)0;
+            if (m_global < M && k_global < N) {
+                size_t byte_off = (size_t)m_global * w_row_bytes + (k_global / 2u);
+                uchar byte = weights[byte_off];
+                int w_int = (k_global & 1u) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                              : ((int)(byte & 0x0F) - 8);
+                uint wb_idx = k_global / 32u;
+                half w_scale = w_scales[m_global * w_scale_per_row + wb_idx];
+                v = (half)w_int * w_scale;
+            }
+            tg_W_fp16[i] = v;
+        }
+
+        /* ── Dequant A tile (8×128 fp16) ── */
+        for (uint i = simd_lane; i < SDM_B_TILE * SDM_K_TILE; i += 32u) {
+            uint b_local = i / SDM_K_TILE;
+            uint k_local = i % SDM_K_TILE;
+            uint b_global = b_base + b_local;
+            uint k_global = k_start + k_local;
+
+            half v = (half)0;
+            if (b_global < B && k_global < N) {
+                char  a_int   = x_q[(size_t)b_global * N + k_global];
+                float a_scale = x_scales[b_global * (N / 128u) + g];
+                v = (half)((float)a_int * a_scale);
+            }
+            tg_A_fp16[i] = v;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* ── 16 sub-matmuls of K=8 each, accumulating into C ── */
+        for (uint k_sub = 0; k_sub < SDM_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            /* A_sub: 8 rows × 8 cols, naturally laid out as rows=b, cols=k.
+             * Source: tg_A_fp16[b_local][k_sub*8 + k_in]
+             * Row stride between b's = SDM_K_TILE. */
+            simdgroup_load(A_sub, tg_A_fp16 + k_sub * 8u, SDM_K_TILE);
+            /* W_sub_T: need 8 rows × 8 cols with rows=k, cols=m.
+             * Source tg_W_fp16 is [m_local][k_local]. Use transpose flag. */
+            simdgroup_load(W_sub_T, tg_W_fp16 + k_sub * 8u, SDM_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            /* C[b][m] += A_sub[b][k] * W_sub_T[k][m] */
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Store C → out[b_base..b_base+8][m_base..m_base+8].
+     * out is row-major [B][M], row stride M. */
+    simdgroup_store(C, out + (size_t)b_base * M + m_base, M);
 }
 
 /* Batched activation quantizer: takes B fp32 rows of length N, produces
