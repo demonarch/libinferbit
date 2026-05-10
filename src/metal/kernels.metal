@@ -685,6 +685,112 @@ kernel void matmul_w4a8_blk32_batched_simdmat_tg32(
     simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
 }
 
+/* matmul_w4a8_blk32_batched_simdmat_tg64 — 32-SIMDgroup variant.
+ * 64×32 output tile per TG, 8×4 sub-tile grid, 1024 threads/TG
+ * (M4 limit). 2× the M reuse of tg32 → more weight bandwidth
+ * amortization at the cost of fewer total TGs.
+ *
+ * Grid: (M/64, B/32, 1). Requires B%32==0, M%64==0, N%128==0.
+ * TG mem: 64×128 W fp16 + 32×128 A fp16 = 24 KB (under the 32 KB limit).
+ */
+constant constexpr int SDMT64_M_BLOCK = 64;
+constant constexpr int SDMT64_B_BLOCK = 32;
+constant constexpr int SDMT64_K_TILE  = 128;
+
+kernel void matmul_w4a8_blk32_batched_simdmat_tg64(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const char   *x_q       [[buffer(2)]],
+    device const float  *x_scales  [[buffer(3)]],
+    device       float  *out       [[buffer(4)]],
+    constant     uint   &M         [[buffer(5)]],
+    constant     uint   &N         [[buffer(6)]],
+    constant     uint   &B         [[buffer(7)]],
+    threadgroup half    *tg_W_fp16 [[threadgroup(0)]],   /* [64][128] */
+    threadgroup half    *tg_A_fp16 [[threadgroup(1)]],   /* [32][128] */
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]])
+{
+    uint tg_lane = simd_id * 32u + simd_lane;
+    constexpr uint TG_THREADS = 32u * 32u;     /* 1024 */
+
+    /* 8×4 sub-tile grid: simd_id 0..31 → (m_off ∈ 0..7, b_off ∈ 0..3) */
+    uint m_off = simd_id & 7u;
+    uint b_off = simd_id >> 3;
+
+    uint m_base = tg_id.x * SDMT64_M_BLOCK;
+    uint b_base = tg_id.y * SDMT64_B_BLOCK;
+    if (m_base >= M || b_base >= B) return;
+
+    uint my_m_base = m_base + m_off * 8u;
+    uint my_b_base = b_base + b_off * 8u;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint n_groups = N / SDMT64_K_TILE;
+    uint w_row_bytes     = N / 2u;
+    uint w_scale_per_row = N / 32u;
+
+    for (uint g = 0; g < n_groups; g++) {
+        uint k_start = g * SDMT64_K_TILE;
+
+        /* 64×128 W = 8192 elts / 1024 lanes = 8 elts/lane */
+        for (uint i = tg_lane; i < SDMT64_M_BLOCK * SDMT64_K_TILE; i += TG_THREADS) {
+            uint m_local = i / SDMT64_K_TILE;
+            uint k_local = i % SDMT64_K_TILE;
+            uint m_global = m_base + m_local;
+            uint k_global = k_start + k_local;
+
+            half v = (half)0;
+            if (m_global < M && k_global < N) {
+                size_t byte_off = (size_t)m_global * w_row_bytes + (k_global / 2u);
+                uchar byte = weights[byte_off];
+                int w_int = (k_global & 1u) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                              : ((int)(byte & 0x0F) - 8);
+                uint wb_idx = k_global / 32u;
+                half w_scale = w_scales[m_global * w_scale_per_row + wb_idx];
+                v = (half)w_int * w_scale;
+            }
+            tg_W_fp16[i] = v;
+        }
+
+        /* 32×128 A = 4096 elts / 1024 lanes = 4 elts/lane */
+        for (uint i = tg_lane; i < SDMT64_B_BLOCK * SDMT64_K_TILE; i += TG_THREADS) {
+            uint b_local = i / SDMT64_K_TILE;
+            uint k_local = i % SDMT64_K_TILE;
+            uint b_global = b_base + b_local;
+            uint k_global = k_start + k_local;
+
+            half v = (half)0;
+            if (b_global < B && k_global < N) {
+                char  a_int   = x_q[(size_t)b_global * N + k_global];
+                float a_scale = x_scales[b_global * (N / 128u) + g];
+                v = (half)((float)a_int * a_scale);
+            }
+            tg_A_fp16[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *A_base = tg_A_fp16 + (size_t)(b_off * 8u) * SDMT64_K_TILE;
+        threadgroup const half *W_base = tg_W_fp16 + (size_t)(m_off * 8u) * SDMT64_K_TILE;
+
+        for (uint k_sub = 0; k_sub < SDMT64_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT64_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT64_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
+}
+
 /* Batched activation quantizer: takes B fp32 rows of length N, produces
  * B int8 rows + B float scale rows of length N/128. Tile: each
  * threadgroup handles one (b, group) cell with the same internal

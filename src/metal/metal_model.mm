@@ -566,10 +566,10 @@ static int rec_matmul_batched(ib_metal_recorder *r,
                 else variant = 0;
             }
             if (variant == 2) {
-                /* Try simdmat variants in descending tile size — bigger
-                 * tile = more dequant amortization, but needs M & B
-                 * divisible by tile dim. Falls through if shape doesn't
-                 * fit any simdmat variant. */
+                /* tg32 (32×32 / 16 SGs) is the sweet spot on M4 —
+                 * bigger (tg64) is consistently slower (more SG
+                 * contention + lower occupancy). Try tg32 first, then
+                 * smaller tiles for shapes that don't fit. */
                 int rc;
                 rc = ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(
                     r, x_fp32, weights, w_scales, out, xq, xs, B, M, N);
