@@ -1663,7 +1663,18 @@ extern "C" int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
 {
     if (!rec || !x_fp32 || !weights || !w_scales || !out
         || M <= 0 || N <= 0) return -1;
-    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_int8_fp32_in");
+    /* Vectorized variant when N is divisible by 128 (32 lanes × 4 elt
+     * per iter). Hidden dims for our 3 GPU blk32 cells: 2048, 2048,
+     * 4096 — all qualify. IB_INT8_VEC4=0 forces the scalar path. */
+    static int vec4_setting = -1;
+    if (vec4_setting < 0) {
+        const char *env = getenv("IB_INT8_VEC4");
+        vec4_setting = (env && env[0] == '0') ? 0 : 1;
+    }
+    const char *pipe_name = (vec4_setting && (N % 128) == 0)
+        ? "matmul_int8_fp32_in_vec4"
+        : "matmul_int8_fp32_in";
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, pipe_name);
     if (!ps) return -1;
     NSUInteger ow=0, ows=0, ox=0, oo=0;
     id<MTLBuffer> b_w   = rec_pick_off(rec->ctx, weights,  &ow);

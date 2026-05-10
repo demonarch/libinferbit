@@ -1430,6 +1430,58 @@ kernel void matmul_int8_fp32_in_qkv(
     }
 }
 
+/* matmul_int8_fp32_in_vec4 — vectorized INT8 matmul variant.
+ * Reads 4 INT8 weights + 4 fp32 activations per loop iteration
+ * (char4 + float4 loads). Same math, fewer loop iterations and
+ * fewer instructions per row.
+ *
+ * Alignment: each lane starts at simd_lane * 4 (4-byte aligned for
+ * char4, 16-byte aligned for float4 since fp32). Stride is 128
+ * elements = 32 lanes × 4 elements per iter.
+ *
+ * Requires N % 128 == 0 (TinyLlama hidden=2048, Llama-3 hidden=2048/4096
+ * all satisfy). Used for the big output_head matmul where the per-lane
+ * loop body matters.
+ */
+kernel void matmul_int8_fp32_in_vec4(
+    device const char   *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x         [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id     [[threadgroup_position_in_grid]],
+    uint                 tg_size   [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const char  *row = weights + (size_t)m * N;
+    /* Reinterpret as char4 / float4 arrays for vectorized loads. */
+    device const char4  *row4 = (device const char4 *)row;
+    device const float4 *x4   = (device const float4*)x;
+
+    float lane_acc = 0.0f;
+    /* Each lane handles N/(32*4) = N/128 iters; element index = lane*4 + iter*128. */
+    uint n_iters = N / 128u;
+    for (uint i = 0; i < n_iters; i++) {
+        uint elem_idx_div4 = simd_lane + i * 32u;   /* index into char4/float4 arrays */
+        char4  w4 = row4[elem_idx_div4];
+        float4 a4 = x4  [elem_idx_div4];
+        lane_acc += (float)w4.x * a4.x
+                  + (float)w4.y * a4.y
+                  + (float)w4.z * a4.z
+                  + (float)w4.w * a4.w;
+    }
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[m] = total * (float)w_scales[m];
+    }
+}
+
 /* Batched variant: takes B fp32 input rows of length N, outputs B fp32
  * rows of length M. Same SIMDgroup-per-(b, m) tile as the blk32 batched
  * matmul. Used when prefill has mixed-precision IBFs (INT8 q/k/v + INT4
