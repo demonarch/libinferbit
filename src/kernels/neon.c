@@ -359,17 +359,21 @@ static void neon_matmul_w4a8(
     }
 }
 
-/* W4A8 with per-32-element block weight scales.
+/* W4A8 with per-32-element block weight scales — unrolled by 4 blocks.
  *
  * scales_w has length M*(N/32) (one fp32 per 32 weight elements per row).
- * Activation grouping (128) is unchanged. Inside each 128-element
- * activation group there are 4 weight blocks of 32; we reduce each
- * block's int32 dot product to scalar, multiply by its block scale,
- * accumulate as fp32, then scale by the per-group activation scale.
+ * Activation grouping (128) is unchanged.
  *
- * Same vdotq fast path as neon_matmul_w4a8; ~+10% per-row overhead from
- * the extra horizontal reduction per 32 elements (scalar vaddvq_s32 +
- * fmul + fadd × 4 per group), well worth the +5 dB SNR / -25% PPL win.
+ * The 4 weight blocks within each 128-element activation group are
+ * processed in parallel: 4 separate int32x4_t accumulators, all loads
+ * + vdotq issued before any horizontal reduction. The compiler/CPU
+ * can then schedule the 4 vdotq pairs (8 instructions) and 4 vaddvq
+ * reductions in parallel through Apple Silicon's wide SIMD pipelines,
+ * hiding the ~6-cycle reduction latency that previously stalled the
+ * loop after each block.
+ *
+ * Empirically this lifts the per-block-32 throughput close to per-row
+ * NEON, eliminating most of the cost of finer-granularity scaling.
  */
 #if IB_HAS_DOTPROD
 IB_DOTPROD_NOINLINE
@@ -381,7 +385,7 @@ static void neon_matmul_w4a8_blk32(
     const uint8_t* w = (const uint8_t*)weights;
     const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
     const int8x16_t bias = vdupq_n_s8(8);
-    const int G_a = IB_W4A8_GROUP;        /* 128 */
+    const int G_a = IB_W4A8_GROUP;       /* 128 */
     const int n_w_blocks = N / 32;
     const int groups = N / G_a;
 
@@ -392,40 +396,76 @@ static void neon_matmul_w4a8_blk32(
 
         for (int g = 0; g < groups; g++) {
             const int j0 = g * G_a;
-            float group_partial = 0.0f;
+            const int wb_base = j0 / 32;   /* 4 blocks per group */
+            const float a_scale = scales_a[g];
 
-            /* 4 weight blocks of 32 within this 128-element activation group. */
-            for (int k = 0; k < G_a; k += 32) {
-                const int j = j0 + k;
-                const int wb_idx = j / 32;
-                const float w_scale = row_scales[wb_idx];
+            /* Load + unpack + dot for ALL 4 blocks before any reduction.
+             * 4 independent int32 accumulators — register pressure stays
+             * within the 32 NEON regs. */
+            int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+            int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
 
-                uint8x16_t packed = vld1q_u8(row + j / 2);
-                uint8x16_t lo_u8 = vandq_u8(packed, mask_lo);
-                uint8x16_t hi_u8 = vshrq_n_u8(packed, 4);
-                int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias);
-                int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias);
-                int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8);
+            #define BLOCK(B, ACC) do { \
+                int j = j0 + (B) * 32; \
+                uint8x16_t packed = vld1q_u8(row + j / 2); \
+                uint8x16_t lo_u8 = vandq_u8(packed, mask_lo); \
+                uint8x16_t hi_u8 = vshrq_n_u8(packed, 4); \
+                int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias); \
+                int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias); \
+                int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8); \
+                int8x16_t a0 = vld1q_s8(input + j); \
+                int8x16_t a1 = vld1q_s8(input + j + 16); \
+                ACC = vdotq_s32(ACC, zipped.val[0], a0); \
+                ACC = vdotq_s32(ACC, zipped.val[1], a1); \
+            } while (0)
 
-                int8x16_t a0 = vld1q_s8(input + j);
-                int8x16_t a1 = vld1q_s8(input + j + 16);
+            #define BLOCK_FALLBACK(B, ACC) do { \
+                int j = j0 + (B) * 32; \
+                uint8x16_t packed = vld1q_u8(row + j / 2); \
+                uint8x16_t lo_u8 = vandq_u8(packed, mask_lo); \
+                uint8x16_t hi_u8 = vshrq_n_u8(packed, 4); \
+                int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias); \
+                int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias); \
+                int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8); \
+                int8x16_t a0 = vld1q_s8(input + j); \
+                int8x16_t a1 = vld1q_s8(input + j + 16); \
+                int16x8_t p0 = vmull_s8(vget_low_s8(zipped.val[0]), vget_low_s8(a0)); \
+                p0 = vmlal_s8(p0, vget_high_s8(zipped.val[0]), vget_high_s8(a0)); \
+                int16x8_t p1 = vmull_s8(vget_low_s8(zipped.val[1]), vget_low_s8(a1)); \
+                p1 = vmlal_s8(p1, vget_high_s8(zipped.val[1]), vget_high_s8(a1)); \
+                ACC = vpadalq_s16(ACC, p0); \
+                ACC = vpadalq_s16(ACC, p1); \
+            } while (0)
 
-                int32x4_t acc = vdupq_n_s32(0);
 #if IB_HAS_DOTPROD
-                acc = vdotq_s32(acc, zipped.val[0], a0);
-                acc = vdotq_s32(acc, zipped.val[1], a1);
+            BLOCK(0, acc0);
+            BLOCK(1, acc1);
+            BLOCK(2, acc2);
+            BLOCK(3, acc3);
 #else
-                int16x8_t p0 = vmull_s8(vget_low_s8(zipped.val[0]), vget_low_s8(a0));
-                p0 = vmlal_s8(p0, vget_high_s8(zipped.val[0]), vget_high_s8(a0));
-                int16x8_t p1 = vmull_s8(vget_low_s8(zipped.val[1]), vget_low_s8(a1));
-                p1 = vmlal_s8(p1, vget_high_s8(zipped.val[1]), vget_high_s8(a1));
-                acc = vpadalq_s16(acc, p0);
-                acc = vpadalq_s16(acc, p1);
+            BLOCK_FALLBACK(0, acc0);
+            BLOCK_FALLBACK(1, acc1);
+            BLOCK_FALLBACK(2, acc2);
+            BLOCK_FALLBACK(3, acc3);
 #endif
-                int32_t sum = vaddvq_s32(acc);
-                group_partial += (float)sum * w_scale;
-            }
-            row_acc += group_partial * scales_a[g];
+            #undef BLOCK
+            #undef BLOCK_FALLBACK
+
+            /* Vectorized cross-lane reduction: acc{0,1,2,3} each have 4
+             * partial sums in 4 lanes. Two vpaddq_s32 trees collapse
+             * them into a single int32x4_t [s0, s1, s2, s3]. Then
+             * convert + vector-multiply by the 4 weight scales (loaded
+             * with one vld1q_f32) + final vaddvq_f32. Replaces 4×
+             * vaddvq_s32 + 4 fmuls + 3 fadds with 3 vpaddq + 1 vcvt +
+             * 1 vmul + 1 vaddvq — cheaper and pipelines better. */
+            int32x4_t sums01 = vpaddq_s32(acc0, acc1);
+            int32x4_t sums23 = vpaddq_s32(acc2, acc3);
+            int32x4_t all_sums = vpaddq_s32(sums01, sums23);
+            float32x4_t fp_sums = vcvtq_f32_s32(all_sums);
+            float32x4_t w_scales_v = vld1q_f32(row_scales + wb_base);
+            float32x4_t scaled = vmulq_f32(fp_sums, w_scales_v);
+            float group_partial = vaddvq_f32(scaled);
+            row_acc += group_partial * a_scale;
         }
 
         /* Caller guarantees N % IB_W4A8_GROUP == 0 (and N % 32 == 0). */
