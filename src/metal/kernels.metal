@@ -1458,6 +1458,115 @@ kernel void matmul_w4a8_blk32_dr_a32_gateup(
     }
 }
 
+/* matmul_w4a8_blk32_dr_a32_rmsnorm_gateup — fuses pre-FFN rmsnorm into
+ * the gate+up matmul. Each TG cooperatively computes the per-token
+ * inverse-RMS scalar from x_in (the residual buffer), then uses
+ * (x_in[k] * inv_rms * rmsnorm_weight[k]) as the activation for the
+ * gate and up matmuls. Saves one Metal dispatch per layer.
+ *
+ * Each TG redundantly recomputes the rmsnorm — for hidden=2048 that's
+ * ~50 cycles per TG vs the saved dispatch (~5 µs). Net: positive
+ * even at modest TG counts.
+ *
+ * Output: rows 0..M-1 → gate[m], M..2M-1 → up[m-M]. Same layout as
+ * matmul_w4a8_blk32_dr_a32_gateup. */
+kernel void matmul_w4a8_blk32_dr_a32_rmsnorm_gateup(
+    device const uchar  *w_gate    [[buffer(0)]],
+    device const half   *ws_gate   [[buffer(1)]],
+    device const uchar  *w_up      [[buffer(2)]],
+    device const half   *ws_up     [[buffer(3)]],
+    device const float  *x_in      [[buffer(4)]],   /* residual buffer */
+    device const half   *rms_weight[[buffer(5)]],   /* fp16 rmsnorm gain */
+    device       float  *gate      [[buffer(6)]],
+    device       float  *up        [[buffer(7)]],
+    constant     uint   &M         [[buffer(8)]],   /* intermediate */
+    constant     uint   &N         [[buffer(9)]],   /* hidden */
+    constant     float  &eps       [[buffer(10)]],
+    threadgroup float   *tg_norm   [[threadgroup(0)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint tg_lane = simd_id * 32u + simd_lane;
+
+    /* ── Step 1: Each TG computes the rmsnorm scalar redundantly ── */
+    float local_ss = 0.0f;
+    for (uint i = tg_lane; i < N; i += tg_size) {
+        float v = x_in[i];
+        local_ss += v * v;
+    }
+    float simd_ss = simd_sum(local_ss);
+
+    /* Cross-SIMD reduction via threadgroup memory. */
+    threadgroup float partials_buf[32];   /* up to 32 SGs */
+    if (simd_lane == 0) partials_buf[simd_id] = simd_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float tg_inv_rms;
+    if (simd_id == 0) {
+        float v = (simd_lane < simdgroups_per_tg) ? partials_buf[simd_lane] : 0.0f;
+        float total = simd_sum(v);
+        if (simd_lane == 0) {
+            float mean = total / (float)N;
+            tg_inv_rms = 1.0f / sqrt(mean + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = tg_inv_rms;
+
+    /* ── Step 2: This SG's matmul row ── */
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= 2u * M) return;
+
+    device const uchar *weights;
+    device const half  *w_scales;
+    device       float *out;
+    uint local_m;
+
+    if (m < M) {
+        weights = w_gate; w_scales = ws_gate; out = gate; local_m = m;
+    } else {
+        weights = w_up;   w_scales = ws_up;   out = up;   local_m = m - M;
+    }
+
+    device const uchar *row = weights + (size_t)local_m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)local_m * n_w_blocks;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int g_start = g * IB_W4A8_GROUP;
+
+        for (int blk = 0; blk < 4; blk++) {
+            int blk_start = g_start + blk * 32;
+            uint wb_idx = (uint)(blk_start / 32);
+            float w_scale = (float)row_scales[wb_idx];
+
+            int n = blk_start + (int)simd_lane;
+            if (n < (int)N) {
+                int byte_off = n / 2;
+                uchar byte = row[byte_off];
+                int w = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                 : ((int)(byte & 0x0F) - 8);
+                /* Apply rmsnorm inline: x_norm[n] = x_in[n] * inv_rms * rms_weight[n] */
+                float x_norm = x_in[n] * inv_rms * (float)rms_weight[n];
+                lane_acc += (float)w * w_scale * x_norm;
+            }
+        }
+    }
+
+    /* Mute unused TG-memory arg. */
+    (void)tg_norm;
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[local_m] = total;
+    }
+}
+
 /* matmul_int8_fp32_in_qkv — INT8 Q/K/V fused matmul.
  * Mirrors matmul_w4a8_blk32_dr_a32_qkv but for INT8 weights.
  * Used when q/k/v projections are stored as INT8 (mixed-precision IBFs

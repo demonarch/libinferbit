@@ -554,21 +554,43 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
                 ib_metal_rec_residual_add(r, b->x, b->xb2, hidden);
             }
         }
-        ib_metal_rec_rmsnorm_fp16(r, b->x, lb->post_norm, b->xb, hidden, eps);
-        /* Try fused gate+up matmul. */
-        int rc_gu = -1;
-        if (lb->gate_bits == 4 && lb->gate_blk32
+        /* Optional fused rmsnorm + gate+up via IB_DECODE_FUSE_RMS_GU=1.
+         * Tried but slower (-12%) — the redundant RMSNorm pass across
+         * ~2800 TGs (per-matmul TG count) costs more than the saved
+         * RMSNorm dispatch. Kept available, off by default. */
+        static int fuse_rms_gu_setting = -1;
+        if (fuse_rms_gu_setting < 0) {
+            const char *env = getenv("IB_DECODE_FUSE_RMS_GU");
+            fuse_rms_gu_setting = (env && env[0] == '1') ? 1 : 0;
+        }
+        int rc_rgu = -1;
+        if (fuse_rms_gu_setting
+            && lb->gate_bits == 4 && lb->gate_blk32
             && lb->up_bits == 4 && lb->up_blk32) {
-            rc_gu = ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(r,
-                b->xb,
+            rc_rgu = ib_metal_rec_matmul_w4a8_blk32_dr_a32_rmsnorm_gateup_fp32_in(r,
+                b->x,
+                lb->post_norm,
                 lb->gate_w, lb->gate_s,
                 lb->up_w,   lb->up_s,
                 b->hb, b->hb2,
-                inter, hidden);
+                inter, hidden, eps);
         }
-        if (rc_gu != 0) {
-            rec_matmul(r, lb->gate_bits, lb->gate_blk32, b->xb, lb->gate_w, lb->gate_s, b->hb,  b->xq, b->xs, inter, hidden);
-            rec_matmul(r, lb->up_bits,   lb->up_blk32,   b->xb, lb->up_w,   lb->up_s,   b->hb2, b->xq, b->xs, inter, hidden);
+        if (rc_rgu != 0) {
+            ib_metal_rec_rmsnorm_fp16(r, b->x, lb->post_norm, b->xb, hidden, eps);
+            int rc_gu = -1;
+            if (lb->gate_bits == 4 && lb->gate_blk32
+                && lb->up_bits == 4 && lb->up_blk32) {
+                rc_gu = ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(r,
+                    b->xb,
+                    lb->gate_w, lb->gate_s,
+                    lb->up_w,   lb->up_s,
+                    b->hb, b->hb2,
+                    inter, hidden);
+            }
+            if (rc_gu != 0) {
+                rec_matmul(r, lb->gate_bits, lb->gate_blk32, b->xb, lb->gate_w, lb->gate_s, b->hb,  b->xq, b->xs, inter, hidden);
+                rec_matmul(r, lb->up_bits,   lb->up_blk32,   b->xb, lb->up_w,   lb->up_s,   b->hb2, b->xq, b->xs, inter, hidden);
+            }
         }
         /* Silu+down fusion (IB_DECODE_FUSE_SILU=1) tried but slower
          * (-17%) — redundant exp() across 512 TGs costs more than the

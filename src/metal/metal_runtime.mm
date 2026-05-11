@@ -1979,6 +1979,58 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_qkv_fp32_in(
     return 0;
 }
 
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_rmsnorm_gateup_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_in_fp32,
+    const void *rms_weight_fp16,
+    const void *gate_w, const void *gate_s,
+    const void *up_w,   const void *up_s,
+    void *gate_out, void *up_out,
+    int M, int N, float eps)
+{
+    if (!rec || !x_in_fp32 || !rms_weight_fp16 || !gate_w || !gate_s
+        || !up_w || !up_s || !gate_out || !up_out
+        || M <= 0 || N <= 0) return -1;
+    if ((N % 32) != 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_w4a8_blk32_dr_a32_rmsnorm_gateup");
+    if (!ps) return -1;
+    id<MTLBuffer> b_gw  = rec_pick(rec->ctx, gate_w);
+    id<MTLBuffer> b_gs  = rec_pick(rec->ctx, gate_s);
+    id<MTLBuffer> b_uw  = rec_pick(rec->ctx, up_w);
+    id<MTLBuffer> b_us  = rec_pick(rec->ctx, up_s);
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_in_fp32);
+    id<MTLBuffer> b_rw  = rec_pick(rec->ctx, rms_weight_fp16);
+    id<MTLBuffer> b_g   = rec_pick(rec->ctx, gate_out);
+    id<MTLBuffer> b_u   = rec_pick(rec->ctx, up_out);
+    if (!b_gw || !b_gs || !b_uw || !b_us || !b_x || !b_rw || !b_g || !b_u) return -1;
+    uint M_u = (uint)M, N_u = (uint)N;
+    float eps_v = eps;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_gw  offset:0 atIndex:0];
+    [enc setBuffer:b_gs  offset:0 atIndex:1];
+    [enc setBuffer:b_uw  offset:0 atIndex:2];
+    [enc setBuffer:b_us  offset:0 atIndex:3];
+    [enc setBuffer:b_x   offset:0 atIndex:4];
+    [enc setBuffer:b_rw  offset:0 atIndex:5];
+    [enc setBuffer:b_g   offset:0 atIndex:6];
+    [enc setBuffer:b_u   offset:0 atIndex:7];
+    [enc setBytes:&M_u   length:sizeof(M_u)   atIndex:8];
+    [enc setBytes:&N_u   length:sizeof(N_u)   atIndex:9];
+    [enc setBytes:&eps_v length:sizeof(eps_v) atIndex:10];
+    /* Reserve TG memory (currently unused by the kernel — kept as a
+     * placeholder for future optimizations). */
+    [enc setThreadgroupMemoryLength:64 atIndex:0];
+    const NSUInteger SIMDS_PER_TG = 4;
+    const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+    NSUInteger M_total = 2 * (NSUInteger)M;
+    NSUInteger n_tg = (M_total + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
 extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(
     ib_metal_recorder *rec,
     const void *x_fp32,

@@ -502,6 +502,19 @@ int ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(ib_metal_recorder *rec,
                                                           void *up_out,
                                                           int M, int N);
 
+/* RMSNorm + Gate + Up fused: each TG cooperatively computes the
+ * inverse-RMS scalar from x_in, then uses (x_in * inv_rms * rms_weight)
+ * as the activation for both gate and up matmuls. Saves one explicit
+ * RMSNorm dispatch per layer. */
+int ib_metal_rec_matmul_w4a8_blk32_dr_a32_rmsnorm_gateup_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_in_fp32,
+    const void *rms_weight_fp16,
+    const void *gate_w, const void *gate_s,
+    const void *up_w,   const void *up_s,
+    void *gate_out, void *up_out,
+    int M, int N, float eps);
+
 int ib_metal_rec_softmax_rows(ib_metal_recorder *rec,
                                 void *data_fp32,
                                 int n_rows, int row_len);
