@@ -1681,6 +1681,25 @@ extern "C" int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
         const char *env = getenv("IB_INT8_VEC4");
         vec4_setting = (env && env[0] == '0') ? 0 : 1;
     }
+    /* Opt-in simdmat path for big-M INT8 matmuls (output_head):
+     * IB_INT8_SIMDMAT=1 routes M >= IB_INT8_SIMDMAT_MIN_M (default 16K)
+     * to the simdgroup_matrix kernel. Wastes 7/8 of compute (B=1 padded
+     * to 8 internally) but the matrix unit's higher MAC throughput
+     * can win for the huge output_head. */
+    static int simdmat_setting = -1;
+    static int simdmat_min_m = 0;
+    if (simdmat_setting < 0) {
+        const char *env = getenv("IB_INT8_SIMDMAT");
+        simdmat_setting = (env && env[0] == '1') ? 1 : 0;
+        const char *envm = getenv("IB_INT8_SIMDMAT_MIN_M");
+        simdmat_min_m = envm ? atoi(envm) : 16384;
+        if (simdmat_min_m < 8) simdmat_min_m = 16384;
+    }
+    if (simdmat_setting && M >= simdmat_min_m && (M % 8) == 0 && (N % 128) == 0) {
+        int rc = ib_metal_rec_matmul_int8_fp32_in_simdmat(
+            rec, x_fp32, weights, w_scales, out, M, N);
+        if (rc == 0) return 0;
+    }
     const char *pipe_name = (vec4_setting && (N % 128) == 0)
         ? "matmul_int8_fp32_in_vec4"
         : "matmul_int8_fp32_in";
@@ -1819,6 +1838,40 @@ extern "C" int ib_metal_rec_rope_inplace_batched(ib_metal_recorder *rec,
     const NSUInteger TG = 64;
     [enc dispatchThreads:MTLSizeMake(total_pairs, (NSUInteger)B, 1)
        threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_matmul_int8_fp32_in_simdmat(ib_metal_recorder *rec,
+                                                          const void *x_fp32,
+                                                          const void *weights,
+                                                          const void *w_scales,
+                                                          void *out,
+                                                          int M, int N)
+{
+    if (!rec || !x_fp32 || !weights || !w_scales || !out || M <= 0 || N <= 0) return -1;
+    if ((M % 8) != 0 || (N % 128) != 0) return -2;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_int8_fp32_in_simdmat");
+    if (!ps) return -1;
+    id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
+    id<MTLBuffer> b_ws  = rec_pick(rec->ctx, w_scales);
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_out = rec_pick(rec->ctx, out);
+    if (!b_w || !b_ws || !b_x || !b_out) return -1;
+    uint M_u = (uint)M, N_u = (uint)N;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_w   offset:0 atIndex:0];
+    [enc setBuffer:b_ws  offset:0 atIndex:1];
+    [enc setBuffer:b_x   offset:0 atIndex:2];
+    [enc setBuffer:b_out offset:0 atIndex:3];
+    [enc setBytes:&M_u length:sizeof(M_u) atIndex:4];
+    [enc setBytes:&N_u length:sizeof(N_u) atIndex:5];
+    [enc setThreadgroupMemoryLength:8*128*sizeof(uint16_t) atIndex:0];
+    [enc setThreadgroupMemoryLength:8*128*sizeof(uint16_t) atIndex:1];
+    NSUInteger n_tg = (M + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];   /* 1 SIMDgroup */
     [enc endEncoding];
     return 0;
 }

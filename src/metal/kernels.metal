@@ -386,6 +386,114 @@ kernel void matmul_w4a8_blk32_dr_a32_add(
     }
 }
 
+/* matmul_int8_fp32_in_simdmat — INT8 matmul via Apple's simdgroup_matrix.
+ *
+ * Targets the per-token output_head matmul (M = vocab_size, K = hidden,
+ * B = 1). Uses 1 SIMDgroup per 8-row output tile. The fp16 activation
+ * tile has only the first row populated with real x[k]; the other 7
+ * rows are zero (so 7/8 of the matrix compute is "wasted"). Even with
+ * that waste, the matrix unit can be faster than the scalar dotprod
+ * kernel for the huge output_head.
+ *
+ * Layout: out[m] = scale[m] * sum_k W[m, k] * x[k]  (B=1).
+ *
+ * Grid: (M/8, 1, 1). Requires M%8==0, K%128==0.
+ */
+constant constexpr int IM_M_TILE = 8;
+constant constexpr int IM_K_TILE = 128;
+
+kernel void matmul_int8_fp32_in_simdmat(
+    device const char   *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x         [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    threadgroup half    *tg_W_fp16 [[threadgroup(0)]],   /* [8][128] */
+    threadgroup half    *tg_A_fp16 [[threadgroup(1)]],   /* [8][128] */
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 tg_id     [[threadgroup_position_in_grid]])
+{
+    uint m_base = tg_id * IM_M_TILE;
+    if (m_base >= M) return;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint n_groups = N / IM_K_TILE;
+
+    for (uint g = 0; g < n_groups; g++) {
+        uint k_start = g * IM_K_TILE;
+
+        /* Cooperative dequant: 8 W rows × 128 cols = 1024 elts.
+         * 32 lanes per SG → 32 elts/lane. INT8 → fp16. */
+        for (uint i = simd_lane; i < IM_M_TILE * IM_K_TILE; i += 32u) {
+            uint m_local = i / IM_K_TILE;
+            uint k_local = i % IM_K_TILE;
+            uint m_global = m_base + m_local;
+            uint k_global = k_start + k_local;
+
+            half v = (half)0;
+            if (m_global < M && k_global < N) {
+                char w_int = weights[(size_t)m_global * N + k_global];
+                v = (half)w_int;
+            }
+            tg_W_fp16[i] = v;
+        }
+
+        /* Cooperative load: 1 real activation row + 7 zero rows.
+         * Each lane handles 32 elts. For b_local==0, copy x; else 0. */
+        for (uint i = simd_lane; i < IM_M_TILE * IM_K_TILE; i += 32u) {
+            uint b_local = i / IM_K_TILE;
+            uint k_local = i % IM_K_TILE;
+            uint k_global = k_start + k_local;
+            half v = (half)0;
+            if (b_local == 0u && k_global < N) {
+                v = (half)x[k_global];
+            }
+            tg_A_fp16[i] = v;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* 16 sub-matmuls of K=8 each. */
+        for (uint k_sub = 0; k_sub < IM_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, tg_A_fp16 + k_sub * 8u, IM_K_TILE);
+            simdgroup_load(W_sub_T, tg_W_fp16 + k_sub * 8u, IM_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* C is 8×8 fp32 result. Only ROW 0 is real (B=1 was padded to 8).
+     * We need the row-0 entries (8 values, one per output column m_base+m_local).
+     * simdgroup_store writes the full 8x8 to memory — too wasteful. Instead,
+     * each lane writes its appropriate cell directly.
+     *
+     * Apple's simdgroup_matrix lane→cell mapping isn't part of the public
+     * API, but a common implementation has lane k holding elements (k/8, k%8).
+     * To stay portable, store the full 8x8 to a small TG scratch, then have
+     * lane 0..7 write the row-0 entries to out[m_base..m_base+8]. */
+    /* Reuse the W tile's TG memory as a 8x8 fp32 scratch (32 fp32 = 1024 half;
+     * we have 1024 half allocated = 512 fp32, more than enough for 64 fp32). */
+    threadgroup float *tg_C = (threadgroup float*)tg_W_fp16;
+    simdgroup_store(C, tg_C, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Lane 0..7 each write one output cell using row 0 of C × per-row scale. */
+    if (simd_lane < 8u) {
+        uint m_global = m_base + simd_lane;
+        if (m_global < M) {
+            float c = tg_C[simd_lane];                /* C[0][simd_lane] */
+            float s = (float)w_scales[m_global];
+            out[m_global] = c * s;
+        }
+    }
+}
+
 /* matmul_w4a8_blk32_dr_a32_qkv — Q/K/V fused matmul.
  *
  * Computes Q, K, V projections in one Metal dispatch. The three

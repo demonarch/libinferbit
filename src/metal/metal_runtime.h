@@ -386,6 +386,16 @@ int ib_metal_rec_matmul_int8_fp32_in(ib_metal_recorder *rec,
                                        void *out,
                                        int M, int N);
 
+/* INT8 matmul via simdgroup_matrix (B=1 with internal 8x padding).
+ * Targets the per-token output_head where M is huge. Requires
+ * M%8==0, N%128==0; returns -2 on shape mismatch. */
+int ib_metal_rec_matmul_int8_fp32_in_simdmat(ib_metal_recorder *rec,
+                                               const void *x_fp32,
+                                               const void *weights,
+                                               const void *w_scales,
+                                               void *out,
+                                               int M, int N);
+
 /* Batched INT8 matmul. x is fp32[B][N], out is fp32[B][M]. */
 int ib_metal_rec_matmul_int8_fp32_in_batched(ib_metal_recorder *rec,
                                                const void *x_fp32,
