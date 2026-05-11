@@ -534,6 +534,91 @@ kernel void matmul_w4a8_blk32_dr_a32_silu(
     }
 }
 
+/* matmul_w4a8_blk32_dr_a32_vec4 — vectorized DR_A32 decode kernel.
+ *
+ * Key change from _dr_a32: each lane processes **4 contiguous K
+ * elements** within ONE block (instead of 1 element across 4 blocks).
+ * 8 lanes cover one 32-elt block, 4 blocks × 8 lanes = 32 lanes per
+ * activation group.
+ *
+ *   block_idx     = simd_lane / 8         (0..3 — which block in the group)
+ *   elt_in_block  = (simd_lane & 7) * 4   (0,4,8,...,28 within the block)
+ *
+ * Per outer-group iteration this lane reads:
+ *   - 1 float4 from activations (16 bytes, 16-byte aligned)
+ *   - 1 uchar2 from weights     (2 bytes — 4 packed nibbles)
+ *   - 1 fp16 weight scale       (for this lane's fixed block_idx)
+ *
+ * 4 fma into per-lane fp32 accumulator. One simd_sum at row end.
+ *
+ * Vs DR_A32: 4× fewer loop iterations, half the byte loads (lanes
+ * share weight bytes more efficiently when they read 2 bytes covering
+ * 4 nibbles).
+ */
+kernel void matmul_w4a8_blk32_dr_a32_vec4(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x         [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const uchar *row = weights + (size_t)m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)m * n_w_blocks;
+
+    /* Fixed per-lane mapping. */
+    uint block_idx_in_group = simd_lane >> 3;       /* 0..3 */
+    uint elt_in_block       = (simd_lane & 7u) << 2; /* 0,4,8,...,28 */
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+
+    for (int g = 0; g < n_groups; g++) {
+        int blk_start = g * IB_W4A8_GROUP + (int)(block_idx_in_group * 32u);
+        int n = blk_start + (int)elt_in_block;
+
+        /* Activation: 4 contiguous fp32 values. */
+        device const float4 *x4 = (device const float4*)(x + n);
+        float4 a4 = x4[0];
+
+        /* Weight: 2 packed bytes = 4 nibbles, stored as: byte0 = (n0|n1<<4),
+         *                                              byte1 = (n2|n3<<4).
+         * (Same layout as in the scalar kernel — lower nibble = even n,
+         *  upper nibble = odd n.) */
+        device const uchar2 *w2 = (device const uchar2*)(row + (n >> 1));
+        uchar2 wb = w2[0];
+        int w0 = (int)( wb.x       & 0x0F) - 8;   /* n   even */
+        int w1 = (int)((wb.x >> 4) & 0x0F) - 8;   /* n+1 odd  */
+        int w2i = (int)( wb.y       & 0x0F) - 8;  /* n+2 even */
+        int w3 = (int)((wb.y >> 4) & 0x0F) - 8;   /* n+3 odd  */
+
+        /* Per-block weight scale (same for all 8 lanes covering this block). */
+        float w_scale = (float)row_scales[(uint)(blk_start / 32)];
+
+        float partial = (float)w0  * a4.x
+                      + (float)w1  * a4.y
+                      + (float)w2i * a4.z
+                      + (float)w3  * a4.w;
+
+        lane_acc += partial * w_scale;
+    }
+
+    /* Single cross-lane reduction at row end. */
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[m] = total;
+    }
+}
+
 kernel void matmul_w4a8_blk32_batched(
     device const uchar  *weights   [[buffer(0)]],
     device const half   *w_scales  [[buffer(1)]],

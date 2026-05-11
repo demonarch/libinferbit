@@ -1147,8 +1147,18 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_fp32_in(ib_metal_recorder *rec,
     }
 
     if (a32_setting) {
-        /* Single-dispatch fused path. */
-        id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, "matmul_w4a8_blk32_dr_a32");
+        /* Single-dispatch fused path. Optionally use the vec4 variant
+         * which processes 4 contiguous K elements per lane via float4
+         * loads — IB_DECODE_VEC4=1. */
+        static int vec4_setting = -1;
+        if (vec4_setting < 0) {
+            const char *env = getenv("IB_DECODE_VEC4");
+            vec4_setting = (env && env[0] == '1') ? 1 : 0;
+        }
+        const char *mm_name = (vec4_setting && (N % 128) == 0)
+            ? "matmul_w4a8_blk32_dr_a32_vec4"
+            : "matmul_w4a8_blk32_dr_a32";
+        id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, mm_name);
         if (!ps_mm) return -1;
         id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
         id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
