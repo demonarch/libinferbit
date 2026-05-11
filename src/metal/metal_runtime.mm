@@ -2462,20 +2462,20 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
               threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
         [enc endEncoding];
     }
-    /* 3. Softmax */
-    {
-        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
-        [enc setComputePipelineState:ps_smax];
-        [enc setBuffer:b_s offset:os atIndex:0];
-        [enc setBytes:&p1 length:sizeof(p1) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nh, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc endEncoding];
+    /* 3+4. Fused softmax + weighted_v: one TG per head, softmax row
+     * stays in TG memory across the two phases. Saves one Metal
+     * dispatch per attention block. Toggle via IB_ATTN_FUSE=0 to fall
+     * back to the original two-kernel path. */
+    static int attn_fuse_setting = -1;
+    if (attn_fuse_setting < 0) {
+        const char *env = getenv("IB_ATTN_FUSE");
+        attn_fuse_setting = (env && env[0] == '0') ? 0 : 1;
     }
-    /* 4. Weighted V */
-    {
+    id<MTLComputePipelineState> ps_swv = attn_fuse_setting
+        ? get_pipeline(rec->ctx, "attn_softmax_wv_fp16") : nil;
+    if (ps_swv) {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
-        [enc setComputePipelineState:ps_wv];
+        [enc setComputePipelineState:ps_swv];
         [enc setBuffer:b_s  offset:os  atIndex:0];
         [enc setBuffer:b_vc offset:ovc atIndex:1];
         [enc setBuffer:b_o  offset:oo  atIndex:2];
@@ -2483,12 +2483,39 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
         [enc setBytes:&nkh length:sizeof(nkh) atIndex:4];
         [enc setBytes:&hd length:sizeof(hd) atIndex:5];
         [enc setBytes:&p1 length:sizeof(p1) atIndex:6];
-        const NSUInteger TG = 64;
-        NSUInteger total = (NSUInteger)nh * (NSUInteger)hd;
-        NSUInteger n_tg = (total + TG - 1) / TG;
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
-              threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+        [enc setThreadgroupMemoryLength:(NSUInteger)p1 * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nh, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
+    } else {
+        /* 3. Softmax */
+        {
+            id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+            [enc setComputePipelineState:ps_smax];
+            [enc setBuffer:b_s offset:os atIndex:0];
+            [enc setBytes:&p1 length:sizeof(p1) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nh, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+        /* 4. Weighted V */
+        {
+            id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+            [enc setComputePipelineState:ps_wv];
+            [enc setBuffer:b_s  offset:os  atIndex:0];
+            [enc setBuffer:b_vc offset:ovc atIndex:1];
+            [enc setBuffer:b_o  offset:oo  atIndex:2];
+            [enc setBytes:&nh length:sizeof(nh) atIndex:3];
+            [enc setBytes:&nkh length:sizeof(nkh) atIndex:4];
+            [enc setBytes:&hd length:sizeof(hd) atIndex:5];
+            [enc setBytes:&p1 length:sizeof(p1) atIndex:6];
+            const NSUInteger TG = 64;
+            NSUInteger total = (NSUInteger)nh * (NSUInteger)hd;
+            NSUInteger n_tg = (total + TG - 1) / TG;
+            [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(TG, 1, 1)];
+            [enc endEncoding];
+        }
     }
     return 0;
 }

@@ -2309,6 +2309,109 @@ kernel void attn_weighted_v_batched(
               + (size_t)h * head_dim + d] = acc;
 }
 
+/* attn_softmax_wv_fused — fuses softmax + weighted_v for the fp16-KV
+ * attention block. One TG per query head. Reads pre-computed scores
+ * from device memory, runs softmax in threadgroup memory, then computes
+ * weighted-V output for the same head — all without a cross-kernel
+ * dispatch barrier.
+ *
+ * Saves one Metal dispatch per layer per token (softmax_rows is fused
+ * into this kernel).
+ *
+ * Layout:
+ *   scores      float[n_heads][seq_pos_p1]  in-place (read + softmax)
+ *   v_cache     float[seq_len][kv_dim]       (kv_bits=16 stored as fp32)
+ *   attn_out    float[n_heads][head_dim]
+ *
+ * Threadgroup memory: float[seq_pos_p1] for softmax row. For seq=1024
+ * that's 4 KB per TG — well within limits.
+ */
+kernel void attn_softmax_wv_fp16(
+    device       float *scores      [[buffer(0)]],   /* in-place softmax */
+    device const float *v_cache     [[buffer(1)]],
+    device       float *attn_out    [[buffer(2)]],
+    constant     uint  &n_heads     [[buffer(3)]],
+    constant     uint  &n_kv_heads  [[buffer(4)]],
+    constant     uint  &head_dim    [[buffer(5)]],
+    constant     uint  &seq_pos_p1  [[buffer(6)]],
+    threadgroup float  *tg_row      [[threadgroup(0)]],
+    uint                tg_id       [[threadgroup_position_in_grid]],
+    uint                tid         [[thread_position_in_threadgroup]],
+    uint                lane        [[thread_index_in_simdgroup]],
+    uint                simd_id     [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint TG_THREADS = 256;
+    constexpr uint NUM_SIMDS  = TG_THREADS / 32;
+
+    uint h = tg_id;
+    if (h >= n_heads) return;
+
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_h = h / heads_per_kv;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    device float *s_row = scores + (size_t)h * seq_pos_p1;
+
+    /* ── Step 1: load scores into tg_row + find row max ── */
+    float local_max = -INFINITY;
+    for (uint i = tid; i < seq_pos_p1; i += TG_THREADS) {
+        float v = s_row[i];
+        tg_row[i] = v;
+        if (v > local_max) local_max = v;
+    }
+    float simd_m = simd_max(local_max);
+    threadgroup float partials_max[NUM_SIMDS];
+    if (lane == 0) partials_max[simd_id] = simd_m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float tg_max;
+    if (simd_id == 0) {
+        float v = (lane < NUM_SIMDS) ? partials_max[lane] : -INFINITY;
+        float mv = simd_max(v);
+        if (lane == 0) tg_max = mv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float row_max = tg_max;
+
+    /* ── Step 2: exp(x - max), sum, normalize in tg_row ── */
+    float local_sum = 0.0f;
+    for (uint i = tid; i < seq_pos_p1; i += TG_THREADS) {
+        float e = exp(tg_row[i] - row_max);
+        tg_row[i] = e;
+        local_sum += e;
+    }
+    float simd_s = simd_sum(local_sum);
+    threadgroup float partials_sum[NUM_SIMDS];
+    if (lane == 0) partials_sum[simd_id] = simd_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float tg_sum;
+    if (simd_id == 0) {
+        float v = (lane < NUM_SIMDS) ? partials_sum[lane] : 0.0f;
+        float sv = simd_sum(v);
+        if (lane == 0) tg_sum = sv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / tg_sum;
+
+    for (uint i = tid; i < seq_pos_p1; i += TG_THREADS) {
+        tg_row[i] = tg_row[i] * inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* ── Step 3: weighted-V using normalized scores in TG memory ── */
+    /* Each thread computes one (or more) (h, d) output cell. */
+    for (uint d = tid; d < head_dim; d += TG_THREADS) {
+        float acc = 0.0f;
+        for (uint t = 0; t < seq_pos_p1; t++) {
+            float s = tg_row[t];
+            float v = v_cache[(size_t)t * kv_dim + (size_t)kv_h * head_dim + d];
+            acc += s * v;
+        }
+        attn_out[(size_t)h * head_dim + d] = acc;
+    }
+}
+
 /* ── INT8 KV cache (matches libinferbit kv_bits=8) ────────────────────
  *
  * Layout (mirrors forward.c::kv_cache_write_int8):
