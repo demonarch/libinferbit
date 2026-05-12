@@ -34,6 +34,28 @@ static void cpu_embed_lookup(const inferbit_model *m, int token, float *out) {
     const uint8_t *base = (const uint8_t*)m->weight_data;
     const uint8_t *data_b = base + e->offset;
     const void *scales_raw = e->scale_size ? (const void*)(base + e->scale_offset) : NULL;
+    if (e->pq) {
+        const pqv2_t *pq = e->pq;
+        uint32_t nc = pq->N / pq->G;
+        uint32_t HALF = pq->half;
+        uint32_t K = pq->K;
+        const uint8_t *idx_base = (const uint8_t *)pq->indices;
+        const int8_t  *cb_q  = (const int8_t  *)pq->cb_q;
+        const uint16_t *cb_s = (const uint16_t *)pq->cb_scale;
+        float rs = pq->row_scale ? ib_fp16_to_fp32(((const uint16_t *)pq->row_scale)[token]) : 1.0f;
+        for (uint32_t c = 0; c < nc; c++) {
+            for (uint32_t s = 0; s < pq->n_subchunks; s++) {
+                uint8_t k = idx_base[((size_t)c * pq->n_subchunks + s) * pq->M + token];
+                float scl = ib_fp16_to_fp32(cb_s[s * K + k]) * rs;
+                for (uint32_t h = 0; h < HALF; h++) {
+                    out[c * pq->G + s * HALF + h] =
+                        (float)cb_q[(s * K + k) * HALF + h] * scl;
+                }
+            }
+        }
+        (void)data_b; (void)scales_raw;
+        return;
+    }
     if (e->bits == 16) {
         const uint16_t *row = (const uint16_t*)data_b + (size_t)token * hidden;
         for (int i = 0; i < hidden; i++) out[i] = ib_fp16_to_fp32(row[i]);
