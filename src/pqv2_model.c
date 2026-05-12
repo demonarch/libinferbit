@@ -74,21 +74,36 @@ static int detect_arch_from_tensors(const ib_pqv2_file* f, ib_ibf_header* h) {
     fill_llama_defaults(h);
     h->hidden_size       = hidden;
     h->num_layers        = n_layers;
-    h->num_heads         = q_proj_M / 64;          /* head_dim hardcoded 64 */
-    h->head_dim          = 64;
-    h->num_kv_heads      = v_proj_M ? (v_proj_M / 64) : h->num_heads;
+    /* head_dim heuristic: 128 when hidden > 2048 (Llama-3.1-8B, larger),
+     * else 64. Covers TinyLlama (2048/64=32), Llama-3.2-1B (2048/64=32),
+     * Llama-3.1-8B (4096/128=32). For exotic configs, override the
+     * detection by storing the right header in a future IBF v7. */
+    int head_dim = (hidden > 2048) ? 128 : 64;
+    h->num_heads         = q_proj_M / head_dim;
+    h->head_dim          = head_dim;
+    h->num_kv_heads      = v_proj_M ? (v_proj_M / head_dim) : h->num_heads;
     h->intermediate_size = gate_proj_M ? gate_proj_M : (hidden * 4);
 
-    /* Vocab size — read from token_embedding raw blob. */
+    /* Vocab size — read from token_embedding tensor (PQ-encoded or raw fp16). */
     h->vocab_size = 32000;
     for (int i = 0; i < f->n_tensors; i++) {
         const ib_pqv2_named_tensor* nt = &f->tensors[i];
-        if (nt->kind == IB_PQV2_KIND_PQV2) continue;
-        if (strcmp(nt->name, "token_embedding") == 0) {
-            /* fp16 storage: bytes / (hidden * 2) = vocab_size */
+        if (strcmp(nt->name, "token_embedding") != 0) continue;
+        if (nt->kind == IB_PQV2_KIND_PQV2) {
+            h->vocab_size = (int)nt->pq.M;
+        } else {
+            /* fp16 raw: bytes / (hidden * 2) = vocab_size */
             h->vocab_size = (int)(nt->raw_size / ((size_t)hidden * 2));
-            break;
         }
+        break;
+    }
+
+    /* Architecture-specific overrides keyed on vocab_size signature.
+     * Llama-3 family uses vocab=128256 and rope_theta=500000 with a
+     * much longer max context. */
+    if (h->vocab_size >= 100000) {
+        h->rope_theta          = 500000.0f;
+        h->max_context_length  = 131072;
     }
 
     /* Pretty-print name for debugging. */
