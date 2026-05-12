@@ -603,6 +603,62 @@ void ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *bufs);
  * via model->weight_data after this call. */
 int ib_metal_strip_cpu_mmap(void *inferbit_model);
 
+/* PQv2 K=256 half=2 matvec recorder (the stacked 2D codebook pyramid
+ * differentiator). out[M] = row_scale[m] * sum_{c,s} cb[s][idx[c,s,m]] · x[c*G+s*half : ...].
+ *
+ * Inputs (all GPU buffers obtained from ib_metal_alloc):
+ *   row_scale_fp16: [M] fp16
+ *   cb_fp16:        [n_subchunks * K * half] fp16 (pre-decoded codebooks)
+ *   indices_u8:     [n_chunks * n_subchunks * M] u8 (transposed for coalesced reads)
+ *   x_fp32:         [N] fp32 activation
+ *   out_fp32:       [M] fp32 result
+ *
+ * Requires K=256, half=2 (current production config). G and n_subchunks
+ * are passed as constants. Returns 0 on success. */
+int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
+                                          const void *row_scale_fp16,
+                                          const void *cb_fp16,
+                                          const void *indices_u8,
+                                          const void *x_fp32,
+                                          void *out_fp32,
+                                          int M, int N, int G, int n_subchunks);
+
+/* fp16 weights × fp32 input → fp32 output. Plain matmul for lm_head
+ * when stored as raw fp16 (PQv2 IBFs leave the head un-quantized). */
+int ib_metal_rec_matmul_fp16w_fp32x(ib_metal_recorder *rec,
+                                      const void *x_fp32,
+                                      const void *w_fp16,
+                                      void *out_fp32,
+                                      int M, int N);
+
+/* Fused PQv2 Q+K+V: one dispatch handles three projections sharing the
+ * same fp32 input x. Returns 0 on success. */
+int ib_metal_rec_matmul_pqv2_qkv_k256_half2(ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *q_rs, const void *q_cb, const void *q_idx, void *q_out,
+    const void *k_rs, const void *k_cb, const void *k_idx, void *k_out,
+    const void *v_rs, const void *v_cb, const void *v_idx, void *v_out,
+    int M_q, int M_kv, int N, int G, int n_subchunks);
+
+/* Fused PQv2 gate+up: one dispatch handles both projections sharing the
+ * same fp32 input x. M_io is the shared output dimension. */
+int ib_metal_rec_matmul_pqv2_gateup_k256_half2(ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *g_rs, const void *g_cb, const void *g_idx, void *g_out,
+    const void *u_rs, const void *u_cb, const void *u_idx, void *u_out,
+    int M_io, int N, int G, int n_subchunks);
+
+/* Batched variant for prefill: x is [B][N], out is [B][M]. Each TG
+ * dispatch handles one (m_block, b) pair so LUT-build is per-token. */
+int ib_metal_rec_matmul_pqv2_k256_half2_batched(ib_metal_recorder *rec,
+                                                  const void *row_scale_fp16,
+                                                  const void *cb_fp16,
+                                                  const void *indices_u8,
+                                                  const void *x_fp32,
+                                                  void *out_fp32,
+                                                  int B, int M, int N,
+                                                  int G, int n_subchunks);
+
 /* Forward one token. `cpu_embed_in` is fp32[hidden] — the result of
  * the CPU-side embedding lookup for the current token. `pos` is the
  * absolute token position. `logits_out` receives fp32[vocab].

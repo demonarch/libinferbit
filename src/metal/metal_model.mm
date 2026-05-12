@@ -26,16 +26,35 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
-/* Per-layer GPU buffer set. Each weight tensor's (bits, is_blk32) pair
- * is recorded so the forward dispatcher can pick the right kernel. */
+/* Per-tensor GPU buffer set. EITHER (w, s, bits, blk32) — for INT4/INT8 —
+ * OR (pq_rs, pq_cb, pq_idx, pq_M, pq_N, pq_G, pq_ns) — for PQv2 — is
+ * populated. `is_pq` selects which path the dispatcher uses. */
+struct tensor_bufs {
+    /* INT4/INT8 path */
+    void *w;
+    void *s;
+    int   bits;
+    int   blk32;
+    /* PQv2 path (the stacked 2D codebook pyramid) */
+    int   is_pq;
+    void *pq_rs;        /* [M] fp16 row_scale */
+    void *pq_cb;        /* [n_subchunks * K * half] fp16 pre-decoded codebooks */
+    void *pq_idx;       /* [n_chunks * n_subchunks * M] u8 indices */
+    int   pq_M;
+    int   pq_N;
+    int   pq_G;
+    int   pq_ns;
+};
+
+/* Per-layer GPU buffer set. */
 struct layer_bufs {
-    void *q_w, *q_s;     int q_bits;     int q_blk32;
-    void *k_w, *k_s;     int k_bits;     int k_blk32;
-    void *v_w, *v_s;     int v_bits;     int v_blk32;
-    void *o_w, *o_s;     int o_bits;     int o_blk32;
-    void *gate_w, *gate_s;  int gate_bits;  int gate_blk32;
-    void *up_w,   *up_s;    int up_bits;    int up_blk32;
-    void *down_w, *down_s;  int down_bits;  int down_blk32;
+    struct tensor_bufs q;
+    struct tensor_bufs k;
+    struct tensor_bufs v;
+    struct tensor_bufs o;
+    struct tensor_bufs gate;
+    struct tensor_bufs up;
+    struct tensor_bufs down;
     void *input_norm;
     void *post_norm;
     /* KV cache: layout depends on kv_bits.
@@ -114,16 +133,26 @@ static int model_is_supported(const inferbit_model *m, char *err, size_t err_sz)
     int kvb = m->header.kv_bits;
     CHECK(kvb == 16 || kvb == 8, "Metal forward requires kv_bits=16 or kv_bits=8");
     CHECK(m->output_norm.bits == 16, "output_norm must be fp16");
-    CHECK((m->output_head.bits == 4 || m->output_head.bits == 8) && m->output_head.pq == NULL,
-          "output_head must be INT4 or INT8 without PQ");
+    CHECK((m->output_head.bits == 4 || m->output_head.bits == 8 || m->output_head.bits == 16) && m->output_head.pq == NULL,
+          "output_head must be INT4/INT8/FP16 without PQ");
     for (int L = 0; L < m->header.num_layers; L++) {
         const ib_layer_meta *lm = &m->layers[L];
-        #define BIT4or8(name) \
-            CHECK((lm->name.bits == 4 || lm->name.bits == 8) && lm->name.pq == NULL, \
-                  "layer matmul tensor must be INT4 or INT8 (no PQ): " #name)
-        BIT4or8(q_proj); BIT4or8(k_proj); BIT4or8(v_proj); BIT4or8(o_proj);
-        BIT4or8(gate_proj); BIT4or8(up_proj); BIT4or8(down_proj);
-        #undef BIT4or8
+        /* Accept INT4/INT8 OR PQv2 (K=256, half=2) for each matmul tensor. */
+        #define TENSOR_OK(name) do { \
+            const ib_tensor_meta *tt = &lm->name; \
+            if (tt->pq) { \
+                CHECK(tt->pq->K == 256 && tt->pq->half == 2, \
+                      "PQv2 GPU path requires K=256 and half=2: " #name); \
+                CHECK(tt->pq->l2_kind == 0, \
+                      "PQv2 L2 residual not yet supported on GPU: " #name); \
+            } else { \
+                CHECK(tt->bits == 4 || tt->bits == 8, \
+                      "layer matmul tensor must be INT4/INT8 or PQv2: " #name); \
+            } \
+        } while (0)
+        TENSOR_OK(q_proj); TENSOR_OK(k_proj); TENSOR_OK(v_proj); TENSOR_OK(o_proj);
+        TENSOR_OK(gate_proj); TENSOR_OK(up_proj); TENSOR_OK(down_proj);
+        #undef TENSOR_OK
         CHECK(lm->input_norm.bits == 16,    "input_norm must be fp16");
         CHECK(lm->post_attn_norm.bits == 16, "post_attn_norm must be fp16");
         CHECK(lm->sparsity_mask_size == 0,
@@ -199,6 +228,103 @@ static void upload_norm(ib_metal_ctx *ctx, const inferbit_model *m,
     release_mmap_range(src, t->size);
 }
 
+/* fp16 helper: scalar fp32 → fp16 IEEE 754 round-to-nearest. */
+static inline uint16_t fp32_to_fp16_bits(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000;
+    int      exp  = (int)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFF;
+    if (exp <= 0)  return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+/* PQv2 tensor upload: produces 3 GPU buffers (row_scale, decoded cb,
+ * indices) + metadata. cb is pre-decoded from int8+scale → fp16 once on
+ * the CPU so the kernel skips the dequant. */
+static void upload_pqv2_tensor(ib_metal_ctx *ctx, const pqv2_t *pq,
+                                struct tensor_bufs *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->is_pq = 1;
+    out->pq_M  = (int)pq->M;
+    out->pq_N  = (int)pq->N;
+    out->pq_G  = (int)pq->G;
+    out->pq_ns = (int)pq->n_subchunks;
+
+    /* row_scale is already fp16 (stored as uint16_t). Upload as-is. */
+    out->pq_rs = ib_metal_alloc(ctx, (size_t)pq->M * sizeof(uint16_t), pq->row_scale);
+
+    /* Decode codebooks: cb_q (int8) * cb_scale (fp16, per-K) → fp16 cb[ns][K][half]. */
+    size_t cb_elts  = (size_t)pq->n_subchunks * pq->K * pq->half;
+    size_t cb_bytes = cb_elts * sizeof(uint16_t);
+    uint16_t *cb_fp16 = (uint16_t *)malloc(cb_bytes);
+    if (!cb_fp16) { fprintf(stderr, "upload_pqv2_tensor: oom\n"); return; }
+    for (uint32_t s = 0; s < pq->n_subchunks; s++) {
+        for (uint32_t k = 0; k < pq->K; k++) {
+            /* cb_scale stored as raw uint16 fp16 — convert via union/memcpy. */
+            uint16_t scl_bits = pq->cb_scale[s * pq->K + k];
+            uint32_t bits32 =
+                ((scl_bits & 0x8000u) << 16) |
+                ((((uint32_t)(scl_bits & 0x7C00u) >> 10) + 0x70u) << 23) |
+                ((uint32_t)(scl_bits & 0x03FFu) << 13);
+            /* zero / denorm / inf handling */
+            if ((scl_bits & 0x7FFFu) == 0) bits32 = (uint32_t)(scl_bits & 0x8000u) << 16;
+            else if ((scl_bits & 0x7C00u) == 0x7C00u) bits32 = ((uint32_t)(scl_bits & 0x8000u) << 16) | 0x7F800000u;
+            float scl;
+            memcpy(&scl, &bits32, 4);
+            for (uint32_t h = 0; h < pq->half; h++) {
+                int8_t q = pq->cb_q[(s * pq->K + k) * pq->half + h];
+                float v = (float)q * scl;
+                cb_fp16[(s * pq->K + k) * pq->half + h] = fp32_to_fp16_bits(v);
+            }
+        }
+    }
+    out->pq_cb = ib_metal_alloc(ctx, cb_bytes, cb_fp16);
+    free(cb_fp16);
+
+    /* Indices on disk are [n_chunks][n_subchunks][M] u8 (laid out by the
+     * Python writer). For the GPU SIMD kernel we transpose to [M][total]
+     * where total = n_chunks * n_subchunks. This makes the inner-loop
+     * `indices[m * total + i]` reads coalesced within a SIMDgroup (32
+     * lanes, each consuming i = lane, lane+32, ...). */
+    uint32_t total = (uint32_t)((pq->N / pq->G) * pq->n_subchunks);
+    size_t idx_bytes = (size_t)pq->M * total;
+    uint8_t *idx_t = (uint8_t *)malloc(idx_bytes);
+    if (!idx_t) { fprintf(stderr, "upload_pqv2_tensor: oom on indices\n"); return; }
+    {
+        const uint8_t *src = (const uint8_t *)pq->indices; /* [nc][ns][M] */
+        uint32_t nc = pq->N / pq->G;
+        for (uint32_t m = 0; m < pq->M; m++) {
+            for (uint32_t c = 0; c < nc; c++) {
+                for (uint32_t s = 0; s < pq->n_subchunks; s++) {
+                    idx_t[(size_t)m * total + c * pq->n_subchunks + s] =
+                        src[((size_t)c * pq->n_subchunks + s) * pq->M + m];
+                }
+            }
+        }
+    }
+    out->pq_idx = ib_metal_alloc(ctx, idx_bytes, idx_t);
+    free(idx_t);
+}
+
+/* Unified tensor upload: PQv2 if t->pq is set, else INT4/INT8 (w + s).
+ * Releases mmap pages for the source bytes after copy. */
+static void upload_tensor(ib_metal_ctx *ctx, const inferbit_model *m,
+                           const ib_tensor_meta *t, struct tensor_bufs *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (t->pq) {
+        upload_pqv2_tensor(ctx, t->pq, out);
+        return;
+    }
+    upload_w_pair(ctx, m, t, &out->w, &out->s);
+    out->bits  = t->bits;
+    out->blk32 = (t->bits == 4 && t->scale_size > (size_t)t->shape[0] * 2);
+    out->is_pq = 0;
+}
+
 extern "C" ib_metal_model_buffers *
 ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
 {
@@ -253,13 +379,13 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
         /* For each INT4 weight tensor, detect per-block-32 layout via
          * scale_size > rows * 2. shape[0] is the row count. */
         #define IS_BLK32(t) ((t).bits == 4 && (t).scale_size > (size_t)(t).shape[0] * 2)
-        upload_w_pair(ctx, m, &lm->q_proj,    &lb->q_w,    &lb->q_s);    lb->q_bits    = lm->q_proj.bits;    lb->q_blk32    = IS_BLK32(lm->q_proj);
-        upload_w_pair(ctx, m, &lm->k_proj,    &lb->k_w,    &lb->k_s);    lb->k_bits    = lm->k_proj.bits;    lb->k_blk32    = IS_BLK32(lm->k_proj);
-        upload_w_pair(ctx, m, &lm->v_proj,    &lb->v_w,    &lb->v_s);    lb->v_bits    = lm->v_proj.bits;    lb->v_blk32    = IS_BLK32(lm->v_proj);
-        upload_w_pair(ctx, m, &lm->o_proj,    &lb->o_w,    &lb->o_s);    lb->o_bits    = lm->o_proj.bits;    lb->o_blk32    = IS_BLK32(lm->o_proj);
-        upload_w_pair(ctx, m, &lm->gate_proj, &lb->gate_w, &lb->gate_s); lb->gate_bits = lm->gate_proj.bits; lb->gate_blk32 = IS_BLK32(lm->gate_proj);
-        upload_w_pair(ctx, m, &lm->up_proj,   &lb->up_w,   &lb->up_s);   lb->up_bits   = lm->up_proj.bits;   lb->up_blk32   = IS_BLK32(lm->up_proj);
-        upload_w_pair(ctx, m, &lm->down_proj, &lb->down_w, &lb->down_s); lb->down_bits = lm->down_proj.bits; lb->down_blk32 = IS_BLK32(lm->down_proj);
+        upload_tensor(ctx, m, &lm->q_proj,    &lb->q);
+        upload_tensor(ctx, m, &lm->k_proj,    &lb->k);
+        upload_tensor(ctx, m, &lm->v_proj,    &lb->v);
+        upload_tensor(ctx, m, &lm->o_proj,    &lb->o);
+        upload_tensor(ctx, m, &lm->gate_proj, &lb->gate);
+        upload_tensor(ctx, m, &lm->up_proj,   &lb->up);
+        upload_tensor(ctx, m, &lm->down_proj, &lb->down);
         #undef IS_BLK32
         upload_norm  (ctx, m, &lm->input_norm,     &lb->input_norm);
         upload_norm  (ctx, m, &lm->post_attn_norm, &lb->post_norm);
@@ -403,13 +529,13 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     #define FR(p) do { if (p) ib_metal_free(ctx, p); } while (0)
     for (int L = 0; L < b->num_layers; L++) {
         struct layer_bufs *lb = &b->layers[L];
-        FR(lb->q_w); FR(lb->q_s);
-        FR(lb->k_w); FR(lb->k_s);
-        FR(lb->v_w); FR(lb->v_s);
-        FR(lb->o_w); FR(lb->o_s);
-        FR(lb->gate_w); FR(lb->gate_s);
-        FR(lb->up_w);   FR(lb->up_s);
-        FR(lb->down_w); FR(lb->down_s);
+        #define FREE_TB(tb) do { \
+            FR((tb).w); FR((tb).s); \
+            FR((tb).pq_rs); FR((tb).pq_cb); FR((tb).pq_idx); \
+        } while (0)
+        FREE_TB(lb->q); FREE_TB(lb->k); FREE_TB(lb->v); FREE_TB(lb->o);
+        FREE_TB(lb->gate); FREE_TB(lb->up); FREE_TB(lb->down);
+        #undef FREE_TB
         FR(lb->input_norm);
         FR(lb->post_norm);
         FR(lb->k_cache); FR(lb->v_cache);
@@ -465,8 +591,28 @@ static int rec_matmul(ib_metal_recorder *r,
     } else if (bits == 8) {
         return ib_metal_rec_matmul_int8_fp32_in(r, x_fp32, weights, w_scales,
                                                   out, M, N);
+    } else if (bits == 16) {
+        return ib_metal_rec_matmul_fp16w_fp32x(r, x_fp32, weights, out, M, N);
     }
     return -1;
+}
+
+/* PQv2-aware matmul dispatch — pick PQv2 kernel when tensor is PQ-encoded,
+ * else fall through to the INT4/INT8 path. M and N are the matmul shape
+ * (caller's responsibility). */
+static int rec_matmul_tb(ib_metal_recorder *r,
+                          const struct tensor_bufs *tb,
+                          const void *x_fp32,
+                          void *out, void *xq, void *xs,
+                          int M, int N)
+{
+    if (tb->is_pq) {
+        return ib_metal_rec_matmul_pqv2_k256_half2(r,
+            tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+            tb->pq_M, tb->pq_N, tb->pq_G, tb->pq_ns);
+    }
+    return rec_matmul(r, tb->bits, tb->blk32, x_fp32, tb->w, tb->s,
+                       out, xq, xs, M, N);
 }
 
 extern "C" int
@@ -503,29 +649,42 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
          * matmuls otherwise. */
         int rc_qkv = -1;
         int qh = b->n_heads * b->head_dim;
-        if (lb->q_bits == 4 && lb->q_blk32
-            && lb->k_bits == 4 && lb->k_blk32
-            && lb->v_bits == 4 && lb->v_blk32) {
+        if (!lb->q.is_pq && !lb->k.is_pq && !lb->v.is_pq
+            && lb->q.bits == 4 && lb->q.blk32
+            && lb->k.bits == 4 && lb->k.blk32
+            && lb->v.bits == 4 && lb->v.blk32) {
             rc_qkv = ib_metal_rec_matmul_w4a8_blk32_dr_a32_qkv_fp32_in(r,
                 b->xb,
-                lb->q_w, lb->q_s,
-                lb->k_w, lb->k_s,
-                lb->v_w, lb->v_s,
+                lb->q.w, lb->q.s,
+                lb->k.w, lb->k.s,
+                lb->v.w, lb->v.s,
                 b->q, b->k, b->v,
                 qh, kv_dim, hidden);
-        } else if (lb->q_bits == 8 && lb->k_bits == 8 && lb->v_bits == 8) {
+        } else if (lb->q.is_pq && lb->k.is_pq && lb->v.is_pq
+                   && lb->q.pq_M == qh && lb->k.pq_M == kv_dim && lb->v.pq_M == kv_dim
+                   && lb->q.pq_N == hidden && lb->k.pq_N == hidden && lb->v.pq_N == hidden
+                   && lb->q.pq_G == lb->k.pq_G && lb->q.pq_G == lb->v.pq_G
+                   && lb->q.pq_ns == lb->k.pq_ns && lb->q.pq_ns == lb->v.pq_ns) {
+            rc_qkv = ib_metal_rec_matmul_pqv2_qkv_k256_half2(r,
+                b->xb,
+                lb->q.pq_rs, lb->q.pq_cb, lb->q.pq_idx, b->q,
+                lb->k.pq_rs, lb->k.pq_cb, lb->k.pq_idx, b->k,
+                lb->v.pq_rs, lb->v.pq_cb, lb->v.pq_idx, b->v,
+                qh, kv_dim, hidden, lb->q.pq_G, lb->q.pq_ns);
+        } else if (!lb->q.is_pq && !lb->k.is_pq && !lb->v.is_pq
+                   && lb->q.bits == 8 && lb->k.bits == 8 && lb->v.bits == 8) {
             rc_qkv = ib_metal_rec_matmul_int8_fp32_in_qkv(r,
                 b->xb,
-                lb->q_w, lb->q_s,
-                lb->k_w, lb->k_s,
-                lb->v_w, lb->v_s,
+                lb->q.w, lb->q.s,
+                lb->k.w, lb->k.s,
+                lb->v.w, lb->v.s,
                 b->q, b->k, b->v,
                 qh, kv_dim, hidden);
         }
         if (rc_qkv != 0) {
-            rec_matmul(r, lb->q_bits, lb->q_blk32, b->xb, lb->q_w, lb->q_s, b->q, b->xq, b->xs, hidden, hidden);
-            rec_matmul(r, lb->k_bits, lb->k_blk32, b->xb, lb->k_w, lb->k_s, b->k, b->xq, b->xs, kv_dim, hidden);
-            rec_matmul(r, lb->v_bits, lb->v_blk32, b->xb, lb->v_w, lb->v_s, b->v, b->xq, b->xs, kv_dim, hidden);
+            rec_matmul_tb(r, &lb->q, b->xb, b->q, b->xq, b->xs, hidden, hidden);
+            rec_matmul_tb(r, &lb->k, b->xb, b->k, b->xq, b->xs, kv_dim, hidden);
+            rec_matmul_tb(r, &lb->v, b->xb, b->v, b->xq, b->xs, kv_dim, hidden);
         }
         ib_metal_rec_rope_inplace_qk(r, b->q, b->k, nh, nkh, hd, pos, th);
         if (b->kv_bits == 16) {
@@ -542,15 +701,15 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
         }
         /* Try fused o_proj+residual: matmul writes x += attn_out·o_w.
          * Saves one residual_add dispatch per layer. Falls back to the
-         * 2-step path for non-blk32 IBFs. */
+         * 2-step path for non-blk32 / PQv2 IBFs. */
         {
             int rc_o = -1;
-            if (lb->o_bits == 4 && lb->o_blk32) {
+            if (!lb->o.is_pq && lb->o.bits == 4 && lb->o.blk32) {
                 rc_o = ib_metal_rec_matmul_w4a8_blk32_dr_a32_add_fp32_in(
-                    r, b->attn_out, lb->o_w, lb->o_s, b->x, hidden, hidden);
+                    r, b->attn_out, lb->o.w, lb->o.s, b->x, hidden, hidden);
             }
             if (rc_o != 0) {
-                rec_matmul(r, lb->o_bits, lb->o_blk32, b->attn_out, lb->o_w, lb->o_s, b->xb2, b->xq, b->xs, hidden, hidden);
+                rec_matmul_tb(r, &lb->o, b->attn_out, b->xb2, b->xq, b->xs, hidden, hidden);
                 ib_metal_rec_residual_add(r, b->x, b->xb2, hidden);
             }
         }
@@ -565,31 +724,41 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
         }
         int rc_rgu = -1;
         if (fuse_rms_gu_setting
-            && lb->gate_bits == 4 && lb->gate_blk32
-            && lb->up_bits == 4 && lb->up_blk32) {
+            && !lb->gate.is_pq && lb->gate.bits == 4 && lb->gate.blk32
+            && !lb->up.is_pq && lb->up.bits == 4 && lb->up.blk32) {
             rc_rgu = ib_metal_rec_matmul_w4a8_blk32_dr_a32_rmsnorm_gateup_fp32_in(r,
                 b->x,
                 lb->post_norm,
-                lb->gate_w, lb->gate_s,
-                lb->up_w,   lb->up_s,
+                lb->gate.w, lb->gate.s,
+                lb->up.w,   lb->up.s,
                 b->hb, b->hb2,
                 inter, hidden, eps);
         }
         if (rc_rgu != 0) {
             ib_metal_rec_rmsnorm_fp16(r, b->x, lb->post_norm, b->xb, hidden, eps);
             int rc_gu = -1;
-            if (lb->gate_bits == 4 && lb->gate_blk32
-                && lb->up_bits == 4 && lb->up_blk32) {
+            if (!lb->gate.is_pq && lb->gate.bits == 4 && lb->gate.blk32
+                && !lb->up.is_pq && lb->up.bits == 4 && lb->up.blk32) {
                 rc_gu = ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(r,
                     b->xb,
-                    lb->gate_w, lb->gate_s,
-                    lb->up_w,   lb->up_s,
+                    lb->gate.w, lb->gate.s,
+                    lb->up.w,   lb->up.s,
                     b->hb, b->hb2,
                     inter, hidden);
+            } else if (lb->gate.is_pq && lb->up.is_pq
+                       && lb->gate.pq_M == inter && lb->up.pq_M == inter
+                       && lb->gate.pq_N == hidden && lb->up.pq_N == hidden
+                       && lb->gate.pq_G == lb->up.pq_G
+                       && lb->gate.pq_ns == lb->up.pq_ns) {
+                rc_gu = ib_metal_rec_matmul_pqv2_gateup_k256_half2(r,
+                    b->xb,
+                    lb->gate.pq_rs, lb->gate.pq_cb, lb->gate.pq_idx, b->hb,
+                    lb->up.pq_rs,   lb->up.pq_cb,   lb->up.pq_idx,   b->hb2,
+                    inter, hidden, lb->gate.pq_G, lb->gate.pq_ns);
             }
             if (rc_gu != 0) {
-                rec_matmul(r, lb->gate_bits, lb->gate_blk32, b->xb, lb->gate_w, lb->gate_s, b->hb,  b->xq, b->xs, inter, hidden);
-                rec_matmul(r, lb->up_bits,   lb->up_blk32,   b->xb, lb->up_w,   lb->up_s,   b->hb2, b->xq, b->xs, inter, hidden);
+                rec_matmul_tb(r, &lb->gate, b->xb, b->hb,  b->xq, b->xs, inter, hidden);
+                rec_matmul_tb(r, &lb->up,   b->xb, b->hb2, b->xq, b->xs, inter, hidden);
             }
         }
         /* Silu+down fusion (IB_DECODE_FUSE_SILU=1) tried but slower
@@ -601,20 +770,20 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
             fuse_silu_setting = (env && env[0] == '1') ? 1 : 0;
         }
         int fused_rc = -1;
-        if (fuse_silu_setting && lb->down_bits == 4 && lb->down_blk32) {
+        if (fuse_silu_setting && !lb->down.is_pq && lb->down.bits == 4 && lb->down.blk32) {
             fused_rc = ib_metal_rec_matmul_w4a8_blk32_dr_a32_silu_fp32_in(
-                r, b->hb, b->hb2, lb->down_w, lb->down_s, b->xb, hidden, inter);
+                r, b->hb, b->hb2, lb->down.w, lb->down.s, b->xb, hidden, inter);
         }
         if (fused_rc != 0) {
             ib_metal_rec_silu_mul(r, b->hb, b->hb2, b->hb, inter);
             /* Fused down_proj+residual: writes x += hb·down_w. */
             int rc_d = -1;
-            if (lb->down_bits == 4 && lb->down_blk32) {
+            if (!lb->down.is_pq && lb->down.bits == 4 && lb->down.blk32) {
                 rc_d = ib_metal_rec_matmul_w4a8_blk32_dr_a32_add_fp32_in(
-                    r, b->hb, lb->down_w, lb->down_s, b->x, hidden, inter);
+                    r, b->hb, lb->down.w, lb->down.s, b->x, hidden, inter);
             }
             if (rc_d != 0) {
-                rec_matmul(r, lb->down_bits, lb->down_blk32, b->hb, lb->down_w, lb->down_s, b->xb, b->xq, b->xs, hidden, inter);
+                rec_matmul_tb(r, &lb->down, b->hb, b->xb, b->xq, b->xs, hidden, inter);
                 ib_metal_rec_residual_add(r, b->x, b->xb, hidden);
             }
         }
@@ -642,6 +811,22 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
  * deduplicates same-row weight loads across SIMD groups in the same
  * threadgroup, so explicit shared memory just adds barrier overhead.
  * Kept around because it may help on other Apple GPUs / batch sizes. */
+/* Batched PQv2-or-INT matmul dispatch. PQv2 path dispatched when tb is
+ * non-NULL and is_pq is set; otherwise the int-bits path runs. */
+static int rec_matmul_batched_tb(ib_metal_recorder *r,
+                                  const struct tensor_bufs *tb,
+                                  const void *x_fp32,
+                                  void *out, void *xq, void *xs,
+                                  int B, int M, int N)
+{
+    if (tb && tb->is_pq) {
+        return ib_metal_rec_matmul_pqv2_k256_half2_batched(r,
+            tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+            B, M, N, tb->pq_G, tb->pq_ns);
+    }
+    return -1;  /* caller falls through to bits-based variant */
+}
+
 static int rec_matmul_batched(ib_metal_recorder *r,
                                 int bits, int blk32,
                                 const void *x_fp32,
@@ -720,8 +905,10 @@ static int model_supports_batched_prefill(const ib_metal_model_buffers *b) {
     for (int L = 0; L < b->num_layers; L++) {
         const struct layer_bufs *lb = &b->layers[L];
         #define CHK(NAME) do { \
-            int bits = lb->NAME##_bits; \
-            int blk32 = lb->NAME##_blk32; \
+            const struct tensor_bufs *tb = &lb->NAME; \
+            if (tb->is_pq) break; /* PQv2 batched kernel exists */ \
+            int bits = tb->bits; \
+            int blk32 = tb->blk32; \
             if (bits != 8 && !(bits == 4 && blk32)) return 0; \
         } while (0)
         CHK(q); CHK(k); CHK(v); CHK(o); CHK(gate); CHK(up); CHK(down);
@@ -769,13 +956,16 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         ib_metal_rec_rmsnorm_fp16_batched(r,
             b->x_b, lb->input_norm, b->xb_b, B, hidden, eps);
 
-        /* Batched Q/K/V matmul (INT4 blk32 or INT8) */
-        rec_matmul_batched(r, lb->q_bits, lb->q_blk32, b->xb_b,
-            lb->q_w, lb->q_s, b->q_b, b->xq_b, b->xs_b, B, qh, hidden);
-        rec_matmul_batched(r, lb->k_bits, lb->k_blk32, b->xb_b,
-            lb->k_w, lb->k_s, b->k_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
-        rec_matmul_batched(r, lb->v_bits, lb->v_blk32, b->xb_b,
-            lb->v_w, lb->v_s, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
+        /* Batched Q/K/V matmul (PQv2 or INT4 blk32 / INT8) */
+        if (rec_matmul_batched_tb(r, &lb->q, b->xb_b, b->q_b, b->xq_b, b->xs_b, B, qh, hidden) != 0)
+            rec_matmul_batched(r, lb->q.bits, lb->q.blk32, b->xb_b,
+                lb->q.w, lb->q.s, b->q_b, b->xq_b, b->xs_b, B, qh, hidden);
+        if (rec_matmul_batched_tb(r, &lb->k, b->xb_b, b->k_b, b->xq_b, b->xs_b, B, kv_dim, hidden) != 0)
+            rec_matmul_batched(r, lb->k.bits, lb->k.blk32, b->xb_b,
+                lb->k.w, lb->k.s, b->k_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
+        if (rec_matmul_batched_tb(r, &lb->v, b->xb_b, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden) != 0)
+            rec_matmul_batched(r, lb->v.bits, lb->v.blk32, b->xb_b,
+                lb->v.w, lb->v.s, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
 
         /* Batched RoPE: each row b at pos = start_pos + b */
         ib_metal_rec_rope_inplace_batched(r, b->q_b, B, nh,  hd, start_pos, th);
@@ -809,8 +999,9 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         }
 
         /* Batched O matmul: attn_out_b -> xb2_b */
-        rec_matmul_batched(r, lb->o_bits, lb->o_blk32, b->attn_out_b,
-            lb->o_w, lb->o_s, b->xb2_b, b->xq_b, b->xs_b, B, hidden, qh);
+        if (rec_matmul_batched_tb(r, &lb->o, b->attn_out_b, b->xb2_b, b->xq_b, b->xs_b, B, hidden, qh) != 0)
+            rec_matmul_batched(r, lb->o.bits, lb->o.blk32, b->attn_out_b,
+                lb->o.w, lb->o.s, b->xb2_b, b->xq_b, b->xs_b, B, hidden, qh);
 
         /* Batched residual: x_b += xb2_b */
         ib_metal_rec_residual_add_batched(r, b->x_b, b->xb2_b, B, hidden);
@@ -820,17 +1011,20 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
             b->x_b, lb->post_norm, b->xb_b, B, hidden, eps);
 
         /* Batched gate / up matmul */
-        rec_matmul_batched(r, lb->gate_bits, lb->gate_blk32, b->xb_b,
-            lb->gate_w, lb->gate_s, b->hb_b,  b->xq_b, b->xs_b, B, inter, hidden);
-        rec_matmul_batched(r, lb->up_bits, lb->up_blk32, b->xb_b,
-            lb->up_w,   lb->up_s,   b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden);
+        if (rec_matmul_batched_tb(r, &lb->gate, b->xb_b, b->hb_b, b->xq_b, b->xs_b, B, inter, hidden) != 0)
+            rec_matmul_batched(r, lb->gate.bits, lb->gate.blk32, b->xb_b,
+                lb->gate.w, lb->gate.s, b->hb_b,  b->xq_b, b->xs_b, B, inter, hidden);
+        if (rec_matmul_batched_tb(r, &lb->up, b->xb_b, b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden) != 0)
+            rec_matmul_batched(r, lb->up.bits, lb->up.blk32, b->xb_b,
+                lb->up.w,   lb->up.s,   b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden);
 
         /* Batched silu_mul: hb_b = silu(hb_b) * hb2_b */
         ib_metal_rec_silu_mul_batched(r, b->hb_b, b->hb2_b, b->hb_b, B, inter);
 
         /* Batched down matmul: hb_b -> xb_b */
-        rec_matmul_batched(r, lb->down_bits, lb->down_blk32, b->hb_b,
-            lb->down_w, lb->down_s, b->xb_b, b->xq_b, b->xs_b, B, hidden, inter);
+        if (rec_matmul_batched_tb(r, &lb->down, b->hb_b, b->xb_b, b->xq_b, b->xs_b, B, hidden, inter) != 0)
+            rec_matmul_batched(r, lb->down.bits, lb->down.blk32, b->hb_b,
+                lb->down.w, lb->down.s, b->xb_b, b->xq_b, b->xs_b, B, hidden, inter);
 
         /* Batched residual: x_b += xb_b */
         ib_metal_rec_residual_add_batched(r, b->x_b, b->xb_b, B, hidden);

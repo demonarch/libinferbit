@@ -2702,3 +2702,394 @@ kernel void attn_weighted_v(
     }
     attn_out[(size_t)h * head_dim + d] = acc;
 }
+
+/* ── PQv2 K=256 matvec — stacked 2D codebook pyramid (L1-only path) ──
+ *
+ * The PQv2 differentiator: weights are not stored as packed nibbles or
+ * INT8 values, but as small per-(chunk, subchunk) codebooks of K=256
+ * entries + uint8 indices into them. For half=2 (the production config),
+ * each codebook entry is a 2-element vector (4 bytes), so the LUT-build
+ * per (c, s) is just 256 × (2-mul + 2-add) ≈ 1024 fp ops — fundamentally
+ * cheaper than a full M-row matmul, and the cost is amortized over all M
+ * output rows that gather from the same LUT.
+ *
+ * Algorithm per output row m:
+ *   out[m] = row_scale[m] * sum over (c, s) of  cb[s][indices[c,s,m]] · x[c*G+s*half : c*G+(s+1)*half]
+ *
+ * Tile layout (this kernel — basic, no L2):
+ *   1 TG per M_BLOCK output rows (M_BLOCK = tg_threads, e.g. 64).
+ *   Per TG, iterate all (chunk c, subchunk s) sequentially.
+ *   Per (c, s): cooperatively build LUT[K=256] in threadgroup memory
+ *   (32 lanes × 8 entries = 256), then each thread gathers its row's
+ *   index from LUT and accumulates into its private accumulator.
+ *
+ * Memory:
+ *   cb_fp16  [n_subchunks][K][half]   — pre-decoded fp16 (uploaded once)
+ *   indices  [n_chunks][n_subchunks][M] uint8 (TRANSPOSED for coalesced reads)
+ *   x        [N] fp32 activation
+ *   out      [M] fp32 result
+ *   row_scale[M] fp16
+ *
+ * Constants assumed: K=256, half=2 (current production PQv2 config).
+ * Other shapes (different K, half, with L2) will need additional kernels.
+ *
+ * Performance: gather is hardware-accelerated on Apple GPU (TG memory
+ * lookup is ~1-cycle/lane). Compute per (c, s, m) is ~3 fp ops. Total
+ * compute = nc × ns × M × ~3 + nc × ns × K × half (LUT build).
+ *
+ * For TinyLlama [2048, 2048] with G=32, ns=16, half=2, K=256:
+ *   nc = 64 → 64 × 16 = 1024 (c,s) iterations
+ *   LUT build per iter: 256 × 2 = 512 ops (amortized over all M)
+ *   Gather per iter: 2048 fp ops (1 per m)
+ *   Total per matmul: ~2.6M ops vs ~4.2M ops for the same INT4 matmul.
+ */
+/* SIMDgroup-cooperative no-LUT PQv2 decode.
+ *
+ * Each output row is handled by one 32-lane SIMDgroup. The (c, s) loop
+ * is striped across lanes: lane=0..15 process s=lane for the even c's,
+ * lane=16..31 process s=lane-16 for the odd c's. After 32 iters per
+ * lane (total = nc*ns / 32 for nc=64, ns=16: 32), simd_sum reduces.
+ *
+ * Indices are pre-transposed by upload_pqv2_tensor to [M][total]
+ * layout so that consecutive lanes read consecutive bytes
+ * (coalesced). Vector loads (half2 for cb, float2 for x) reduce
+ * memory transactions.
+ *
+ * Threadgroup memory: none (no LUT, no barrier). */
+kernel void matmul_pqv2_k256_half2(
+    device const half  *row_scale  [[buffer(0)]],   /* [M] */
+    device const half  *cb_fp16    [[buffer(1)]],   /* [ns][K=256][2] */
+    device const uchar *indices    [[buffer(2)]],   /* [M][total] u8 */
+    device const float *x          [[buffer(3)]],   /* [N] */
+    device       float *out        [[buffer(4)]],   /* [M] */
+    constant     uint  &M          [[buffer(5)]],
+    constant     uint  &N          [[buffer(6)]],
+    constant     uint  &G          [[buffer(7)]],
+    constant     uint  &n_subchunks[[buffer(8)]],
+    uint                tg_id      [[threadgroup_position_in_grid]],
+    uint                sg_id      [[simdgroup_index_in_threadgroup]],
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                sgs_per_tg [[simdgroups_per_threadgroup]])
+{
+    uint my_m = tg_id * sgs_per_tg + sg_id;
+    if (my_m >= M) return;
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint half_total = total >> 1u;
+
+    device const uchar *idx_row = indices + (size_t)my_m * total;
+    float acc = 0.0f;
+
+    /* 2-way manual unroll for ILP: each lane runs two independent
+     * idx→cb→mul-add chains concurrently so the GPU can hide global-load
+     * latency behind useful work. */
+    for (uint i = lane; i < half_total; i += 32u) {
+        uint i2 = i + half_total;
+        uint c0, s0, c1, s1;
+        if (n_subchunks == 16u) {
+            c0 = i  >> 4u; s0 = i  & 15u;
+            c1 = i2 >> 4u; s1 = i2 & 15u;
+        } else {
+            c0 = i  / n_subchunks; s0 = i  - c0 * n_subchunks;
+            c1 = i2 / n_subchunks; s1 = i2 - c1 * n_subchunks;
+        }
+
+        uint k0 = (uint)idx_row[i];
+        uint k1 = (uint)idx_row[i2];
+        float2 xv0 = *((device const float2 *)(x + c0 * G + s0 * HALF));
+        float2 xv1 = *((device const float2 *)(x + c1 * G + s1 * HALF));
+        device const half2 *cb_s0 = (device const half2 *)(cb_fp16 + (size_t)s0 * K * HALF);
+        device const half2 *cb_s1 = (device const half2 *)(cb_fp16 + (size_t)s1 * K * HALF);
+        half2 vv0 = cb_s0[k0];
+        half2 vv1 = cb_s1[k1];
+        acc += (float)vv0.x * xv0.x + (float)vv0.y * xv0.y
+             + (float)vv1.x * xv1.x + (float)vv1.y * xv1.y;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        out[my_m] = acc * (float)row_scale[my_m];
+    }
+}
+
+/* PQv2 Q+K+V fusion: three matmuls sharing the same x input.
+ *
+ * Saves 2 dispatch encoders per layer (44 per token at 22 layers).
+ *
+ * Layout: dispatched as a 1D grid of size (M_q + M_kv + M_kv) /
+ * sgs_per_tg threadgroups. Each SIMDgroup is mapped to one output row
+ * across one of the three tensors, picked by `global_sg`. */
+kernel void matmul_pqv2_qkv_k256_half2(
+    device const float *x          [[buffer(0)]],
+
+    device const half  *q_rs       [[buffer(1)]],
+    device const half  *q_cb       [[buffer(2)]],
+    device const uchar *q_idx      [[buffer(3)]],
+    device       float *q_out      [[buffer(4)]],
+
+    device const half  *k_rs       [[buffer(5)]],
+    device const half  *k_cb       [[buffer(6)]],
+    device const uchar *k_idx      [[buffer(7)]],
+    device       float *k_out      [[buffer(8)]],
+
+    device const half  *v_rs       [[buffer(9)]],
+    device const half  *v_cb       [[buffer(10)]],
+    device const uchar *v_idx      [[buffer(11)]],
+    device       float *v_out      [[buffer(12)]],
+
+    constant     uint  &M_q        [[buffer(13)]],
+    constant     uint  &M_kv       [[buffer(14)]],
+    constant     uint  &N          [[buffer(15)]],
+    constant     uint  &G          [[buffer(16)]],
+    constant     uint  &n_subchunks[[buffer(17)]],
+
+    uint                tg_id      [[threadgroup_position_in_grid]],
+    uint                sg_id      [[simdgroup_index_in_threadgroup]],
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                sgs_per_tg [[simdgroups_per_threadgroup]])
+{
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+
+    uint global_sg = tg_id * sgs_per_tg + sg_id;
+    uint my_m;
+    device const half  *rs;
+    device const half  *cb;
+    device const uchar *idx;
+    device       float *out;
+    if (global_sg < M_q) {
+        rs = q_rs; cb = q_cb; idx = q_idx; out = q_out;
+        my_m = global_sg;
+    } else if (global_sg < M_q + M_kv) {
+        rs = k_rs; cb = k_cb; idx = k_idx; out = k_out;
+        my_m = global_sg - M_q;
+    } else if (global_sg < M_q + 2u * M_kv) {
+        rs = v_rs; cb = v_cb; idx = v_idx; out = v_out;
+        my_m = global_sg - M_q - M_kv;
+    } else {
+        return;
+    }
+
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint half_total = total >> 1u;
+    device const uchar *idx_row = idx + (size_t)my_m * total;
+
+    float acc = 0.0f;
+    for (uint i = lane; i < half_total; i += 32u) {
+        uint i2 = i + half_total;
+        uint c0, s0, c1, s1;
+        if (n_subchunks == 16u) {
+            c0 = i  >> 4u; s0 = i  & 15u;
+            c1 = i2 >> 4u; s1 = i2 & 15u;
+        } else {
+            c0 = i  / n_subchunks; s0 = i  - c0 * n_subchunks;
+            c1 = i2 / n_subchunks; s1 = i2 - c1 * n_subchunks;
+        }
+        uint k0 = (uint)idx_row[i];
+        uint k1 = (uint)idx_row[i2];
+        float2 xv0 = *((device const float2 *)(x + c0 * G + s0 * HALF));
+        float2 xv1 = *((device const float2 *)(x + c1 * G + s1 * HALF));
+        device const half2 *cb_s0 = (device const half2 *)(cb + (size_t)s0 * K * HALF);
+        device const half2 *cb_s1 = (device const half2 *)(cb + (size_t)s1 * K * HALF);
+        half2 vv0 = cb_s0[k0];
+        half2 vv1 = cb_s1[k1];
+        acc += (float)vv0.x * xv0.x + (float)vv0.y * xv0.y
+             + (float)vv1.x * xv1.x + (float)vv1.y * xv1.y;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        out[my_m] = acc * (float)rs[my_m];
+    }
+}
+
+/* PQv2 gate+up fusion: two matmuls sharing the same x input, same
+ * output shape M_io. Saves 1 dispatch encoder per layer. */
+kernel void matmul_pqv2_gateup_k256_half2(
+    device const float *x          [[buffer(0)]],
+
+    device const half  *g_rs       [[buffer(1)]],
+    device const half  *g_cb       [[buffer(2)]],
+    device const uchar *g_idx      [[buffer(3)]],
+    device       float *g_out      [[buffer(4)]],
+
+    device const half  *u_rs       [[buffer(5)]],
+    device const half  *u_cb       [[buffer(6)]],
+    device const uchar *u_idx      [[buffer(7)]],
+    device       float *u_out      [[buffer(8)]],
+
+    constant     uint  &M_io       [[buffer(9)]],
+    constant     uint  &N          [[buffer(10)]],
+    constant     uint  &G          [[buffer(11)]],
+    constant     uint  &n_subchunks[[buffer(12)]],
+
+    uint                tg_id      [[threadgroup_position_in_grid]],
+    uint                sg_id      [[simdgroup_index_in_threadgroup]],
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                sgs_per_tg [[simdgroups_per_threadgroup]])
+{
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+
+    uint global_sg = tg_id * sgs_per_tg + sg_id;
+    uint my_m;
+    device const half  *rs;
+    device const half  *cb;
+    device const uchar *idx;
+    device       float *out;
+    if (global_sg < M_io) {
+        rs = g_rs; cb = g_cb; idx = g_idx; out = g_out;
+        my_m = global_sg;
+    } else if (global_sg < 2u * M_io) {
+        rs = u_rs; cb = u_cb; idx = u_idx; out = u_out;
+        my_m = global_sg - M_io;
+    } else {
+        return;
+    }
+
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint half_total = total >> 1u;
+    device const uchar *idx_row = idx + (size_t)my_m * total;
+
+    float acc = 0.0f;
+    for (uint i = lane; i < half_total; i += 32u) {
+        uint i2 = i + half_total;
+        uint c0, s0, c1, s1;
+        if (n_subchunks == 16u) {
+            c0 = i  >> 4u; s0 = i  & 15u;
+            c1 = i2 >> 4u; s1 = i2 & 15u;
+        } else {
+            c0 = i  / n_subchunks; s0 = i  - c0 * n_subchunks;
+            c1 = i2 / n_subchunks; s1 = i2 - c1 * n_subchunks;
+        }
+        uint k0 = (uint)idx_row[i];
+        uint k1 = (uint)idx_row[i2];
+        float2 xv0 = *((device const float2 *)(x + c0 * G + s0 * HALF));
+        float2 xv1 = *((device const float2 *)(x + c1 * G + s1 * HALF));
+        device const half2 *cb_s0 = (device const half2 *)(cb + (size_t)s0 * K * HALF);
+        device const half2 *cb_s1 = (device const half2 *)(cb + (size_t)s1 * K * HALF);
+        half2 vv0 = cb_s0[k0];
+        half2 vv1 = cb_s1[k1];
+        acc += (float)vv0.x * xv0.x + (float)vv0.y * xv0.y
+             + (float)vv1.x * xv1.x + (float)vv1.y * xv1.y;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        out[my_m] = acc * (float)rs[my_m];
+    }
+}
+
+/* PQv2 K=256 half=2 BATCHED matvec for prefill.
+ *
+ * Same kernel structure as the single-token variant but each TG handles
+ * (M_BLOCK rows × B batch tokens). The LUT is computed once per (c, s, b)
+ * — i.e., per batch token, so it depends on x[b][k]. We process one b at
+ * a time to keep LUT in TG memory; for B=32 that's 32 outer iterations
+ * per TG.
+ *
+ * Output layout: out[B][M] row-major. */
+kernel void matmul_pqv2_k256_half2_batched(
+    device const half  *row_scale  [[buffer(0)]],
+    device const half  *cb_fp16    [[buffer(1)]],
+    device const uchar *indices    [[buffer(2)]],   /* [M][total] u8 */
+    device const float *x          [[buffer(3)]],   /* [B][N] */
+    device       float *out        [[buffer(4)]],   /* [B][M] */
+    constant     uint  &M          [[buffer(5)]],
+    constant     uint  &N          [[buffer(6)]],
+    constant     uint  &G          [[buffer(7)]],
+    constant     uint  &n_subchunks[[buffer(8)]],
+    constant     uint  &B          [[buffer(9)]],
+    uint2               tg_id      [[threadgroup_position_in_grid]],
+    uint                sg_id      [[simdgroup_index_in_threadgroup]],
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                sgs_per_tg [[simdgroups_per_threadgroup]])
+{
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+
+    /* Grid: (M/sgs_per_tg, B). Each SIMDgroup handles one (b, m) output. */
+    uint b = tg_id.y;
+    if (b >= B) return;
+    uint my_m = tg_id.x * sgs_per_tg + sg_id;
+    if (my_m >= M) return;
+
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint half_total = total >> 1u;
+
+    device const float *x_b = x + (size_t)b * N;
+    device const uchar *idx_row = indices + (size_t)my_m * total;
+
+    float acc = 0.0f;
+    for (uint i = lane; i < half_total; i += 32u) {
+        uint i2 = i + half_total;
+        uint c0, s0, c1, s1;
+        if (n_subchunks == 16u) {
+            c0 = i  >> 4u; s0 = i  & 15u;
+            c1 = i2 >> 4u; s1 = i2 & 15u;
+        } else {
+            c0 = i  / n_subchunks; s0 = i  - c0 * n_subchunks;
+            c1 = i2 / n_subchunks; s1 = i2 - c1 * n_subchunks;
+        }
+        uint k0 = (uint)idx_row[i];
+        uint k1 = (uint)idx_row[i2];
+        float2 xv0 = *((device const float2 *)(x_b + c0 * G + s0 * HALF));
+        float2 xv1 = *((device const float2 *)(x_b + c1 * G + s1 * HALF));
+        device const half2 *cb_s0 = (device const half2 *)(cb_fp16 + (size_t)s0 * K * HALF);
+        device const half2 *cb_s1 = (device const half2 *)(cb_fp16 + (size_t)s1 * K * HALF);
+        half2 vv0 = cb_s0[k0];
+        half2 vv1 = cb_s1[k1];
+        acc += (float)vv0.x * xv0.x + (float)vv0.y * xv0.y
+             + (float)vv1.x * xv1.x + (float)vv1.y * xv1.y;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        out[(size_t)b * M + my_m] = acc * (float)row_scale[my_m];
+    }
+}
+
+/* matmul_fp16w_fp32x — fp16 weights × fp32 input → fp32 output.
+ *
+ * For PQv2 IBFs where output_head and (optionally) other tensors are
+ * stored as raw fp16 (because PQ-encoding the lm_head is not supported).
+ *
+ * Layout:
+ *   w[M][N] row-major fp16
+ *   x[N] fp32
+ *   out[M] fp32
+ *
+ * One SIMDgroup (32 threads) computes one output row. Threads within
+ * the SIMDgroup split the N reduction, then simd_sum reduces.
+ * threads_per_threadgroup = 32 * SIMDS_PER_TG; one row per SIMDgroup. */
+kernel void matmul_fp16w_fp32x(
+    device const half  *w   [[buffer(0)]],
+    device const float *x   [[buffer(1)]],
+    device       float *out [[buffer(2)]],
+    constant     uint  &M   [[buffer(3)]],
+    constant     uint  &N   [[buffer(4)]],
+    uint                tg_id    [[threadgroup_position_in_grid]],
+    uint                sg_id    [[simdgroup_index_in_threadgroup]],
+    uint                lane     [[thread_index_in_simdgroup]],
+    uint                sgs_per_tg [[simdgroups_per_threadgroup]])
+{
+    uint my_m = tg_id * sgs_per_tg + sg_id;
+    if (my_m >= M) return;
+    device const half *row = w + (size_t)my_m * N;
+    float acc = 0.0f;
+    /* Stride by 32 lanes × 4 lanes-of-vector = 128 N units per loop iter. */
+    uint n_vec4 = N >> 2;  /* N must be a multiple of 4 (always true here). */
+    device const half4  *row4 = (device const half4 *)row;
+    device const float4 *x4   = (device const float4 *)x;
+    for (uint i = lane; i < n_vec4; i += 32u) {
+        half4 w4 = row4[i];
+        float4 xv = x4[i];
+        acc += (float)w4.x * xv.x + (float)w4.y * xv.y
+             + (float)w4.z * xv.z + (float)w4.w * xv.w;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        out[my_m] = acc;
+    }
+}

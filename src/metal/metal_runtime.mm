@@ -2573,6 +2573,281 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
     return 0;
 }
 
+/* fp16 weights × fp32 input → fp32 output, for lm_head when stored as
+ * raw fp16 (PQv2 IBFs leave the lm_head un-quantized). */
+extern "C" int ib_metal_rec_matmul_fp16w_fp32x(ib_metal_recorder *rec,
+                                                 const void *x_fp32,
+                                                 const void *w_fp16,
+                                                 void *out_fp32,
+                                                 int M, int N)
+{
+    if (!rec || !x_fp32 || !w_fp16 || !out_fp32 || M <= 0 || N <= 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_fp16w_fp32x");
+    if (!ps) return -1;
+    NSUInteger ow=0, ox=0, oo=0;
+    id<MTLBuffer> b_w = rec_pick_off(rec->ctx, w_fp16,   &ow);
+    id<MTLBuffer> b_x = rec_pick_off(rec->ctx, x_fp32,   &ox);
+    id<MTLBuffer> b_o = rec_pick_off(rec->ctx, out_fp32, &oo);
+    if (!b_w || !b_x || !b_o) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_w offset:ow atIndex:0];
+    [enc setBuffer:b_x offset:ox atIndex:1];
+    [enc setBuffer:b_o offset:oo atIndex:2];
+    [enc setBytes:&M_u length:sizeof(M_u) atIndex:3];
+    [enc setBytes:&N_u length:sizeof(N_u) atIndex:4];
+
+    /* 1 SIMDgroup per row, 4 SIMDgroups per TG → 128 threads/TG. */
+    const NSUInteger SIMDS_PER_TG = 4;
+    const NSUInteger TG_THREADS = 32 * SIMDS_PER_TG;
+    NSUInteger n_tg = ((NSUInteger)M + SIMDS_PER_TG - 1) / SIMDS_PER_TG;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(TG_THREADS, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
+                                                     const void *row_scale_fp16,
+                                                     const void *cb_fp16,
+                                                     const void *indices_u8,
+                                                     const void *x_fp32,
+                                                     void *out_fp32,
+                                                     int M, int N, int G, int n_subchunks)
+{
+    if (!rec || !row_scale_fp16 || !cb_fp16 || !indices_u8 || !x_fp32 || !out_fp32
+        || M <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0) return -1;
+    if ((N % G) != 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_pqv2_k256_half2");
+    if (!ps) return -1;
+    NSUInteger ors=0, ocb=0, oi=0, ox=0, oo=0;
+    id<MTLBuffer> b_rs = rec_pick_off(rec->ctx, row_scale_fp16, &ors);
+    id<MTLBuffer> b_cb = rec_pick_off(rec->ctx, cb_fp16, &ocb);
+    id<MTLBuffer> b_i  = rec_pick_off(rec->ctx, indices_u8, &oi);
+    id<MTLBuffer> b_x  = rec_pick_off(rec->ctx, x_fp32, &ox);
+    id<MTLBuffer> b_o  = rec_pick_off(rec->ctx, out_fp32, &oo);
+    if (!b_rs || !b_cb || !b_i || !b_x || !b_o) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, G_u = (uint)G, ns_u = (uint)n_subchunks;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_rs offset:ors atIndex:0];
+    [enc setBuffer:b_cb offset:ocb atIndex:1];
+    [enc setBuffer:b_i  offset:oi  atIndex:2];
+    [enc setBuffer:b_x  offset:ox  atIndex:3];
+    [enc setBuffer:b_o  offset:oo  atIndex:4];
+    [enc setBytes:&M_u  length:sizeof(M_u)  atIndex:5];
+    [enc setBytes:&N_u  length:sizeof(N_u)  atIndex:6];
+    [enc setBytes:&G_u  length:sizeof(G_u)  atIndex:7];
+    [enc setBytes:&ns_u length:sizeof(ns_u) atIndex:8];
+
+    /* SIMDgroups per TG; tunable via IB_PQV2_SGPT. Default 4 = 128 threads/TG. */
+    static NSUInteger SGPT_cached = 0;
+    if (!SGPT_cached) {
+        const char *env_sgpt = getenv("IB_PQV2_SGPT");
+        SGPT_cached = env_sgpt ? (NSUInteger)atoi(env_sgpt) : 4;
+        if (SGPT_cached < 1 || SGPT_cached > 32) SGPT_cached = 4;
+    }
+    const NSUInteger SGPT = SGPT_cached;
+    NSUInteger n_tg = ((NSUInteger)M + SGPT - 1) / SGPT;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+/* PQv2 Q+K+V fusion: one dispatch covers all three projections. */
+extern "C" int ib_metal_rec_matmul_pqv2_qkv_k256_half2(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *q_rs, const void *q_cb, const void *q_idx, void *q_out,
+    const void *k_rs, const void *k_cb, const void *k_idx, void *k_out,
+    const void *v_rs, const void *v_cb, const void *v_idx, void *v_out,
+    int M_q, int M_kv, int N, int G, int n_subchunks)
+{
+    if (!rec || !x_fp32 || !q_rs || !q_cb || !q_idx || !q_out
+        || !k_rs || !k_cb || !k_idx || !k_out
+        || !v_rs || !v_cb || !v_idx || !v_out
+        || M_q <= 0 || M_kv <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0) return -1;
+    if ((N % G) != 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_pqv2_qkv_k256_half2");
+    if (!ps) return -1;
+
+    NSUInteger ox=0;
+    NSUInteger oqrs=0, oqcb=0, oqi=0, oqo=0;
+    NSUInteger okrs=0, okcb=0, oki=0, oko=0;
+    NSUInteger ovrs=0, ovcb=0, ovi=0, ovo=0;
+    id<MTLBuffer> b_x   = rec_pick_off(rec->ctx, x_fp32, &ox);
+    id<MTLBuffer> b_qrs = rec_pick_off(rec->ctx, q_rs, &oqrs);
+    id<MTLBuffer> b_qcb = rec_pick_off(rec->ctx, q_cb, &oqcb);
+    id<MTLBuffer> b_qi  = rec_pick_off(rec->ctx, q_idx, &oqi);
+    id<MTLBuffer> b_qo  = rec_pick_off(rec->ctx, q_out, &oqo);
+    id<MTLBuffer> b_krs = rec_pick_off(rec->ctx, k_rs, &okrs);
+    id<MTLBuffer> b_kcb = rec_pick_off(rec->ctx, k_cb, &okcb);
+    id<MTLBuffer> b_ki  = rec_pick_off(rec->ctx, k_idx, &oki);
+    id<MTLBuffer> b_ko  = rec_pick_off(rec->ctx, k_out, &oko);
+    id<MTLBuffer> b_vrs = rec_pick_off(rec->ctx, v_rs, &ovrs);
+    id<MTLBuffer> b_vcb = rec_pick_off(rec->ctx, v_cb, &ovcb);
+    id<MTLBuffer> b_vi  = rec_pick_off(rec->ctx, v_idx, &ovi);
+    id<MTLBuffer> b_vo  = rec_pick_off(rec->ctx, v_out, &ovo);
+    if (!b_x || !b_qrs || !b_qcb || !b_qi || !b_qo
+             || !b_krs || !b_kcb || !b_ki || !b_ko
+             || !b_vrs || !b_vcb || !b_vi || !b_vo) return -1;
+
+    uint M_q_u = (uint)M_q, M_kv_u = (uint)M_kv;
+    uint N_u = (uint)N, G_u = (uint)G, ns_u = (uint)n_subchunks;
+
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_x   offset:ox   atIndex:0];
+    [enc setBuffer:b_qrs offset:oqrs atIndex:1];
+    [enc setBuffer:b_qcb offset:oqcb atIndex:2];
+    [enc setBuffer:b_qi  offset:oqi  atIndex:3];
+    [enc setBuffer:b_qo  offset:oqo  atIndex:4];
+    [enc setBuffer:b_krs offset:okrs atIndex:5];
+    [enc setBuffer:b_kcb offset:okcb atIndex:6];
+    [enc setBuffer:b_ki  offset:oki  atIndex:7];
+    [enc setBuffer:b_ko  offset:oko  atIndex:8];
+    [enc setBuffer:b_vrs offset:ovrs atIndex:9];
+    [enc setBuffer:b_vcb offset:ovcb atIndex:10];
+    [enc setBuffer:b_vi  offset:ovi  atIndex:11];
+    [enc setBuffer:b_vo  offset:ovo  atIndex:12];
+    [enc setBytes:&M_q_u  length:sizeof(M_q_u)  atIndex:13];
+    [enc setBytes:&M_kv_u length:sizeof(M_kv_u) atIndex:14];
+    [enc setBytes:&N_u    length:sizeof(N_u)    atIndex:15];
+    [enc setBytes:&G_u    length:sizeof(G_u)    atIndex:16];
+    [enc setBytes:&ns_u   length:sizeof(ns_u)   atIndex:17];
+
+    static NSUInteger SGPT_cached = 0;
+    if (!SGPT_cached) {
+        const char *env = getenv("IB_PQV2_SGPT");
+        SGPT_cached = env ? (NSUInteger)atoi(env) : 4;
+        if (SGPT_cached < 1 || SGPT_cached > 32) SGPT_cached = 4;
+    }
+    NSUInteger total_rows = (NSUInteger)(M_q + 2 * M_kv);
+    NSUInteger n_tg = (total_rows + SGPT_cached - 1) / SGPT_cached;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32 * SGPT_cached, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+/* PQv2 gate+up fusion: one dispatch covers both projections. */
+extern "C" int ib_metal_rec_matmul_pqv2_gateup_k256_half2(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *g_rs, const void *g_cb, const void *g_idx, void *g_out,
+    const void *u_rs, const void *u_cb, const void *u_idx, void *u_out,
+    int M_io, int N, int G, int n_subchunks)
+{
+    if (!rec || !x_fp32 || !g_rs || !g_cb || !g_idx || !g_out
+        || !u_rs || !u_cb || !u_idx || !u_out
+        || M_io <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0) return -1;
+    if ((N % G) != 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_pqv2_gateup_k256_half2");
+    if (!ps) return -1;
+
+    NSUInteger ox=0;
+    NSUInteger ogrs=0, ogcb=0, ogi=0, ogo=0;
+    NSUInteger ours=0, oucb=0, oui=0, ouo=0;
+    id<MTLBuffer> b_x   = rec_pick_off(rec->ctx, x_fp32, &ox);
+    id<MTLBuffer> b_grs = rec_pick_off(rec->ctx, g_rs, &ogrs);
+    id<MTLBuffer> b_gcb = rec_pick_off(rec->ctx, g_cb, &ogcb);
+    id<MTLBuffer> b_gi  = rec_pick_off(rec->ctx, g_idx, &ogi);
+    id<MTLBuffer> b_go  = rec_pick_off(rec->ctx, g_out, &ogo);
+    id<MTLBuffer> b_urs = rec_pick_off(rec->ctx, u_rs, &ours);
+    id<MTLBuffer> b_ucb = rec_pick_off(rec->ctx, u_cb, &oucb);
+    id<MTLBuffer> b_ui  = rec_pick_off(rec->ctx, u_idx, &oui);
+    id<MTLBuffer> b_uo  = rec_pick_off(rec->ctx, u_out, &ouo);
+    if (!b_x || !b_grs || !b_gcb || !b_gi || !b_go
+             || !b_urs || !b_ucb || !b_ui || !b_uo) return -1;
+
+    uint M_io_u = (uint)M_io;
+    uint N_u = (uint)N, G_u = (uint)G, ns_u = (uint)n_subchunks;
+
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_x   offset:ox   atIndex:0];
+    [enc setBuffer:b_grs offset:ogrs atIndex:1];
+    [enc setBuffer:b_gcb offset:ogcb atIndex:2];
+    [enc setBuffer:b_gi  offset:ogi  atIndex:3];
+    [enc setBuffer:b_go  offset:ogo  atIndex:4];
+    [enc setBuffer:b_urs offset:ours atIndex:5];
+    [enc setBuffer:b_ucb offset:oucb atIndex:6];
+    [enc setBuffer:b_ui  offset:oui  atIndex:7];
+    [enc setBuffer:b_uo  offset:ouo  atIndex:8];
+    [enc setBytes:&M_io_u length:sizeof(M_io_u) atIndex:9];
+    [enc setBytes:&N_u    length:sizeof(N_u)    atIndex:10];
+    [enc setBytes:&G_u    length:sizeof(G_u)    atIndex:11];
+    [enc setBytes:&ns_u   length:sizeof(ns_u)   atIndex:12];
+
+    static NSUInteger SGPT_cached_gu = 0;
+    if (!SGPT_cached_gu) {
+        const char *env = getenv("IB_PQV2_SGPT");
+        SGPT_cached_gu = env ? (NSUInteger)atoi(env) : 4;
+        if (SGPT_cached_gu < 1 || SGPT_cached_gu > 32) SGPT_cached_gu = 4;
+    }
+    NSUInteger total_rows = (NSUInteger)(2 * M_io);
+    NSUInteger n_tg = (total_rows + SGPT_cached_gu - 1) / SGPT_cached_gu;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32 * SGPT_cached_gu, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+extern "C" int ib_metal_rec_matmul_pqv2_k256_half2_batched(ib_metal_recorder *rec,
+                                                             const void *row_scale_fp16,
+                                                             const void *cb_fp16,
+                                                             const void *indices_u8,
+                                                             const void *x_fp32,
+                                                             void *out_fp32,
+                                                             int B, int M, int N,
+                                                             int G, int n_subchunks)
+{
+    if (!rec || !row_scale_fp16 || !cb_fp16 || !indices_u8 || !x_fp32 || !out_fp32
+        || B <= 0 || M <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0) return -1;
+    if ((N % G) != 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_pqv2_k256_half2_batched");
+    if (!ps) return -1;
+    NSUInteger ors=0, ocb=0, oi=0, ox=0, oo=0;
+    id<MTLBuffer> b_rs = rec_pick_off(rec->ctx, row_scale_fp16, &ors);
+    id<MTLBuffer> b_cb = rec_pick_off(rec->ctx, cb_fp16, &ocb);
+    id<MTLBuffer> b_i  = rec_pick_off(rec->ctx, indices_u8, &oi);
+    id<MTLBuffer> b_x  = rec_pick_off(rec->ctx, x_fp32, &ox);
+    id<MTLBuffer> b_o  = rec_pick_off(rec->ctx, out_fp32, &oo);
+    if (!b_rs || !b_cb || !b_i || !b_x || !b_o) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, G_u = (uint)G, ns_u = (uint)n_subchunks, B_u = (uint)B;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_rs offset:ors atIndex:0];
+    [enc setBuffer:b_cb offset:ocb atIndex:1];
+    [enc setBuffer:b_i  offset:oi  atIndex:2];
+    [enc setBuffer:b_x  offset:ox  atIndex:3];
+    [enc setBuffer:b_o  offset:oo  atIndex:4];
+    [enc setBytes:&M_u  length:sizeof(M_u)  atIndex:5];
+    [enc setBytes:&N_u  length:sizeof(N_u)  atIndex:6];
+    [enc setBytes:&G_u  length:sizeof(G_u)  atIndex:7];
+    [enc setBytes:&ns_u length:sizeof(ns_u) atIndex:8];
+    [enc setBytes:&B_u  length:sizeof(B_u)  atIndex:9];
+
+    /* SIMDgroups per TG. Each SIMDgroup = one (b, m) output. */
+    static NSUInteger SGPT_bcached = 0;
+    if (!SGPT_bcached) {
+        const char *env = getenv("IB_PQV2_SGPT");
+        SGPT_bcached = env ? (NSUInteger)atoi(env) : 4;
+        if (SGPT_bcached < 1 || SGPT_bcached > 32) SGPT_bcached = 4;
+    }
+    const NSUInteger SGPT = SGPT_bcached;
+    NSUInteger n_tg_x = ((NSUInteger)M + SGPT - 1) / SGPT;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg_x, (NSUInteger)B, 1)
+          threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
 extern "C" int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,
                                                    const void *q_fp32,
                                                    const void *k_fp32,
