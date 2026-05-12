@@ -657,6 +657,17 @@ int ib_metal_rec_matmul_pqv2_batched_simdmat(ib_metal_recorder *rec,
     const void *x_fp32, void *out_fp32,
     int B, int M, int N, int G, int n_subchunks);
 
+/* Greedy argmax over logits → int32 token id (single TG, 32 lanes). */
+int ib_metal_rec_argmax_logits(ib_metal_recorder *rec,
+    const void *logits_fp32, void *out_token_i32, int vocab);
+
+/* PQv2 embedding lookup on GPU: token id → fp32 embedding row. */
+int ib_metal_rec_embed_lookup_pqv2(ib_metal_recorder *rec,
+    const void *in_token_i32,
+    const void *row_scale_fp16, const void *cb_fp16, const void *indices_u8,
+    void *out_fp32,
+    int M_vocab, int N, int G, int n_subchunks);
+
 /* PQv2 decode (B=1) via Apple simdgroup_matrix. X-broadcast trick:
  * fills an 8x8 X tile with replicated x[k..k+7] rows so the matrix
  * unit can do 8-row matvec partials per instruction. Returns -2 if
@@ -715,6 +726,29 @@ int ib_metal_forward_prefill(ib_metal_ctx *ctx,
 /* Resets every layer's KV cache write position back to 0 — used between
  * generation runs that don't share a prefix. */
 void ib_metal_reset_kv(ib_metal_model_buffers *bufs);
+
+/* Paginated greedy decode: runs `n_steps` autoregressive forwards on the
+ * GPU in a single command buffer, with argmax + embedding-lookup also
+ * on the GPU. CPU pays only one waitUntilCompleted (instead of n_steps).
+ *
+ * `init_input_embed_fp32`: caller pre-decodes the first input token's
+ * fp32 embedding (so the first iteration is identical to forward_token).
+ * For step i>0 the kernel feeds back the previous-step argmax via the
+ * GPU embed-lookup kernel — requires the model's token_embedding to be
+ * PQ-encoded (which the v6/PQv2 IBF is).
+ *
+ * `start_pos`: position of the first step's KV write. KV cache will be
+ * extended to start_pos + n_steps - 1.
+ *
+ * `out_tokens[n_steps]`: filled with the int32 argmax tokens.
+ *
+ * Returns 0 on success; -2 if token_embedding isn't PQ-encoded; -1 on
+ * other errors. */
+int ib_metal_forward_decode_n(ib_metal_ctx *ctx,
+                               ib_metal_model_buffers *bufs,
+                               const float *init_input_embed_fp32,
+                               int start_pos, int n_steps,
+                               int *out_tokens);
 
 #ifdef __cplusplus
 }

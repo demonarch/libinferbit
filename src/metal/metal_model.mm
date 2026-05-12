@@ -88,6 +88,16 @@ struct ib_metal_model_buffers {
     /* Output head: tensor_bufs unifies INT4/INT8/FP16 and PQv2 paths. */
     struct tensor_bufs output_head;
 
+    /* GPU-side token-embedding buffers, populated only if the IBF's
+     * token_embedding is PQ-encoded. Used by ib_metal_forward_decode_n
+     * for on-GPU embedding feedback in the autoregressive loop. */
+    int   token_embedding_is_pq;
+    void *token_embedding_pq_rs;
+    void *token_embedding_pq_cb;
+    void *token_embedding_pq_idx;
+    int   token_embedding_pq_G;
+    int   token_embedding_pq_ns;
+
     /* State buffers (reused across layers). */
     void *x;
     void *xb;
@@ -409,6 +419,22 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
     upload_norm(ctx, m, &m->output_norm, &b->output_norm);
     upload_tensor(ctx, m, &m->output_head, &b->output_head);
 
+    /* If token_embedding is PQ-encoded, upload it as PQv2 buffers so the
+     * paginated decode path can do GPU embedding lookups. CPU still uses
+     * the inferbit_model's pq pointer for the per-token CPU path. */
+    if (m->token_embedding.pq) {
+        struct tensor_bufs emb_tb;
+        upload_pqv2_tensor(ctx, m->token_embedding.pq, &emb_tb);
+        b->token_embedding_is_pq = 1;
+        b->token_embedding_pq_rs  = emb_tb.pq_rs;
+        b->token_embedding_pq_cb  = emb_tb.pq_cb;
+        b->token_embedding_pq_idx = emb_tb.pq_idx;
+        b->token_embedding_pq_G   = emb_tb.pq_G;
+        b->token_embedding_pq_ns  = emb_tb.pq_ns;
+    } else {
+        b->token_embedding_is_pq = 0;
+    }
+
     int max_n = b->intermediate > b->hidden ? b->intermediate : b->hidden;
     int xs_groups = (max_n + 127) / 128;
     b->x        = ib_metal_alloc(ctx, (size_t)b->hidden * sizeof(float), NULL);
@@ -547,6 +573,9 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     FR(b->output_norm);
     FR(b->output_head.w); FR(b->output_head.s);
     FR(b->output_head.pq_rs); FR(b->output_head.pq_cb); FR(b->output_head.pq_idx);
+    FR(b->token_embedding_pq_rs);
+    FR(b->token_embedding_pq_cb);
+    FR(b->token_embedding_pq_idx);
     FR(b->x); FR(b->xb); FR(b->xb2);
     FR(b->q); FR(b->k); FR(b->v); FR(b->attn_out);
     FR(b->hb); FR(b->hb2); FR(b->scores);
@@ -634,21 +663,14 @@ static int rec_matmul_tb(ib_metal_recorder *r,
                        out, xq, xs, M, N);
 }
 
-extern "C" int
-ib_metal_forward_token(ib_metal_ctx *ctx,
-                        ib_metal_model_buffers *b,
-                        const float *cpu_embed_in,
-                        int pos,
-                        float *logits_out)
+/* Record the per-step body of a single-token forward pass (rmsnorm,
+ * QKV, RoPE, attention, residuals, FFN, final rmsnorm, lm_head) into
+ * the recorder. Assumes b->x already holds the fp32 input embedding.
+ * Writes the next-token logits into b->logits. */
+static void record_single_forward_step(ib_metal_recorder *r,
+                                        ib_metal_model_buffers *b,
+                                        int pos)
 {
-    if (!ctx || !b || !cpu_embed_in || !logits_out) return -1;
-    if (pos < 0 || pos >= b->seq_len) return -1;
-
-    memcpy(b->x, cpu_embed_in, (size_t)b->hidden * sizeof(float));
-
-    ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
-    if (!r) return -1;
-
     int hidden = b->hidden;
     int inter  = b->intermediate;
     int kv_dim = b->kv_dim;
@@ -809,11 +831,81 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
     }
     ib_metal_rec_rmsnorm_fp16(r, b->x, b->output_norm, b->xb, hidden, eps);
     rec_matmul_tb(r, &b->output_head, b->xb, b->logits, b->xq, b->xs, b->vocab, hidden);
+}
+
+extern "C" int
+ib_metal_forward_token(ib_metal_ctx *ctx,
+                        ib_metal_model_buffers *b,
+                        const float *cpu_embed_in,
+                        int pos,
+                        float *logits_out)
+{
+    if (!ctx || !b || !cpu_embed_in || !logits_out) return -1;
+    if (pos < 0 || pos >= b->seq_len) return -1;
+
+    memcpy(b->x, cpu_embed_in, (size_t)b->hidden * sizeof(float));
+
+    ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
+    if (!r) return -1;
+
+    record_single_forward_step(r, b, pos);
 
     int rc = ib_metal_recorder_commit(r);
     if (rc != 0) return rc;
 
     memcpy(logits_out, b->logits, (size_t)b->vocab * sizeof(float));
+    return 0;
+}
+
+extern "C" int
+ib_metal_forward_decode_n(ib_metal_ctx *ctx,
+                           ib_metal_model_buffers *b,
+                           const float *init_input_embed_fp32,
+                           int start_pos, int n_steps,
+                           int *out_tokens)
+{
+    if (!ctx || !b || !init_input_embed_fp32 || !out_tokens || n_steps <= 0) return -1;
+    if (start_pos < 0 || start_pos + n_steps > b->seq_len) return -1;
+    /* GPU embed feedback requires PQ-encoded token embedding. */
+    if (!b->token_embedding_is_pq) return -2;
+
+    /* Load first step's input into b->x. Subsequent steps use the GPU
+     * embed_lookup to fill b->x from out_tokens[step-1]. */
+    memcpy(b->x, init_input_embed_fp32, (size_t)b->hidden * sizeof(float));
+
+    /* Scratch for the int32 token IDs produced on the GPU. */
+    void *gpu_tokens = ib_metal_alloc(ctx, (size_t)n_steps * sizeof(int), NULL);
+    if (!gpu_tokens) return -1;
+
+    ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
+    if (!r) { ib_metal_free(ctx, gpu_tokens); return -1; }
+
+    for (int step = 0; step < n_steps; step++) {
+        int pos = start_pos + step;
+        if (step > 0) {
+            /* Decode token_id[step-1] → b->x (the next forward's input). */
+            int *tok_slot = (int *)gpu_tokens + (step - 1);
+            ib_metal_rec_embed_lookup_pqv2(r,
+                tok_slot,
+                b->token_embedding_pq_rs,
+                b->token_embedding_pq_cb,
+                b->token_embedding_pq_idx,
+                b->x,
+                b->vocab, b->hidden,
+                b->token_embedding_pq_G,
+                b->token_embedding_pq_ns);
+        }
+        record_single_forward_step(r, b, pos);
+        /* argmax b->logits → gpu_tokens[step]. */
+        int *out_slot = (int *)gpu_tokens + step;
+        ib_metal_rec_argmax_logits(r, b->logits, out_slot, b->vocab);
+    }
+
+    int rc = ib_metal_recorder_commit(r);
+    if (rc != 0) { ib_metal_free(ctx, gpu_tokens); return rc; }
+
+    memcpy(out_tokens, gpu_tokens, (size_t)n_steps * sizeof(int));
+    ib_metal_free(ctx, gpu_tokens);
     return 0;
 }
 

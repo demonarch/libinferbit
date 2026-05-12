@@ -3302,3 +3302,74 @@ kernel void matmul_fp16w_fp32x(
         out[my_m] = acc;
     }
 }
+
+/* Greedy argmax over a logits vector. Single threadgroup of 32 lanes:
+ * each lane scans vocab/32 entries, then simd-reduce to find the best.
+ * Output: one int32 token id at *out_token. */
+kernel void argmax_logits(
+    device const float *logits   [[buffer(0)]],
+    device       int   *out_token[[buffer(1)]],
+    constant     uint  &vocab    [[buffer(2)]],
+    uint                lane     [[thread_index_in_simdgroup]])
+{
+    float best_val = -INFINITY;
+    int   best_idx = 0;
+    for (uint i = lane; i < vocab; i += 32u) {
+        float v = logits[i];
+        if (v > best_val) { best_val = v; best_idx = (int)i; }
+    }
+    /* simd-reduce: find the lane with max value, broadcast its idx.
+     * Use min reduction over (best_idx if val == gmax else INT_MAX)
+     * to pick the lowest lane index without dealing with simd_vote
+     * conversions. */
+    float gmax = simd_max(best_val);
+    int  cand  = (best_val == gmax) ? best_idx : 0x7fffffff;
+    int  gbest = simd_min(cand);
+    if (lane == 0) {
+        out_token[0] = gbest;
+    }
+}
+
+/* PQv2 embedding lookup: given a token id in *in_token, write the
+ * fp32-decoded embedding row into out[hidden]. Mirrors the CPU
+ * embedding_lookup PQ branch.
+ *
+ * Layout: 1 SIMDgroup, 32 lanes process the N output elements. Each
+ * lane handles N/32 of the per-row work (=hidden/32 columns). For
+ * TinyLlama hidden=2048 → 64 cols per lane. */
+kernel void embed_lookup_pqv2(
+    device const int   *in_token   [[buffer(0)]],
+    device const half  *row_scale  [[buffer(1)]],
+    device const half  *cb_fp16    [[buffer(2)]],
+    device const uchar *indices    [[buffer(3)]],
+    device       float *out        [[buffer(4)]],
+    constant     uint  &M_vocab    [[buffer(5)]],
+    constant     uint  &N          [[buffer(6)]],
+    constant     uint  &G          [[buffer(7)]],
+    constant     uint  &n_subchunks[[buffer(8)]],
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                tg_size    [[threads_per_threadgroup]])
+{
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+    int tok = in_token[0];
+    if (tok < 0 || (uint)tok >= M_vocab) {
+        if (lane == 0) { for (uint i = 0; i < N; i++) out[i] = 0.0f; }
+        return;
+    }
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    float rs = (float)row_scale[tok];
+    device const uchar *idx_row = indices + (size_t)tok * total;
+
+    /* Each lane covers a stride. With tg_size=32, each lane writes N/32 elements. */
+    for (uint n = lane; n < N; n += tg_size) {
+        uint c = n / G;
+        uint within = n - c * G;
+        uint s = within / HALF;
+        uint h = within - s * HALF;
+        uint k_idx = (uint)idx_row[c * n_subchunks + s];
+        float v = (float)cb_fp16[(s * K + k_idx) * HALF + h];
+        out[n] = v * rs;
+    }
+}

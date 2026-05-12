@@ -3196,3 +3196,69 @@ extern "C" int ib_metal_attention_block_fp16(ib_metal_ctx *ctx,
     }
     return 0;
 }
+
+/* Greedy argmax over logits → int32 token id. */
+extern "C" int ib_metal_rec_argmax_logits(ib_metal_recorder *rec,
+                                            const void *logits_fp32,
+                                            void *out_token_i32,
+                                            int vocab)
+{
+    if (!rec || !logits_fp32 || !out_token_i32 || vocab <= 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "argmax_logits");
+    if (!ps) return -1;
+    NSUInteger ol = 0, ot = 0;
+    id<MTLBuffer> b_l = rec_pick_off(rec->ctx, logits_fp32, &ol);
+    id<MTLBuffer> b_t = rec_pick_off(rec->ctx, out_token_i32, &ot);
+    if (!b_l || !b_t) return -1;
+    uint vocab_u = (uint)vocab;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_l offset:ol atIndex:0];
+    [enc setBuffer:b_t offset:ot atIndex:1];
+    [enc setBytes:&vocab_u length:sizeof(vocab_u) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
+/* PQv2 embedding lookup: GPU-side decode of token_embedding row → fp32. */
+extern "C" int ib_metal_rec_embed_lookup_pqv2(ib_metal_recorder *rec,
+                                                const void *in_token_i32,
+                                                const void *row_scale_fp16,
+                                                const void *cb_fp16,
+                                                const void *indices_u8,
+                                                void *out_fp32,
+                                                int M_vocab, int N,
+                                                int G, int n_subchunks)
+{
+    if (!rec || !in_token_i32 || !row_scale_fp16 || !cb_fp16 || !indices_u8
+        || !out_fp32 || M_vocab <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0)
+        return -1;
+    if ((N % G) != 0) return -1;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "embed_lookup_pqv2");
+    if (!ps) return -1;
+    NSUInteger oi=0, ors=0, ocb=0, oid=0, oo=0;
+    id<MTLBuffer> b_i  = rec_pick_off(rec->ctx, in_token_i32, &oi);
+    id<MTLBuffer> b_rs = rec_pick_off(rec->ctx, row_scale_fp16, &ors);
+    id<MTLBuffer> b_cb = rec_pick_off(rec->ctx, cb_fp16, &ocb);
+    id<MTLBuffer> b_id = rec_pick_off(rec->ctx, indices_u8, &oid);
+    id<MTLBuffer> b_o  = rec_pick_off(rec->ctx, out_fp32, &oo);
+    if (!b_i || !b_rs || !b_cb || !b_id || !b_o) return -1;
+    uint M_u = (uint)M_vocab, N_u = (uint)N, G_u = (uint)G, ns_u = (uint)n_subchunks;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_i  offset:oi  atIndex:0];
+    [enc setBuffer:b_rs offset:ors atIndex:1];
+    [enc setBuffer:b_cb offset:ocb atIndex:2];
+    [enc setBuffer:b_id offset:oid atIndex:3];
+    [enc setBuffer:b_o  offset:oo  atIndex:4];
+    [enc setBytes:&M_u  length:sizeof(M_u)  atIndex:5];
+    [enc setBytes:&N_u  length:sizeof(N_u)  atIndex:6];
+    [enc setBytes:&G_u  length:sizeof(G_u)  atIndex:7];
+    [enc setBytes:&ns_u length:sizeof(ns_u) atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}

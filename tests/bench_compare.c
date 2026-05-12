@@ -201,11 +201,42 @@ int main(int argc, char **argv) {
     generated[0] = first_decode;
     t0 = now_sec();
     if (use_gpu) {
-        for (int i = 0; i < gen_tokens; i++) {
-            int tok = (i == 0) ? first_decode : generated[i - 1];
-            cpu_embed_lookup(m, tok, embed_buf);
-            ib_metal_forward_token(ctx, gbufs, embed_buf, prompt_tokens + i, logits);
-            generated[i] = argmax_logit(logits, vocab);
+        /* Paginated mode: IB_DECODE_PAGE_N=N to chain N forwards per
+         * command buffer with GPU argmax + embed_lookup. Off → original
+         * one-CB-per-token path. */
+        int page_n = 0;
+        const char *page_env = getenv("IB_DECODE_PAGE_N");
+        if (page_env) page_n = atoi(page_env);
+        if (page_n > 0) {
+            int i = 0;
+            while (i < gen_tokens) {
+                int n = gen_tokens - i;
+                if (n > page_n) n = page_n;
+                int tok = (i == 0) ? first_decode : generated[i - 1];
+                cpu_embed_lookup(m, tok, embed_buf);
+                int rc = ib_metal_forward_decode_n(ctx, gbufs, embed_buf,
+                                                     prompt_tokens + i, n,
+                                                     generated + i);
+                if (rc != 0) {
+                    fprintf(stderr, "forward_decode_n rc=%d, falling back\n", rc);
+                    /* Fallback to per-token for remaining. */
+                    for (int j = 0; j < n; j++) {
+                        int t = (i + j == 0) ? first_decode : generated[i + j - 1];
+                        cpu_embed_lookup(m, t, embed_buf);
+                        ib_metal_forward_token(ctx, gbufs, embed_buf,
+                                                prompt_tokens + i + j, logits);
+                        generated[i + j] = argmax_logit(logits, vocab);
+                    }
+                }
+                i += n;
+            }
+        } else {
+            for (int i = 0; i < gen_tokens; i++) {
+                int tok = (i == 0) ? first_decode : generated[i - 1];
+                cpu_embed_lookup(m, tok, embed_buf);
+                ib_metal_forward_token(ctx, gbufs, embed_buf, prompt_tokens + i, logits);
+                generated[i] = argmax_logit(logits, vocab);
+            }
         }
     } else {
         for (int i = 0; i < gen_tokens; i++) {
