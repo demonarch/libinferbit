@@ -981,15 +981,42 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
                 B, M, N, tb->pq_G, tb->pq_ns);
             if (rc == 0) return 0;
         }
-        /* Default cascade: tg32 → b8 → SIMD-coop. */
-        rc = ib_metal_rec_matmul_pqv2_batched_simdmat(r,
-            tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
-            B, M, N, tb->pq_G, tb->pq_ns);
-        if (rc == 0) return 0;
-        rc = ib_metal_rec_matmul_pqv2_batched_simdmat_b8(r,
-            tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
-            B, M, N, tb->pq_G, tb->pq_ns);
-        if (rc == 0) return 0;
+        /* Auto-split: decompose B into (k×32) + (k×16) + (k×8) + r.
+         * Each chunk records a separate dispatch with offset pointers
+         * so any prompt size B≥8 hits the simdmat fast path for as
+         * much of B as possible. Tiny remainder r (<8) uses SIMD-coop. */
+        int b_off = 0, rem = B;
+        int split_rc = 0;
+        struct { int unit; int (*rec)(ib_metal_recorder*, const void*, const void*,
+                                       const void*, const void*, void*,
+                                       int, int, int, int, int); } steps[] = {
+            { 32, ib_metal_rec_matmul_pqv2_batched_simdmat },
+            { 16, ib_metal_rec_matmul_pqv2_batched_simdmat_b16 },
+            {  8, ib_metal_rec_matmul_pqv2_batched_simdmat_b8 },
+        };
+        for (int si = 0; si < 3 && split_rc == 0; si++) {
+            int unit = steps[si].unit;
+            if (rem < unit) continue;     /* try smaller units */
+            int chunk = (rem / unit) * unit;
+            const void *xp = (const float *)x_fp32 + (size_t)b_off * N;
+            void       *op = (float *)out          + (size_t)b_off * M;
+            split_rc = steps[si].rec(r,
+                tb->pq_rs, tb->pq_cb, tb->pq_idx, xp, op,
+                chunk, M, N, tb->pq_G, tb->pq_ns);
+            if (split_rc != 0) break;
+            b_off += chunk; rem -= chunk;
+        }
+        if (split_rc == 0 && rem > 0) {
+            const void *xp = (const float *)x_fp32 + (size_t)b_off * N;
+            void       *op = (float *)out          + (size_t)b_off * M;
+            split_rc = ib_metal_rec_matmul_pqv2_k256_half2_batched(r,
+                tb->pq_rs, tb->pq_cb, tb->pq_idx, xp, op,
+                rem, M, N, tb->pq_G, tb->pq_ns);
+            if (split_rc == 0) { b_off += rem; rem = 0; }
+        }
+        if (split_rc == 0 && b_off == B) return 0;
+        /* Auto-split refused (e.g. shape constraint failed mid-way).
+         * Fall through to SIMD-coop full-B fallback below. */
         return ib_metal_rec_matmul_pqv2_k256_half2_batched(r,
             tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
             B, M, N, tb->pq_G, tb->pq_ns);
@@ -1095,9 +1122,29 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
                           float *last_logits_out)
 {
     if (!ctx || !b || !cpu_embeds_in || !last_logits_out) return -1;
-    if (n_tokens < 1 || n_tokens > b->b_max) return -1;
+    if (n_tokens < 1) return -1;
     if (start_pos < 0 || start_pos + n_tokens > b->seq_len) return -1;
     if (!model_supports_batched_prefill(b)) return -2;
+
+    /* Auto-chunk when the prompt exceeds the preallocated batched
+     * scratch (b_max). Each chunk advances start_pos by chunk_size;
+     * only the LAST chunk's logits are kept (caller only consumes the
+     * final logits anyway). This makes arbitrary prompt sizes work
+     * without bloating the default scratch allocation. */
+    if (n_tokens > b->b_max) {
+        int chunk_size = b->b_max;
+        int sent = 0;
+        while (sent < n_tokens) {
+            int this_chunk = n_tokens - sent;
+            if (this_chunk > chunk_size) this_chunk = chunk_size;
+            int rc = ib_metal_forward_prefill(ctx, b,
+                cpu_embeds_in + (size_t)sent * b->hidden,
+                this_chunk, start_pos + sent, last_logits_out);
+            if (rc != 0) return rc;
+            sent += this_chunk;
+        }
+        return 0;
+    }
 
     int hidden = b->hidden;
     int inter  = b->intermediate;

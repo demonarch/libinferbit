@@ -1646,6 +1646,105 @@ kernel void matmul_pqv2_batched_simdmat_tg16(
     simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
 }
 
+/* matmul_pqv2_batched_simdmat_b16 — B_BLOCK=16 variant. 32×16 output
+ * tile, 8 SIMDgroups per TG (4×2 sub-tile grid), 128 threads/TG.
+ * Halves the W-loads vs b8 for the same B coverage.
+ * Requires M%32, B%16, N%64. */
+kernel void matmul_pqv2_batched_simdmat_b16(
+    device const half  *row_scale  [[buffer(0)]],
+    device const half  *cb_fp16    [[buffer(1)]],
+    device const uchar *indices    [[buffer(2)]],
+    device const float *x_fp32     [[buffer(3)]],
+    device       float *out        [[buffer(4)]],
+    constant     uint  &M          [[buffer(5)]],
+    constant     uint  &N          [[buffer(6)]],
+    constant     uint  &B          [[buffer(7)]],
+    constant     uint  &G          [[buffer(8)]],
+    constant     uint  &n_subchunks[[buffer(9)]],
+    threadgroup half   *tg_W_fp16  [[threadgroup(0)]],  /* [32][64] */
+    threadgroup half   *tg_A_fp16  [[threadgroup(1)]],  /* [16][64] */
+    uint                simd_lane  [[thread_index_in_simdgroup]],
+    uint                simd_id    [[simdgroup_index_in_threadgroup]],
+    uint2               tg_id      [[threadgroup_position_in_grid]])
+{
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+    constexpr uint M_BLK = 32u;
+    constexpr uint B_BLK = 16u;
+    constexpr uint K_TILE = 64u;
+    uint tg_lane = simd_id * 32u + simd_lane;
+    constexpr uint TG_THREADS = 8u * 32u;
+
+    /* 4×2 sub-tile mapping: simd_id 0..7 → (m_off ∈ [0..3], b_off ∈ [0..1]). */
+    uint m_off = simd_id & 3u;
+    uint b_off = simd_id >> 2u;
+
+    uint m_base = tg_id.x * M_BLK;
+    uint b_base = tg_id.y * B_BLK;
+    if (m_base >= M || b_base >= B) return;
+
+    uint my_m_base = m_base + m_off * 8u;
+    uint my_b_base = b_base + b_off * 8u;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint n_tiles = N / K_TILE;
+
+    for (uint t = 0; t < n_tiles; t++) {
+        uint k_start = t * K_TILE;
+
+        for (uint i = tg_lane; i < M_BLK * K_TILE; i += TG_THREADS) {
+            uint m_local = i / K_TILE;
+            uint k_local = i - m_local * K_TILE;
+            uint m_global = m_base + m_local;
+            uint n_global = k_start + k_local;
+            half v = (half)0;
+            if (m_global < M && n_global < N) {
+                uint c = n_global / G;
+                uint within = n_global - c * G;
+                uint s = within / HALF;
+                uint h = within - s * HALF;
+                uint k_idx = (uint)indices[(size_t)m_global * total + c * n_subchunks + s];
+                half cb_v = cb_fp16[(s * K + k_idx) * HALF + h];
+                v = cb_v * row_scale[m_global];
+            }
+            tg_W_fp16[i] = v;
+        }
+
+        for (uint i = tg_lane; i < B_BLK * K_TILE; i += TG_THREADS) {
+            uint b_local = i / K_TILE;
+            uint k_local = i - b_local * K_TILE;
+            uint b_global = b_base + b_local;
+            uint n_global = k_start + k_local;
+            half v = (half)0;
+            if (b_global < B && n_global < N) {
+                v = (half)x_fp32[(size_t)b_global * N + n_global];
+            }
+            tg_A_fp16[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *A_base = tg_A_fp16 + (size_t)(b_off * 8u) * K_TILE;
+        threadgroup const half *W_base = tg_W_fp16 + (size_t)(m_off * 8u) * K_TILE;
+
+        for (uint k_sub = 0; k_sub < K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
+}
+
 /* matmul_pqv2_batched_simdmat_b8 — B_BLOCK=8 variant of the PQv2 simdmat
  * kernel. Output tile: 32 rows × 8 batch. 4 SIMDgroups per TG (4×1
  * sub-tile grid). Works for any B that is a multiple of 8 (e.g. B=8,

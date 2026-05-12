@@ -666,6 +666,14 @@ int ib_metal_rec_matmul_pqv2_batched_simdmat_b8(ib_metal_recorder *rec,
     const void *x_fp32, void *out_fp32,
     int B, int M, int N, int G, int n_subchunks);
 
+/* PQv2 batched simdmat B_BLOCK=16: 32×16 output tile, 8 SGs/TG, 4 KB+8 KB
+ * TG memory. Halves W loads vs b8 for any B%16. Smooths the prompt-size
+ * speed curve at B in {16, 48, 80, ...}. */
+int ib_metal_rec_matmul_pqv2_batched_simdmat_b16(ib_metal_recorder *rec,
+    const void *row_scale_fp16, const void *cb_fp16, const void *indices_u8,
+    const void *x_fp32, void *out_fp32,
+    int B, int M, int N, int G, int n_subchunks);
+
 /* PQv2 batched simdmat tg64: 64×32 output tile, 32 SIMDgroups per TG.
  * Better W-load amortization. Requires M%64 + B%32 + N%64. */
 int ib_metal_rec_matmul_pqv2_batched_simdmat_tg64(ib_metal_recorder *rec,
