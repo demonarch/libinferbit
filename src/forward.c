@@ -6,8 +6,13 @@
 
 #include "inferbit_internal.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 /* W4A8 path is on by default. Set IB_W4A8=0 in env to force the FP32
  * activation fallback (used for A/B comparison and debugging). */
@@ -31,6 +36,42 @@ static inline const void* tensor_data(const inferbit_model* m, const ib_tensor_m
 static inline const void* tensor_scales_raw(const inferbit_model* m, const ib_tensor_meta* t) {
     if (t->scale_offset == 0 && t->scale_size == 0) return NULL;
     return (const uint8_t*)m->weight_data + t->scale_offset;
+}
+
+/* Path D (Solution 5): pread the indices for one PQv2 tensor from the
+ * on-disk file into the model's shared scratch buffer. The PQv2 kernel
+ * reads via pq->indices, which we redirected to scratch at load time
+ * (pqv2_model.c). Each matmul refills scratch from pq->indices_file_offset.
+ *
+ * Returns 0 on success. Falls back silently to a no-op if the model
+ * isn't in drive mode or the offset isn't set. */
+static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) {
+    if (!m || m->residency_mode != 1) return 0;
+    if (!t || !t->pq) return 0;
+    if (!m->drive_indices_scratch || m->drive_fd < 0) return 0;
+    const pqv2_t* pq = t->pq;
+    size_t bytes = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
+    if (bytes == 0 || bytes > m->drive_indices_scratch_size) return -1;
+    off_t off = (off_t)pq->indices_file_offset;
+    if (off == 0) return 0;     /* not redirected; mmap'd path */
+    /* pread fills scratch from disk. The fd has F_NOCACHE on Darwin so
+     * this read bypasses UBC entirely. */
+    size_t done = 0;
+    uint8_t *buf = (uint8_t *)m->drive_indices_scratch;
+    while (done < bytes) {
+        ssize_t r = pread(m->drive_fd, buf + done, bytes - done, off + (off_t)done);
+        if (r <= 0) {
+            if (r == -1 && errno == EINTR) continue;
+            return -1;
+        }
+        done += (size_t)r;
+    }
+#if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
+    /* Solution 4: on Linux, drop the just-read region from the page
+     * cache so subsequent matmuls aren't biased by it. No-op on Darwin. */
+    (void)posix_fadvise(m->drive_fd, off, (off_t)bytes, POSIX_FADV_DONTNEED);
+#endif
+    return 0;
 }
 
 /* ── FP16 conversion ────────────────────────────────────────── */
@@ -392,6 +433,12 @@ static void tensor_matmul(
      * for K=256; falls back to single-thread for other K or no pool. */
     if (t->pq) {
         const pqv2_t* pq = t->pq;
+        /* Path D drive mode (Solution 5): pread the indices from disk
+         * into the model's scratch buffer (which pq->indices was
+         * redirected to at load). Kernel then reads from scratch. */
+        if (m->residency_mode == 1) {
+            (void)drive_load_indices(m, t);
+        }
         if (pq->K == 256 && m->thread_pool && m->num_threads > 1) {
             pqv2_threaded_matvec_k256(m, m->thread_pool, m->num_threads,
                                         pq, input, out);
@@ -504,6 +551,11 @@ static void tensor_matmul_batch(
      * the single-position threaded path → identical fp32 sum order. */
     if (t->pq) {
         const pqv2_t* pq = t->pq;
+        /* Drive mode: pread indices ONCE for this tensor; the batched
+         * kernel below reuses the same scratch for all B positions. */
+        if (m->residency_mode == 1) {
+            (void)drive_load_indices(m, t);
+        }
         if (pq->K == 256 && B >= 1 && B <= 8 &&
             m->thread_pool && m->num_threads > 1) {
             pqv2_threaded_matvec_k256_batch(m, m->thread_pool, m->num_threads,
@@ -515,6 +567,8 @@ static void tensor_matmul_batch(
             return;
         }
         for (int b = 0; b < B; b++) {
+            /* Recursive call will re-pread; could optimize later by
+             * not re-loading scratch within the same tensor. */
             tensor_matmul(m, t, out + (size_t)b * M, input + (size_t)b * N,
                           M, N, scale_buf);
         }

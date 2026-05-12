@@ -196,6 +196,22 @@ struct inferbit_model {
     /* Threading */
     int num_threads;
     struct ib_thread_pool* thread_pool;
+
+    /* Residency mode (Path D, doc 23/24, executed via doc 32). Controls
+     * whether PQv2 indices pages stay RAM-resident or are streamed from
+     * disk per matmul.
+     *   0 = RAM (default): full model mmap'd; OS holds it hot.
+     *   1 = DRIVE: file fd is F_NOCACHE on Darwin / POSIX_FADV_RANDOM on
+     *       Linux. Before each PQv2 matmul we pread() the indices into
+     *       a single page-aligned scratch buffer; the kernel reads from
+     *       there. Peak indices residency = max-matmul-indices,
+     *       independent of model size.
+     *
+     * Off by default. Enable via IB_RESIDENCY_MODE=drive at model load. */
+    int    residency_mode;
+    int    drive_fd;                  /* fd of the IBF, F_NOCACHE set on Darwin */
+    void  *drive_indices_scratch;     /* page-aligned shared buffer */
+    size_t drive_indices_scratch_size;
 };
 
 /* ── Config struct ──────────────────────────────────────────── */

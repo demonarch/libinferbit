@@ -258,8 +258,8 @@ static inline uint16_t fp32_to_fp16_bits(float f) {
 /* PQv2 tensor upload: produces 3 GPU buffers (row_scale, decoded cb,
  * indices) + metadata. cb is pre-decoded from int8+scale → fp16 once on
  * the CPU so the kernel skips the dequant. */
-static void upload_pqv2_tensor(ib_metal_ctx *ctx, const pqv2_t *pq,
-                                struct tensor_bufs *out)
+static void upload_pqv2_tensor(ib_metal_ctx *ctx, const inferbit_model *m,
+                                const pqv2_t *pq, struct tensor_bufs *out)
 {
     memset(out, 0, sizeof(*out));
     out->is_pq = 1;
@@ -308,18 +308,45 @@ static void upload_pqv2_tensor(ib_metal_ctx *ctx, const pqv2_t *pq,
     size_t idx_bytes = (size_t)pq->M * total;
     uint8_t *idx_t = (uint8_t *)malloc(idx_bytes);
     if (!idx_t) { fprintf(stderr, "upload_pqv2_tensor: oom on indices\n"); return; }
+    /* In CPU drive mode (doc 32), pq->indices has been redirected to a
+     * shared scratch buffer that is empty at upload time. The original
+     * file offset is stashed in pq->indices_file_offset. pread() the
+     * real bytes from disk into a temp buffer for GPU upload — GPU
+     * forward keeps a full-residency copy in MTLBuffer (drive mode is
+     * a CPU-side capability only). */
+    uint8_t *src_buf = NULL;
+    const uint8_t *src;
+    if (m && m->residency_mode == 1 && pq->indices_file_offset != 0
+        && m->drive_fd >= 0) {
+        src_buf = (uint8_t *)malloc(idx_bytes);
+        if (!src_buf) { free(idx_t); fprintf(stderr, "upload_pqv2_tensor: oom on drive-pread\n"); return; }
+        size_t done = 0;
+        off_t off = (off_t)pq->indices_file_offset;
+        while (done < idx_bytes) {
+            ssize_t r = pread(m->drive_fd, src_buf + done, idx_bytes - done, off + (off_t)done);
+            if (r <= 0) {
+                if (r == -1 && errno == EINTR) continue;
+                fprintf(stderr, "upload_pqv2_tensor: pread failed in drive mode\n");
+                free(src_buf); free(idx_t); return;
+            }
+            done += (size_t)r;
+        }
+        src = src_buf;
+    } else {
+        src = (const uint8_t *)pq->indices; /* [nc][ns][M] */
+    }
     {
-        const uint8_t *src = (const uint8_t *)pq->indices; /* [nc][ns][M] */
         uint32_t nc = pq->N / pq->G;
-        for (uint32_t m = 0; m < pq->M; m++) {
+        for (uint32_t m_ = 0; m_ < pq->M; m_++) {
             for (uint32_t c = 0; c < nc; c++) {
                 for (uint32_t s = 0; s < pq->n_subchunks; s++) {
-                    idx_t[(size_t)m * total + c * pq->n_subchunks + s] =
-                        src[((size_t)c * pq->n_subchunks + s) * pq->M + m];
+                    idx_t[(size_t)m_ * total + c * pq->n_subchunks + s] =
+                        src[((size_t)c * pq->n_subchunks + s) * pq->M + m_];
                 }
             }
         }
     }
+    if (src_buf) free(src_buf);
     out->pq_idx = ib_metal_alloc(ctx, idx_bytes, idx_t);
     free(idx_t);
 }
@@ -331,7 +358,7 @@ static void upload_tensor(ib_metal_ctx *ctx, const inferbit_model *m,
 {
     memset(out, 0, sizeof(*out));
     if (t->pq) {
-        upload_pqv2_tensor(ctx, t->pq, out);
+        upload_pqv2_tensor(ctx, m, t->pq, out);
         return;
     }
     upload_w_pair(ctx, m, t, &out->w, &out->s);
@@ -424,7 +451,7 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
      * the inferbit_model's pq pointer for the per-token CPU path. */
     if (m->token_embedding.pq) {
         struct tensor_bufs emb_tb;
-        upload_pqv2_tensor(ctx, m->token_embedding.pq, &emb_tb);
+        upload_pqv2_tensor(ctx, m, m->token_embedding.pq, &emb_tb);
         b->token_embedding_is_pq = 1;
         b->token_embedding_pq_rs  = emb_tb.pq_rs;
         b->token_embedding_pq_cb  = emb_tb.pq_cb;

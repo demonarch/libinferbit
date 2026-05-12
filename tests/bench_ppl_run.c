@@ -9,10 +9,44 @@
  * PPL = exp(mean NLL).
  */
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE 1
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+
+/* Peak resident-set size in bytes via getrusage. ru_maxrss is BYTES on
+ * macOS, KB on Linux. */
+static size_t peak_rss_bytes(void) {
+    struct rusage r;
+    if (getrusage(RUSAGE_SELF, &r) != 0) return 0;
+#if defined(__APPLE__)
+    return (size_t)r.ru_maxrss;
+#else
+    return (size_t)r.ru_maxrss * 1024;
+#endif
+}
+
+/* Current resident-set size in bytes. On macOS via mach_task_basic_info
+ * (the only way to get *current* RSS — getrusage returns peak only).
+ * Returns 0 on platforms where it isn't implemented. */
+static size_t current_rss_bytes(void) {
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &cnt) != KERN_SUCCESS) return 0;
+    return (size_t)info.resident_size;
+#else
+    return 0;
+#endif
+}
 #include <math.h>
 #include <time.h>
 
@@ -139,6 +173,41 @@ int main(int argc, char **argv) {
     inferbit_kv_clear(m);
     if (use_gpu) ib_metal_reset_kv(gbufs);
 
+    /* Optional memory-pressure hog. IB_RSS_HOG_MB=N allocates N MB of
+     * incompressible (random-looking) memory and mlocks it so macOS's
+     * memory compressor can't sneak the pressure away. This forces the
+     * kernel to actually evict file-backed mmap pages to make room. */
+    void *hog = NULL;
+    size_t hog_bytes = 0;
+    {
+        const char *hg = getenv("IB_RSS_HOG_MB");
+        if (hg) {
+            long mb = atol(hg);
+            if (mb > 0) {
+                hog_bytes = (size_t)mb * 1024 * 1024;
+                hog = malloc(hog_bytes);
+                if (hog) {
+                    long ps = sysconf(_SC_PAGESIZE);
+                    if (ps <= 0) ps = 4096;
+                    /* Fill with a high-entropy pattern (linear-congruential)
+                     * so the compressor can't shrink it. */
+                    uint64_t seed = 0xdeadbeefcafebabeULL;
+                    for (size_t off = 0; off < hog_bytes; off += (size_t)ps) {
+                        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                        memcpy((char*)hog + off, &seed, sizeof(seed));
+                    }
+                    if (mlock(hog, hog_bytes) == 0) {
+                        fprintf(stderr, "RSS hog allocated %.1f MB and mlocked\n",
+                                hog_bytes / 1048576.0);
+                    } else {
+                        fprintf(stderr, "RSS hog allocated %.1f MB (mlock failed; may be compressed)\n",
+                                hog_bytes / 1048576.0);
+                    }
+                }
+            }
+        }
+    }
+
     /* Warmup phase: feed first `warmup` tokens. */
     if (use_gpu) {
         for (int i = 0; i < warmup; i++) {
@@ -181,6 +250,18 @@ int main(int argc, char **argv) {
     printf("PPL=%.6f\n", ppl);
     printf("N_SCORED=%d\n", n_scored);
     printf("SCORING_S=%.3f\n", elapsed);
+    {
+        size_t peak = peak_rss_bytes();
+        size_t cur  = current_rss_bytes();
+        printf("PEAK_RSS_BYTES=%zu\n", peak);
+        printf("PEAK_RSS_MB=%.1f\n", peak / (1024.0 * 1024.0));
+        printf("CUR_RSS_BYTES=%zu\n", cur);
+        printf("CUR_RSS_MB=%.1f\n", cur / (1024.0 * 1024.0));
+        printf("HOG_MB=%.1f\n", hog_bytes / (1024.0 * 1024.0));
+        const char *rm = getenv("IB_RESIDENCY_MODE");
+        printf("RESIDENCY_MODE=%s\n", rm ? rm : "ram");
+    }
+    if (hog) { munlock(hog, hog_bytes); free(hog); }
     printf("SCORE_TOK_PER_SEC=%.2f\n", (double)score / elapsed);
 
     free(tokens); free(logits); free(embed_buf);

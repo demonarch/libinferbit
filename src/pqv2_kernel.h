@@ -39,6 +39,12 @@ typedef struct {
      * hot kernel skips the int8→fp32 decode loop on every call. */
     const float *cb_fp32;        /* [n_subchunks * K * half] */
     const float *l2_cb_fp32;     /* [n_subchunks * l2_K * half], NULL if no L2 */
+
+    /* Path D drive mode (doc 32): byte offset of this tensor's indices
+     * region within the on-disk IBF file. Set at load time when the
+     * model is in drive mode; otherwise 0. Used by forward.c to
+     * pread() into the shared scratch buffer before each matmul. */
+    size_t indices_file_offset;
 } pqv2_t;
 
 /* Load .pqv2 file into freshly-malloc'd buffers. Returns 0 on success.

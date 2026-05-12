@@ -60,6 +60,12 @@ void inferbit_free(inferbit_model* model) {
         free(model->pqv2_thread_acc_pool);
         model->pqv2_thread_acc_pool = NULL;
     }
+    if (model->drive_indices_scratch) {
+        free(model->drive_indices_scratch);
+        model->drive_indices_scratch = NULL;
+        model->drive_indices_scratch_size = 0;
+    }
+    /* model->drive_fd is owned by pqv2_file_backing — don't close here. */
 
     /* Unmap weight data */
     if (model->weight_data_mmap && model->weight_data) {

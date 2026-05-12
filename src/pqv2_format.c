@@ -77,8 +77,32 @@ int ib_pqv2_file_load(const char *path, ib_pqv2_file *out) {
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return -1; }
     size_t fsz = (size_t)st.st_size;
-    void *buf = mmap(NULL, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
+
+    /* Drive mode (IB_RESIDENCY_MODE=drive): bypass the OS page cache
+     * for this fd. On Darwin F_NOCACHE makes all subsequent reads (via
+     * pread) skip UBC; on Linux we set POSIX_FADV_RANDOM after the
+     * mmap so the kernel doesn't bother prefetching. */
+    int drive_mode = 0;
+    {
+        const char *rm = getenv("IB_RESIDENCY_MODE");
+        drive_mode = (rm && (!strcmp(rm, "drive") || !strcmp(rm, "1"))) ? 1 : 0;
+    }
+#if defined(__APPLE__) && defined(F_NOCACHE)
+    if (drive_mode) (void)fcntl(fd, F_NOCACHE, 1);
+#endif
+
+    /* Solution 2 — MAP_NOCACHE on Darwin so the small-tensor pages don't
+     * accumulate in UBC over time. Linux gets POSIX_MADV_DONTNEED after
+     * mmap to mark the mapping low-retention. */
+    int map_flags = MAP_PRIVATE;
+#if defined(__APPLE__) && defined(MAP_NOCACHE)
+    if (drive_mode) map_flags |= MAP_NOCACHE;
+#endif
+    void *buf = mmap(NULL, fsz, PROT_READ, map_flags, fd, 0);
     if (buf == MAP_FAILED) { close(fd); return -1; }
+#if !defined(__APPLE__) && defined(POSIX_MADV_DONTNEED)
+    if (drive_mode) (void)posix_madvise(buf, fsz, POSIX_MADV_DONTNEED);
+#endif
     out->_buffer = buf; out->_buffer_size = fsz; out->_is_mmap = 1; out->_fd = fd;
 
     const uint8_t *p = (const uint8_t *)buf;

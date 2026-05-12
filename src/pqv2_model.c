@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define IB_PQV2_MAGIC "IBFV6PQ2"
 
@@ -238,6 +239,13 @@ static inferbit_model* pqv2_load_internal(const char* path,
     }
     m->num_threads = threads;
 
+    /* Path D residency mode (env-gated for now). "drive" => evict
+     * indices pages after each matmul on CPU. Default 0 = RAM. */
+    {
+        const char *rm = getenv("IB_RESIDENCY_MODE");
+        m->residency_mode = (rm && (!strcmp(rm, "drive") || !strcmp(rm, "1"))) ? 1 : 0;
+    }
+
     if (ib_alloc_kv_caches(m, ctx_len, kv_dynamic) != 0) goto fail;
     if (ib_alloc_buffers(m) != 0) goto fail;
 
@@ -265,6 +273,72 @@ static inferbit_model* pqv2_load_internal(const char* path,
         size_t pool_bytes  = (pool_floats * sizeof(float) + 63) & ~(size_t)63;
         m->pqv2_thread_acc_pool = aligned_alloc(64, pool_bytes);
         m->pqv2_thread_acc_pool_floats = pool_floats;
+    }
+
+    /* Path D drive mode setup (Solution 5): allocate one shared indices
+     * scratch buffer sized for the model's largest PQv2 matmul, walk
+     * every PQv2 tensor and redirect pq->indices to the scratch. After
+     * this, every matmul does pread(file_fd, scratch, len, offset)
+     * before kernel dispatch — the kernel reads from scratch.
+     *
+     * Walks token_embedding + output_head + all layer projections. */
+    if (m->residency_mode == 1) {
+        const uint8_t *file_base = (const uint8_t *)f->_buffer;
+        size_t max_idx_bytes = 0;
+        /* First pass: max indices size + store original offsets. */
+        const ib_tensor_meta *tslots[2 + 7 * 256];   /* head + per-layer 7 */
+        int nslots = 0;
+        /* token_embedding is intentionally NOT redirected: cpu_embed_lookup
+         * reads emb->pq->indices directly (not via tensor_matmul) so its
+         * pointer must keep pointing into the mmap region.
+         * Its full indices region for a 32k-vocab model is ~32 MB; keeping
+         * it RAM-resident is the right trade. output_head IS redirected
+         * because it goes through tensor_matmul. */
+        if (m->output_head.pq)     tslots[nslots++] = &m->output_head;
+        for (int li = 0; li < m->header.num_layers; li++) {
+            ib_layer_meta *L = &m->layers[li];
+            const ib_tensor_meta *s7[7] = {
+                &L->q_proj, &L->k_proj, &L->v_proj, &L->o_proj,
+                &L->gate_proj, &L->up_proj, &L->down_proj,
+            };
+            for (int i = 0; i < 7; i++) {
+                if (s7[i]->pq) tslots[nslots++] = s7[i];
+            }
+        }
+        for (int i = 0; i < nslots; i++) {
+            const pqv2_t *pq = tslots[i]->pq;
+            size_t b = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
+            if (b > max_idx_bytes) max_idx_bytes = b;
+        }
+        /* Page-align the scratch. */
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps <= 0) ps = 4096;
+        size_t scratch_size = (max_idx_bytes + (size_t)ps - 1) & ~((size_t)ps - 1);
+        void *scratch = NULL;
+        if (scratch_size > 0) scratch = aligned_alloc((size_t)ps, scratch_size);
+        if (!scratch) {
+            fprintf(stderr, "ib pqv2: drive mode scratch alloc failed (%zu B) — falling back to RAM mode\n",
+                    scratch_size);
+            m->residency_mode = 0;
+        } else {
+            m->drive_indices_scratch = scratch;
+            m->drive_indices_scratch_size = scratch_size;
+            m->drive_fd = f->_fd;
+            /* Second pass: rewrite pq->indices to point at scratch.
+             * The kernel always reads from this pointer; we refill via
+             * pread before each matmul. */
+            for (int i = 0; i < nslots; i++) {
+                pqv2_t *mpq = (pqv2_t *)tslots[i]->pq;   /* cast away const */
+                /* Record file offset of indices region, then redirect
+                 * indices to the shared scratch. Per-matmul pread will
+                 * refill scratch from the file at indices_file_offset. */
+                size_t off = (const uint8_t *)mpq->indices - file_base;
+                mpq->indices_file_offset = off;
+                mpq->indices = (const uint8_t *)scratch;
+            }
+            fprintf(stderr, "ib pqv2: drive mode ON. scratch=%zu B, fd=%d, %d tensors redirected\n",
+                    scratch_size, f->_fd, nslots);
+        }
     }
     return m;
 
