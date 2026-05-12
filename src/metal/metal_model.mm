@@ -929,12 +929,33 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
                                   int B, int M, int N)
 {
     if (tb && tb->is_pq) {
-        /* Cascade: tg32 (32×32, M%32 + B%32) → b8 (32×8, M%32 + B%8) →
-         * SIMD-coop fallback. tg64 (64×32) is built and available but
-         * empirically same-or-worse on TinyLlama (TG memory pressure
-         * reduces SIMDgroup occupancy faster than W-load amortization
-         * pays back). Kept available via the recorder for tuning. */
-        int rc = ib_metal_rec_matmul_pqv2_batched_simdmat(r,
+        /* Optional tile-geometry override for the throughput sweep.
+         *   IB_PQV2_TILE=tg32  (32×32, default, M%32+B%32+N%64)
+         *   IB_PQV2_TILE=tg16  (16×32, higher occupancy, M%16+B%32+N%64)
+         *   IB_PQV2_TILE=tg64  (64×32, more reuse, M%64+B%32+N%64)
+         * When set and applicable, tries the chosen variant first. */
+        static int tile_pref = -2;  /* -2 = unread, -1 = no pref, 0=32, 1=16, 2=64 */
+        if (tile_pref == -2) {
+            const char *env = getenv("IB_PQV2_TILE");
+            if (!env)                    tile_pref = -1;
+            else if (!strcmp(env, "tg16")) tile_pref = 1;
+            else if (!strcmp(env, "tg64")) tile_pref = 2;
+            else                            tile_pref = 0;
+        }
+        int rc;
+        if (tile_pref == 1) {
+            rc = ib_metal_rec_matmul_pqv2_batched_simdmat_tg16(r,
+                tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+                B, M, N, tb->pq_G, tb->pq_ns);
+            if (rc == 0) return 0;
+        } else if (tile_pref == 2) {
+            rc = ib_metal_rec_matmul_pqv2_batched_simdmat_tg64(r,
+                tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+                B, M, N, tb->pq_G, tb->pq_ns);
+            if (rc == 0) return 0;
+        }
+        /* Default cascade: tg32 → b8 → SIMD-coop. */
+        rc = ib_metal_rec_matmul_pqv2_batched_simdmat(r,
             tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
             B, M, N, tb->pq_G, tb->pq_ns);
         if (rc == 0) return 0;

@@ -673,6 +673,14 @@ int ib_metal_rec_matmul_pqv2_batched_simdmat_tg64(ib_metal_recorder *rec,
     const void *x_fp32, void *out_fp32,
     int B, int M, int N, int G, int n_subchunks);
 
+/* PQv2 batched simdmat tg16: 16×32 output tile, 8 SIMDgroups per TG,
+ * 6 KB TG memory. Targets higher per-shader-core TG occupancy for
+ * gather-bound throughput. Requires M%16 + B%32 + N%64. */
+int ib_metal_rec_matmul_pqv2_batched_simdmat_tg16(ib_metal_recorder *rec,
+    const void *row_scale_fp16, const void *cb_fp16, const void *indices_u8,
+    const void *x_fp32, void *out_fp32,
+    int B, int M, int N, int G, int n_subchunks);
+
 /* Greedy argmax over logits → int32 token id (single TG, 32 lanes). */
 int ib_metal_rec_argmax_logits(ib_metal_recorder *rec,
     const void *logits_fp32, void *out_token_i32, int vocab);
