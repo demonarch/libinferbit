@@ -929,12 +929,17 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
                                   int B, int M, int N)
 {
     if (tb && tb->is_pq) {
-        /* Try Apple simdgroup_matrix path first (requires M%32, B%32, N%64). */
+        /* Cascade by tile-fit: B_BLOCK=32 (best amortization, needs B%32),
+         * then B_BLOCK=8 (needs B%8 — handles arbitrary prompts ≥8),
+         * then SIMD-coop fallback (no shape constraints). */
         int rc = ib_metal_rec_matmul_pqv2_batched_simdmat(r,
             tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
             B, M, N, tb->pq_G, tb->pq_ns);
         if (rc == 0) return 0;
-        /* Fall back to the SIMD-coop batched kernel (no shape constraints). */
+        rc = ib_metal_rec_matmul_pqv2_batched_simdmat_b8(r,
+            tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+            B, M, N, tb->pq_G, tb->pq_ns);
+        if (rc == 0) return 0;
         return ib_metal_rec_matmul_pqv2_k256_half2_batched(r,
             tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
             B, M, N, tb->pq_G, tb->pq_ns);

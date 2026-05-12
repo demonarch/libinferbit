@@ -657,6 +657,15 @@ int ib_metal_rec_matmul_pqv2_batched_simdmat(ib_metal_recorder *rec,
     const void *x_fp32, void *out_fp32,
     int B, int M, int N, int G, int n_subchunks);
 
+/* PQv2 batched simdmat with B_BLOCK=8 (4 SIMDgroups per TG, 32×8 output
+ * tile). Closes the prefill speed cliff for prompt sizes that aren't a
+ * multiple of 32 — works at any B%8==0. Returns -2 when M%32, B%8, or
+ * N%64 not satisfied. */
+int ib_metal_rec_matmul_pqv2_batched_simdmat_b8(ib_metal_recorder *rec,
+    const void *row_scale_fp16, const void *cb_fp16, const void *indices_u8,
+    const void *x_fp32, void *out_fp32,
+    int B, int M, int N, int G, int n_subchunks);
+
 /* Greedy argmax over logits → int32 token id (single TG, 32 lanes). */
 int ib_metal_rec_argmax_logits(ib_metal_recorder *rec,
     const void *logits_fp32, void *out_token_i32, int vocab);
