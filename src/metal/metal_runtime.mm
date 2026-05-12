@@ -971,6 +971,31 @@ extern "C" int ib_metal_recorder_commit(ib_metal_recorder *rec) {
     }
 }
 
+/* Path D GPU drive mode: commit the current CB + wait, then allocate
+ * a fresh CB so the same recorder handle keeps being usable. Used to
+ * serialize per-PQv2-matmul streaming: caller preads indices into the
+ * shared MTLBuffer scratch, calls checkpoint to make sure earlier
+ * dispatches finished before the pread overwrote scratch, records
+ * the matmul, checkpoint again to make sure GPU finished reading
+ * scratch before the NEXT pread can overwrite it.
+ *
+ * Returns 0 on success. Recorder handle remains valid. */
+extern "C" int ib_metal_recorder_checkpoint(ib_metal_recorder *rec) {
+    if (!rec) return -1;
+    @autoreleasepool {
+        [rec->cb commit];
+        [rec->cb waitUntilCompleted];
+        bool err = (rec->cb.status == MTLCommandBufferStatusError);
+        if (err) {
+            fprintf(stderr, "Metal recorder checkpoint: cmd buffer error: %s\n",
+                    [[rec->cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+        rec->cb = [rec->ctx->queue commandBuffer];
+        return 0;
+    }
+}
+
 static id<MTLBuffer> rec_pick(ib_metal_ctx *ctx, const void *p) {
     auto it = ctx->buffers.find((void *)p);
     return it == ctx->buffers.end() ? nil : it->second;

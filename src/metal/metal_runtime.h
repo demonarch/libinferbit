@@ -759,6 +759,13 @@ int ib_metal_forward_prefill(ib_metal_ctx *ctx,
  * generation runs that don't share a prefix. */
 void ib_metal_reset_kv(ib_metal_model_buffers *bufs);
 
+/* GPU drive mode (doc 32): commit + wait the recorder's current
+ * command buffer, then allocate a fresh one. Same recorder handle
+ * remains valid for subsequent rec_* calls. Used to serialize a
+ * per-matmul streaming pattern where CPU preads weight pages into a
+ * shared MTLBuffer scratch between dispatches. */
+int ib_metal_recorder_checkpoint(ib_metal_recorder *rec);
+
 /* Paginated greedy decode: runs `n_steps` autoregressive forwards on the
  * GPU in a single command buffer, with argmax + embedding-lookup also
  * on the GPU. CPU pays only one waitUntilCompleted (instead of n_steps).
