@@ -1418,6 +1418,118 @@ kernel void matmul_pqv2_batched_simdmat(
     simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
 }
 
+/* matmul_pqv2_batched_simdmat_tg64 — bigger output tile per TG.
+ *
+ * Tile: 64 M rows × 32 B tokens = 2048 outputs. 32 SIMDgroups per TG
+ * (8×4 sub-tile grid; M4 limit is 32 SGs/TG). Same K_TILE=64.
+ *
+ * The point: each W gather covers 64 rows × K_TILE cols (2× M_BLOCK
+ * of the base kernel), so the cooperative dequant amortizes across
+ * twice as many output rows. Half as many TGs (more work each).
+ *
+ * Requires M % 64 == 0, B % 32 == 0, N % 64 == 0. */
+constant constexpr int PSDM64_M_BLOCK = 64;
+constant constexpr int PSDM64_B_BLOCK = 32;
+constant constexpr int PSDM64_K_TILE  = 64;
+
+kernel void matmul_pqv2_batched_simdmat_tg64(
+    device const half  *row_scale  [[buffer(0)]],
+    device const half  *cb_fp16    [[buffer(1)]],
+    device const uchar *indices    [[buffer(2)]],
+    device const float *x_fp32     [[buffer(3)]],
+    device       float *out        [[buffer(4)]],
+    constant     uint  &M          [[buffer(5)]],
+    constant     uint  &N          [[buffer(6)]],
+    constant     uint  &B          [[buffer(7)]],
+    constant     uint  &G          [[buffer(8)]],
+    constant     uint  &n_subchunks[[buffer(9)]],
+    threadgroup half   *tg_W_fp16  [[threadgroup(0)]],  /* [64][64] = 8 KB */
+    threadgroup half   *tg_A_fp16  [[threadgroup(1)]],  /* [32][64] = 4 KB */
+    uint                simd_lane  [[thread_index_in_simdgroup]],
+    uint                simd_id    [[simdgroup_index_in_threadgroup]],
+    uint2               tg_id      [[threadgroup_position_in_grid]])
+{
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+    uint tg_lane = simd_id * 32u + simd_lane;
+    constexpr uint TG_THREADS = 32u * 32u;  /* 32 SGs × 32 lanes */
+
+    /* 8×4 sub-tile mapping: simd_id 0..31 → (m_off, b_off) ∈ [0..7]×[0..3]. */
+    uint m_off = simd_id & 7u;
+    uint b_off = simd_id >> 3u;
+
+    uint m_base = tg_id.x * PSDM64_M_BLOCK;
+    uint b_base = tg_id.y * PSDM64_B_BLOCK;
+    if (m_base >= M || b_base >= B) return;
+
+    uint my_m_base = m_base + m_off * 8u;
+    uint my_b_base = b_base + b_off * 8u;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint n_tiles = N / PSDM64_K_TILE;
+
+    for (uint t = 0; t < n_tiles; t++) {
+        uint k_start = t * PSDM64_K_TILE;
+
+        /* Cooperative PQv2 dequant W tile (64 rows × 64 cols = 4096 elts;
+         * 1024 lanes → 4/lane). */
+        for (uint i = tg_lane; i < PSDM64_M_BLOCK * PSDM64_K_TILE; i += TG_THREADS) {
+            uint m_local = i / PSDM64_K_TILE;
+            uint k_local = i - m_local * PSDM64_K_TILE;
+            uint m_global = m_base + m_local;
+            uint n_global = k_start + k_local;
+
+            half v = (half)0;
+            if (m_global < M && n_global < N) {
+                uint c = n_global / G;
+                uint within = n_global - c * G;
+                uint s = within / HALF;
+                uint h = within - s * HALF;
+                uint k_idx = (uint)indices[(size_t)m_global * total + c * n_subchunks + s];
+                half cb_v = cb_fp16[(s * K + k_idx) * HALF + h];
+                v = cb_v * row_scale[m_global];
+            }
+            tg_W_fp16[i] = v;
+        }
+
+        /* Cooperative activation cast fp32 → fp16 (32 rows × 64 cols = 2048 elts;
+         * 1024 lanes → 2/lane). */
+        for (uint i = tg_lane; i < PSDM64_B_BLOCK * PSDM64_K_TILE; i += TG_THREADS) {
+            uint b_local = i / PSDM64_K_TILE;
+            uint k_local = i - b_local * PSDM64_K_TILE;
+            uint b_global = b_base + b_local;
+            uint n_global = k_start + k_local;
+
+            half v = (half)0;
+            if (b_global < B && n_global < N) {
+                v = (half)x_fp32[(size_t)b_global * N + n_global];
+            }
+            tg_A_fp16[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *A_base = tg_A_fp16 + (size_t)(b_off * 8u) * PSDM64_K_TILE;
+        threadgroup const half *W_base = tg_W_fp16 + (size_t)(m_off * 8u) * PSDM64_K_TILE;
+
+        for (uint k_sub = 0; k_sub < PSDM64_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, PSDM64_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, PSDM64_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
+}
+
 /* matmul_pqv2_batched_simdmat_b8 — B_BLOCK=8 variant of the PQv2 simdmat
  * kernel. Output tile: 32 rows × 8 batch. 4 SIMDgroups per TG (4×1
  * sub-tile grid). Works for any B that is a multiple of 8 (e.g. B=8,

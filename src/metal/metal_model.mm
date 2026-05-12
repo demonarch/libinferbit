@@ -929,9 +929,11 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
                                   int B, int M, int N)
 {
     if (tb && tb->is_pq) {
-        /* Cascade by tile-fit: B_BLOCK=32 (best amortization, needs B%32),
-         * then B_BLOCK=8 (needs B%8 — handles arbitrary prompts ≥8),
-         * then SIMD-coop fallback (no shape constraints). */
+        /* Cascade: tg32 (32×32, M%32 + B%32) → b8 (32×8, M%32 + B%8) →
+         * SIMD-coop fallback. tg64 (64×32) is built and available but
+         * empirically same-or-worse on TinyLlama (TG memory pressure
+         * reduces SIMDgroup occupancy faster than W-load amortization
+         * pays back). Kept available via the recorder for tuning. */
         int rc = ib_metal_rec_matmul_pqv2_batched_simdmat(r,
             tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
             B, M, N, tb->pq_G, tb->pq_ns);
