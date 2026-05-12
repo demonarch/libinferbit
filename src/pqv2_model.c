@@ -162,6 +162,7 @@ static inferbit_model* pqv2_load_internal(const char* path,
         const ib_pqv2_named_tensor* nt = &f->tensors[i];
         const char* n = nt->name;
         if (nt->kind == IB_PQV2_KIND_PQV2) {
+            /* Layer projections: L<L>.<parent>.<proj> */
             int li;
             char parent[32], proj[32];
             if (sscanf(n, "L%d.%31[^.].%31s", &li, parent, proj) == 3 &&
@@ -179,6 +180,10 @@ static inferbit_model* pqv2_load_internal(const char* path,
                     else if (strcmp(proj, "down_proj") == 0) slot = &L->down_proj;
                 }
                 if (slot) set_pq_meta(slot, &nt->pq);
+            } else if (strcmp(n, "token_embedding") == 0) {
+                set_pq_meta(&m->token_embedding, &nt->pq);
+            } else if (strcmp(n, "lm_head") == 0) {
+                set_pq_meta(&m->output_head, &nt->pq);
             }
         } else {
             int li;

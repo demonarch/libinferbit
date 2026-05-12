@@ -85,10 +85,8 @@ struct ib_metal_model_buffers {
     struct layer_bufs *layers;
 
     void *output_norm;
-    void *output_head_w;
-    void *output_head_s;
-    int   output_head_bits;
-    int   output_head_blk32;
+    /* Output head: tensor_bufs unifies INT4/INT8/FP16 and PQv2 paths. */
+    struct tensor_bufs output_head;
 
     /* State buffers (reused across layers). */
     void *x;
@@ -133,8 +131,15 @@ static int model_is_supported(const inferbit_model *m, char *err, size_t err_sz)
     int kvb = m->header.kv_bits;
     CHECK(kvb == 16 || kvb == 8, "Metal forward requires kv_bits=16 or kv_bits=8");
     CHECK(m->output_norm.bits == 16, "output_norm must be fp16");
-    CHECK((m->output_head.bits == 4 || m->output_head.bits == 8 || m->output_head.bits == 16) && m->output_head.pq == NULL,
-          "output_head must be INT4/INT8/FP16 without PQ");
+    if (m->output_head.pq) {
+        CHECK(m->output_head.pq->K == 256 && m->output_head.pq->half == 2,
+              "PQv2 GPU path requires K=256 and half=2 on output_head");
+        CHECK(m->output_head.pq->l2_kind == 0,
+              "PQv2 L2 residual not yet supported on GPU for output_head");
+    } else {
+        CHECK(m->output_head.bits == 4 || m->output_head.bits == 8 || m->output_head.bits == 16,
+              "output_head must be INT4/INT8/FP16 or PQv2");
+    }
     for (int L = 0; L < m->header.num_layers; L++) {
         const ib_layer_meta *lm = &m->layers[L];
         /* Accept INT4/INT8 OR PQv2 (K=256, half=2) for each matmul tensor. */
@@ -402,10 +407,7 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
     }
 
     upload_norm(ctx, m, &m->output_norm, &b->output_norm);
-    upload_w_pair(ctx, m, &m->output_head, &b->output_head_w, &b->output_head_s);
-    b->output_head_bits = m->output_head.bits;
-    b->output_head_blk32 = (m->output_head.bits == 4 &&
-                             m->output_head.scale_size > (size_t)m->output_head.shape[0] * 2);
+    upload_tensor(ctx, m, &m->output_head, &b->output_head);
 
     int max_n = b->intermediate > b->hidden ? b->intermediate : b->hidden;
     int xs_groups = (max_n + 127) / 128;
@@ -542,7 +544,9 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
         FR(lb->k_scales); FR(lb->v_scales);
     }
     free(b->layers);
-    FR(b->output_norm); FR(b->output_head_w); FR(b->output_head_s);
+    FR(b->output_norm);
+    FR(b->output_head.w); FR(b->output_head.s);
+    FR(b->output_head.pq_rs); FR(b->output_head.pq_cb); FR(b->output_head.pq_idx);
     FR(b->x); FR(b->xb); FR(b->xb2);
     FR(b->q); FR(b->k); FR(b->v); FR(b->attn_out);
     FR(b->hb); FR(b->hb2); FR(b->scores);
@@ -789,9 +793,7 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
         }
     }
     ib_metal_rec_rmsnorm_fp16(r, b->x, b->output_norm, b->xb, hidden, eps);
-    rec_matmul(r, b->output_head_bits, b->output_head_blk32, b->xb,
-                b->output_head_w, b->output_head_s,
-                b->logits, b->xq, b->xs, b->vocab, hidden);
+    rec_matmul_tb(r, &b->output_head, b->xb, b->logits, b->xq, b->xs, b->vocab, hidden);
 
     int rc = ib_metal_recorder_commit(r);
     if (rc != 0) return rc;
@@ -820,6 +822,12 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
                                   int B, int M, int N)
 {
     if (tb && tb->is_pq) {
+        /* Try Apple simdgroup_matrix path first (requires M%32, B%32, N%64). */
+        int rc = ib_metal_rec_matmul_pqv2_batched_simdmat(r,
+            tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+            B, M, N, tb->pq_G, tb->pq_ns);
+        if (rc == 0) return 0;
+        /* Fall back to the SIMD-coop batched kernel (no shape constraints). */
         return ib_metal_rec_matmul_pqv2_k256_half2_batched(r,
             tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
             B, M, N, tb->pq_G, tb->pq_ns);
@@ -1036,9 +1044,7 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
     ib_metal_rec_rmsnorm_fp16(r,
         ROW_F(b->x_b, B - 1, hidden), b->output_norm,
         b->xb, hidden, eps);
-    rec_matmul(r, b->output_head_bits, b->output_head_blk32, b->xb,
-                b->output_head_w, b->output_head_s,
-                b->logits, b->xq, b->xs, b->vocab, hidden);
+    rec_matmul_tb(r, &b->output_head, b->xb, b->logits, b->xq, b->xs, b->vocab, hidden);
 
     int rc = ib_metal_recorder_commit(r);
     if (rc != 0) return rc;

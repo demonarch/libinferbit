@@ -648,6 +648,15 @@ int ib_metal_rec_matmul_pqv2_gateup_k256_half2(ib_metal_recorder *rec,
     const void *u_rs, const void *u_cb, const void *u_idx, void *u_out,
     int M_io, int N, int G, int n_subchunks);
 
+/* PQv2 batched simdmat — uses Apple's simdgroup_matrix HW for the
+ * prefill matmul, gathering PQv2 weights into a fp16 tile per K-chunk
+ * before each 32×32 tile matmul. Returns -2 when shape constraints
+ * (M%32, B%32, N%64) aren't met; caller falls back. */
+int ib_metal_rec_matmul_pqv2_batched_simdmat(ib_metal_recorder *rec,
+    const void *row_scale_fp16, const void *cb_fp16, const void *indices_u8,
+    const void *x_fp32, void *out_fp32,
+    int B, int M, int N, int G, int n_subchunks);
+
 /* Batched variant for prefill: x is [B][N], out is [B][M]. Each TG
  * dispatch handles one (m_block, b) pair so LUT-build is per-token. */
 int ib_metal_rec_matmul_pqv2_k256_half2_batched(ib_metal_recorder *rec,

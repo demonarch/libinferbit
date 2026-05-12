@@ -91,6 +91,30 @@ static void embedding_lookup(const inferbit_model* m, int token_id, float* out) 
     int hidden = m->header.hidden_size;
     const ib_tensor_meta* emb = &m->token_embedding;
 
+    if (emb->pq) {
+        /* PQv2 embedding: decode one row. */
+        const pqv2_t* pq = emb->pq;
+        uint32_t G = pq->G;
+        uint32_t ns = pq->n_subchunks;
+        uint32_t K = pq->K;
+        uint32_t HALF = pq->half;
+        uint32_t nc = pq->N / G;
+        const uint8_t* idx_base = (const uint8_t*)pq->indices;  /* [nc][ns][M] */
+        const int8_t* cb_q = (const int8_t*)pq->cb_q;           /* [ns][K][HALF] */
+        const uint16_t* cb_s = (const uint16_t*)pq->cb_scale;   /* [ns][K] */
+        float rs = pq->row_scale ? fp16_to_fp32(((const uint16_t*)pq->row_scale)[token_id]) : 1.0f;
+        for (uint32_t c = 0; c < nc; c++) {
+            for (uint32_t s = 0; s < ns; s++) {
+                uint8_t k = idx_base[((size_t)c * ns + s) * pq->M + token_id];
+                float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
+                for (uint32_t h = 0; h < HALF; h++) {
+                    int8_t q = cb_q[(s * K + k) * HALF + h];
+                    out[c * G + s * HALF + h] = (float)q * scl;
+                }
+            }
+        }
+        return;
+    }
     if (emb->bits == 8) {
         /* INT8 embedding: dequantize row */
         const int8_t* data = (const int8_t*)tensor_data(m, emb);
