@@ -657,6 +657,15 @@ int ib_metal_rec_matmul_pqv2_batched_simdmat(ib_metal_recorder *rec,
     const void *x_fp32, void *out_fp32,
     int B, int M, int N, int G, int n_subchunks);
 
+/* PQv2 decode (B=1) via Apple simdgroup_matrix. X-broadcast trick:
+ * fills an 8x8 X tile with replicated x[k..k+7] rows so the matrix
+ * unit can do 8-row matvec partials per instruction. Returns -2 if
+ * M%8 or N%64 not satisfied; caller falls back to SIMD-coop. */
+int ib_metal_rec_matmul_pqv2_simdmat_decode(ib_metal_recorder *rec,
+    const void *row_scale_fp16, const void *cb_fp16, const void *indices_u8,
+    const void *x_fp32, void *out_fp32,
+    int M, int N, int G, int n_subchunks);
+
 /* Batched variant for prefill: x is [B][N], out is [B][M]. Each TG
  * dispatch handles one (m_block, b) pair so LUT-build is per-token. */
 int ib_metal_rec_matmul_pqv2_k256_half2_batched(ib_metal_recorder *rec,

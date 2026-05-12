@@ -611,6 +611,21 @@ static int rec_matmul_tb(ib_metal_recorder *r,
                           int M, int N)
 {
     if (tb->is_pq) {
+        /* Optional simdmat decode (IB_PQV2_SIMDMAT_DECODE=1). Uses
+         * Apple simdgroup_matrix; on small M (TinyLlama) the x-broadcast
+         * 8× compute waste outweighs the matrix-HW win, so off by default.
+         * May help on larger M (lm_head M=32000) — kept available. */
+        static int simdmat_dec_setting = -1;
+        if (simdmat_dec_setting < 0) {
+            const char *env = getenv("IB_PQV2_SIMDMAT_DECODE");
+            simdmat_dec_setting = (env && env[0] == '1') ? 1 : 0;
+        }
+        if (simdmat_dec_setting) {
+            int rc = ib_metal_rec_matmul_pqv2_simdmat_decode(r,
+                tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+                tb->pq_M, tb->pq_N, tb->pq_G, tb->pq_ns);
+            if (rc == 0) return 0;
+        }
         return ib_metal_rec_matmul_pqv2_k256_half2(r,
             tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
             tb->pq_M, tb->pq_N, tb->pq_G, tb->pq_ns);

@@ -2852,6 +2852,106 @@ kernel void attn_weighted_v(
  *   Gather per iter: 2048 fp ops (1 per m)
  *   Total per matmul: ~2.6M ops vs ~4.2M ops for the same INT4 matmul.
  */
+/* matmul_pqv2_simdmat_decode — PQv2 matvec via Apple's simdgroup_matrix.
+ *
+ * Decode is a matvec (B=1). Apple's matrix unit needs 8×8 fp16 inputs,
+ * so we use the x-broadcast trick: the X tile has the same 8 elements
+ * of x repeated across 8 rows. Only the first row of the 8×8 output
+ * tile is meaningful (rows 1..7 compute the same matvec partials);
+ * we accept 8× compute on the inactive rows because the matrix HW
+ * throughput is ~10× scalar fp16 fma.
+ *
+ * Geometry:
+ *   - 1 SIMDgroup per TG = 32 lanes
+ *   - 1 SIMDgroup computes 8 output rows in parallel
+ *   - Grid: (M/8, 1, 1)
+ *   - K tile = 64; per K-tile: gather 8×64 PQv2 weights, cast 64 x's
+ *     into the broadcast X tile, run 8 simdgroup_matrix mma's.
+ *
+ * Requires M % 8 == 0, N % 64 == 0. */
+kernel void matmul_pqv2_simdmat_decode(
+    device const half  *row_scale  [[buffer(0)]],   /* [M] */
+    device const half  *cb_fp16    [[buffer(1)]],   /* [ns][K=256][2] */
+    device const uchar *indices    [[buffer(2)]],   /* [M][total] u8 */
+    device const float *x_fp32     [[buffer(3)]],   /* [N] */
+    device       float *out        [[buffer(4)]],   /* [M] */
+    constant     uint  &M          [[buffer(5)]],
+    constant     uint  &N          [[buffer(6)]],
+    constant     uint  &G          [[buffer(7)]],
+    constant     uint  &n_subchunks[[buffer(8)]],
+    threadgroup half   *tg_W_fp16  [[threadgroup(0)]],  /* [8][64] = 1 KB */
+    threadgroup half   *tg_X_fp16  [[threadgroup(1)]],  /* [8][64] = 1 KB (rows replicated) */
+    threadgroup float  *tg_C       [[threadgroup(2)]],  /* [8][8] = 256 B */
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                tg_id      [[threadgroup_position_in_grid]])
+{
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+    constexpr uint TILE = 64u;
+
+    uint m_base = tg_id * 8u;
+    if (m_base >= M) return;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint n_tiles = N / TILE;
+
+    for (uint t = 0; t < n_tiles; t++) {
+        uint k_start = t * TILE;
+
+        /* PQv2 dequant 8 W rows × 64 cols = 512 elts; 32 lanes → 16/lane. */
+        for (uint i = lane; i < 8u * TILE; i += 32u) {
+            uint m_local = i >> 6u;            /* / 64 */
+            uint k_local = i & 63u;            /* % 64 */
+            uint m_global = m_base + m_local;
+            uint n_global = k_start + k_local;
+
+            half v = (half)0;
+            if (m_global < M && n_global < N) {
+                uint c = n_global / G;
+                uint within = n_global - c * G;
+                uint s = within / HALF;
+                uint h = within - s * HALF;
+                uint k_idx = (uint)indices[(size_t)m_global * total + c * n_subchunks + s];
+                half cb_v = cb_fp16[(s * K + k_idx) * HALF + h];
+                v = cb_v * row_scale[m_global];
+            }
+            tg_W_fp16[i] = v;
+        }
+
+        /* Cast 64 x's to fp16, replicate across 8 rows. 64 lanes work? No,
+         * we have 32. 2 elts/lane × 8 rows = 16/lane work. */
+        for (uint i = lane; i < TILE; i += 32u) {
+            half v = (half)x_fp32[k_start + i];
+            for (uint r = 0; r < 8u; r++) tg_X_fp16[r * TILE + i] = v;
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* 8 sub-matmuls of K=8 each. */
+        for (uint k_sub = 0; k_sub < TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;   /* X (8x8, rows are replicas) */
+            simdgroup_half8x8 W_sub_T; /* W transposed */
+            simdgroup_load(A_sub, tg_X_fp16 + k_sub * 8u, TILE);
+            simdgroup_load(W_sub_T, tg_W_fp16 + k_sub * 8u, TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Store the full 8x8 to scratch, then read row 0: C[0][j] is the
+     * meaningful matvec result for output row m_base+j. */
+    simdgroup_store(C, tg_C, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 8u) {
+        out[m_base + lane] = tg_C[lane];
+    }
+}
+
 /* SIMDgroup-cooperative no-LUT PQv2 decode.
  *
  * Each output row is handled by one 32-lane SIMDgroup. The (c, s) loop

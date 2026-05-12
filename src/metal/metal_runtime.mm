@@ -2609,6 +2609,59 @@ extern "C" int ib_metal_rec_matmul_fp16w_fp32x(ib_metal_recorder *rec,
     return 0;
 }
 
+/* PQv2 decode (B=1) via Apple's simdgroup_matrix. Returns -2 if shape
+ * doesn't satisfy M%8==0, N%64==0 — caller falls back. */
+extern "C" int ib_metal_rec_matmul_pqv2_simdmat_decode(ib_metal_recorder *rec,
+                                                        const void *row_scale_fp16,
+                                                        const void *cb_fp16,
+                                                        const void *indices_u8,
+                                                        const void *x_fp32,
+                                                        void *out_fp32,
+                                                        int M, int N, int G, int n_subchunks)
+{
+    if (!rec || !row_scale_fp16 || !cb_fp16 || !indices_u8 || !x_fp32 || !out_fp32
+        || M <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0) return -1;
+    if ((N % G) != 0) return -1;
+    if ((M % 8) != 0 || (N % 64) != 0) return -2;
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_pqv2_simdmat_decode");
+    if (!ps) return -1;
+
+    NSUInteger ors=0, ocb=0, oi=0, ox=0, oo=0;
+    id<MTLBuffer> b_rs = rec_pick_off(rec->ctx, row_scale_fp16, &ors);
+    id<MTLBuffer> b_cb = rec_pick_off(rec->ctx, cb_fp16, &ocb);
+    id<MTLBuffer> b_i  = rec_pick_off(rec->ctx, indices_u8, &oi);
+    id<MTLBuffer> b_x  = rec_pick_off(rec->ctx, x_fp32, &ox);
+    id<MTLBuffer> b_o  = rec_pick_off(rec->ctx, out_fp32, &oo);
+    if (!b_rs || !b_cb || !b_i || !b_x || !b_o) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, G_u = (uint)G, ns_u = (uint)n_subchunks;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_rs offset:ors atIndex:0];
+    [enc setBuffer:b_cb offset:ocb atIndex:1];
+    [enc setBuffer:b_i  offset:oi  atIndex:2];
+    [enc setBuffer:b_x  offset:ox  atIndex:3];
+    [enc setBuffer:b_o  offset:oo  atIndex:4];
+    [enc setBytes:&M_u  length:sizeof(M_u)  atIndex:5];
+    [enc setBytes:&N_u  length:sizeof(N_u)  atIndex:6];
+    [enc setBytes:&G_u  length:sizeof(G_u)  atIndex:7];
+    [enc setBytes:&ns_u length:sizeof(ns_u) atIndex:8];
+
+    /* Threadgroup memory: tg_W_fp16 [8][64], tg_X_fp16 [8][64], tg_C [8][8]. */
+    NSUInteger tg_W_bytes = 8 * 64 * sizeof(uint16_t);
+    NSUInteger tg_X_bytes = 8 * 64 * sizeof(uint16_t);
+    NSUInteger tg_C_bytes = 8 * 8  * sizeof(float);
+    [enc setThreadgroupMemoryLength:tg_W_bytes atIndex:0];
+    [enc setThreadgroupMemoryLength:tg_X_bytes atIndex:1];
+    [enc setThreadgroupMemoryLength:tg_C_bytes atIndex:2];
+
+    NSUInteger n_tg = (NSUInteger)M / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
 extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
                                                      const void *row_scale_fp16,
                                                      const void *cb_fp16,
