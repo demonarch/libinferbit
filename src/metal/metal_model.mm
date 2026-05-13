@@ -241,13 +241,74 @@ static void release_mmap_range(const void *src, size_t len) {
 #endif
 }
 
+/* Pre-shuffle INT4-blk32 weights from row-major [M][N/2] into tile-major
+ * [(M/32)*(N/64)][32*32] bytes (32-row × 64-col tile flattened). Matches
+ * the K_TILE=64 pipelined kernel's tile geometry so each TG reads its
+ * 1024-byte tile as one contiguous chunk. Caller owns the returned buffer. */
+static uint8_t *shuffle_int4_blk32_k64(const uint8_t *src, int M, int N) {
+    if (M <= 0 || N <= 0 || (M % 32) || (N % 64)) return NULL;
+    size_t total = (size_t)M * (size_t)(N / 2);
+    uint8_t *dst = (uint8_t *)malloc(total);
+    if (!dst) return NULL;
+    int num_k_tiles = N / 64;
+    int row_bytes = N / 2;       /* bytes per src row */
+    for (int m = 0; m < M; m++) {
+        int m_t = m / 32;
+        int m_in_t = m % 32;
+        const uint8_t *src_row = src + (size_t)m * row_bytes;
+        for (int kb = 0; kb < row_bytes; kb++) {
+            int k_in_bytes = kb * 2;          /* the col-index of the LOW nibble */
+            int k_t = k_in_bytes / 64;
+            int kb_in_t = (k_in_bytes % 64) / 2;  /* = kb % 32 */
+            size_t tile_idx = (size_t)m_t * num_k_tiles + k_t;
+            size_t dst_off = tile_idx * 1024 + (size_t)m_in_t * 32 + kb_in_t;
+            dst[dst_off] = src_row[kb];
+        }
+    }
+    return dst;
+}
+
 static void upload_w_pair(ib_metal_ctx *ctx, const inferbit_model *m,
                            const ib_tensor_meta *t,
                            void **out_w, void **out_s)
 {
     const uint8_t *base = (const uint8_t *)m->weight_data;
     const uint8_t *w_src = base + t->offset;
-    *out_w = ib_metal_alloc(ctx, t->size, w_src);
+    /* IB_PREFILL_SHUFFLED=1 — EXPERIMENTAL / KNOWN BROKEN FOR DECODE.
+     *
+     * The shuffled prefill kernel (variant=3) reads INT4 weights in
+     * tile-major [(M/32)*(N/64)][32×32-bytes] layout instead of
+     * row-major. Setting this env flag rewrites the upload-time
+     * weights in place — but the decode kernels (dr_a32 family) still
+     * expect row-major, so DECODE PRODUCES GARBAGE in this mode. The
+     * empirical PP perf is also -13% vs the default K=64 pipelined
+     * (negative result), so this flag should only be used for kernel
+     * micro-benching, never in production. Dual-buffer (keep both
+     * layouts) is the path forward if shuffled kernel is ever revised
+     * to win. */
+    int can_shuffle = (t->bits == 4 &&
+                       t->scale_size > (size_t)t->shape[0] * 2 &&  /* blk32 */
+                       t->shape[0] > 0 && t->shape[1] > 0 &&
+                       (t->shape[0] % 32) == 0 && (t->shape[1] % 64) == 0);
+    static int shuffle_setting = -1;
+    if (shuffle_setting < 0) {
+        const char *env = getenv("IB_PREFILL_SHUFFLED");
+        shuffle_setting = (env && env[0] == '1') ? 1 : 0;
+        if (shuffle_setting) {
+            fprintf(stderr, "ib_metal: WARNING IB_PREFILL_SHUFFLED=1 — decode kernels will misread weights; use for prefill micro-bench only.\n");
+        }
+    }
+    if (shuffle_setting && can_shuffle) {
+        uint8_t *sh = shuffle_int4_blk32_k64(w_src, t->shape[0], t->shape[1]);
+        if (sh) {
+            *out_w = ib_metal_alloc(ctx, t->size, sh);
+            free(sh);
+        } else {
+            *out_w = ib_metal_alloc(ctx, t->size, w_src);
+        }
+    } else {
+        *out_w = ib_metal_alloc(ctx, t->size, w_src);
+    }
     release_mmap_range(w_src, t->size);
     if (t->scale_size > 0) {
         const uint8_t *s_src = base + t->scale_offset;

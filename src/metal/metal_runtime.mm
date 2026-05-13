@@ -1381,19 +1381,29 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(ib_me
     if (!rec || !x_fp32 || !weights || !w_scales || !out
         || !scratch_x_q || !scratch_x_scales || B <= 0 || M <= 0 || N <= 0) return -1;
     if ((N % 128) != 0 || (M % 32) != 0 || (B % 32) != 0) return -2;
-    /* Pipelined variant (double-buffered K-tile): the dequant of tile
-     * g+1 is interleaved with simdmat ops on tile g for ILP. Opt-in
-     * for now (IB_PREFILL_PIPELINED=1) until empirically validated
-     * across shapes. Uses 32 KB TG memory (vs 16 KB single-buffer);
-     * Apple GPUs support up to 32 KB per TG. */
-    static int pipelined_setting = -1;
-    if (pipelined_setting < 0) {
-        const char *env = getenv("IB_PREFILL_PIPELINED");
-        pipelined_setting = (env && env[0] == '1') ? 1 : 0;
+    /* Kernel variant selector (read once, cached):
+     *   default: tg32 K=64 pipelined (16 KB TG mem, +8-9% over K=128 single)
+     *   IB_PREFILL_K64=0:        tg32 single-buffer K=128 (legacy)
+     *   IB_PREFILL_PIPELINED=1:  tg32 pipelined K=128 (32 KB, occupancy regression)
+     *   IB_PREFILL_SHUFFLED=1:   tg32 K=64 pipelined with tile-major weight layout
+     *                            (requires upload-time shuffle in metal_model.mm) */
+    static int variant_idx = -1;
+    if (variant_idx < 0) {
+        const char *k64_env   = getenv("IB_PREFILL_K64");
+        const char *pipe_env  = getenv("IB_PREFILL_PIPELINED");
+        const char *shuf_env  = getenv("IB_PREFILL_SHUFFLED");
+        if (shuf_env && shuf_env[0] == '1') variant_idx = 3;
+        else if (k64_env && k64_env[0] == '0') variant_idx = 0;
+        else if (pipe_env && pipe_env[0] == '1') variant_idx = 1;
+        else variant_idx = 2;
     }
-    const char *mm_kernel = pipelined_setting
-        ? "matmul_w4a8_blk32_batched_simdmat_tg32_pipelined"
-        : "matmul_w4a8_blk32_batched_simdmat_tg32";
+    const char *mm_kernel;
+    switch (variant_idx) {
+        case 3:  mm_kernel = "matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_shuffled"; break;
+        case 2:  mm_kernel = "matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined"; break;
+        case 1:  mm_kernel = "matmul_w4a8_blk32_batched_simdmat_tg32_pipelined"; break;
+        default: mm_kernel = "matmul_w4a8_blk32_batched_simdmat_tg32"; break;
+    }
     id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128_batched");
     id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, mm_kernel);
     if (!ps_q || !ps_mm) return -1;
@@ -1431,10 +1441,20 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(ib_me
         [enc setBytes:&M_u length:sizeof(M_u) atIndex:5];
         [enc setBytes:&N_u length:sizeof(N_u) atIndex:6];
         [enc setBytes:&B_u length:sizeof(B_u) atIndex:7];
-        /* Pipelined kernel needs double the TG memory for two slots. */
-        NSUInteger tg_factor = pipelined_setting ? 2u : 1u;
-        NSUInteger tg_w_bytes = tg_factor * 32 * 128 * sizeof(uint16_t);
-        NSUInteger tg_a_bytes = tg_factor * 32 * 128 * sizeof(uint16_t);
+        /* TG memory per slot × number of slots:
+         *   default / K=64 pipelined / shuffled:  2 slots × 32× 64 fp16 = 16 KB
+         *   K=128 pipelined:                       2 slots × 32×128 fp16 = 32 KB
+         *   K=128 single:                          1 slot  × 32×128 fp16 = 16 KB */
+        NSUInteger slot_w_bytes, slot_a_bytes;
+        NSUInteger n_slots;
+        switch (variant_idx) {
+            case 3: /* shuffled K=64 pipelined */
+            case 2:  slot_w_bytes = slot_a_bytes = 32 * 64 * sizeof(uint16_t); n_slots = 2; break;
+            case 1:  slot_w_bytes = slot_a_bytes = 32 * 128 * sizeof(uint16_t); n_slots = 2; break;
+            default: slot_w_bytes = slot_a_bytes = 32 * 128 * sizeof(uint16_t); n_slots = 1; break;
+        }
+        NSUInteger tg_w_bytes = n_slots * slot_w_bytes;
+        NSUInteger tg_a_bytes = n_slots * slot_a_bytes;
         [enc setThreadgroupMemoryLength:tg_w_bytes atIndex:0];
         [enc setThreadgroupMemoryLength:tg_a_bytes atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M / 32, (NSUInteger)B / 32, 1)
@@ -2739,7 +2759,19 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
     if (!rec || !row_scale_fp16 || !cb_fp16 || !indices_u8 || !x_fp32 || !out_fp32
         || M <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0) return -1;
     if ((N % G) != 0) return -1;
-    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_pqv2_k256_half2");
+    /* K-split variant: K_SPLIT SGs cooperate per output row with TG-mem
+     * cross-SG reduction. Opt-in via IB_PQV2_KSPLIT=1; empirically better
+     * for shapes where M is small enough that 1-SG-per-row leaves the GPU
+     * under-subscribed. */
+    static int ksplit_setting = -1;
+    if (ksplit_setting < 0) {
+        const char *env = getenv("IB_PQV2_KSPLIT");
+        ksplit_setting = (env && env[0] == '1') ? 1 : 0;
+    }
+    const char *ps_name = ksplit_setting
+        ? "matmul_pqv2_k256_half2_ksplit"
+        : "matmul_pqv2_k256_half2";
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, ps_name);
     if (!ps) return -1;
     NSUInteger ors=0, ocb=0, oi=0, ox=0, oo=0;
     id<MTLBuffer> b_rs = rec_pick_off(rec->ctx, row_scale_fp16, &ors);
@@ -2762,17 +2794,26 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
     [enc setBytes:&G_u  length:sizeof(G_u)  atIndex:7];
     [enc setBytes:&ns_u length:sizeof(ns_u) atIndex:8];
 
-    /* SIMDgroups per TG; tunable via IB_PQV2_SGPT. Default 4 = 128 threads/TG. */
-    static NSUInteger SGPT_cached = 0;
-    if (!SGPT_cached) {
-        const char *env_sgpt = getenv("IB_PQV2_SGPT");
-        SGPT_cached = env_sgpt ? (NSUInteger)atoi(env_sgpt) : 4;
-        if (SGPT_cached < 1 || SGPT_cached > 32) SGPT_cached = 4;
+    if (ksplit_setting) {
+        /* K-split: 16 SGs/TG (K_SPLIT=4 × M_PER_TG=4); n_tg = ceil(M/4). */
+        const NSUInteger SGPT = 16;
+        const NSUInteger M_PER_TG = 4;
+        NSUInteger n_tg = ((NSUInteger)M + M_PER_TG - 1) / M_PER_TG;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
+    } else {
+        /* SIMDgroups per TG; tunable via IB_PQV2_SGPT. Default 4 = 128 threads/TG. */
+        static NSUInteger SGPT_cached = 0;
+        if (!SGPT_cached) {
+            const char *env_sgpt = getenv("IB_PQV2_SGPT");
+            SGPT_cached = env_sgpt ? (NSUInteger)atoi(env_sgpt) : 4;
+            if (SGPT_cached < 1 || SGPT_cached > 32) SGPT_cached = 4;
+        }
+        const NSUInteger SGPT = SGPT_cached;
+        NSUInteger n_tg = ((NSUInteger)M + SGPT - 1) / SGPT;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
     }
-    const NSUInteger SGPT = SGPT_cached;
-    NSUInteger n_tg = ((NSUInteger)M + SGPT - 1) / SGPT;
-    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
     [enc endEncoding];
     return 0;
 }
