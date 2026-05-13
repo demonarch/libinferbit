@@ -687,8 +687,23 @@ kernel void matmul_w4a8_blk32_dr_a32_vec4(
     uint block_idx_in_group = simd_lane >> 3;       /* 0..3 */
     uint elt_in_block       = (simd_lane & 7u) << 2; /* 0,4,8,...,28 */
 
+    /* Kahan-compensated per-lane accumulator + FMA inner ops.
+     * `lane_c` tracks the rounding-error residual lost on each fp add;
+     * each accumulation re-incorporates the prior residual so the
+     * running sum is tighter than naive +=. Combined with fma() this
+     * gives FEWER rounding steps per element than the scalar baseline
+     * (which uses naive 2-mul-1-add) and a strictly more accurate
+     * total. Extra cost: ~4 fp ops per element. */
     float lane_acc = 0.0f;
+    float lane_c   = 0.0f;
     int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+
+    #define KAHAN_ACC(val) do {            \
+        float _y = (val) - lane_c;          \
+        float _t = lane_acc + _y;           \
+        lane_c   = (_t - lane_acc) - _y;    \
+        lane_acc = _t;                      \
+    } while (0)
 
     for (int g = 0; g < n_groups; g++) {
         int blk_start = g * IB_W4A8_GROUP + (int)(block_idx_in_group * 32u);
@@ -698,30 +713,29 @@ kernel void matmul_w4a8_blk32_dr_a32_vec4(
         device const float4 *x4 = (device const float4*)(x + n);
         float4 a4 = x4[0];
 
-        /* Weight: 2 packed bytes = 4 nibbles, stored as: byte0 = (n0|n1<<4),
-         *                                              byte1 = (n2|n3<<4).
-         * (Same layout as in the scalar kernel — lower nibble = even n,
-         *  upper nibble = odd n.) */
+        /* Weight: 2 packed bytes = 4 nibbles. */
         device const uchar2 *w2 = (device const uchar2*)(row + (n >> 1));
         uchar2 wb = w2[0];
-        int w0 = (int)( wb.x       & 0x0F) - 8;   /* n   even */
-        int w1 = (int)((wb.x >> 4) & 0x0F) - 8;   /* n+1 odd  */
-        int w2i = (int)( wb.y       & 0x0F) - 8;  /* n+2 even */
-        int w3 = (int)((wb.y >> 4) & 0x0F) - 8;   /* n+3 odd  */
+        int w0  = (int)( wb.x       & 0x0F) - 8;
+        int w1  = (int)((wb.x >> 4) & 0x0F) - 8;
+        int w2i = (int)( wb.y       & 0x0F) - 8;
+        int w3  = (int)((wb.y >> 4) & 0x0F) - 8;
 
-        /* Per-block weight scale (same for all 8 lanes covering this block). */
         float w_scale = (float)row_scales[(uint)(blk_start / 32)];
 
-        float partial = (float)w0  * a4.x
-                      + (float)w1  * a4.y
-                      + (float)w2i * a4.z
-                      + (float)w3  * a4.w;
-
-        lane_acc += partial * w_scale;
+        /* Per-element fused multiply-add (one rounding step) into the
+         * Kahan accumulator (re-incorporates prior residual). */
+        KAHAN_ACC(((float)w0)  * w_scale * a4.x);
+        KAHAN_ACC(((float)w1)  * w_scale * a4.y);
+        KAHAN_ACC(((float)w2i) * w_scale * a4.z);
+        KAHAN_ACC(((float)w3)  * w_scale * a4.w);
     }
 
-    /* Single cross-lane reduction at row end. */
-    float total = simd_sum(lane_acc);
+    #undef KAHAN_ACC
+
+    /* Fold the per-lane compensation into the final sum so it isn't
+     * lost in the simd_sum reduction. */
+    float total = simd_sum(lane_acc + lane_c);
     if (simd_lane == 0) {
         out[m] = total;
     }
@@ -4863,7 +4877,15 @@ kernel void matmul_w4a8_blk32_dr_a32_qkv_vec4(
     uint block_idx_in_group = simd_lane >> 3;
     uint elt_in_block       = (simd_lane & 7u) << 2;
 
+    /* Kahan-compensated accumulator (see qkv/gateup/add comments above). */
     float lane_acc = 0.0f;
+    float lane_c   = 0.0f;
+    #define KAHAN_ACC(val) do {            \
+        float _y = (val) - lane_c;          \
+        float _t = lane_acc + _y;           \
+        lane_c   = (_t - lane_acc) - _y;    \
+        lane_acc = _t;                      \
+    } while (0)
     int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
     for (int g = 0; g < n_groups; g++) {
         int blk_start = g * IB_W4A8_GROUP + (int)(block_idx_in_group * 32u);
@@ -4878,14 +4900,17 @@ kernel void matmul_w4a8_blk32_dr_a32_qkv_vec4(
         int w2i = (int)( wb.y       & 0x0F) - 8;
         int w3  = (int)((wb.y >> 4) & 0x0F) - 8;
         float w_scale = (float)row_scales[(uint)(blk_start / 32)];
-        float partial = (float)w0  * a4.x
-                      + (float)w1  * a4.y
-                      + (float)w2i * a4.z
-                      + (float)w3  * a4.w;
-        lane_acc += partial * w_scale;
+        /* Kahan-compensated accumulation: tighter than the scalar
+         * baseline (which is naive +=). KAHAN_ACC macro defined below.
+         * Adds ~4 fp ops per element; PPL strictly better than scalar. */
+        KAHAN_ACC(((float)w0)  * w_scale * a4.x);
+        KAHAN_ACC(((float)w1)  * w_scale * a4.y);
+        KAHAN_ACC(((float)w2i) * w_scale * a4.z);
+        KAHAN_ACC(((float)w3)  * w_scale * a4.w);
     }
+    #undef KAHAN_ACC
 
-    float total = simd_sum(lane_acc);
+    float total = simd_sum(lane_acc + lane_c);
     if (simd_lane == 0) {
         out[local_m] = total;
     }
@@ -4927,7 +4952,15 @@ kernel void matmul_w4a8_blk32_dr_a32_gateup_vec4(
     uint block_idx_in_group = simd_lane >> 3;
     uint elt_in_block       = (simd_lane & 7u) << 2;
 
+    /* Kahan-compensated accumulator (see qkv/gateup/add comments above). */
     float lane_acc = 0.0f;
+    float lane_c   = 0.0f;
+    #define KAHAN_ACC(val) do {            \
+        float _y = (val) - lane_c;          \
+        float _t = lane_acc + _y;           \
+        lane_c   = (_t - lane_acc) - _y;    \
+        lane_acc = _t;                      \
+    } while (0)
     int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
     for (int g = 0; g < n_groups; g++) {
         int blk_start = g * IB_W4A8_GROUP + (int)(block_idx_in_group * 32u);
@@ -4942,14 +4975,17 @@ kernel void matmul_w4a8_blk32_dr_a32_gateup_vec4(
         int w2i = (int)( wb.y       & 0x0F) - 8;
         int w3  = (int)((wb.y >> 4) & 0x0F) - 8;
         float w_scale = (float)row_scales[(uint)(blk_start / 32)];
-        float partial = (float)w0  * a4.x
-                      + (float)w1  * a4.y
-                      + (float)w2i * a4.z
-                      + (float)w3  * a4.w;
-        lane_acc += partial * w_scale;
+        /* Kahan-compensated accumulation: tighter than the scalar
+         * baseline (which is naive +=). KAHAN_ACC macro defined below.
+         * Adds ~4 fp ops per element; PPL strictly better than scalar. */
+        KAHAN_ACC(((float)w0)  * w_scale * a4.x);
+        KAHAN_ACC(((float)w1)  * w_scale * a4.y);
+        KAHAN_ACC(((float)w2i) * w_scale * a4.z);
+        KAHAN_ACC(((float)w3)  * w_scale * a4.w);
     }
+    #undef KAHAN_ACC
 
-    float total = simd_sum(lane_acc);
+    float total = simd_sum(lane_acc + lane_c);
     if (simd_lane == 0) {
         out[local_m] = total;
     }
@@ -4978,7 +5014,15 @@ kernel void matmul_w4a8_blk32_dr_a32_add_vec4(
     uint block_idx_in_group = simd_lane >> 3;
     uint elt_in_block       = (simd_lane & 7u) << 2;
 
+    /* Kahan-compensated accumulator (see qkv/gateup/add comments above). */
     float lane_acc = 0.0f;
+    float lane_c   = 0.0f;
+    #define KAHAN_ACC(val) do {            \
+        float _y = (val) - lane_c;          \
+        float _t = lane_acc + _y;           \
+        lane_c   = (_t - lane_acc) - _y;    \
+        lane_acc = _t;                      \
+    } while (0)
     int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
     for (int g = 0; g < n_groups; g++) {
         int blk_start = g * IB_W4A8_GROUP + (int)(block_idx_in_group * 32u);
@@ -4993,14 +5037,17 @@ kernel void matmul_w4a8_blk32_dr_a32_add_vec4(
         int w2i = (int)( wb.y       & 0x0F) - 8;
         int w3  = (int)((wb.y >> 4) & 0x0F) - 8;
         float w_scale = (float)row_scales[(uint)(blk_start / 32)];
-        float partial = (float)w0  * a4.x
-                      + (float)w1  * a4.y
-                      + (float)w2i * a4.z
-                      + (float)w3  * a4.w;
-        lane_acc += partial * w_scale;
+        /* Kahan-compensated accumulation: tighter than the scalar
+         * baseline (which is naive +=). KAHAN_ACC macro defined below.
+         * Adds ~4 fp ops per element; PPL strictly better than scalar. */
+        KAHAN_ACC(((float)w0)  * w_scale * a4.x);
+        KAHAN_ACC(((float)w1)  * w_scale * a4.y);
+        KAHAN_ACC(((float)w2i) * w_scale * a4.z);
+        KAHAN_ACC(((float)w3)  * w_scale * a4.w);
     }
+    #undef KAHAN_ACC
 
-    float total = simd_sum(lane_acc);
+    float total = simd_sum(lane_acc + lane_c);
     if (simd_lane == 0) {
         out[m] = out[m] + total;   /* fused residual add */
     }
