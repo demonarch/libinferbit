@@ -105,15 +105,22 @@ struct ib_metal_model_buffers {
     int   token_embedding_pq_ns;
 
     /* Path D GPU drive mode (doc 32 follow-up): when the model is in
-     * residency_mode==drive AND uploaded to Metal, all PQv2 tensors'
-     * pq_idx share this ONE scratch MTLBuffer. Each matmul preads its
-     * indices into this buffer (transposed to [M][total]) just before
-     * its dispatch is committed. Bounded GPU RAM = max-matmul-indices
-     * × 1 (single scratch), instead of per-tensor full residency.
-     * 0 when not in GPU drive mode. */
-    void   *gpu_drive_idx_scratch;       /* shared MTLBuffer base */
-    size_t  gpu_drive_idx_scratch_size;
-    void   *gpu_drive_idx_staging;       /* CPU malloc for pread → transpose buffer */
+     * residency_mode==drive AND uploaded to Metal, the PQ-indices for
+     * every streamed PQv2 tensor share a 2-slot ring of MTLBuffer
+     * scratches. Slot i is refilled (pread + transpose) just before
+     * the matmul that reads it; with 2 slots, the GPU dispatch reading
+     * slot 0 runs concurrently with the CPU refilling slot 1, so we
+     * checkpoint only once per pair of streamed matmuls (halves the
+     * GPU syncs vs the original single-scratch implementation).
+     *
+     * Bounded GPU RAM = max-matmul-indices × 2 — still independent of
+     * model size, still tiny vs full per-tensor residency. */
+    void   *gpu_drive_idx_scratch[2];    /* 2 shared MTLBuffer slots */
+    size_t  gpu_drive_idx_scratch_size;  /* size of EACH slot */
+    void   *gpu_drive_idx_staging[2];    /* 2 CPU pread → transpose buffers */
+    int     gpu_drive_idx_n_slots;       /* 0 = drive mode off, else N (currently 2) */
+    int     gpu_drive_idx_slot;          /* next slot to refill: 0 or 1 */
+    int     gpu_drive_idx_in_flight;     /* dispatches in current CB reading drive slots */
 
     /* State buffers (reused across layers). */
     void *x;
@@ -511,10 +518,10 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
         b->token_embedding_is_pq = 0;
     }
 
-    /* Path D GPU drive mode finalizer: allocate one shared MTLBuffer
-     * scratch sized for the largest streamed PQv2 matmul, point every
-     * deferred tb->pq_idx at it, and stash a CPU staging buffer for the
-     * pread + [nc][ns][M]→[M][total] transpose. */
+    /* Path D GPU drive mode finalizer: allocate a 2-slot ring of
+     * MTLBuffer scratches, each sized for the largest streamed PQv2
+     * matmul. tb->pq_idx is set to slot 0 as a sentinel — the actual
+     * dispatch picks the slot dynamically via drive_prepare_pq. */
     if (m->residency_mode == 1) {
         size_t max_idx = 0;
         #define IDX_BYTES(tb) ((size_t)(tb).pq_M * ((tb).pq_N / (tb).pq_G) * (tb).pq_ns)
@@ -533,16 +540,27 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
         if (max_idx > 0) {
             /* Page-align scratch size. */
             size_t scratch_sz = (max_idx + 16383u) & ~((size_t)16383u);
-            b->gpu_drive_idx_scratch = ib_metal_alloc(ctx, scratch_sz, NULL);
+            const int n_slots = 2;
+            int alloc_ok = 1;
+            for (int i = 0; i < n_slots; i++) {
+                b->gpu_drive_idx_scratch[i] = ib_metal_alloc(ctx, scratch_sz, NULL);
+                b->gpu_drive_idx_staging[i] = malloc(scratch_sz);
+                if (!b->gpu_drive_idx_scratch[i] || !b->gpu_drive_idx_staging[i]) {
+                    alloc_ok = 0;
+                }
+            }
             b->gpu_drive_idx_scratch_size = scratch_sz;
-            b->gpu_drive_idx_staging = malloc(scratch_sz);
-            if (!b->gpu_drive_idx_scratch || !b->gpu_drive_idx_staging) {
-                fprintf(stderr, "ib_metal: GPU drive scratch alloc failed (%zu B)\n", scratch_sz);
+            b->gpu_drive_idx_n_slots = alloc_ok ? n_slots : 0;
+            b->gpu_drive_idx_slot = 0;
+            b->gpu_drive_idx_in_flight = 0;
+            if (!alloc_ok) {
+                fprintf(stderr, "ib_metal: GPU drive scratch alloc failed (%zu B × %d)\n",
+                        scratch_sz, n_slots);
             } else {
                 int n_repointed = 0;
                 #define REPOINT(tb) do { \
                     if ((tb).is_pq && (tb).pq_drive_file_offset != 0) { \
-                        (tb).pq_idx = b->gpu_drive_idx_scratch; \
+                        (tb).pq_idx = b->gpu_drive_idx_scratch[0]; \
                         n_repointed++; \
                     } \
                 } while (0)
@@ -552,8 +570,8 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
                     REPOINT(lb->gate); REPOINT(lb->up); REPOINT(lb->down);
                 }
                 REPOINT(b->output_head);
-                fprintf(stderr, "ib_metal: GPU drive mode ON. scratch=%zu B, %d tensors streamed\n",
-                        scratch_sz, n_repointed);
+                fprintf(stderr, "ib_metal: GPU drive mode ON. %d-slot ring, %zu B/slot, %d tensors streamed\n",
+                        n_slots, scratch_sz, n_repointed);
                 #undef REPOINT
             }
         }
@@ -711,9 +729,11 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     FR(b->token_embedding_pq_rs);
     FR(b->token_embedding_pq_cb);
     FR(b->token_embedding_pq_idx);
-    /* Free shared GPU drive mode scratch + CPU staging exactly once. */
-    FR(b->gpu_drive_idx_scratch);
-    if (b->gpu_drive_idx_staging) free(b->gpu_drive_idx_staging);
+    /* Free shared GPU drive mode 2-slot ring exactly once. */
+    for (int i = 0; i < 2; i++) {
+        FR(b->gpu_drive_idx_scratch[i]);
+        if (b->gpu_drive_idx_staging[i]) free(b->gpu_drive_idx_staging[i]);
+    }
     FR(b->x); FR(b->xb); FR(b->xb2);
     FR(b->q); FR(b->k); FR(b->v); FR(b->attn_out);
     FR(b->hb); FR(b->hb2); FR(b->scores);
@@ -743,19 +763,18 @@ ib_metal_reset_kv(ib_metal_model_buffers *b)
 }
 
 /* Path D GPU drive mode helper: pread this tensor's PQ indices from
- * the IBF on disk into the shared CPU staging buffer, then transpose
- * from on-disk layout [nc][ns][M] into the shared MTLBuffer scratch
- * with kernel-expected layout [M][total]. Caller must have already
- * waited for any prior GPU reads of the scratch to complete (via
- * ib_metal_recorder_checkpoint) before invoking this — otherwise
- * concurrent GPU reads would observe a half-overwritten buffer.
- * Returns 0 on success, -1 on error. */
-static int drive_load_pq_idx(ib_metal_model_buffers *b,
-                              const struct tensor_bufs *tb)
+ * the IBF into the slot's staging buffer, then transpose into the
+ * slot's MTLBuffer scratch ([nc][ns][M] → [M][total]). Caller must
+ * have already ensured the slot is not being read by any in-flight
+ * GPU dispatch. Returns 0 on success, -1 on error. */
+static int drive_load_pq_idx_to_slot(ib_metal_model_buffers *b,
+                                       const struct tensor_bufs *tb,
+                                       int slot)
 {
     if (!tb || !tb->is_pq || tb->pq_drive_file_offset == 0) return 0;
     if (!b || !b->model) return -1;
-    if (!b->gpu_drive_idx_scratch || !b->gpu_drive_idx_staging) return -1;
+    if (slot < 0 || slot >= b->gpu_drive_idx_n_slots) return -1;
+    if (!b->gpu_drive_idx_scratch[slot] || !b->gpu_drive_idx_staging[slot]) return -1;
     const inferbit_model *m = (const inferbit_model *)b->model;
     if (m->drive_fd < 0) return -1;
 
@@ -765,11 +784,11 @@ static int drive_load_pq_idx(ib_metal_model_buffers *b,
     uint32_t total = nc * ns;
     size_t idx_bytes = (size_t)M * total;
     if (idx_bytes > b->gpu_drive_idx_scratch_size) {
-        fprintf(stderr, "drive_load_pq_idx: %zu B > scratch %zu B\n",
+        fprintf(stderr, "drive_load_pq_idx_to_slot: %zu B > slot %zu B\n",
                 idx_bytes, b->gpu_drive_idx_scratch_size);
         return -1;
     }
-    uint8_t *staging = (uint8_t *)b->gpu_drive_idx_staging;
+    uint8_t *staging = (uint8_t *)b->gpu_drive_idx_staging[slot];
     size_t done = 0;
     off_t off = (off_t)tb->pq_drive_file_offset;
     while (done < idx_bytes) {
@@ -777,13 +796,13 @@ static int drive_load_pq_idx(ib_metal_model_buffers *b,
                           off + (off_t)done);
         if (r <= 0) {
             if (r == -1 && errno == EINTR) continue;
-            fprintf(stderr, "drive_load_pq_idx: pread failed (off=%lld, want=%zu)\n",
+            fprintf(stderr, "drive_load_pq_idx_to_slot: pread failed (off=%lld, want=%zu)\n",
                     (long long)off, idx_bytes - done);
             return -1;
         }
         done += (size_t)r;
     }
-    uint8_t *dst = (uint8_t *)b->gpu_drive_idx_scratch;
+    uint8_t *dst = (uint8_t *)b->gpu_drive_idx_scratch[slot];
     /* Transpose [nc][ns][M] → [M][total = nc*ns]. */
     for (uint32_t m_ = 0; m_ < M; m_++) {
         uint8_t *row = dst + (size_t)m_ * total;
@@ -797,17 +816,37 @@ static int drive_load_pq_idx(ib_metal_model_buffers *b,
     return 0;
 }
 
-/* GPU drive mode wrapper: if this tensor is streamed, commit prior
- * dispatches + wait, refill the shared scratch from disk, then a fresh
- * CB awaits the dispatch the caller is about to record. Returns 0
- * always (RAM-mode is no-op); -1 only on hard failure. */
-static int drive_prepare_pq(ib_metal_recorder *r,
-                             ib_metal_model_buffers *b,
-                             const struct tensor_bufs *tb)
+/* GPU drive mode 2-slot ring wrapper. Returns the MTLBuffer pointer
+ * the matmul should read pq_idx from — either the ring slot we just
+ * loaded into (drive-streamed) or tb->pq_idx unchanged (RAM-mode).
+ * Returns NULL on hard error.
+ *
+ * Ring discipline:
+ *   - Each PQ matmul consumes one slot.
+ *   - With 2 slots, we can fill the next slot while the GPU is reading
+ *     the prior one. The CB stays open across the pair.
+ *   - When BOTH slots are in flight, we must checkpoint (commit + wait)
+ *     before refilling slot 0 — that drains the CB and frees both
+ *     slots. Sync cost = once per pair of streamed matmuls, instead of
+ *     once per matmul. */
+static void *drive_prepare_pq(ib_metal_recorder *r,
+                                ib_metal_model_buffers *b,
+                                const struct tensor_bufs *tb)
 {
-    if (!tb || !tb->is_pq || tb->pq_drive_file_offset == 0) return 0;
-    if (ib_metal_recorder_checkpoint(r) != 0) return -1;
-    return drive_load_pq_idx(b, tb);
+    if (!tb || !tb->is_pq || tb->pq_drive_file_offset == 0) {
+        return tb ? tb->pq_idx : NULL;
+    }
+    if (!b || b->gpu_drive_idx_n_slots < 1) return NULL;
+    int n = b->gpu_drive_idx_n_slots;
+    if (b->gpu_drive_idx_in_flight >= n) {
+        if (ib_metal_recorder_checkpoint(r) != 0) return NULL;
+        b->gpu_drive_idx_in_flight = 0;
+    }
+    int slot = b->gpu_drive_idx_slot;
+    if (drive_load_pq_idx_to_slot(b, tb, slot) != 0) return NULL;
+    b->gpu_drive_idx_slot = (slot + 1) % n;
+    b->gpu_drive_idx_in_flight++;
+    return b->gpu_drive_idx_scratch[slot];
 }
 
 /* Records ONE matmul into the recorder, picking the kernel based on
@@ -848,7 +887,8 @@ static int rec_matmul_tb(ib_metal_recorder *r,
                           int M, int N)
 {
     if (tb->is_pq) {
-        if (drive_prepare_pq(r, b, tb) != 0) return -1;
+        void *idx = drive_prepare_pq(r, b, tb);
+        if (!idx) return -1;
         /* Optional simdmat decode (IB_PQV2_SIMDMAT_DECODE=1). Uses
          * Apple simdgroup_matrix; on small M (TinyLlama) the x-broadcast
          * 8× compute waste outweighs the matrix-HW win, so off by default.
@@ -860,12 +900,12 @@ static int rec_matmul_tb(ib_metal_recorder *r,
         }
         if (simdmat_dec_setting) {
             int rc = ib_metal_rec_matmul_pqv2_simdmat_decode(r,
-                tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+                tb->pq_rs, tb->pq_cb, idx, x_fp32, out,
                 tb->pq_M, tb->pq_N, tb->pq_G, tb->pq_ns);
             if (rc == 0) return 0;
         }
         return ib_metal_rec_matmul_pqv2_k256_half2(r,
-            tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+            tb->pq_rs, tb->pq_cb, idx, x_fp32, out,
             tb->pq_M, tb->pq_N, tb->pq_G, tb->pq_ns);
     }
     return rec_matmul(r, tb->bits, tb->blk32, x_fp32, tb->w, tb->s,
@@ -1061,6 +1101,9 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
 
     ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
     if (!r) return -1;
+    /* Drive-mode ring counters start clean on each new recorder/CB. */
+    b->gpu_drive_idx_in_flight = 0;
+    b->gpu_drive_idx_slot = 0;
 
     record_single_forward_step(r, b, pos);
 
@@ -1146,7 +1189,8 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
                                   int B, int M, int N)
 {
     if (tb && tb->is_pq) {
-        if (drive_prepare_pq(r, b, tb) != 0) return -1;
+        void *idx = drive_prepare_pq(r, b, tb);
+        if (!idx) return -1;
         /* Optional tile-geometry override for the throughput sweep.
          *   IB_PQV2_TILE=tg32  (32×32, default, M%32+B%32+N%64)
          *   IB_PQV2_TILE=tg16  (16×32, higher occupancy, M%16+B%32+N%64)
@@ -1163,12 +1207,12 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
         int rc;
         if (tile_pref == 1) {
             rc = ib_metal_rec_matmul_pqv2_batched_simdmat_tg16(r,
-                tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+                tb->pq_rs, tb->pq_cb, idx, x_fp32, out,
                 B, M, N, tb->pq_G, tb->pq_ns);
             if (rc == 0) return 0;
         } else if (tile_pref == 2) {
             rc = ib_metal_rec_matmul_pqv2_batched_simdmat_tg64(r,
-                tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+                tb->pq_rs, tb->pq_cb, idx, x_fp32, out,
                 B, M, N, tb->pq_G, tb->pq_ns);
             if (rc == 0) return 0;
         }
@@ -1192,7 +1236,7 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
             const void *xp = (const float *)x_fp32 + (size_t)b_off * N;
             void       *op = (float *)out          + (size_t)b_off * M;
             split_rc = steps[si].rec(r,
-                tb->pq_rs, tb->pq_cb, tb->pq_idx, xp, op,
+                tb->pq_rs, tb->pq_cb, idx, xp, op,
                 chunk, M, N, tb->pq_G, tb->pq_ns);
             if (split_rc != 0) break;
             b_off += chunk; rem -= chunk;
@@ -1201,7 +1245,7 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
             const void *xp = (const float *)x_fp32 + (size_t)b_off * N;
             void       *op = (float *)out          + (size_t)b_off * M;
             split_rc = ib_metal_rec_matmul_pqv2_k256_half2_batched(r,
-                tb->pq_rs, tb->pq_cb, tb->pq_idx, xp, op,
+                tb->pq_rs, tb->pq_cb, idx, xp, op,
                 rem, M, N, tb->pq_G, tb->pq_ns);
             if (split_rc == 0) { b_off += rem; rem = 0; }
         }
@@ -1209,7 +1253,7 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
         /* Auto-split refused (e.g. shape constraint failed mid-way).
          * Fall through to SIMD-coop full-B fallback below. */
         return ib_metal_rec_matmul_pqv2_k256_half2_batched(r,
-            tb->pq_rs, tb->pq_cb, tb->pq_idx, x_fp32, out,
+            tb->pq_rs, tb->pq_cb, idx, x_fp32, out,
             B, M, N, tb->pq_G, tb->pq_ns);
     }
     return -1;  /* caller falls through to bits-based variant */
@@ -1224,19 +1268,21 @@ static int rec_matmul_batched(ib_metal_recorder *r,
 {
     if (bits == 4) {
         if (blk32) {
-            /* Variant selection (read once, cached):
-             *   IB_PREFILL_SIMDMAT=1 → simdgroup_matrix kernel (Apple's
-             *     8x8 fp16 matrix-multiply hardware intrinsic)
+            /* Variant selection (read once, cached). Default is simdmat
+             * (Apple's 8x8 fp16 matrix-multiply HW intrinsic) — empirically
+             * ~5× faster than the scalar-style batched kernel at typical
+             * prefill shapes. Env overrides:
+             *   IB_PREFILL_SIMDMAT=0 → force non-simdmat (legacy default)
              *   IB_PREFILL_TILED=1   → threadgroup-memory tiled kernel
-             *   default              → non-tiled batched kernel
              * Precedence: SIMDMAT > TILED > default. */
             static int variant = -2;
             if (variant == -2) {
                 const char *simd_env  = getenv("IB_PREFILL_SIMDMAT");
                 const char *tiled_env = getenv("IB_PREFILL_TILED");
-                if (simd_env && simd_env[0] == '1') variant = 2;
+                if (simd_env && simd_env[0] == '0') variant = 0;
+                else if (simd_env && simd_env[0] == '1') variant = 2;
                 else if (tiled_env && tiled_env[0] == '1') variant = 1;
-                else variant = 0;
+                else variant = 2;  /* default ON */
             }
             if (variant == 2) {
                 /* tg32 with INT8 activation quantize (16 SGs / 32×32
@@ -1354,6 +1400,9 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
 
     ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
     if (!r) return -1;
+    /* Drive-mode ring counters start clean on each new recorder/CB. */
+    b->gpu_drive_idx_in_flight = 0;
+    b->gpu_drive_idx_slot = 0;
 
     #define ROW_F(buf, n, dim) ((float*)(buf) + (size_t)(n) * (dim))
 

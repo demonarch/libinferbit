@@ -140,10 +140,12 @@ int main(int argc, char **argv) {
         if (getenv("IB_STRIP_MMAP")) ib_metal_strip_cpu_mmap(m);
     }
 
-    /* Opt-in batched prefill (Item 2 from the future-work list).
-     * Off by default to keep existing tests deterministic; flip
-     * IB_PREFILL_BATCH=1 in the env to use ib_metal_forward_prefill. */
-    int use_batched_prefill = (use_gpu && getenv("IB_PREFILL_BATCH") != NULL);
+    /* Batched prefill is the realistic workload — empirically ~5× faster
+     * than per-token forward at PP=32. On by default; opt out with
+     * IB_PREFILL_BATCH=0. The per-token fallback still kicks in if
+     * forward_prefill returns -2 (model not supported). */
+    const char *pb_env = getenv("IB_PREFILL_BATCH");
+    int use_batched_prefill = use_gpu && !(pb_env && pb_env[0] == '0');
     float *embed_batch = NULL;
     if (use_batched_prefill) {
         embed_batch = malloc((size_t)prompt_tokens * hidden * sizeof(float));
