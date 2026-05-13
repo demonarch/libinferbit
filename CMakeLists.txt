@@ -310,6 +310,11 @@ if(IB_METAL_ENABLED)
     target_link_libraries(bench_ppl_run inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(bench_ppl_run PRIVATE src include)
     add_dependencies(bench_ppl_run metal_kernels_header inferbit_static)
+
+    add_executable(bench_mps_gemm tests/bench_mps_gemm.mm)
+    target_link_libraries(bench_mps_gemm
+        ${PLATFORM_LIBS} "-framework Metal" "-framework Foundation"
+        "-framework MetalPerformanceShaders")
 endif()
 
 enable_testing()
