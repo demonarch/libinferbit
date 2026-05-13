@@ -1685,3 +1685,160 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
     return 0;
     #undef ROW_F
 }
+
+/* All-logits variant of forward_prefill: produces per-position logits
+ * for all n_tokens (vs the standard last-token only). Used by
+ * speculative decoding to verify each draft token. Same KV-cache
+ * write semantics as forward_prefill; same shape constraints.
+ *
+ * Output layout: all_logits_out[i] is the vocab-length logit vector
+ * for the (start_pos + i)-th position, i = 0..n_tokens-1. Caller
+ * must allocate n_tokens * vocab * sizeof(float) bytes. */
+extern "C" int
+ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
+                                      ib_metal_model_buffers *b,
+                                      const float *cpu_embeds_in,
+                                      int n_tokens, int start_pos,
+                                      float *all_logits_out)
+{
+    if (!ctx || !b || !cpu_embeds_in || !all_logits_out) return -1;
+    if (n_tokens < 1) return -1;
+    if (start_pos < 0 || start_pos + n_tokens > b->seq_len) return -1;
+    if (!model_supports_batched_prefill(b)) return -2;
+    /* No auto-chunk: speculative draft length is small (K ≤ 8). */
+    if (n_tokens > b->b_max) return -3;
+    /* Use B = n_tokens throughout — DO NOT pad up to multiple of 32.
+     * Padding would pollute the KV cache with zero embeddings at
+     * positions [start_pos+n_tokens..start_pos+B_pad-1] which subsequent
+     * iterations would read in attention and produce garbage. The
+     * rec_matmul_batched_tb auto-split kernel handles small B (<32)
+     * via the SIMD-coop fallback; slower than simdmat but correct.
+     * Speculative-decoding throughput needs the KV correctness first. */
+
+    int hidden = b->hidden;
+    int inter  = b->intermediate;
+    int kv_dim = b->kv_dim;
+    int qh     = b->n_heads * b->head_dim;
+    int nh     = b->n_heads;
+    int nkh    = b->n_kv_heads;
+    int hd     = b->head_dim;
+    float th   = b->rope_theta;
+    float eps  = b->eps;
+    int sl     = b->seq_len;
+    int B      = n_tokens;
+
+    /* Copy embeddings into x_b. Only the first B rows are populated. */
+    memcpy(b->x_b, cpu_embeds_in, (size_t)B * hidden * sizeof(float));
+
+    /* Allocate a GPU buffer for B × vocab logits. Freed after copy. */
+    size_t all_bytes = (size_t)B * b->vocab * sizeof(float);
+    void *all_logits_gpu = ib_metal_alloc(ctx, all_bytes, NULL);
+    if (!all_logits_gpu) return -1;
+
+    ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
+    if (!r) { ib_metal_free(ctx, all_logits_gpu); return -1; }
+    b->gpu_drive_idx_in_flight = 0;
+    b->gpu_drive_idx_slot = 0;
+
+    #define ROW_F(buf, n, dim) ((float*)(buf) + (size_t)(n) * (dim))
+
+    /* Same per-layer body as forward_prefill, using B_pad as the
+     * batched dim. For positions ≥ n_tokens (padding) the KV writes
+     * write zeros at positions start_pos+pad which are also future
+     * (overwritten on next call) — benign. */
+    int B_use = B;
+    for (int L = 0; L < b->num_layers; L++) {
+        struct layer_bufs *lb = &b->layers[L];
+        ib_metal_rec_rmsnorm_fp16_batched(r,
+            b->x_b, lb->input_norm, b->xb_b, B_use, hidden, eps);
+
+        int rc_qkv = -1;
+        if (!lb->q.is_pq && !lb->k.is_pq && !lb->v.is_pq
+            && lb->q.bits == 4 && lb->q.blk32
+            && lb->k.bits == 4 && lb->k.blk32
+            && lb->v.bits == 4 && lb->v.blk32
+            && !lb->q.w_fp16 && !lb->k.w_fp16 && !lb->v.w_fp16
+            && (qh % 32) == 0 && (kv_dim % 32) == 0
+            && (hidden % 128) == 0 && (B_use % 32) == 0) {
+            rc_qkv = ib_metal_rec_matmul_w4a8_blk32_batched_qkv_simdmat_k64_fp32_in(
+                r, b->xb_b,
+                lb->q.w, lb->q.s, lb->k.w, lb->k.s, lb->v.w, lb->v.s,
+                b->q_b, b->k_b, b->v_b, b->xq_b, b->xs_b,
+                B_use, qh, kv_dim, hidden);
+        }
+        if (rc_qkv != 0) {
+            if (rec_matmul_batched_tb(r, b, &lb->q, b->xb_b, b->q_b, b->xq_b, b->xs_b, B_use, qh, hidden) != 0)
+                rec_matmul_batched(r, lb->q.bits, lb->q.blk32, b->xb_b, lb->q.w, lb->q.s, b->q_b, b->xq_b, b->xs_b, B_use, qh, hidden);
+            if (rec_matmul_batched_tb(r, b, &lb->k, b->xb_b, b->k_b, b->xq_b, b->xs_b, B_use, kv_dim, hidden) != 0)
+                rec_matmul_batched(r, lb->k.bits, lb->k.blk32, b->xb_b, lb->k.w, lb->k.s, b->k_b, b->xq_b, b->xs_b, B_use, kv_dim, hidden);
+            if (rec_matmul_batched_tb(r, b, &lb->v, b->xb_b, b->v_b, b->xq_b, b->xs_b, B_use, kv_dim, hidden) != 0)
+                rec_matmul_batched(r, lb->v.bits, lb->v.blk32, b->xb_b, lb->v.w, lb->v.s, b->v_b, b->xq_b, b->xs_b, B_use, kv_dim, hidden);
+        }
+        ib_metal_rec_rope_inplace_batched(r, b->q_b, B_use, nh,  hd, start_pos, th);
+        ib_metal_rec_rope_inplace_batched(r, b->k_b, B_use, nkh, hd, start_pos, th);
+
+        if (b->kv_bits == 16) {
+            ib_metal_rec_attention_block_fp16_batched(r,
+                b->q_b, b->k_b, b->v_b, lb->k_cache, lb->v_cache,
+                b->scores_b, b->attn_out_b,
+                B_use, nh, nkh, hd, sl, start_pos);
+        } else {
+            for (int bb = 0; bb < B_use; bb++) {
+                int pos = start_pos + bb;
+                float *q_row = ROW_F(b->q_b, bb, qh);
+                float *k_row = ROW_F(b->k_b, bb, kv_dim);
+                float *v_row = ROW_F(b->v_b, bb, kv_dim);
+                float *attn_out_row = ROW_F(b->attn_out_b, bb, qh);
+                ib_metal_rec_attention_block_int8(r,
+                    q_row, k_row, v_row,
+                    lb->k_cache, lb->v_cache, lb->k_scales, lb->v_scales,
+                    b->scores, attn_out_row,
+                    nh, nkh, hd, sl, pos);
+            }
+        }
+        if (rec_matmul_batched_tb(r, b, &lb->o, b->attn_out_b, b->xb2_b, b->xq_b, b->xs_b, B_use, hidden, qh) != 0)
+            rec_matmul_batched(r, lb->o.bits, lb->o.blk32, b->attn_out_b, lb->o.w, lb->o.s, b->xb2_b, b->xq_b, b->xs_b, B_use, hidden, qh);
+        ib_metal_rec_residual_add_batched(r, b->x_b, b->xb2_b, B_use, hidden);
+
+        ib_metal_rec_rmsnorm_fp16_batched(r, b->x_b, lb->post_norm, b->xb_b, B_use, hidden, eps);
+
+        int rc_gu = -1;
+        if (!lb->gate.is_pq && !lb->up.is_pq
+            && lb->gate.bits == 4 && lb->gate.blk32
+            && lb->up.bits == 4 && lb->up.blk32
+            && !lb->gate.w_fp16 && !lb->up.w_fp16
+            && (inter % 32) == 0 && (hidden % 128) == 0 && (B_use % 32) == 0) {
+            rc_gu = ib_metal_rec_matmul_w4a8_blk32_batched_gateup_simdmat_k64_fp32_in(
+                r, b->xb_b,
+                lb->gate.w, lb->gate.s, lb->up.w, lb->up.s,
+                b->hb_b, b->hb2_b, b->xq_b, b->xs_b,
+                B_use, inter, hidden);
+        }
+        if (rc_gu != 0) {
+            if (rec_matmul_batched_tb(r, b, &lb->gate, b->xb_b, b->hb_b, b->xq_b, b->xs_b, B_use, inter, hidden) != 0)
+                rec_matmul_batched(r, lb->gate.bits, lb->gate.blk32, b->xb_b, lb->gate.w, lb->gate.s, b->hb_b, b->xq_b, b->xs_b, B_use, inter, hidden);
+            if (rec_matmul_batched_tb(r, b, &lb->up, b->xb_b, b->hb2_b, b->xq_b, b->xs_b, B_use, inter, hidden) != 0)
+                rec_matmul_batched(r, lb->up.bits, lb->up.blk32, b->xb_b, lb->up.w, lb->up.s, b->hb2_b, b->xq_b, b->xs_b, B_use, inter, hidden);
+        }
+        ib_metal_rec_silu_mul_batched(r, b->hb_b, b->hb2_b, b->hb_b, B_use, inter);
+
+        if (rec_matmul_batched_tb(r, b, &lb->down, b->hb_b, b->xb_b, b->xq_b, b->xs_b, B_use, hidden, inter) != 0)
+            rec_matmul_batched(r, lb->down.bits, lb->down.blk32, b->hb_b, lb->down.w, lb->down.s, b->xb_b, b->xq_b, b->xs_b, B_use, hidden, inter);
+        ib_metal_rec_residual_add_batched(r, b->x_b, b->xb_b, B_use, hidden);
+    }
+
+    /* Final batched RMSNorm + batched lm_head — outputs B_use × vocab. */
+    ib_metal_rec_rmsnorm_fp16_batched(r, b->x_b, b->output_norm, b->xb_b, B_use, hidden, eps);
+    if (rec_matmul_batched_tb(r, b, &b->output_head, b->xb_b, all_logits_gpu, b->xq_b, b->xs_b, B_use, b->vocab, hidden) != 0)
+        rec_matmul_batched(r, b->output_head.bits, b->output_head.blk32, b->xb_b,
+                           b->output_head.w, b->output_head.s, all_logits_gpu, b->xq_b, b->xs_b, B_use, b->vocab, hidden);
+
+    int rc = ib_metal_recorder_commit(r);
+    if (rc != 0) { ib_metal_free(ctx, all_logits_gpu); return rc; }
+
+    /* Copy only the first n_tokens × vocab back to host. */
+    memcpy(all_logits_out, all_logits_gpu, (size_t)n_tokens * b->vocab * sizeof(float));
+    ib_metal_free(ctx, all_logits_gpu);
+    return 0;
+    #undef ROW_F
+}

@@ -803,6 +803,18 @@ void ib_metal_reset_kv(ib_metal_model_buffers *bufs);
  * shared MTLBuffer scratch between dispatches. */
 int ib_metal_recorder_checkpoint(ib_metal_recorder *rec);
 
+/* All-logits variant of forward_prefill: outputs per-position logits
+ * for all n_tokens (vs the standard last-token only). Used by
+ * speculative decoding to verify each draft token in one batched
+ * forward pass. n_tokens is rounded up to a multiple of 32 internally
+ * for the batched lm_head simdmat; padding rows are computed but
+ * discarded. all_logits_out must be sized for n_tokens × vocab fp32. */
+int ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
+                                          ib_metal_model_buffers *b,
+                                          const float *cpu_embeds_in,
+                                          int n_tokens, int start_pos,
+                                          float *all_logits_out);
+
 /* Paginated greedy decode: runs `n_steps` autoregressive forwards on the
  * GPU in a single command buffer, with argmax + embedding-lookup also
  * on the GPU. CPU pays only one waitUntilCompleted (instead of n_steps).
