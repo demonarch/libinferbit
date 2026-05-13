@@ -1474,16 +1474,36 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         ib_metal_rec_rmsnorm_fp16_batched(r,
             b->x_b, lb->input_norm, b->xb_b, B, hidden, eps);
 
-        /* Batched Q/K/V matmul (PQv2 or INT4 blk32 / INT8) */
-        if (rec_matmul_batched_tb(r, b, &lb->q, b->xb_b, b->q_b, b->xq_b, b->xs_b, B, qh, hidden) != 0)
-            rec_matmul_batched(r, lb->q.bits, lb->q.blk32, b->xb_b,
-                lb->q.w, lb->q.s, b->q_b, b->xq_b, b->xs_b, B, qh, hidden);
-        if (rec_matmul_batched_tb(r, b, &lb->k, b->xb_b, b->k_b, b->xq_b, b->xs_b, B, kv_dim, hidden) != 0)
-            rec_matmul_batched(r, lb->k.bits, lb->k.blk32, b->xb_b,
-                lb->k.w, lb->k.s, b->k_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
-        if (rec_matmul_batched_tb(r, b, &lb->v, b->xb_b, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden) != 0)
-            rec_matmul_batched(r, lb->v.bits, lb->v.blk32, b->xb_b,
-                lb->v.w, lb->v.s, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
+        /* Batched Q/K/V matmul. Try fused INT4-blk32 simdmat first
+         * (one Metal dispatch instead of three); fall back to per-tensor
+         * paths for PQv2 / INT8 / per-row INT4. */
+        int rc_qkv = -1;
+        if (!lb->q.is_pq && !lb->k.is_pq && !lb->v.is_pq
+            && lb->q.bits == 4 && lb->q.blk32
+            && lb->k.bits == 4 && lb->k.blk32
+            && lb->v.bits == 4 && lb->v.blk32
+            && (qh % 32) == 0 && (kv_dim % 32) == 0
+            && (hidden % 128) == 0 && (B % 32) == 0) {
+            rc_qkv = ib_metal_rec_matmul_w4a8_blk32_batched_qkv_simdmat_k64_fp32_in(
+                r, b->xb_b,
+                lb->q.w, lb->q.s,
+                lb->k.w, lb->k.s,
+                lb->v.w, lb->v.s,
+                b->q_b, b->k_b, b->v_b,
+                b->xq_b, b->xs_b,
+                B, qh, kv_dim, hidden);
+        }
+        if (rc_qkv != 0) {
+            if (rec_matmul_batched_tb(r, b, &lb->q, b->xb_b, b->q_b, b->xq_b, b->xs_b, B, qh, hidden) != 0)
+                rec_matmul_batched(r, lb->q.bits, lb->q.blk32, b->xb_b,
+                    lb->q.w, lb->q.s, b->q_b, b->xq_b, b->xs_b, B, qh, hidden);
+            if (rec_matmul_batched_tb(r, b, &lb->k, b->xb_b, b->k_b, b->xq_b, b->xs_b, B, kv_dim, hidden) != 0)
+                rec_matmul_batched(r, lb->k.bits, lb->k.blk32, b->xb_b,
+                    lb->k.w, lb->k.s, b->k_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
+            if (rec_matmul_batched_tb(r, b, &lb->v, b->xb_b, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden) != 0)
+                rec_matmul_batched(r, lb->v.bits, lb->v.blk32, b->xb_b,
+                    lb->v.w, lb->v.s, b->v_b, b->xq_b, b->xs_b, B, kv_dim, hidden);
+        }
 
         /* Batched RoPE: each row b at pos = start_pos + b */
         ib_metal_rec_rope_inplace_batched(r, b->q_b, B, nh,  hd, start_pos, th);
@@ -1528,13 +1548,30 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         ib_metal_rec_rmsnorm_fp16_batched(r,
             b->x_b, lb->post_norm, b->xb_b, B, hidden, eps);
 
-        /* Batched gate / up matmul */
-        if (rec_matmul_batched_tb(r, b, &lb->gate, b->xb_b, b->hb_b, b->xq_b, b->xs_b, B, inter, hidden) != 0)
-            rec_matmul_batched(r, lb->gate.bits, lb->gate.blk32, b->xb_b,
-                lb->gate.w, lb->gate.s, b->hb_b,  b->xq_b, b->xs_b, B, inter, hidden);
-        if (rec_matmul_batched_tb(r, b, &lb->up, b->xb_b, b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden) != 0)
-            rec_matmul_batched(r, lb->up.bits, lb->up.blk32, b->xb_b,
-                lb->up.w,   lb->up.s,   b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden);
+        /* Batched gate / up matmul. Try fused INT4-blk32 simdmat first
+         * (one Metal dispatch instead of two); fall back to per-tensor
+         * paths for PQv2 / INT8 / per-row INT4. */
+        int rc_gu = -1;
+        if (!lb->gate.is_pq && !lb->up.is_pq
+            && lb->gate.bits == 4 && lb->gate.blk32
+            && lb->up.bits == 4 && lb->up.blk32
+            && (inter % 32) == 0 && (hidden % 128) == 0 && (B % 32) == 0) {
+            rc_gu = ib_metal_rec_matmul_w4a8_blk32_batched_gateup_simdmat_k64_fp32_in(
+                r, b->xb_b,
+                lb->gate.w, lb->gate.s,
+                lb->up.w,   lb->up.s,
+                b->hb_b, b->hb2_b,
+                b->xq_b, b->xs_b,
+                B, inter, hidden);
+        }
+        if (rc_gu != 0) {
+            if (rec_matmul_batched_tb(r, b, &lb->gate, b->xb_b, b->hb_b, b->xq_b, b->xs_b, B, inter, hidden) != 0)
+                rec_matmul_batched(r, lb->gate.bits, lb->gate.blk32, b->xb_b,
+                    lb->gate.w, lb->gate.s, b->hb_b,  b->xq_b, b->xs_b, B, inter, hidden);
+            if (rec_matmul_batched_tb(r, b, &lb->up, b->xb_b, b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden) != 0)
+                rec_matmul_batched(r, lb->up.bits, lb->up.blk32, b->xb_b,
+                    lb->up.w,   lb->up.s,   b->hb2_b, b->xq_b, b->xs_b, B, inter, hidden);
+        }
 
         /* Batched silu_mul: hb_b = silu(hb_b) * hb2_b */
         ib_metal_rec_silu_mul_batched(r, b->hb_b, b->hb2_b, b->hb_b, B, inter);

@@ -1583,6 +1583,307 @@ kernel void matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined(
     #undef K64_DEQUANT_A
 }
 
+/* matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_qkv —
+ * batched fused QKV for INT4 prefill. Three matmuls (Q, K, V) sharing
+ * the same input x_q / x_scales in ONE Metal dispatch. Each TG handles
+ * a 32×32 output tile of one of {Q, K, V}, picked by m_tile_id range:
+ *   tg_id.x in [0, M_q/32)              → Q
+ *   tg_id.x in [M_q/32, (M_q+M_kv)/32)  → K
+ *   tg_id.x in [(M_q+M_kv)/32, ...)     → V
+ *
+ * Saves 2 of every 3 Metal compute-encoder begin/end cycles per layer
+ * for INT4-blk32 prefill (no separate Q, K, V dispatchers needed).
+ * Per-matmul math is identical to the non-fused K=64 pipelined kernel.
+ *
+ * Grid: ((M_q + 2*M_kv)/32, B/32, 1). All M dims must be multiples
+ * of 32; N must be a multiple of 128. */
+kernel void matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_qkv(
+    device const uchar  *q_w       [[buffer(0)]],
+    device const half   *q_s       [[buffer(1)]],
+    device const uchar  *k_w       [[buffer(2)]],
+    device const half   *k_s       [[buffer(3)]],
+    device const uchar  *v_w       [[buffer(4)]],
+    device const half   *v_s       [[buffer(5)]],
+    device const char   *x_q       [[buffer(6)]],
+    device const float  *x_scales  [[buffer(7)]],
+    device       float  *q_out     [[buffer(8)]],
+    device       float  *k_out     [[buffer(9)]],
+    device       float  *v_out     [[buffer(10)]],
+    constant     uint   &M_Q       [[buffer(11)]],
+    constant     uint   &M_KV      [[buffer(12)]],
+    constant     uint   &N         [[buffer(13)]],
+    constant     uint   &B         [[buffer(14)]],
+    threadgroup half    *tg_W_buf  [[threadgroup(0)]],   /* [2][32][64] = 8 KB */
+    threadgroup half    *tg_A_buf  [[threadgroup(1)]],   /* [2][32][64] = 8 KB */
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]])
+{
+    uint tg_lane = simd_id * 32u + simd_lane;
+    constexpr uint TG_THREADS = 16u * 32u;
+    constexpr uint TILE_BYTES = SDMT32_K64_M_BLOCK * SDMT32_K64_K_TILE;  /* 32*64 */
+
+    /* Pick which projection this TG owns based on its m-tile id. */
+    uint m_tiles_q  = M_Q  / SDMT32_K64_M_BLOCK;
+    uint m_tiles_kv = M_KV / SDMT32_K64_M_BLOCK;
+
+    device const uchar *weights;
+    device const half  *w_scales;
+    device       float *out;
+    uint M_for_proj;
+    uint m_tile_local;
+    if (tg_id.x < m_tiles_q) {
+        weights = q_w; w_scales = q_s; out = q_out;
+        M_for_proj = M_Q;
+        m_tile_local = tg_id.x;
+    } else if (tg_id.x < m_tiles_q + m_tiles_kv) {
+        weights = k_w; w_scales = k_s; out = k_out;
+        M_for_proj = M_KV;
+        m_tile_local = tg_id.x - m_tiles_q;
+    } else {
+        weights = v_w; w_scales = v_s; out = v_out;
+        M_for_proj = M_KV;
+        m_tile_local = tg_id.x - m_tiles_q - m_tiles_kv;
+    }
+
+    uint m_off = simd_id & 3u;
+    uint b_off = simd_id >> 2;
+    uint m_base = m_tile_local * SDMT32_K64_M_BLOCK;
+    uint b_base = tg_id.y * SDMT32_K64_B_BLOCK;
+    if (b_base >= B) return;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint n_groups        = N / SDMT32_K64_K_TILE;
+    uint w_row_bytes     = N / 2u;
+    uint w_scale_per_row = N / 32u;
+
+    threadgroup half *W_slot[2] = { tg_W_buf, tg_W_buf + TILE_BYTES };
+    threadgroup half *A_slot[2] = { tg_A_buf, tg_A_buf + TILE_BYTES };
+
+    #define QKV_DEQUANT_W(slot_ptr, g)                                              \
+        for (uint i = tg_lane; i < TILE_BYTES; i += TG_THREADS) {                   \
+            uint m_local = i / SDMT32_K64_K_TILE;                                   \
+            uint k_local = i % SDMT32_K64_K_TILE;                                   \
+            uint m_global = m_base + m_local;                                       \
+            uint k_global = (g) * SDMT32_K64_K_TILE + k_local;                      \
+            half v = (half)0;                                                       \
+            if (m_global < M_for_proj && k_global < N) {                            \
+                size_t byte_off = (size_t)m_global * w_row_bytes + (k_global / 2u);\
+                uchar byte = weights[byte_off];                                     \
+                int w_int = (k_global & 1u) ? ((int)((byte >> 4) & 0x0F) - 8)       \
+                                              : ((int)(byte & 0x0F) - 8);           \
+                uint wb_idx = k_global / 32u;                                       \
+                half w_scale = w_scales[m_global * w_scale_per_row + wb_idx];       \
+                v = (half)w_int * w_scale;                                          \
+            }                                                                       \
+            (slot_ptr)[i] = v;                                                      \
+        }
+
+    #define QKV_DEQUANT_A(slot_ptr, g)                                              \
+        for (uint i = tg_lane; i < TILE_BYTES; i += TG_THREADS) {                   \
+            uint b_local = i / SDMT32_K64_K_TILE;                                   \
+            uint k_local = i % SDMT32_K64_K_TILE;                                   \
+            uint b_global = b_base + b_local;                                       \
+            uint k_global = (g) * SDMT32_K64_K_TILE + k_local;                      \
+            half v = (half)0;                                                       \
+            if (b_global < B && k_global < N) {                                     \
+                char  a_int   = x_q[(size_t)b_global * N + k_global];               \
+                uint scale_g  = (g) >> 1u;                                          \
+                float a_scale = x_scales[b_global * (N / 128u) + scale_g];          \
+                v = (half)((float)a_int * a_scale);                                 \
+            }                                                                       \
+            (slot_ptr)[i] = v;                                                      \
+        }
+
+    QKV_DEQUANT_W(W_slot[0], 0u);
+    QKV_DEQUANT_A(A_slot[0], 0u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint g = 1u; g < n_groups; g++) {
+        uint cur  = (g - 1u) & 1u;
+        uint next = g & 1u;
+
+        QKV_DEQUANT_W(W_slot[next], g);
+        QKV_DEQUANT_A(A_slot[next], g);
+
+        threadgroup const half *A_base = A_slot[cur] + (size_t)(b_off * 8u) * SDMT32_K64_K_TILE;
+        threadgroup const half *W_base = W_slot[cur] + (size_t)(m_off * 8u) * SDMT32_K64_K_TILE;
+        for (uint k_sub = 0; k_sub < SDMT32_K64_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32_K64_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32_K64_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    {
+        uint last = (n_groups - 1u) & 1u;
+        threadgroup const half *A_base = A_slot[last] + (size_t)(b_off * 8u) * SDMT32_K64_K_TILE;
+        threadgroup const half *W_base = W_slot[last] + (size_t)(m_off * 8u) * SDMT32_K64_K_TILE;
+        for (uint k_sub = 0; k_sub < SDMT32_K64_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32_K64_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32_K64_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+    }
+
+    uint my_m_base = m_base + m_off * 8u;
+    uint my_b_base = b_base + b_off * 8u;
+    simdgroup_store(C, out + (size_t)my_b_base * M_for_proj + my_m_base, M_for_proj);
+
+    #undef QKV_DEQUANT_W
+    #undef QKV_DEQUANT_A
+}
+
+/* matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_gateup —
+ * batched fused gate+up for INT4 prefill. Two matmuls (gate, up) with
+ * the same input x_q in ONE Metal dispatch. tg_id.x < M/32 → gate;
+ * else → up (local m_tile_id = tg_id.x - M/32). Saves one Metal
+ * compute-encoder begin/end pair per layer for INT4-blk32 prefill.
+ *
+ * Grid: (2 * M/32, B/32, 1). M and B must be multiples of 32,
+ * N % 128 == 0. */
+kernel void matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_gateup(
+    device const uchar  *gate_w    [[buffer(0)]],
+    device const half   *gate_s    [[buffer(1)]],
+    device const uchar  *up_w      [[buffer(2)]],
+    device const half   *up_s      [[buffer(3)]],
+    device const char   *x_q       [[buffer(4)]],
+    device const float  *x_scales  [[buffer(5)]],
+    device       float  *gate_out  [[buffer(6)]],
+    device       float  *up_out    [[buffer(7)]],
+    constant     uint   &M         [[buffer(8)]],
+    constant     uint   &N         [[buffer(9)]],
+    constant     uint   &B         [[buffer(10)]],
+    threadgroup half    *tg_W_buf  [[threadgroup(0)]],
+    threadgroup half    *tg_A_buf  [[threadgroup(1)]],
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]])
+{
+    uint tg_lane = simd_id * 32u + simd_lane;
+    constexpr uint TG_THREADS = 16u * 32u;
+    constexpr uint TILE_BYTES = SDMT32_K64_M_BLOCK * SDMT32_K64_K_TILE;
+
+    uint m_tiles_per_proj = M / SDMT32_K64_M_BLOCK;
+
+    device const uchar *weights;
+    device const half  *w_scales;
+    device       float *out;
+    uint m_tile_local;
+    if (tg_id.x < m_tiles_per_proj) {
+        weights = gate_w; w_scales = gate_s; out = gate_out;
+        m_tile_local = tg_id.x;
+    } else {
+        weights = up_w;   w_scales = up_s;   out = up_out;
+        m_tile_local = tg_id.x - m_tiles_per_proj;
+    }
+
+    uint m_off = simd_id & 3u;
+    uint b_off = simd_id >> 2;
+    uint m_base = m_tile_local * SDMT32_K64_M_BLOCK;
+    uint b_base = tg_id.y * SDMT32_K64_B_BLOCK;
+    if (b_base >= B) return;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint n_groups        = N / SDMT32_K64_K_TILE;
+    uint w_row_bytes     = N / 2u;
+    uint w_scale_per_row = N / 32u;
+
+    threadgroup half *W_slot[2] = { tg_W_buf, tg_W_buf + TILE_BYTES };
+    threadgroup half *A_slot[2] = { tg_A_buf, tg_A_buf + TILE_BYTES };
+
+    #define GU_DEQUANT_W(slot_ptr, g)                                               \
+        for (uint i = tg_lane; i < TILE_BYTES; i += TG_THREADS) {                   \
+            uint m_local = i / SDMT32_K64_K_TILE;                                   \
+            uint k_local = i % SDMT32_K64_K_TILE;                                   \
+            uint m_global = m_base + m_local;                                       \
+            uint k_global = (g) * SDMT32_K64_K_TILE + k_local;                      \
+            half v = (half)0;                                                       \
+            if (m_global < M && k_global < N) {                                     \
+                size_t byte_off = (size_t)m_global * w_row_bytes + (k_global / 2u);\
+                uchar byte = weights[byte_off];                                     \
+                int w_int = (k_global & 1u) ? ((int)((byte >> 4) & 0x0F) - 8)       \
+                                              : ((int)(byte & 0x0F) - 8);           \
+                uint wb_idx = k_global / 32u;                                       \
+                half w_scale = w_scales[m_global * w_scale_per_row + wb_idx];       \
+                v = (half)w_int * w_scale;                                          \
+            }                                                                       \
+            (slot_ptr)[i] = v;                                                      \
+        }
+
+    #define GU_DEQUANT_A(slot_ptr, g)                                               \
+        for (uint i = tg_lane; i < TILE_BYTES; i += TG_THREADS) {                   \
+            uint b_local = i / SDMT32_K64_K_TILE;                                   \
+            uint k_local = i % SDMT32_K64_K_TILE;                                   \
+            uint b_global = b_base + b_local;                                       \
+            uint k_global = (g) * SDMT32_K64_K_TILE + k_local;                      \
+            half v = (half)0;                                                       \
+            if (b_global < B && k_global < N) {                                     \
+                char  a_int   = x_q[(size_t)b_global * N + k_global];               \
+                uint scale_g  = (g) >> 1u;                                          \
+                float a_scale = x_scales[b_global * (N / 128u) + scale_g];          \
+                v = (half)((float)a_int * a_scale);                                 \
+            }                                                                       \
+            (slot_ptr)[i] = v;                                                      \
+        }
+
+    GU_DEQUANT_W(W_slot[0], 0u);
+    GU_DEQUANT_A(A_slot[0], 0u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint g = 1u; g < n_groups; g++) {
+        uint cur  = (g - 1u) & 1u;
+        uint next = g & 1u;
+
+        GU_DEQUANT_W(W_slot[next], g);
+        GU_DEQUANT_A(A_slot[next], g);
+
+        threadgroup const half *A_base = A_slot[cur] + (size_t)(b_off * 8u) * SDMT32_K64_K_TILE;
+        threadgroup const half *W_base = W_slot[cur] + (size_t)(m_off * 8u) * SDMT32_K64_K_TILE;
+        for (uint k_sub = 0; k_sub < SDMT32_K64_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32_K64_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32_K64_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    {
+        uint last = (n_groups - 1u) & 1u;
+        threadgroup const half *A_base = A_slot[last] + (size_t)(b_off * 8u) * SDMT32_K64_K_TILE;
+        threadgroup const half *W_base = W_slot[last] + (size_t)(m_off * 8u) * SDMT32_K64_K_TILE;
+        for (uint k_sub = 0; k_sub < SDMT32_K64_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32_K64_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32_K64_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+    }
+
+    uint my_m_base = m_base + m_off * 8u;
+    uint my_b_base = b_base + b_off * 8u;
+    simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
+
+    #undef GU_DEQUANT_W
+    #undef GU_DEQUANT_A
+}
+
 /* matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_shuffled —
  * version of the K_TILE=64 pipelined kernel that reads INT4 weights
  * from a pre-shuffled tile-major layout: weights[tile_idx][m_in_t][kb_in_t]
@@ -3850,6 +4151,91 @@ kernel void matmul_pqv2_k256_half2(
         float2 xv1 = *((device const float2 *)(x + c1 * G + s1 * HALF));
         device const half2 *cb_s0 = (device const half2 *)(cb_fp16 + (size_t)s0 * K * HALF);
         device const half2 *cb_s1 = (device const half2 *)(cb_fp16 + (size_t)s1 * K * HALF);
+        half2 vv0 = cb_s0[k0];
+        half2 vv1 = cb_s1[k1];
+        acc += (float)vv0.x * xv0.x + (float)vv0.y * xv0.y
+             + (float)vv1.x * xv1.x + (float)vv1.y * xv1.y;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        out[my_m] = acc * (float)row_scale[my_m];
+    }
+}
+
+/* matmul_pqv2_k256_half2_cbtg — codebook-in-TG-memory variant of
+ * PQv2 decode. Prefetches the per-matmul codebook (n_subchunks × K=256
+ * × HALF=2 × fp16 = 16 KB for n_subchunks=16) into TG memory once at
+ * kernel start, then the inner loop's index→cb lookup reads from
+ * TG-memory (L1-speed) instead of global memory. For decode where
+ * each codebook is read ~half_total × M times, this cuts global cb
+ * traffic ~M× to a single per-TG load.
+ *
+ * Grid: same as baseline (M / SGS_PER_TG threadgroups, SGS_PER_TG
+ * SIMDgroups per TG). cb load cost is amortized across the
+ * SGS_PER_TG output rows.
+ *
+ * TG memory: 16 KB for cb (fits the 32 KB/TG budget with room for
+ * the cross-SG reduction in PQv2 K-split if combined later).
+ *
+ * Requires n_subchunks = 16 (fast bitwise (c,s) decode path) and
+ * K = 256 (standard PQv2). For other n_subchunks the code falls back
+ * to scalar divmod still using TG cb. */
+kernel void matmul_pqv2_k256_half2_cbtg(
+    device const half  *row_scale  [[buffer(0)]],
+    device const half  *cb_fp16    [[buffer(1)]],   /* [ns][K=256][2] global */
+    device const uchar *indices    [[buffer(2)]],
+    device const float *x          [[buffer(3)]],
+    device       float *out        [[buffer(4)]],
+    constant     uint  &M          [[buffer(5)]],
+    constant     uint  &N          [[buffer(6)]],
+    constant     uint  &G          [[buffer(7)]],
+    constant     uint  &n_subchunks[[buffer(8)]],
+    threadgroup half   *tg_cb      [[threadgroup(0)]], /* [ns][K=256][2] = 16 KB at ns=16 */
+    uint                tg_id      [[threadgroup_position_in_grid]],
+    uint                sg_id      [[simdgroup_index_in_threadgroup]],
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                sgs_per_tg [[simdgroups_per_threadgroup]])
+{
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+    uint tg_threads = sgs_per_tg * 32u;
+    uint tg_lane    = sg_id * 32u + lane;
+
+    /* Cooperative codebook load into TG memory: ns × K × HALF half values. */
+    uint cb_elts = n_subchunks * K * HALF;
+    for (uint i = tg_lane; i < cb_elts; i += tg_threads) {
+        tg_cb[i] = cb_fp16[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint my_m = tg_id * sgs_per_tg + sg_id;
+    if (my_m >= M) return;
+
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint half_total = total >> 1u;
+
+    device const uchar *idx_row = indices + (size_t)my_m * total;
+    float acc = 0.0f;
+
+    /* Same 2-way unrolled inner loop as the global-cb variant, but
+     * read cb from TG memory. */
+    for (uint i = lane; i < half_total; i += 32u) {
+        uint i2 = i + half_total;
+        uint c0, s0, c1, s1;
+        if (n_subchunks == 16u) {
+            c0 = i  >> 4u; s0 = i  & 15u;
+            c1 = i2 >> 4u; s1 = i2 & 15u;
+        } else {
+            c0 = i  / n_subchunks; s0 = i  - c0 * n_subchunks;
+            c1 = i2 / n_subchunks; s1 = i2 - c1 * n_subchunks;
+        }
+        uint k0 = (uint)idx_row[i];
+        uint k1 = (uint)idx_row[i2];
+        float2 xv0 = *((device const float2 *)(x + c0 * G + s0 * HALF));
+        float2 xv1 = *((device const float2 *)(x + c1 * G + s1 * HALF));
+        threadgroup const half2 *cb_s0 = (threadgroup const half2 *)(tg_cb + (size_t)s0 * K * HALF);
+        threadgroup const half2 *cb_s1 = (threadgroup const half2 *)(tg_cb + (size_t)s1 * K * HALF);
         half2 vv0 = cb_s0[k0];
         half2 vv1 = cb_s1[k1];
         acc += (float)vv0.x * xv0.x + (float)vv0.y * xv0.y

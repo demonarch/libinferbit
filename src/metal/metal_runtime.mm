@@ -1464,6 +1464,165 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(ib_me
     return 0;
 }
 
+/* Batched fused QKV (K=64 pipelined simdmat) dispatcher. Quantizes
+ * x once into the scratch buffers, then runs the QKV-fused kernel
+ * with one compute-encoder. Saves 2 encoder begin/end cycles per
+ * layer vs 3 separate matmul dispatches for INT4-blk32 prefill. */
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_qkv_simdmat_k64_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *q_w, const void *q_s,
+    const void *k_w, const void *k_s,
+    const void *v_w, const void *v_s,
+    void *q_out, void *k_out, void *v_out,
+    void *scratch_x_q, void *scratch_x_scales,
+    int B, int M_Q, int M_KV, int N)
+{
+    if (!rec || !x_fp32 || !q_w || !q_s || !k_w || !k_s || !v_w || !v_s
+        || !q_out || !k_out || !v_out
+        || !scratch_x_q || !scratch_x_scales
+        || B <= 0 || M_Q <= 0 || M_KV <= 0 || N <= 0) return -1;
+    if ((N % 128) != 0 || (M_Q % 32) != 0 || (M_KV % 32) != 0 || (B % 32) != 0) return -2;
+
+    id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128_batched");
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx,
+        "matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_qkv");
+    if (!ps_q || !ps_mm) return -1;
+
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_qw  = rec_pick(rec->ctx, q_w);
+    id<MTLBuffer> b_qs  = rec_pick(rec->ctx, q_s);
+    id<MTLBuffer> b_kw  = rec_pick(rec->ctx, k_w);
+    id<MTLBuffer> b_ks  = rec_pick(rec->ctx, k_s);
+    id<MTLBuffer> b_vw  = rec_pick(rec->ctx, v_w);
+    id<MTLBuffer> b_vs  = rec_pick(rec->ctx, v_s);
+    id<MTLBuffer> b_qo  = rec_pick(rec->ctx, q_out);
+    id<MTLBuffer> b_ko  = rec_pick(rec->ctx, k_out);
+    id<MTLBuffer> b_vo  = rec_pick(rec->ctx, v_out);
+    id<MTLBuffer> b_xq  = rec_pick(rec->ctx, scratch_x_q);
+    id<MTLBuffer> b_xs  = rec_pick(rec->ctx, scratch_x_scales);
+    if (!b_x || !b_qw || !b_qs || !b_kw || !b_ks || !b_vw || !b_vs
+        || !b_qo || !b_ko || !b_vo || !b_xq || !b_xs) return -1;
+
+    uint M_Q_u = (uint)M_Q, M_KV_u = (uint)M_KV, N_u = (uint)N, B_u = (uint)B;
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_q];
+        [enc setBuffer:b_x  offset:0 atIndex:0];
+        [enc setBuffer:b_xq offset:0 atIndex:1];
+        [enc setBuffer:b_xs offset:0 atIndex:2];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:3];
+        [enc setBytes:&B_u length:sizeof(B_u) atIndex:4];
+        NSUInteger nq = (NSUInteger)((N + 127) / 128);
+        [enc dispatchThreadgroups:MTLSizeMake(nq, (NSUInteger)B, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+    }
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_mm];
+        [enc setBuffer:b_qw offset:0 atIndex:0];
+        [enc setBuffer:b_qs offset:0 atIndex:1];
+        [enc setBuffer:b_kw offset:0 atIndex:2];
+        [enc setBuffer:b_ks offset:0 atIndex:3];
+        [enc setBuffer:b_vw offset:0 atIndex:4];
+        [enc setBuffer:b_vs offset:0 atIndex:5];
+        [enc setBuffer:b_xq offset:0 atIndex:6];
+        [enc setBuffer:b_xs offset:0 atIndex:7];
+        [enc setBuffer:b_qo offset:0 atIndex:8];
+        [enc setBuffer:b_ko offset:0 atIndex:9];
+        [enc setBuffer:b_vo offset:0 atIndex:10];
+        [enc setBytes:&M_Q_u  length:sizeof(M_Q_u)  atIndex:11];
+        [enc setBytes:&M_KV_u length:sizeof(M_KV_u) atIndex:12];
+        [enc setBytes:&N_u    length:sizeof(N_u)    atIndex:13];
+        [enc setBytes:&B_u    length:sizeof(B_u)    atIndex:14];
+        NSUInteger slot_w = 32 * 64 * sizeof(uint16_t);
+        NSUInteger slot_a = 32 * 64 * sizeof(uint16_t);
+        [enc setThreadgroupMemoryLength:2 * slot_w atIndex:0];
+        [enc setThreadgroupMemoryLength:2 * slot_a atIndex:1];
+        NSUInteger n_tg_x = (NSUInteger)(M_Q + 2 * M_KV) / 32;
+        NSUInteger n_tg_y = (NSUInteger)B / 32;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg_x, n_tg_y, 1)
+              threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        [enc endEncoding];
+    }
+    return 0;
+}
+
+/* Batched fused gate+up (K=64 pipelined simdmat) dispatcher. */
+extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_gateup_simdmat_k64_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *gate_w, const void *gate_s,
+    const void *up_w,   const void *up_s,
+    void *gate_out, void *up_out,
+    void *scratch_x_q, void *scratch_x_scales,
+    int B, int M, int N)
+{
+    if (!rec || !x_fp32 || !gate_w || !gate_s || !up_w || !up_s
+        || !gate_out || !up_out
+        || !scratch_x_q || !scratch_x_scales
+        || B <= 0 || M <= 0 || N <= 0) return -1;
+    if ((N % 128) != 0 || (M % 32) != 0 || (B % 32) != 0) return -2;
+
+    id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128_batched");
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx,
+        "matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_gateup");
+    if (!ps_q || !ps_mm) return -1;
+
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_gw  = rec_pick(rec->ctx, gate_w);
+    id<MTLBuffer> b_gs  = rec_pick(rec->ctx, gate_s);
+    id<MTLBuffer> b_uw  = rec_pick(rec->ctx, up_w);
+    id<MTLBuffer> b_us  = rec_pick(rec->ctx, up_s);
+    id<MTLBuffer> b_go  = rec_pick(rec->ctx, gate_out);
+    id<MTLBuffer> b_uo  = rec_pick(rec->ctx, up_out);
+    id<MTLBuffer> b_xq  = rec_pick(rec->ctx, scratch_x_q);
+    id<MTLBuffer> b_xs  = rec_pick(rec->ctx, scratch_x_scales);
+    if (!b_x || !b_gw || !b_gs || !b_uw || !b_us
+        || !b_go || !b_uo || !b_xq || !b_xs) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, B_u = (uint)B;
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_q];
+        [enc setBuffer:b_x  offset:0 atIndex:0];
+        [enc setBuffer:b_xq offset:0 atIndex:1];
+        [enc setBuffer:b_xs offset:0 atIndex:2];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:3];
+        [enc setBytes:&B_u length:sizeof(B_u) atIndex:4];
+        NSUInteger nq = (NSUInteger)((N + 127) / 128);
+        [enc dispatchThreadgroups:MTLSizeMake(nq, (NSUInteger)B, 1)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+    }
+    {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_mm];
+        [enc setBuffer:b_gw offset:0 atIndex:0];
+        [enc setBuffer:b_gs offset:0 atIndex:1];
+        [enc setBuffer:b_uw offset:0 atIndex:2];
+        [enc setBuffer:b_us offset:0 atIndex:3];
+        [enc setBuffer:b_xq offset:0 atIndex:4];
+        [enc setBuffer:b_xs offset:0 atIndex:5];
+        [enc setBuffer:b_go offset:0 atIndex:6];
+        [enc setBuffer:b_uo offset:0 atIndex:7];
+        [enc setBytes:&M_u length:sizeof(M_u) atIndex:8];
+        [enc setBytes:&N_u length:sizeof(N_u) atIndex:9];
+        [enc setBytes:&B_u length:sizeof(B_u) atIndex:10];
+        NSUInteger slot_w = 32 * 64 * sizeof(uint16_t);
+        NSUInteger slot_a = 32 * 64 * sizeof(uint16_t);
+        [enc setThreadgroupMemoryLength:2 * slot_w atIndex:0];
+        [enc setThreadgroupMemoryLength:2 * slot_a atIndex:1];
+        NSUInteger n_tg_x = (NSUInteger)(2 * M) / 32;
+        NSUInteger n_tg_y = (NSUInteger)B / 32;
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg_x, n_tg_y, 1)
+              threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        [enc endEncoding];
+    }
+    return 0;
+}
+
 /* 4-SIMDgroup tg-shared variant of the simdmat kernel: each
  * threadgroup computes a 16×16 output tile via 4 parallel SIMD groups
  * (2×2 sub-tile grid), sharing a single co-loaded W+A dequant pair.
@@ -2759,18 +2918,26 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
     if (!rec || !row_scale_fp16 || !cb_fp16 || !indices_u8 || !x_fp32 || !out_fp32
         || M <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0) return -1;
     if ((N % G) != 0) return -1;
-    /* K-split variant: K_SPLIT SGs cooperate per output row with TG-mem
-     * cross-SG reduction. Opt-in via IB_PQV2_KSPLIT=1; empirically better
-     * for shapes where M is small enough that 1-SG-per-row leaves the GPU
-     * under-subscribed. */
-    static int ksplit_setting = -1;
-    if (ksplit_setting < 0) {
-        const char *env = getenv("IB_PQV2_KSPLIT");
-        ksplit_setting = (env && env[0] == '1') ? 1 : 0;
+    /* Decode variant selector:
+     *   default: baseline — global-mem codebook reads. L1 caching makes
+     *            this faster in practice than the TG-prefetch variants.
+     *   IB_PQV2_CBTG=1:   codebook prefetched into TG mem (opt-in
+     *                     negative result, -9-12% — L1 already handled cb well)
+     *   IB_PQV2_KSPLIT=1: K-split kernel (opt-in negative result, -1%) */
+    static int decode_variant = -1;
+    if (decode_variant < 0) {
+        const char *ksplit_env = getenv("IB_PQV2_KSPLIT");
+        const char *cbtg_env   = getenv("IB_PQV2_CBTG");
+        if (cbtg_env && cbtg_env[0] == '1') decode_variant = 2;
+        else if (ksplit_env && ksplit_env[0] == '1') decode_variant = 1;
+        else decode_variant = 0;
     }
-    const char *ps_name = ksplit_setting
-        ? "matmul_pqv2_k256_half2_ksplit"
-        : "matmul_pqv2_k256_half2";
+    const char *ps_name;
+    switch (decode_variant) {
+        case 2:  ps_name = "matmul_pqv2_k256_half2_cbtg"; break;
+        case 1:  ps_name = "matmul_pqv2_k256_half2_ksplit"; break;
+        default: ps_name = "matmul_pqv2_k256_half2"; break;
+    }
     id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, ps_name);
     if (!ps) return -1;
     NSUInteger ors=0, ocb=0, oi=0, ox=0, oo=0;
@@ -2794,15 +2961,29 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
     [enc setBytes:&G_u  length:sizeof(G_u)  atIndex:7];
     [enc setBytes:&ns_u length:sizeof(ns_u) atIndex:8];
 
-    if (ksplit_setting) {
+    if (decode_variant == 1) {
         /* K-split: 16 SGs/TG (K_SPLIT=4 × M_PER_TG=4); n_tg = ceil(M/4). */
         const NSUInteger SGPT = 16;
         const NSUInteger M_PER_TG = 4;
         NSUInteger n_tg = ((NSUInteger)M + M_PER_TG - 1) / M_PER_TG;
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
+    } else if (decode_variant == 2) {
+        /* cbtg: SGPT SGs per TG, each TG loads 16KB codebook once into TG mem. */
+        static NSUInteger SGPT_cached = 0;
+        if (!SGPT_cached) {
+            const char *env_sgpt = getenv("IB_PQV2_SGPT");
+            SGPT_cached = env_sgpt ? (NSUInteger)atoi(env_sgpt) : 4;
+            if (SGPT_cached < 1 || SGPT_cached > 32) SGPT_cached = 4;
+        }
+        const NSUInteger SGPT = SGPT_cached;
+        NSUInteger n_tg = ((NSUInteger)M + SGPT - 1) / SGPT;
+        NSUInteger cb_bytes = (NSUInteger)n_subchunks * 256u * 2u * sizeof(uint16_t);
+        [enc setThreadgroupMemoryLength:cb_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
     } else {
-        /* SIMDgroups per TG; tunable via IB_PQV2_SGPT. Default 4 = 128 threads/TG. */
+        /* baseline: SIMDgroups per TG via IB_PQV2_SGPT. Default 4 = 128 threads/TG. */
         static NSUInteger SGPT_cached = 0;
         if (!SGPT_cached) {
             const char *env_sgpt = getenv("IB_PQV2_SGPT");

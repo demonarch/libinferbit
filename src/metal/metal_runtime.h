@@ -357,6 +357,31 @@ int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(ib_metal_recorde
                                                                   void *scratch_x_scales,
                                                                   int B, int M, int N);
 
+/* Batched fused QKV (K=64 pipelined simdmat): Q+K+V matmuls in one
+ * Metal compute-encoder dispatch. M_Q, M_KV all multiples of 32;
+ * N % 128 == 0; B % 32 == 0. The 3-output dispatcher reuses the same
+ * x_q / x_scales scratch buffers prepared once by the caller. */
+int ib_metal_rec_matmul_w4a8_blk32_batched_qkv_simdmat_k64_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *q_w, const void *q_s,
+    const void *k_w, const void *k_s,
+    const void *v_w, const void *v_s,
+    void *q_out, void *k_out, void *v_out,
+    void *scratch_x_q, void *scratch_x_scales,
+    int B, int M_Q, int M_KV, int N);
+
+/* Batched fused gate+up (K=64 pipelined simdmat): gate and up matmuls
+ * in one Metal compute-encoder dispatch. M, B multiples of 32, N % 128. */
+int ib_metal_rec_matmul_w4a8_blk32_batched_gateup_simdmat_k64_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *gate_w, const void *gate_s,
+    const void *up_w,   const void *up_s,
+    void *gate_out, void *up_out,
+    void *scratch_x_q, void *scratch_x_scales,
+    int B, int M, int N);
+
 /* Fused fp32-input variant of tg32: skips the separate INT8 quantize
  * pass + scratch round-trip. Reads activations directly as fp32 and
  * converts to fp16 in the cooperative load. Requires B%32==0, M%32==0. */
