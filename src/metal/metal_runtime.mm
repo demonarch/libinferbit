@@ -2656,6 +2656,31 @@ extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [enc endEncoding];
     }
+    /* 3+4. Fused softmax + weighted-V (default-on; opt out with IB_ATTN_FUSE=0). */
+    static int attn_fuse_b_setting = -1;
+    if (attn_fuse_b_setting < 0) {
+        const char *env = getenv("IB_ATTN_FUSE");
+        attn_fuse_b_setting = (env && env[0] == '0') ? 0 : 1;
+    }
+    id<MTLComputePipelineState> ps_swvb = attn_fuse_b_setting
+        ? get_pipeline(rec->ctx, "attn_softmax_wv_fp16_batched") : nil;
+    if (ps_swvb) {
+        id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+        [enc setComputePipelineState:ps_swvb];
+        [enc setBuffer:b_s  offset:os  atIndex:0];
+        [enc setBuffer:b_vc offset:ovc atIndex:1];
+        [enc setBuffer:b_o  offset:oo  atIndex:2];
+        [enc setBytes:&B_u length:sizeof(B_u) atIndex:3];
+        [enc setBytes:&nh  length:sizeof(nh)  atIndex:4];
+        [enc setBytes:&nkh length:sizeof(nkh) atIndex:5];
+        [enc setBytes:&hd  length:sizeof(hd)  atIndex:6];
+        [enc setBytes:&max_score_len length:sizeof(max_score_len) atIndex:7];
+        [enc setThreadgroupMemoryLength:(NSUInteger)max_score_len * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)B * nh, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        return 0;
+    }
     /* 3. Softmax over (B*n_heads) rows of length max_score_len */
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];

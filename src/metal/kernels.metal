@@ -3767,6 +3767,109 @@ kernel void attn_softmax_wv_fp16(
     }
 }
 
+/* attn_softmax_wv_fp16_batched — fuses softmax + weighted_v for the
+ * batched (prefill) fp16-KV attention path. Each TG handles one
+ * (B-row, n_head) pair. Same softmax-then-weighted-V structure as the
+ * decode variant. Saves one Metal dispatch per attention block.
+ *
+ * scores layout: float[B][n_heads][max_score_len], in-place softmax.
+ * v_cache layout: float[seq_len][kv_dim] (kv_bits=16 stored as fp32).
+ * attn_out: float[B][n_heads][head_dim] (batched output buffer).
+ *
+ * Note: each B-row b only attends to positions [0, start_pos + b + 1)
+ * via the causal mask (scores already have -INFINITY past this point
+ * from the scores kernel). softmax skips positions where it's safe to
+ * but reads everything up to max_score_len for simplicity.
+ *
+ * Threadgroup memory: max_score_len * sizeof(float) per TG. */
+kernel void attn_softmax_wv_fp16_batched(
+    device       float *scores      [[buffer(0)]],   /* [B][nh][max_score_len] */
+    device const float *v_cache     [[buffer(1)]],   /* [seq_len][kv_dim] */
+    device       float *attn_out    [[buffer(2)]],   /* [B][nh][head_dim] */
+    constant     uint  &B           [[buffer(3)]],
+    constant     uint  &n_heads     [[buffer(4)]],
+    constant     uint  &n_kv_heads  [[buffer(5)]],
+    constant     uint  &head_dim    [[buffer(6)]],
+    constant     uint  &max_score_len [[buffer(7)]],
+    threadgroup float  *tg_row      [[threadgroup(0)]],
+    uint                tg_id       [[threadgroup_position_in_grid]],
+    uint                tid         [[thread_position_in_threadgroup]],
+    uint                lane        [[thread_index_in_simdgroup]],
+    uint                simd_id     [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint TG_THREADS = 256;
+    constexpr uint NUM_SIMDS  = TG_THREADS / 32;
+
+    /* 1D grid: tg_id ∈ [0, B*n_heads). Layout: tg_id = b * n_heads + h. */
+    uint b = tg_id / n_heads;
+    uint h = tg_id - b * n_heads;
+    if (b >= B || h >= n_heads) return;
+
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_h = h / heads_per_kv;
+    uint kv_dim = n_kv_heads * head_dim;
+
+    device float *s_row = scores + ((size_t)b * n_heads + h) * max_score_len;
+
+    /* Step 1: load scores into TG memory + find row max. */
+    float local_max = -INFINITY;
+    for (uint i = tid; i < max_score_len; i += TG_THREADS) {
+        float v = s_row[i];
+        tg_row[i] = v;
+        if (v > local_max) local_max = v;
+    }
+    float simd_m = simd_max(local_max);
+    threadgroup float partials_max[NUM_SIMDS];
+    if (lane == 0) partials_max[simd_id] = simd_m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float tg_max;
+    if (simd_id == 0) {
+        float v = (lane < NUM_SIMDS) ? partials_max[lane] : -INFINITY;
+        float mv = simd_max(v);
+        if (lane == 0) tg_max = mv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float row_max = tg_max;
+
+    /* Step 2: exp(x - max), sum, normalize in TG memory. */
+    float local_sum = 0.0f;
+    for (uint i = tid; i < max_score_len; i += TG_THREADS) {
+        float e = exp(tg_row[i] - row_max);
+        tg_row[i] = e;
+        local_sum += e;
+    }
+    float simd_s = simd_sum(local_sum);
+    threadgroup float partials_sum[NUM_SIMDS];
+    if (lane == 0) partials_sum[simd_id] = simd_s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float tg_sum;
+    if (simd_id == 0) {
+        float v = (lane < NUM_SIMDS) ? partials_sum[lane] : 0.0f;
+        float sv = simd_sum(v);
+        if (lane == 0) tg_sum = sv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = 1.0f / tg_sum;
+
+    for (uint i = tid; i < max_score_len; i += TG_THREADS) {
+        tg_row[i] = tg_row[i] * inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Step 3: weighted-V using normalized scores in TG memory. */
+    for (uint d = tid; d < head_dim; d += TG_THREADS) {
+        float acc = 0.0f;
+        for (uint t = 0; t < max_score_len; t++) {
+            float s = tg_row[t];
+            float v = v_cache[(size_t)t * kv_dim + (size_t)kv_h * head_dim + d];
+            acc += s * v;
+        }
+        attn_out[((size_t)b * n_heads + h) * head_dim + d] = acc;
+    }
+}
+
 /* ── INT8 KV cache (matches libinferbit kv_bits=8) ────────────────────
  *
  * Layout (mirrors forward.c::kv_cache_write_int8):
