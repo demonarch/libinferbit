@@ -1309,6 +1309,141 @@ kernel void matmul_w4a8_blk32_batched_simdmat_tg32(
     simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
 }
 
+/* matmul_w4a8_blk32_batched_simdmat_tg32_pipelined — software-pipelined
+ * version of tg32. Same tile geometry (32×32 output, 16 SIMDgroups,
+ * K_TILE=128), but the K-loop is restructured so that the dequant of
+ * tile g+1 and the simdmat ops on tile g use disjoint TG-memory slots
+ * and can run with their instruction streams interleaved by the
+ * compiler. The dequant memory loads should hide some of the
+ * simdgroup_multiply_accumulate latency.
+ *
+ * Threadgroup memory: 2× W (32×128 fp16) + 2× A (32×128 fp16) = 32 KB
+ * — at the per-TG limit but within it for Apple GPUs.
+ *
+ * Same shape constraints as tg32: B%32==0, M%32==0, N%128==0. */
+kernel void matmul_w4a8_blk32_batched_simdmat_tg32_pipelined(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const char   *x_q       [[buffer(2)]],
+    device const float  *x_scales  [[buffer(3)]],
+    device       float  *out       [[buffer(4)]],
+    constant     uint   &M         [[buffer(5)]],
+    constant     uint   &N         [[buffer(6)]],
+    constant     uint   &B         [[buffer(7)]],
+    threadgroup half    *tg_W_buf  [[threadgroup(0)]],   /* [2][32][128] */
+    threadgroup half    *tg_A_buf  [[threadgroup(1)]],   /* [2][32][128] */
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]])
+{
+    uint tg_lane = simd_id * 32u + simd_lane;
+    constexpr uint TG_THREADS = 16u * 32u;
+    constexpr uint TILE_BYTES = SDMT32_M_BLOCK * SDMT32_K_TILE;  /* 32*128 */
+
+    uint m_off = simd_id & 3u;
+    uint b_off = simd_id >> 2;
+    uint m_base = tg_id.x * SDMT32_M_BLOCK;
+    uint b_base = tg_id.y * SDMT32_B_BLOCK;
+    if (m_base >= M || b_base >= B) return;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint n_groups = N / SDMT32_K_TILE;
+    uint w_row_bytes     = N / 2u;
+    uint w_scale_per_row = N / 32u;
+
+    /* Per-buffer slot pointers. */
+    threadgroup half *W_slot[2] = { tg_W_buf, tg_W_buf + TILE_BYTES };
+    threadgroup half *A_slot[2] = { tg_A_buf, tg_A_buf + TILE_BYTES };
+
+    /* Lambda-ish helpers: dequant tile g into slot s. */
+    #define DEQUANT_W(slot_ptr, g)                                                  \
+        for (uint i = tg_lane; i < TILE_BYTES; i += TG_THREADS) {                   \
+            uint m_local = i / SDMT32_K_TILE;                                       \
+            uint k_local = i % SDMT32_K_TILE;                                       \
+            uint m_global = m_base + m_local;                                       \
+            uint k_global = (g) * SDMT32_K_TILE + k_local;                          \
+            half v = (half)0;                                                       \
+            if (m_global < M && k_global < N) {                                     \
+                size_t byte_off = (size_t)m_global * w_row_bytes + (k_global / 2u);\
+                uchar byte = weights[byte_off];                                     \
+                int w_int = (k_global & 1u) ? ((int)((byte >> 4) & 0x0F) - 8)       \
+                                              : ((int)(byte & 0x0F) - 8);           \
+                uint wb_idx = k_global / 32u;                                       \
+                half w_scale = w_scales[m_global * w_scale_per_row + wb_idx];       \
+                v = (half)w_int * w_scale;                                          \
+            }                                                                       \
+            (slot_ptr)[i] = v;                                                      \
+        }
+
+    #define DEQUANT_A(slot_ptr, g)                                                  \
+        for (uint i = tg_lane; i < TILE_BYTES; i += TG_THREADS) {                   \
+            uint b_local = i / SDMT32_K_TILE;                                       \
+            uint k_local = i % SDMT32_K_TILE;                                       \
+            uint b_global = b_base + b_local;                                       \
+            uint k_global = (g) * SDMT32_K_TILE + k_local;                          \
+            half v = (half)0;                                                       \
+            if (b_global < B && k_global < N) {                                     \
+                char  a_int   = x_q[(size_t)b_global * N + k_global];               \
+                float a_scale = x_scales[b_global * (N / 128u) + (g)];              \
+                v = (half)((float)a_int * a_scale);                                 \
+            }                                                                       \
+            (slot_ptr)[i] = v;                                                      \
+        }
+
+    /* Preload tile 0 into slot 0. */
+    DEQUANT_W(W_slot[0], 0u);
+    DEQUANT_A(A_slot[0], 0u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint g = 1u; g < n_groups; g++) {
+        uint cur  = (g - 1u) & 1u;   /* slot we're simdmat-ing from */
+        uint next = g & 1u;          /* slot we're dequanting into */
+
+        /* Dequant next tile (into the OTHER slot — no conflict with simdmat). */
+        DEQUANT_W(W_slot[next], g);
+        DEQUANT_A(A_slot[next], g);
+
+        /* Simdmat from the current slot. The compiler is free to
+         * interleave these simdmat issues with the dequant memory ops
+         * above, hiding HW latency. */
+        threadgroup const half *A_base = A_slot[cur] + (size_t)(b_off * 8u) * SDMT32_K_TILE;
+        threadgroup const half *W_base = W_slot[cur] + (size_t)(m_off * 8u) * SDMT32_K_TILE;
+        for (uint k_sub = 0; k_sub < SDMT32_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Final simdmat on the last loaded tile. */
+    {
+        uint last = (n_groups - 1u) & 1u;
+        threadgroup const half *A_base = A_slot[last] + (size_t)(b_off * 8u) * SDMT32_K_TILE;
+        threadgroup const half *W_base = W_slot[last] + (size_t)(m_off * 8u) * SDMT32_K_TILE;
+        for (uint k_sub = 0; k_sub < SDMT32_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+    }
+
+    uint my_m_base = m_base + m_off * 8u;
+    uint my_b_base = b_base + b_off * 8u;
+    simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
+
+    #undef DEQUANT_W
+    #undef DEQUANT_A
+}
+
 /* matmul_pqv2_batched_simdmat — PQv2 batched matmul via Apple's
  * simdgroup_matrix hardware. Same tile structure as the INT4 tg32
  * variant (32×32 output, 16 SIMDgroups per TG, 4×4 sub-tile grid),
@@ -3803,5 +3938,209 @@ kernel void embed_lookup_pqv2(
         uint k_idx = (uint)idx_row[c * n_subchunks + s];
         float v = (float)cb_fp16[(s * K + k_idx) * HALF + h];
         out[n] = v * rs;
+    }
+}
+
+/* ── vec4 variants of the fused decode kernels ─────────────────────────
+ *
+ * The non-vec4 fused decode kernels (qkv / gateup / add) each iterate
+ * the inner K-loop one element per lane. Vec4 versions process 4
+ * contiguous K elements per lane (float4 + uchar2 loads), 4× fewer
+ * inner-loop iterations. Pattern mirrors matmul_w4a8_blk32_dr_a32_vec4
+ * defined earlier: lanes 0..7 cover block 0 (offsets 0,4,8,..,28),
+ * lanes 8..15 cover block 1, etc. Requires N % 128 == 0.
+ *
+ * Each kernel below is the vec4 sibling of its non-vec4 counterpart
+ * with the inner loop replaced — outer structure (kernel selection by
+ * m-range for the multi-output kernels, fused add at the end, etc.)
+ * is preserved exactly.
+ */
+
+kernel void matmul_w4a8_blk32_dr_a32_qkv_vec4(
+    device const uchar  *w_q       [[buffer(0)]],
+    device const half   *ws_q      [[buffer(1)]],
+    device const uchar  *w_k       [[buffer(2)]],
+    device const half   *ws_k      [[buffer(3)]],
+    device const uchar  *w_v       [[buffer(4)]],
+    device const half   *ws_v      [[buffer(5)]],
+    device const float  *x         [[buffer(6)]],
+    device       float  *q         [[buffer(7)]],
+    device       float  *k         [[buffer(8)]],
+    device       float  *v         [[buffer(9)]],
+    constant     uint   &M_Q       [[buffer(10)]],
+    constant     uint   &M_KV      [[buffer(11)]],
+    constant     uint   &N         [[buffer(12)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    uint M_total = M_Q + 2u * M_KV;
+    if (m >= M_total) return;
+
+    device const uchar *weights;
+    device const half  *w_scales;
+    device       float *out;
+    uint local_m;
+    if (m < M_Q) {
+        weights = w_q;  w_scales = ws_q;  out = q;
+        local_m = m;
+    } else if (m < M_Q + M_KV) {
+        weights = w_k;  w_scales = ws_k;  out = k;
+        local_m = m - M_Q;
+    } else {
+        weights = w_v;  w_scales = ws_v;  out = v;
+        local_m = m - M_Q - M_KV;
+    }
+
+    device const uchar *row = weights + (size_t)local_m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)local_m * n_w_blocks;
+
+    uint block_idx_in_group = simd_lane >> 3;
+    uint elt_in_block       = (simd_lane & 7u) << 2;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int blk_start = g * IB_W4A8_GROUP + (int)(block_idx_in_group * 32u);
+        int n = blk_start + (int)elt_in_block;
+
+        device const float4 *x4 = (device const float4*)(x + n);
+        float4 a4 = x4[0];
+        device const uchar2 *w2 = (device const uchar2*)(row + (n >> 1));
+        uchar2 wb = w2[0];
+        int w0  = (int)( wb.x       & 0x0F) - 8;
+        int w1  = (int)((wb.x >> 4) & 0x0F) - 8;
+        int w2i = (int)( wb.y       & 0x0F) - 8;
+        int w3  = (int)((wb.y >> 4) & 0x0F) - 8;
+        float w_scale = (float)row_scales[(uint)(blk_start / 32)];
+        float partial = (float)w0  * a4.x
+                      + (float)w1  * a4.y
+                      + (float)w2i * a4.z
+                      + (float)w3  * a4.w;
+        lane_acc += partial * w_scale;
+    }
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[local_m] = total;
+    }
+}
+
+kernel void matmul_w4a8_blk32_dr_a32_gateup_vec4(
+    device const uchar  *w_gate    [[buffer(0)]],
+    device const half   *ws_gate   [[buffer(1)]],
+    device const uchar  *w_up      [[buffer(2)]],
+    device const half   *ws_up     [[buffer(3)]],
+    device const float  *x         [[buffer(4)]],
+    device       float  *gate      [[buffer(5)]],
+    device       float  *up        [[buffer(6)]],
+    constant     uint   &M         [[buffer(7)]],
+    constant     uint   &N         [[buffer(8)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= 2u * M) return;
+
+    device const uchar *weights;
+    device const half  *w_scales;
+    device       float *out;
+    uint local_m;
+    if (m < M) {
+        weights = w_gate; w_scales = ws_gate; out = gate; local_m = m;
+    } else {
+        weights = w_up;   w_scales = ws_up;   out = up;   local_m = m - M;
+    }
+
+    device const uchar *row = weights + (size_t)local_m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)local_m * n_w_blocks;
+
+    uint block_idx_in_group = simd_lane >> 3;
+    uint elt_in_block       = (simd_lane & 7u) << 2;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int blk_start = g * IB_W4A8_GROUP + (int)(block_idx_in_group * 32u);
+        int n = blk_start + (int)elt_in_block;
+
+        device const float4 *x4 = (device const float4*)(x + n);
+        float4 a4 = x4[0];
+        device const uchar2 *w2 = (device const uchar2*)(row + (n >> 1));
+        uchar2 wb = w2[0];
+        int w0  = (int)( wb.x       & 0x0F) - 8;
+        int w1  = (int)((wb.x >> 4) & 0x0F) - 8;
+        int w2i = (int)( wb.y       & 0x0F) - 8;
+        int w3  = (int)((wb.y >> 4) & 0x0F) - 8;
+        float w_scale = (float)row_scales[(uint)(blk_start / 32)];
+        float partial = (float)w0  * a4.x
+                      + (float)w1  * a4.y
+                      + (float)w2i * a4.z
+                      + (float)w3  * a4.w;
+        lane_acc += partial * w_scale;
+    }
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[local_m] = total;
+    }
+}
+
+kernel void matmul_w4a8_blk32_dr_a32_add_vec4(
+    device const uchar  *weights   [[buffer(0)]],
+    device const half   *w_scales  [[buffer(1)]],
+    device const float  *x         [[buffer(2)]],
+    device       float  *out       [[buffer(3)]],
+    constant     uint   &M         [[buffer(4)]],
+    constant     uint   &N         [[buffer(5)]],
+    uint                 simd_lane  [[thread_index_in_simdgroup]],
+    uint                 simd_id    [[simdgroup_index_in_threadgroup]],
+    uint                 tg_id      [[threadgroup_position_in_grid]],
+    uint                 tg_size    [[threads_per_threadgroup]])
+{
+    uint simdgroups_per_tg = tg_size / 32u;
+    uint m = tg_id * simdgroups_per_tg + simd_id;
+    if (m >= M) return;
+
+    device const uchar *row = weights + (size_t)m * (N / 2);
+    uint n_w_blocks = N / 32u;
+    device const half *row_scales = w_scales + (size_t)m * n_w_blocks;
+
+    uint block_idx_in_group = simd_lane >> 3;
+    uint elt_in_block       = (simd_lane & 7u) << 2;
+
+    float lane_acc = 0.0f;
+    int n_groups = (int)((N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP);
+    for (int g = 0; g < n_groups; g++) {
+        int blk_start = g * IB_W4A8_GROUP + (int)(block_idx_in_group * 32u);
+        int n = blk_start + (int)elt_in_block;
+
+        device const float4 *x4 = (device const float4*)(x + n);
+        float4 a4 = x4[0];
+        device const uchar2 *w2 = (device const uchar2*)(row + (n >> 1));
+        uchar2 wb = w2[0];
+        int w0  = (int)( wb.x       & 0x0F) - 8;
+        int w1  = (int)((wb.x >> 4) & 0x0F) - 8;
+        int w2i = (int)( wb.y       & 0x0F) - 8;
+        int w3  = (int)((wb.y >> 4) & 0x0F) - 8;
+        float w_scale = (float)row_scales[(uint)(blk_start / 32)];
+        float partial = (float)w0  * a4.x
+                      + (float)w1  * a4.y
+                      + (float)w2i * a4.z
+                      + (float)w3  * a4.w;
+        lane_acc += partial * w_scale;
+    }
+
+    float total = simd_sum(lane_acc);
+    if (simd_lane == 0) {
+        out[m] = out[m] + total;   /* fused residual add */
     }
 }

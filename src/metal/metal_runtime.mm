@@ -1381,8 +1381,21 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(ib_me
     if (!rec || !x_fp32 || !weights || !w_scales || !out
         || !scratch_x_q || !scratch_x_scales || B <= 0 || M <= 0 || N <= 0) return -1;
     if ((N % 128) != 0 || (M % 32) != 0 || (B % 32) != 0) return -2;
+    /* Pipelined variant (double-buffered K-tile): the dequant of tile
+     * g+1 is interleaved with simdmat ops on tile g for ILP. Opt-in
+     * for now (IB_PREFILL_PIPELINED=1) until empirically validated
+     * across shapes. Uses 32 KB TG memory (vs 16 KB single-buffer);
+     * Apple GPUs support up to 32 KB per TG. */
+    static int pipelined_setting = -1;
+    if (pipelined_setting < 0) {
+        const char *env = getenv("IB_PREFILL_PIPELINED");
+        pipelined_setting = (env && env[0] == '1') ? 1 : 0;
+    }
+    const char *mm_kernel = pipelined_setting
+        ? "matmul_w4a8_blk32_batched_simdmat_tg32_pipelined"
+        : "matmul_w4a8_blk32_batched_simdmat_tg32";
     id<MTLComputePipelineState> ps_q  = get_pipeline(rec->ctx, "quantize_input_int8_g128_batched");
-    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, "matmul_w4a8_blk32_batched_simdmat_tg32");
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx, mm_kernel);
     if (!ps_q || !ps_mm) return -1;
 
     id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
@@ -1418,8 +1431,10 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_simdmat_tg32_fp32_in(ib_me
         [enc setBytes:&M_u length:sizeof(M_u) atIndex:5];
         [enc setBytes:&N_u length:sizeof(N_u) atIndex:6];
         [enc setBytes:&B_u length:sizeof(B_u) atIndex:7];
-        NSUInteger tg_w_bytes = 32 * 128 * sizeof(uint16_t);
-        NSUInteger tg_a_bytes = 32 * 128 * sizeof(uint16_t);
+        /* Pipelined kernel needs double the TG memory for two slots. */
+        NSUInteger tg_factor = pipelined_setting ? 2u : 1u;
+        NSUInteger tg_w_bytes = tg_factor * 32 * 128 * sizeof(uint16_t);
+        NSUInteger tg_a_bytes = tg_factor * 32 * 128 * sizeof(uint16_t);
         [enc setThreadgroupMemoryLength:tg_w_bytes atIndex:0];
         [enc setThreadgroupMemoryLength:tg_a_bytes atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M / 32, (NSUInteger)B / 32, 1)
@@ -2017,7 +2032,17 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_qkv_fp32_in(
         || !q_out || !k_out || !v_out
         || M_Q <= 0 || M_KV <= 0 || N <= 0) return -1;
     if ((N % 32) != 0) return -1;
-    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_w4a8_blk32_dr_a32_qkv");
+    /* Vec4 variant (4 K-elements per lane via float4+uchar2 loads) is
+     * default-on when N % 128 == 0. Opt out with IB_DECODE_FUSED_VEC4=0. */
+    static int vec4_setting = -1;
+    if (vec4_setting < 0) {
+        const char *env = getenv("IB_DECODE_FUSED_VEC4");
+        vec4_setting = (env && env[0] == '0') ? 0 : 1;
+    }
+    const char *qkv_name = (vec4_setting && (N % 128) == 0)
+        ? "matmul_w4a8_blk32_dr_a32_qkv_vec4"
+        : "matmul_w4a8_blk32_dr_a32_qkv";
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, qkv_name);
     if (!ps) return -1;
     id<MTLBuffer> b_qw  = rec_pick(rec->ctx, q_w);
     id<MTLBuffer> b_qs  = rec_pick(rec->ctx, q_s);
@@ -2120,7 +2145,15 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_gateup_fp32_in(
     if (!rec || !x_fp32 || !gate_w || !gate_s || !up_w || !up_s
         || !gate_out || !up_out || M <= 0 || N <= 0) return -1;
     if ((N % 32) != 0) return -1;
-    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_w4a8_blk32_dr_a32_gateup");
+    static int vec4_setting = -1;
+    if (vec4_setting < 0) {
+        const char *env = getenv("IB_DECODE_FUSED_VEC4");
+        vec4_setting = (env && env[0] == '0') ? 0 : 1;
+    }
+    const char *gu_name = (vec4_setting && (N % 128) == 0)
+        ? "matmul_w4a8_blk32_dr_a32_gateup_vec4"
+        : "matmul_w4a8_blk32_dr_a32_gateup";
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, gu_name);
     if (!ps) return -1;
     id<MTLBuffer> b_gw  = rec_pick(rec->ctx, gate_w);
     id<MTLBuffer> b_gs  = rec_pick(rec->ctx, gate_s);
@@ -2215,7 +2248,15 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_dr_a32_add_fp32_in(
     if (!rec || !x_fp32 || !weights || !w_scales || !out
         || M <= 0 || N <= 0) return -1;
     if ((N % 32) != 0) return -1;
-    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, "matmul_w4a8_blk32_dr_a32_add");
+    static int vec4_setting = -1;
+    if (vec4_setting < 0) {
+        const char *env = getenv("IB_DECODE_FUSED_VEC4");
+        vec4_setting = (env && env[0] == '0') ? 0 : 1;
+    }
+    const char *add_name = (vec4_setting && (N % 128) == 0)
+        ? "matmul_w4a8_blk32_dr_a32_add_vec4"
+        : "matmul_w4a8_blk32_dr_a32_add";
+    id<MTLComputePipelineState> ps = get_pipeline(rec->ctx, add_name);
     if (!ps) return -1;
     id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
     id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights);
