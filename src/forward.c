@@ -140,17 +140,55 @@ static void embedding_lookup(const inferbit_model* m, int token_id, float* out) 
         uint32_t K = pq->K;
         uint32_t HALF = pq->half;
         uint32_t nc = pq->N / G;
-        const uint8_t* idx_base = (const uint8_t*)pq->indices;  /* [nc][ns][M] */
+        uint32_t total = nc * ns;
         const int8_t* cb_q = (const int8_t*)pq->cb_q;           /* [ns][K][HALF] */
         const uint16_t* cb_s = (const uint16_t*)pq->cb_scale;   /* [ns][K] */
         float rs = pq->row_scale ? fp16_to_fp32(((const uint16_t*)pq->row_scale)[token_id]) : 1.0f;
-        for (uint32_t c = 0; c < nc; c++) {
-            for (uint32_t s = 0; s < ns; s++) {
-                uint8_t k = idx_base[((size_t)c * ns + s) * pq->M + token_id];
-                float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
-                for (uint32_t h = 0; h < HALF; h++) {
-                    int8_t q = cb_q[(s * K + k) * HALF + h];
-                    out[c * G + s * HALF + h] = (float)q * scl;
+
+        /* Doc-35 feature 1: if the pre-transposed sidecar is built and
+         * the embedding has a sidecar entry, pread one ROW (total bytes)
+         * from the sidecar instead of mmap-reading `total` widely-strided
+         * single bytes. Sidecar layout is [token][total] so a row is
+         * one contiguous pread = ~1024 bytes. Keeps the source mmap
+         * region cold (cache-eviction-friendly). */
+        if (m->residency_mode == 1 && m->drive_fd_pretransposed >= 0
+            && pq->indices_pretransposed_offset != 0) {
+            uint8_t row_buf[2048];   /* nc*ns ≤ 2048 in practice */
+            if (total > sizeof(row_buf)) goto embed_mmap_path;
+            off_t off = (off_t)pq->indices_pretransposed_offset
+                      + (off_t)token_id * (off_t)total;
+            size_t done = 0;
+            while (done < total) {
+                ssize_t r = pread(m->drive_fd_pretransposed,
+                                  row_buf + done, total - done,
+                                  off + (off_t)done);
+                if (r <= 0) { if (r == -1 && errno == EINTR) continue; goto embed_mmap_path; }
+                done += (size_t)r;
+            }
+            for (uint32_t c = 0; c < nc; c++) {
+                for (uint32_t s = 0; s < ns; s++) {
+                    uint8_t k = row_buf[c * ns + s];
+                    float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
+                    for (uint32_t h = 0; h < HALF; h++) {
+                        int8_t q = cb_q[(s * K + k) * HALF + h];
+                        out[c * G + s * HALF + h] = (float)q * scl;
+                    }
+                }
+            }
+            return;
+        }
+
+embed_mmap_path:
+        {
+            const uint8_t* idx_base = (const uint8_t*)pq->indices;  /* [nc][ns][M] */
+            for (uint32_t c = 0; c < nc; c++) {
+                for (uint32_t s = 0; s < ns; s++) {
+                    uint8_t k = idx_base[((size_t)c * ns + s) * pq->M + token_id];
+                    float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
+                    for (uint32_t h = 0; h < HALF; h++) {
+                        int8_t q = cb_q[(s * K + k) * HALF + h];
+                        out[c * G + s * HALF + h] = (float)q * scl;
+                    }
                 }
             }
         }

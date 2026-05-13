@@ -362,7 +362,27 @@ static inferbit_model* pqv2_load_internal(const char* path,
             if (no_sidecar && no_sidecar[0] == '1') {
                 fprintf(stderr, "ib pqv2: IB_NO_SIDECAR=1 — using legacy per-matmul transpose path\n");
             } else {
-                rc = build_pretransposed_sidecar(m, file_base, mpq_list, nslots);
+                /* Doc-35 feature 1: include token_embedding in the
+                 * sidecar so embed_lookup can pread one row per token
+                 * (1024 contiguous bytes) instead of mmap-reading 1024
+                 * widely-strided bytes. Token embedding stays mmap-
+                 * pointer (no redirect) — only the sidecar entry is
+                 * added. embed_lookup checks sidecar_offset != 0 and
+                 * preads if available. */
+                pqv2_t *sidecar_list[nslots + 1];
+                int sidecar_n = 0;
+                for (int i = 0; i < nslots; i++) sidecar_list[sidecar_n++] = mpq_list[i];
+                if (m->token_embedding.pq) {
+                    sidecar_list[sidecar_n++] = (pqv2_t *)m->token_embedding.pq;
+                    /* Also set indices_file_offset for the embed so the
+                     * sidecar builder can pread the source bytes. */
+                    pqv2_t *emb_pq = (pqv2_t *)m->token_embedding.pq;
+                    if (emb_pq->indices_file_offset == 0) {
+                        emb_pq->indices_file_offset =
+                            (size_t)((const uint8_t *)emb_pq->indices - file_base);
+                    }
+                }
+                rc = build_pretransposed_sidecar(m, file_base, sidecar_list, sidecar_n);
                 if (rc != 0) {
                     fprintf(stderr, "ib pqv2: pre-transposed sidecar build failed (rc=%d); GPU drive will use per-matmul transpose fallback\n", rc);
                 }
