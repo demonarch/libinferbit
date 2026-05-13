@@ -10,6 +10,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
+
+/* Forward decl for drive-mode pre-transposed sidecar builder. Defined
+ * later in this file; called from the drive-mode setup. */
+static int build_pretransposed_sidecar(inferbit_model *m,
+                                         const uint8_t *file_base,
+                                         pqv2_t **pq_list, int n_pq);
 
 #define IB_PQV2_MAGIC "IBFV6PQ2"
 
@@ -154,6 +163,7 @@ static inferbit_model* pqv2_load_internal(const char* path,
         free(f);
         return NULL;
     }
+    m->drive_fd_pretransposed = -1;  /* set by build_pretransposed_sidecar if drive mode */
     if (detect_arch_from_tensors(f, &m->header) != 0) {
         fprintf(stderr, "pqv2_load: cannot detect architecture from %s\n", path);
         ib_pqv2_file_free(f);
@@ -324,20 +334,41 @@ static inferbit_model* pqv2_load_internal(const char* path,
             m->drive_indices_scratch = scratch;
             m->drive_indices_scratch_size = scratch_size;
             m->drive_fd = f->_fd;
-            /* Second pass: rewrite pq->indices to point at scratch.
-             * The kernel always reads from this pointer; we refill via
-             * pread before each matmul. */
+            m->drive_fd_pretransposed = -1;
+            /* Second pass: rewrite pq->indices to point at scratch (CPU
+             * path). Record original file offset for CPU drive_load_indices. */
             for (int i = 0; i < nslots; i++) {
-                pqv2_t *mpq = (pqv2_t *)tslots[i]->pq;   /* cast away const */
-                /* Record file offset of indices region, then redirect
-                 * indices to the shared scratch. Per-matmul pread will
-                 * refill scratch from the file at indices_file_offset. */
+                pqv2_t *mpq = (pqv2_t *)tslots[i]->pq;
                 size_t off = (const uint8_t *)mpq->indices - file_base;
                 mpq->indices_file_offset = off;
                 mpq->indices = (const uint8_t *)scratch;
+                mpq->indices_pretransposed_offset = 0;
             }
-            fprintf(stderr, "ib pqv2: drive mode ON. scratch=%zu B, fd=%d, %d tensors redirected\n",
-                    scratch_size, f->_fd, nslots);
+            /* Build pre-transposed sidecar for the GPU drive path. Writes
+             * each tensor's indices in kernel-native [M][total] layout to
+             * an unlinked tmpfile and sets indices_pretransposed_offset
+             * on each pqv2_t. The GPU drive-mode preads pull bytes
+             * directly to MTLBuffer scratch — NO per-matmul transpose,
+             * which was the doc-35 CPU-bottleneck floor.
+             *
+             * CPU drive path (chunk-major in-file) unaffected: still
+             * preads from drive_fd at indices_file_offset. */
+            pqv2_t *mpq_list[nslots];
+            for (int i = 0; i < nslots; i++) {
+                mpq_list[i] = (pqv2_t *)tslots[i]->pq;
+            }
+            int rc = -1;
+            const char *no_sidecar = getenv("IB_NO_SIDECAR");
+            if (no_sidecar && no_sidecar[0] == '1') {
+                fprintf(stderr, "ib pqv2: IB_NO_SIDECAR=1 — using legacy per-matmul transpose path\n");
+            } else {
+                rc = build_pretransposed_sidecar(m, file_base, mpq_list, nslots);
+                if (rc != 0) {
+                    fprintf(stderr, "ib pqv2: pre-transposed sidecar build failed (rc=%d); GPU drive will use per-matmul transpose fallback\n", rc);
+                }
+            }
+            fprintf(stderr, "ib pqv2: drive mode ON. scratch=%zu B, fd=%d, sidecar_fd=%d, %d tensors\n",
+                    scratch_size, m->drive_fd, m->drive_fd_pretransposed, nslots);
         }
     }
     return m;
@@ -359,4 +390,130 @@ inferbit_model* pqv2_or_legacy_load(const char* path,
         return pqv2_load_internal(path, config);
     }
     return ibf_load(path, config);
+}
+
+/* Pre-transposed sidecar for drive mode.
+ *
+ * Each PQv2 tensor's indices are stored on disk in [n_chunks][n_subchunks][M]
+ * (chunk-major, the legacy format). Both GPU upload and drive-mode preads
+ * have to transpose this to [M][total = n_chunks * n_subchunks] before the
+ * kernel can consume it. Per-matmul transpose is the CPU-bottleneck floor
+ * that caps drive-mode tok/s at ~2.3 tok/s (doc 35).
+ *
+ * This function does the transpose ONCE at load and writes results to an
+ * unlinked tmpfile in [M][total] order. drive_load_pq_idx_to_slot then
+ * preads bytes that are already in kernel-native layout — zero-copy into
+ * the MTLBuffer scratch.
+ *
+ * Sets m->drive_fd to the sidecar fd and each pq->indices_file_offset to
+ * its position in the sidecar.
+ *
+ * Cost: one-time read of full indices region + one-time write of same.
+ * For TinyLlama: ~528 MB indices × 2 = ~1 GB I/O ≈ 350 ms one-time.
+ *
+ * Returns 0 on success. Caller falls back to in-file drive mode on
+ * non-zero return. */
+static int build_pretransposed_sidecar(inferbit_model *m,
+                                         const uint8_t *file_base,
+                                         pqv2_t **pq_list, int n_pq)
+{
+    if (!m || !file_base || !pq_list || n_pq <= 0) return -1;
+
+    /* Open + unlink tmpfile so it auto-cleans on process exit. */
+    char path[] = "/tmp/inferbit-pretposed-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return -2;
+    if (unlink(path) != 0) {
+        /* benign — just means we leak the path until process exits */
+    }
+#ifdef F_NOCACHE
+    /* macOS: bypass UBC for the sidecar — we only ever pread from it,
+     * never want it accumulating in page cache. */
+    (void)fcntl(fd, F_NOCACHE, 1);
+#endif
+
+    /* Pre-pad with one byte so all tensor offsets are ≥ 1. The
+     * GPU upload code treats pq_drive_file_offset == 0 as "not
+     * streamed"; the first tensor would otherwise land at offset 0
+     * and be incorrectly skipped. */
+    {
+        const uint8_t pad = 0;
+        if (write(fd, &pad, 1) != 1) {
+            close(fd); return -3;
+        }
+    }
+    /* Walk each tensor, transpose its indices to the sidecar.
+     * Layout: source [c][s][m] → dest [m][c*ns+s]. */
+    off_t sidecar_off = 1;
+    /* Reuse one staging buffer sized for the largest tensor's indices. */
+    size_t max_bytes = 0;
+    for (int i = 0; i < n_pq; i++) {
+        size_t b = (size_t)pq_list[i]->M * (pq_list[i]->N / pq_list[i]->G)
+                   * pq_list[i]->n_subchunks;
+        if (b > max_bytes) max_bytes = b;
+    }
+    uint8_t *staging = (uint8_t *)malloc(max_bytes);
+    if (!staging) { close(fd); return -3; }
+
+    /* We need a second staging buffer to hold the original chunk-major
+     * bytes we pread from the source file. Mmap-read would touch every
+     * page into UBC, defeating drive-mode RAM savings — pread keeps
+     * the source-file pages out of cache (F_NOCACHE is set on the source
+     * fd in drive mode). */
+    uint8_t *read_buf = (uint8_t *)malloc(max_bytes);
+    if (!read_buf) { free(staging); close(fd); return -5; }
+
+    for (int i = 0; i < n_pq; i++) {
+        pqv2_t *pq = pq_list[i];
+        uint32_t M = pq->M;
+        uint32_t nc = pq->N / pq->G;
+        uint32_t ns = pq->n_subchunks;
+        uint32_t total = nc * ns;
+        size_t idx_bytes = (size_t)M * total;
+
+        /* pread the original chunk-major bytes from the source IBF.
+         * pq->indices_file_offset was set just above to point at the
+         * indices region in the source file. */
+        size_t got = 0;
+        off_t src_off = (off_t)pq->indices_file_offset;
+        while (got < idx_bytes) {
+            ssize_t r = pread(m->drive_fd, read_buf + got,
+                              idx_bytes - got, src_off + (off_t)got);
+            if (r <= 0) {
+                if (r == -1 && errno == EINTR) continue;
+                free(read_buf); free(staging); close(fd); return -6;
+            }
+            got += (size_t)r;
+        }
+        const uint8_t *src = read_buf;
+        /* Transpose into staging: dst[m * total + c*ns + s] = src[(c*ns+s)*M + m]. */
+        for (uint32_t m_ = 0; m_ < M; m_++) {
+            uint8_t *row = staging + (size_t)m_ * total;
+            for (uint32_t c = 0; c < nc; c++) {
+                for (uint32_t s = 0; s < ns; s++) {
+                    row[c * ns + s] = src[((size_t)c * ns + s) * M + m_];
+                }
+            }
+        }
+        /* Write transposed bytes to sidecar at current offset. */
+        size_t written = 0;
+        while (written < idx_bytes) {
+            ssize_t w = write(fd, staging + written, idx_bytes - written);
+            if (w <= 0) {
+                if (w == -1 && errno == EINTR) continue;
+                free(staging); close(fd); return -4;
+            }
+            written += (size_t)w;
+        }
+        /* Record this tensor's sidecar offset for runtime GPU preads. */
+        pq->indices_pretransposed_offset = (size_t)sidecar_off;
+        sidecar_off += (off_t)idx_bytes;
+    }
+
+    free(staging);
+    free(read_buf);
+    m->drive_fd_pretransposed = fd;
+    fprintf(stderr, "ib pqv2: pre-transposed sidecar built (%lld B, %d tensors) — GPU drive preads skip transpose\n",
+            (long long)sidecar_off, n_pq);
+    return 0;
 }

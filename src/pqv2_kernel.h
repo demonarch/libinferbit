@@ -45,6 +45,11 @@ typedef struct {
      * model is in drive mode; otherwise 0. Used by forward.c to
      * pread() into the shared scratch buffer before each matmul. */
     size_t indices_file_offset;
+    /* Sidecar offset for the pre-transposed [m][total] copy. Used by
+     * GPU drive mode (doc 35 feature 3) to skip the per-matmul
+     * transpose. 0 = no sidecar; pread from drive_fd at
+     * indices_file_offset (legacy chunk-major path). */
+    size_t indices_pretransposed_offset;
 } pqv2_t;
 
 /* Load .pqv2 file into freshly-malloc'd buffers. Returns 0 on success.

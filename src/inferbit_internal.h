@@ -212,6 +212,13 @@ struct inferbit_model {
     int    drive_fd;                  /* fd of the IBF, F_NOCACHE set on Darwin */
     void  *drive_indices_scratch;     /* page-aligned shared buffer */
     size_t drive_indices_scratch_size;
+    /* Pre-transposed sidecar (doc 35 feature 3). Built once at drive-
+     * mode init from the original [c][s][m] indices, stores them in
+     * kernel-native [m][total] layout for GPU drive-mode preads —
+     * eliminates the per-matmul transpose that was the drive-mode
+     * CPU-bottleneck floor. CPU drive path continues to use drive_fd
+     * (chunk-major). -1 = no sidecar (CPU-only drive or build failed). */
+    int    drive_fd_pretransposed;
 };
 
 /* ── Config struct ──────────────────────────────────────────── */

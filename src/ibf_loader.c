@@ -437,6 +437,8 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
         ib_close(fd);
         return NULL;
     }
+    /* Drive-mode sidecar fd defaults to -1 (no sidecar). */
+    model->drive_fd_pretransposed = -1;
 
     /* Parse JSON header */
     if (parse_header_json(json_buf, header_size, &model->header,

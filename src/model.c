@@ -3,6 +3,7 @@
 #include "platform.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>   /* close() for drive_fd_pretransposed */
 
 /* Defined in ibf_loader.c */
 inferbit_model* ibf_load(const char* path, const inferbit_config* config);
@@ -66,6 +67,11 @@ void inferbit_free(inferbit_model* model) {
         model->drive_indices_scratch_size = 0;
     }
     /* model->drive_fd is owned by pqv2_file_backing — don't close here. */
+    /* model->drive_fd_pretransposed IS owned here (unlinked tmpfile). */
+    if (model->drive_fd_pretransposed >= 0) {
+        close(model->drive_fd_pretransposed);
+        model->drive_fd_pretransposed = -1;
+    }
 
     /* Unmap weight data */
     if (model->weight_data_mmap && model->weight_data) {

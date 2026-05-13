@@ -466,7 +466,15 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
     if (m && m->residency_mode == 1 && pq->indices_file_offset != 0
         && !keep_indices_resident) {
         out->pq_idx = NULL;
-        out->pq_drive_file_offset = pq->indices_file_offset;
+        /* Prefer the pre-transposed sidecar offset if available (doc 35
+         * feature 3 — skips per-matmul transpose). Falls back to the
+         * legacy in-file chunk-major offset if sidecar build failed.
+         * Selector is the SIDECAR FD presence (the first tensor's
+         * sidecar offset is 0, so we can't use offset != 0 as the
+         * selector). */
+        out->pq_drive_file_offset = (m->drive_fd_pretransposed >= 0)
+            ? pq->indices_pretransposed_offset
+            : pq->indices_file_offset;
         return;
     }
     out->pq_drive_file_offset = 0;
@@ -912,7 +920,6 @@ static int drive_load_pq_idx_to_slot(ib_metal_model_buffers *b,
     if (slot < 0 || slot >= b->gpu_drive_idx_n_slots) return -1;
     if (!b->gpu_drive_idx_scratch[slot] || !b->gpu_drive_idx_staging[slot]) return -1;
     const inferbit_model *m = (const inferbit_model *)b->model;
-    if (m->drive_fd < 0) return -1;
 
     uint32_t M     = (uint32_t)tb->pq_M;
     uint32_t nc    = (uint32_t)(tb->pq_N / tb->pq_G);
@@ -924,28 +931,58 @@ static int drive_load_pq_idx_to_slot(ib_metal_model_buffers *b,
                 idx_bytes, b->gpu_drive_idx_scratch_size);
         return -1;
     }
+    /* Doc-35 feature 3: prefer the pre-transposed sidecar (fd in
+     * m->drive_fd_pretransposed) — those bytes are already in
+     * kernel-native [M][total] layout, so we pread directly to the
+     * MTLBuffer scratch with zero transpose work on the critical path.
+     * Lifts the drive-mode CPU floor from ~2.3 tok/s.
+     *
+     * Falls back to the legacy in-file [c][s][m] path (with per-matmul
+     * transpose) if sidecar build failed. */
+    int use_sidecar = (m->drive_fd_pretransposed >= 0);
+    int fd = use_sidecar ? m->drive_fd_pretransposed : m->drive_fd;
+    if (fd < 0) return -1;
+    off_t off = (off_t)tb->pq_drive_file_offset;
+
+    if (use_sidecar) {
+        /* Direct-to-scratch pread; no transpose. */
+        uint8_t *dst = (uint8_t *)b->gpu_drive_idx_scratch[slot];
+        size_t done = 0;
+        while (done < idx_bytes) {
+            ssize_t r = pread(fd, dst + done, idx_bytes - done,
+                              off + (off_t)done);
+            if (r <= 0) {
+                if (r == -1 && errno == EINTR) continue;
+                fprintf(stderr, "drive_load_pq_idx_to_slot[sidecar]: pread failed (off=%lld, want=%zu)\n",
+                        (long long)off, idx_bytes - done);
+                return -1;
+            }
+            done += (size_t)r;
+        }
+        return 0;
+    }
+
+    /* Legacy fallback: pread into staging, transpose to scratch. */
     uint8_t *staging = (uint8_t *)b->gpu_drive_idx_staging[slot];
     size_t done = 0;
-    off_t off = (off_t)tb->pq_drive_file_offset;
     while (done < idx_bytes) {
-        ssize_t r = pread(m->drive_fd, staging + done, idx_bytes - done,
+        ssize_t r = pread(fd, staging + done, idx_bytes - done,
                           off + (off_t)done);
         if (r <= 0) {
             if (r == -1 && errno == EINTR) continue;
-            fprintf(stderr, "drive_load_pq_idx_to_slot: pread failed (off=%lld, want=%zu)\n",
+            fprintf(stderr, "drive_load_pq_idx_to_slot[legacy]: pread failed (off=%lld, want=%zu)\n",
                     (long long)off, idx_bytes - done);
             return -1;
         }
         done += (size_t)r;
     }
-    uint8_t *dst = (uint8_t *)b->gpu_drive_idx_scratch[slot];
     /* Transpose [nc][ns][M] → [M][total = nc*ns]. */
+    uint8_t *dst = (uint8_t *)b->gpu_drive_idx_scratch[slot];
     for (uint32_t m_ = 0; m_ < M; m_++) {
         uint8_t *row = dst + (size_t)m_ * total;
         for (uint32_t c = 0; c < nc; c++) {
             for (uint32_t s = 0; s < ns; s++) {
-                row[c * ns + s] =
-                    staging[((size_t)c * ns + s) * M + m_];
+                row[c * ns + s] = staging[((size_t)c * ns + s) * M + m_];
             }
         }
     }
