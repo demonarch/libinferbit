@@ -1623,6 +1623,47 @@ extern "C" int ib_metal_rec_matmul_w4a8_blk32_batched_gateup_simdmat_k64_fp32_in
     return 0;
 }
 
+/* MPS-hybrid prefill dispatcher: fp16-weight × fp32-input simdmat
+ * K=64 pipelined. Caller pre-dequanted weights to fp16 at upload. */
+extern "C" int ib_metal_rec_matmul_fp16w_fp32x_batched_simdmat_k64_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *weights_fp16,
+    void *out,
+    int B, int M, int N)
+{
+    if (!rec || !x_fp32 || !weights_fp16 || !out
+        || B <= 0 || M <= 0 || N <= 0) return -1;
+    if ((N % 64) != 0 || (M % 32) != 0 || (B % 32) != 0) return -2;
+
+    id<MTLComputePipelineState> ps_mm = get_pipeline(rec->ctx,
+        "matmul_fp16w_fp32x_batched_simdmat_tg32_k64_pipelined");
+    if (!ps_mm) return -1;
+
+    id<MTLBuffer> b_x   = rec_pick(rec->ctx, x_fp32);
+    id<MTLBuffer> b_w   = rec_pick(rec->ctx, weights_fp16);
+    id<MTLBuffer> b_out = rec_pick(rec->ctx, out);
+    if (!b_x || !b_w || !b_out) return -1;
+
+    uint M_u = (uint)M, N_u = (uint)N, B_u = (uint)B;
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps_mm];
+    [enc setBuffer:b_w   offset:0 atIndex:0];
+    [enc setBuffer:b_x   offset:0 atIndex:1];
+    [enc setBuffer:b_out offset:0 atIndex:2];
+    [enc setBytes:&M_u length:sizeof(M_u) atIndex:3];
+    [enc setBytes:&N_u length:sizeof(N_u) atIndex:4];
+    [enc setBytes:&B_u length:sizeof(B_u) atIndex:5];
+    NSUInteger slot_w = 32 * 64 * sizeof(uint16_t);
+    NSUInteger slot_a = 32 * 64 * sizeof(uint16_t);
+    [enc setThreadgroupMemoryLength:2 * slot_w atIndex:0];
+    [enc setThreadgroupMemoryLength:2 * slot_a atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M / 32, (NSUInteger)B / 32, 1)
+          threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    [enc endEncoding];
+    return 0;
+}
+
 /* 4-SIMDgroup tg-shared variant of the simdmat kernel: each
  * threadgroup computes a 16×16 output tile via 4 parallel SIMD groups
  * (2×2 sub-tile grid), sharing a single co-loaded W+A dequant pair.

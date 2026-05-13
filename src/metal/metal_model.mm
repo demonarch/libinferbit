@@ -36,6 +36,10 @@ struct tensor_bufs {
     void *s;
     int   bits;
     int   blk32;
+    /* Optional fp16 dequant of INT4-blk32 weights for the MPS-hybrid
+     * prefill kernel (IB_PREFILL_FP16_W=1). NULL when not pre-dequanted.
+     * Doubles the per-tensor GPU memory (acceptable on small models). */
+    void *w_fp16;
     /* PQv2 path (the stacked 2D codebook pyramid) */
     int   is_pq;
     void *pq_rs;        /* [M] fp16 row_scale */
@@ -239,6 +243,52 @@ static void release_mmap_range(const void *src, size_t len) {
 #if defined(MADV_FREE)
     madvise(addr, len_a, MADV_FREE);
 #endif
+}
+
+/* Forward decl — defined later in this file. */
+static inline uint16_t fp32_to_fp16_bits(float f);
+
+/* Dequantize INT4-blk32 weights to fp16 [M][N], for the MPS-hybrid
+ * prefill kernel. Per-32-element block has a single fp16 scale; each
+ * nibble decoded as ((byte >> 0/4) & 0x0F) - 8. Returns malloc'd buffer
+ * the caller owns (uploaded to MTLBuffer, then freed). */
+static uint16_t *dequant_int4_blk32_to_fp16(const uint8_t *w_src,
+                                              const uint16_t *ws_fp16_src,
+                                              int M, int N)
+{
+    if (M <= 0 || N <= 0 || (N % 32) != 0) return NULL;
+    size_t total = (size_t)M * N;
+    uint16_t *dst = (uint16_t *)malloc(total * sizeof(uint16_t));
+    if (!dst) return NULL;
+    int row_bytes  = N / 2;
+    int scales_per_row = N / 32;
+    for (int m = 0; m < M; m++) {
+        const uint8_t  *row    = w_src + (size_t)m * row_bytes;
+        const uint16_t *scales = ws_fp16_src + (size_t)m * scales_per_row;
+        for (int n = 0; n < N; n++) {
+            uint8_t byte = row[n / 2];
+            int w_int = (n & 1) ? ((int)((byte >> 4) & 0x0F) - 8)
+                                  : ((int)(byte & 0x0F) - 8);
+            uint16_t s_bits = scales[n / 32];
+            /* Decode fp16 scale → fp32, multiply, re-encode as fp16. */
+            uint32_t sign = (s_bits & 0x8000) << 16;
+            uint32_t expo = (s_bits >> 10) & 0x1F;
+            uint32_t mant = s_bits & 0x3FF;
+            float w_scale;
+            if (expo == 0) {
+                /* Subnormal: 2^-14 * mant/1024 */
+                w_scale = (float)mant / 1024.0f / 16384.0f;
+            } else if (expo == 31) {
+                w_scale = 0.0f;  /* inf/NaN → treat as 0 */
+            } else {
+                uint32_t f32_bits = sign | ((expo - 15 + 127) << 23) | (mant << 13);
+                memcpy(&w_scale, &f32_bits, 4);
+            }
+            float val = (float)w_int * w_scale;
+            dst[(size_t)m * N + n] = fp32_to_fp16_bits(val);
+        }
+    }
+    return dst;
 }
 
 /* Pre-shuffle INT4-blk32 weights from row-major [M][N/2] into tile-major
@@ -480,6 +530,31 @@ static void upload_tensor(ib_metal_ctx *ctx, const inferbit_model *m,
     out->bits  = t->bits;
     out->blk32 = (t->bits == 4 && t->scale_size > (size_t)t->shape[0] * 2);
     out->is_pq = 0;
+    out->w_fp16 = NULL;
+    /* MPS-hybrid prefill (IB_PREFILL_FP16_W=1): pre-dequantize INT4-blk32
+     * weights to fp16 and upload as a parallel buffer. Doubles GPU RAM
+     * for the weight tensor — only viable on small models. Decode still
+     * uses the original INT4 buffer; only the fp16-weight prefill kernel
+     * reads out->w_fp16. */
+    static int fp16w_setting = -1;
+    if (fp16w_setting < 0) {
+        const char *env = getenv("IB_PREFILL_FP16_W");
+        fp16w_setting = (env && env[0] == '1') ? 1 : 0;
+    }
+    if (fp16w_setting && out->bits == 4 && out->blk32
+        && t->shape[0] > 0 && t->shape[1] > 0
+        && (t->shape[1] % 32) == 0) {
+        const uint8_t *base = (const uint8_t *)m->weight_data;
+        const uint8_t *w_src = base + t->offset;
+        const uint16_t *ws_src = (const uint16_t *)(base + t->scale_offset);
+        uint16_t *fp16w = dequant_int4_blk32_to_fp16(w_src, ws_src,
+                                                       t->shape[0], t->shape[1]);
+        if (fp16w) {
+            size_t bytes = (size_t)t->shape[0] * t->shape[1] * sizeof(uint16_t);
+            out->w_fp16 = ib_metal_alloc(ctx, bytes, fp16w);
+            free(fp16w);
+        }
+    }
 }
 
 extern "C" ib_metal_model_buffers *
@@ -769,7 +844,7 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     for (int L = 0; L < b->num_layers; L++) {
         struct layer_bufs *lb = &b->layers[L];
         #define FREE_TB(tb) do { \
-            FR((tb).w); FR((tb).s); \
+            FR((tb).w); FR((tb).s); FR((tb).w_fp16); \
             FR((tb).pq_rs); FR((tb).pq_cb); \
             FR_IDX(tb); \
         } while (0)
@@ -783,7 +858,7 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     }
     free(b->layers);
     FR(b->output_norm);
-    FR(b->output_head.w); FR(b->output_head.s);
+    FR(b->output_head.w); FR(b->output_head.s); FR(b->output_head.w_fp16);
     FR(b->output_head.pq_rs); FR(b->output_head.pq_cb);
     FR_IDX(b->output_head);
     #undef FR_IDX
@@ -1249,6 +1324,14 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
                                   void *out, void *xq, void *xs,
                                   int B, int M, int N)
 {
+    /* MPS-hybrid path: if we have fp16-dequanted weights for this
+     * INT4-blk32 tensor, dispatch the simpler fp16-weight simdmat
+     * kernel (no INT4 unpack, no per-element scale). */
+    if (tb && !tb->is_pq && tb->w_fp16) {
+        int rc = ib_metal_rec_matmul_fp16w_fp32x_batched_simdmat_k64_fp32_in(
+            r, x_fp32, tb->w_fp16, out, B, M, N);
+        if (rc == 0) return 0;
+    }
     if (tb && tb->is_pq) {
         void *idx = drive_prepare_pq(r, b, tb);
         if (!idx) return -1;
@@ -1482,6 +1565,7 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
             && lb->q.bits == 4 && lb->q.blk32
             && lb->k.bits == 4 && lb->k.blk32
             && lb->v.bits == 4 && lb->v.blk32
+            && !lb->q.w_fp16 && !lb->k.w_fp16 && !lb->v.w_fp16  /* prefer fp16 individual path when available */
             && (qh % 32) == 0 && (kv_dim % 32) == 0
             && (hidden % 128) == 0 && (B % 32) == 0) {
             rc_qkv = ib_metal_rec_matmul_w4a8_blk32_batched_qkv_simdmat_k64_fp32_in(
@@ -1555,6 +1639,7 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         if (!lb->gate.is_pq && !lb->up.is_pq
             && lb->gate.bits == 4 && lb->gate.blk32
             && lb->up.bits == 4 && lb->up.blk32
+            && !lb->gate.w_fp16 && !lb->up.w_fp16  /* prefer fp16 individual path */
             && (inter % 32) == 0 && (hidden % 128) == 0 && (B % 32) == 0) {
             rc_gu = ib_metal_rec_matmul_w4a8_blk32_batched_gateup_simdmat_k64_fp32_in(
                 r, b->xb_b,

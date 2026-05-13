@@ -2031,6 +2031,125 @@ kernel void matmul_w4a8_blk32_batched_simdmat_tg32_k64_pipelined_shuffled(
     #undef K64SH_DEQUANT_A
 }
 
+/* matmul_fp16w_fp32x_batched_simdmat_tg32_k64_pipelined — MPS-hybrid
+ * prefill kernel. Same K=64 pipelined tile geometry as the INT4-blk32
+ * default, but the weight tile is loaded directly from device-memory
+ * fp16 (no INT4 unpack, no per-block scale multiply per element). The
+ * activation tile is dequanted fp32→fp16 cooperatively, same as the
+ * existing K=64 kernel.
+ *
+ * Caller must have pre-dequanted the INT4-blk32 weights to fp16 at
+ * upload time (doubles the GPU weight buffer; viable on small models).
+ *
+ * Grid: same as K=64 pipelined: (M/32, B/32, 1). Same shape constraints.
+ * TG memory: 16 KB (2×32×64 half W + 2×32×64 half A). */
+kernel void matmul_fp16w_fp32x_batched_simdmat_tg32_k64_pipelined(
+    device const half   *weights   [[buffer(0)]],   /* fp16 [M][N] */
+    device const float  *x         [[buffer(1)]],   /* fp32 [B][N] */
+    device       float  *out       [[buffer(2)]],   /* fp32 [B][M] */
+    constant     uint   &M         [[buffer(3)]],
+    constant     uint   &N         [[buffer(4)]],
+    constant     uint   &B         [[buffer(5)]],
+    threadgroup half    *tg_W_buf  [[threadgroup(0)]],
+    threadgroup half    *tg_A_buf  [[threadgroup(1)]],
+    uint                 simd_lane [[thread_index_in_simdgroup]],
+    uint                 simd_id   [[simdgroup_index_in_threadgroup]],
+    uint2                tg_id     [[threadgroup_position_in_grid]])
+{
+    uint tg_lane = simd_id * 32u + simd_lane;
+    constexpr uint TG_THREADS = 16u * 32u;
+    constexpr uint TILE_BYTES = SDMT32_K64_M_BLOCK * SDMT32_K64_K_TILE;
+
+    uint m_off = simd_id & 3u;
+    uint b_off = simd_id >> 2;
+    uint m_base = tg_id.x * SDMT32_K64_M_BLOCK;
+    uint b_base = tg_id.y * SDMT32_K64_B_BLOCK;
+    if (m_base >= M || b_base >= B) return;
+
+    simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint n_groups = N / SDMT32_K64_K_TILE;
+
+    threadgroup half *W_slot[2] = { tg_W_buf, tg_W_buf + TILE_BYTES };
+    threadgroup half *A_slot[2] = { tg_A_buf, tg_A_buf + TILE_BYTES };
+
+    /* Load fp16 W tile directly from device memory into TG memory.
+     * No dequant — just a copy. Each TG reads its 32×64 fp16 slice
+     * of weights at offset (m_base * N + g*64). */
+    #define FP16W_LOAD_W(slot_ptr, g)                                              \
+        for (uint i = tg_lane; i < TILE_BYTES; i += TG_THREADS) {                  \
+            uint m_local = i / SDMT32_K64_K_TILE;                                  \
+            uint k_local = i % SDMT32_K64_K_TILE;                                  \
+            uint m_global = m_base + m_local;                                      \
+            uint k_global = (g) * SDMT32_K64_K_TILE + k_local;                     \
+            half v = (half)0;                                                      \
+            if (m_global < M && k_global < N) {                                    \
+                v = weights[(size_t)m_global * N + k_global];                      \
+            }                                                                      \
+            (slot_ptr)[i] = v;                                                     \
+        }
+
+    /* fp32 → fp16 cast of A. No INT8 quantize/dequant round-trip. */
+    #define FP16W_LOAD_A(slot_ptr, g)                                              \
+        for (uint i = tg_lane; i < TILE_BYTES; i += TG_THREADS) {                  \
+            uint b_local = i / SDMT32_K64_K_TILE;                                  \
+            uint k_local = i % SDMT32_K64_K_TILE;                                  \
+            uint b_global = b_base + b_local;                                      \
+            uint k_global = (g) * SDMT32_K64_K_TILE + k_local;                     \
+            half v = (half)0;                                                      \
+            if (b_global < B && k_global < N) {                                    \
+                v = (half)x[(size_t)b_global * N + k_global];                      \
+            }                                                                      \
+            (slot_ptr)[i] = v;                                                     \
+        }
+
+    FP16W_LOAD_W(W_slot[0], 0u);
+    FP16W_LOAD_A(A_slot[0], 0u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint g = 1u; g < n_groups; g++) {
+        uint cur  = (g - 1u) & 1u;
+        uint next = g & 1u;
+
+        FP16W_LOAD_W(W_slot[next], g);
+        FP16W_LOAD_A(A_slot[next], g);
+
+        threadgroup const half *A_base = A_slot[cur] + (size_t)(b_off * 8u) * SDMT32_K64_K_TILE;
+        threadgroup const half *W_base = W_slot[cur] + (size_t)(m_off * 8u) * SDMT32_K64_K_TILE;
+        for (uint k_sub = 0; k_sub < SDMT32_K64_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32_K64_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32_K64_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    {
+        uint last = (n_groups - 1u) & 1u;
+        threadgroup const half *A_base = A_slot[last] + (size_t)(b_off * 8u) * SDMT32_K64_K_TILE;
+        threadgroup const half *W_base = W_slot[last] + (size_t)(m_off * 8u) * SDMT32_K64_K_TILE;
+        for (uint k_sub = 0; k_sub < SDMT32_K64_K_TILE / 8u; k_sub++) {
+            simdgroup_half8x8 A_sub;
+            simdgroup_half8x8 W_sub_T;
+            simdgroup_load(A_sub, A_base + k_sub * 8u, SDMT32_K64_K_TILE);
+            simdgroup_load(W_sub_T, W_base + k_sub * 8u, SDMT32_K64_K_TILE,
+                            ulong2(0, 0), /*transpose=*/true);
+            simdgroup_multiply_accumulate(C, A_sub, W_sub_T, C);
+        }
+    }
+
+    uint my_m_base = m_base + m_off * 8u;
+    uint my_b_base = b_base + b_off * 8u;
+    simdgroup_store(C, out + (size_t)my_b_base * M + my_m_base, M);
+
+    #undef FP16W_LOAD_W
+    #undef FP16W_LOAD_A
+}
+
 /* matmul_pqv2_batched_simdmat — PQv2 batched matmul via Apple's
  * simdgroup_matrix hardware. Same tile structure as the INT4 tg32
  * variant (32×32 output, 16 SIMDgroups per TG, 4×4 sub-tile grid),

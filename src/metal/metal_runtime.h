@@ -382,6 +382,18 @@ int ib_metal_rec_matmul_w4a8_blk32_batched_gateup_simdmat_k64_fp32_in(
     void *scratch_x_q, void *scratch_x_scales,
     int B, int M, int N);
 
+/* MPS-hybrid prefill: fp16 weights × fp32 inputs batched matmul via
+ * K=64 pipelined simdmat. Skips the INT4 unpack + per-element scale
+ * multiply by reading pre-dequanted fp16 weights directly. Caller is
+ * responsible for the upload-time dequant.
+ * Shape constraints: B % 32 == 0, M % 32 == 0, N % 64 == 0. */
+int ib_metal_rec_matmul_fp16w_fp32x_batched_simdmat_k64_fp32_in(
+    ib_metal_recorder *rec,
+    const void *x_fp32,
+    const void *weights_fp16,
+    void *out,
+    int B, int M, int N);
+
 /* Fused fp32-input variant of tg32: skips the separate INT8 quantize
  * pass + scratch round-trip. Reads activations directly as fp32 and
  * converts to fp16 in the cooperative load. Requires B%32==0, M%32==0. */
