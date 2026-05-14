@@ -477,6 +477,70 @@ void test_generate_stream(void) {
     inferbit_config_free(cfg);
 }
 
+void test_kv_truncate_correctness(void) {
+    /* Verifies that inferbit_kv_truncate produces a state functionally
+     * equivalent to feeding the truncated prefix from scratch. I.e.:
+     *   model.forward(a,b,c,d,e); model.truncate(3); model.forward(d,e)
+     * should produce the same logits as
+     *   model2.forward(a,b,c,d,e)
+     * because both have KV for [a,b,c,d,e] at the end. */
+    write_tiny_ibf();
+    inferbit_config* cfg1 = inferbit_config_create();
+    inferbit_config* cfg2 = inferbit_config_create();
+    inferbit_model* mtrunc = inferbit_load(TINY_IBF, cfg1);
+    inferbit_model* mfresh = inferbit_load(TINY_IBF, cfg2);
+    assert(mtrunc && mfresh);
+
+    float logits_trunc[VOCAB], logits_fresh[VOCAB];
+    int32_t toks_full[] = {1, 2, 3, 4, 5};
+
+    /* Path A: forward 5 → truncate to 3 → forward last 2 */
+    int rc = inferbit_forward(mtrunc, toks_full, 5, logits_trunc, VOCAB);
+    assert(rc == INFERBIT_OK);
+    assert(inferbit_kv_length(mtrunc) == 5);
+    inferbit_kv_truncate(mtrunc, 3);
+    assert(inferbit_kv_length(mtrunc) == 3);
+    int32_t toks_tail[] = {4, 5};
+    rc = inferbit_forward(mtrunc, toks_tail, 2, logits_trunc, VOCAB);
+    assert(rc == INFERBIT_OK);
+    assert(inferbit_kv_length(mtrunc) == 5);
+
+    /* Path B: forward all 5 fresh */
+    rc = inferbit_forward(mfresh, toks_full, 5, logits_fresh, VOCAB);
+    assert(rc == INFERBIT_OK);
+    assert(inferbit_kv_length(mfresh) == 5);
+
+    /* Logits at the same position-5 prediction should match. The tiny
+     * fixture is fp32 throughout so we expect exact equality. */
+    for (int i = 0; i < VOCAB; i++) {
+        assert(isfinite(logits_trunc[i]));
+        assert(isfinite(logits_fresh[i]));
+        float diff = logits_trunc[i] - logits_fresh[i];
+        if (diff < 0) diff = -diff;
+        assert(diff < 1e-4f);  /* tiny tolerance for any reordering */
+    }
+
+    /* Truncate-to-zero behaves like clear. */
+    inferbit_kv_truncate(mtrunc, 0);
+    assert(inferbit_kv_length(mtrunc) == 0);
+
+    /* Truncate to a length >= current is a no-op. */
+    rc = inferbit_forward(mtrunc, toks_full, 3, logits_trunc, VOCAB);
+    assert(rc == INFERBIT_OK);
+    assert(inferbit_kv_length(mtrunc) == 3);
+    inferbit_kv_truncate(mtrunc, 99);  /* > current */
+    assert(inferbit_kv_length(mtrunc) == 3);
+
+    /* Negative input clamps to 0. */
+    inferbit_kv_truncate(mtrunc, -5);
+    assert(inferbit_kv_length(mtrunc) == 0);
+
+    inferbit_free(mtrunc);
+    inferbit_free(mfresh);
+    inferbit_config_free(cfg1);
+    inferbit_config_free(cfg2);
+}
+
 void test_kv_clear_and_reuse(void) {
     write_tiny_ibf();
     inferbit_config* cfg = inferbit_config_create();
@@ -684,6 +748,7 @@ int main(void) {
     TEST(test_generate_basic);
     TEST(test_generate_stream);
     TEST(test_kv_clear_and_reuse);
+    TEST(test_kv_truncate_correctness);
     TEST(test_forward_deterministic);
     TEST(test_spec_decoding_tiny);
     TEST(test_prompt_lookup_search);
