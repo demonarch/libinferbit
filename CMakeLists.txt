@@ -14,11 +14,19 @@ else()
     set(CMAKE_C_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined")
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
 
-    # Tune for the host microarchitecture on Apple Silicon (enables dotprod
-    # scheduling and register pressure assumptions that the kernels rely on
-    # to keep batch accumulators in NEON registers instead of spilling).
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
-        add_compile_options(-mcpu=apple-m1)
+    # ARM64: the NEON kernels use the SDOT/UDOT (vdotq_*) intrinsics, which
+    # require the `dotprod` feature. On Apple Silicon `-mcpu=apple-m1` pulls
+    # it in; on other aarch64 targets (e.g. Linux arm64 CI runners, where
+    # CMAKE_SYSTEM_PROCESSOR is "aarch64") the compiler otherwise defaults
+    # to baseline armv8-a and rejects vdotq_s32 with a target mismatch, so
+    # request armv8.2-a+dotprod explicitly.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64" OR
+       CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        if(APPLE)
+            add_compile_options(-mcpu=apple-m1)
+        else()
+            add_compile_options(-march=armv8.2-a+dotprod)
+        endif()
     endif()
 endif()
 

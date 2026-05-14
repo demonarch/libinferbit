@@ -1,14 +1,12 @@
 #include "pqv2_format.h"
 #include "pqv2_kernel.h"
+#include "platform.h"   /* ib_open/ib_mmap/ib_close + cross-platform I/O */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 
 #define IB_PQV2_MAGIC "IBFV6PQ2"
 #define IB_PQV2_VERSION 1u
@@ -72,10 +70,10 @@ static float* decode_codebook_fp32(const int8_t *cb_q, const uint16_t *cb_scale,
 
 int ib_pqv2_file_load(const char *path, ib_pqv2_file *out) {
     memset(out, 0, sizeof(*out));
-    int fd = open(path, O_RDONLY);
+    int fd = ib_open(path, O_RDONLY);
     if (fd < 0) return -1;
-    struct stat st;
-    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+    ib_struct_stat st;
+    if (ib_fstat(fd, &st) < 0) { ib_close(fd); return -1; }
     size_t fsz = (size_t)st.st_size;
 
     /* Drive mode (IB_RESIDENCY_MODE=drive): bypass the OS page cache
@@ -98,8 +96,8 @@ int ib_pqv2_file_load(const char *path, ib_pqv2_file *out) {
 #if defined(__APPLE__) && defined(MAP_NOCACHE)
     if (drive_mode) map_flags |= MAP_NOCACHE;
 #endif
-    void *buf = mmap(NULL, fsz, PROT_READ, map_flags, fd, 0);
-    if (buf == MAP_FAILED) { close(fd); return -1; }
+    void *buf = ib_mmap(NULL, fsz, PROT_READ, map_flags, fd, 0);
+    if (buf == MAP_FAILED) { ib_close(fd); return -1; }
 #if !defined(__APPLE__) && defined(POSIX_MADV_DONTNEED)
     if (drive_mode) (void)posix_madvise(buf, fsz, POSIX_MADV_DONTNEED);
 #endif
@@ -173,10 +171,10 @@ void ib_pqv2_file_free(ib_pqv2_file *f) {
         free(f->tensors);
     }
     if (f->_buffer) {
-        if (f->_is_mmap) munmap(f->_buffer, f->_buffer_size);
+        if (f->_is_mmap) ib_munmap(f->_buffer, f->_buffer_size);
         else free(f->_buffer);
     }
-    if (f->_fd >= 0) close(f->_fd);
+    if (f->_fd >= 0) ib_close(f->_fd);
     memset(f, 0, sizeof(*f));
 }
 

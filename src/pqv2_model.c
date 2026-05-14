@@ -5,14 +5,13 @@
  */
 #include "inferbit_internal.h"
 #include "pqv2_format.h"
+#include "platform.h"   /* ib_close/ib_write/pread/mkstemp/sysconf shims */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <sys/stat.h>
 
 /* Forward decl for drive-mode pre-transposed sidecar builder. Defined
  * later in this file; called from the drive-mode setup. */
@@ -459,8 +458,8 @@ static int build_pretransposed_sidecar(inferbit_model *m,
      * and be incorrectly skipped. */
     {
         const uint8_t pad = 0;
-        if (write(fd, &pad, 1) != 1) {
-            close(fd); return -3;
+        if (ib_write(fd, &pad, 1) != 1) {
+            ib_close(fd); return -3;
         }
     }
     /* Walk each tensor, transpose its indices to the sidecar.
@@ -474,7 +473,7 @@ static int build_pretransposed_sidecar(inferbit_model *m,
         if (b > max_bytes) max_bytes = b;
     }
     uint8_t *staging = (uint8_t *)malloc(max_bytes);
-    if (!staging) { close(fd); return -3; }
+    if (!staging) { ib_close(fd); return -3; }
 
     /* We need a second staging buffer to hold the original chunk-major
      * bytes we pread from the source file. Mmap-read would touch every
@@ -482,7 +481,7 @@ static int build_pretransposed_sidecar(inferbit_model *m,
      * the source-file pages out of cache (F_NOCACHE is set on the source
      * fd in drive mode). */
     uint8_t *read_buf = (uint8_t *)malloc(max_bytes);
-    if (!read_buf) { free(staging); close(fd); return -5; }
+    if (!read_buf) { free(staging); ib_close(fd); return -5; }
 
     for (int i = 0; i < n_pq; i++) {
         pqv2_t *pq = pq_list[i];
@@ -502,7 +501,7 @@ static int build_pretransposed_sidecar(inferbit_model *m,
                               idx_bytes - got, src_off + (off_t)got);
             if (r <= 0) {
                 if (r == -1 && errno == EINTR) continue;
-                free(read_buf); free(staging); close(fd); return -6;
+                free(read_buf); free(staging); ib_close(fd); return -6;
             }
             got += (size_t)r;
         }
@@ -519,10 +518,10 @@ static int build_pretransposed_sidecar(inferbit_model *m,
         /* Write transposed bytes to sidecar at current offset. */
         size_t written = 0;
         while (written < idx_bytes) {
-            ssize_t w = write(fd, staging + written, idx_bytes - written);
+            ssize_t w = ib_write(fd, staging + written, idx_bytes - written);
             if (w <= 0) {
                 if (w == -1 && errno == EINTR) continue;
-                free(staging); close(fd); return -4;
+                free(staging); ib_close(fd); return -4;
             }
             written += (size_t)w;
         }

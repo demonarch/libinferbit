@@ -76,6 +76,43 @@ static inline int ib_clock_gettime(int clk, struct timespec* ts) {
     return 0;
 }
 
+/* ── POSIX I/O shims for the drive-mode (Path D) code ───────────
+ * Drive mode (residency_mode=1) is a POSIX-only streaming optimisation
+ * and is never enabled on Windows — these shims only have to compile +
+ * link so the shared drive-mode code paths build. */
+#include <string.h>
+
+static inline ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
+    __int64 cur = _lseeki64(fd, 0, SEEK_CUR);
+    if (cur < 0) return -1;
+    if (_lseeki64(fd, (__int64)offset, SEEK_SET) < 0) return -1;
+    int r = _read(fd, buf, (unsigned int)count);
+    _lseeki64(fd, cur, SEEK_SET);
+    return (ssize_t)r;
+}
+
+#define ib_write _write
+
+/* Only _SC_PAGESIZE is used; map sysconf() to the Win32 page size. */
+#ifndef _SC_PAGESIZE
+#define _SC_PAGESIZE 1
+#endif
+static inline long ib_win_pagesize(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (long)si.dwPageSize;
+}
+#define sysconf(name) ib_win_pagesize()
+
+static inline int mkstemp(char* tmpl) {
+    if (_mktemp_s(tmpl, strlen(tmpl) + 1) != 0) return -1;
+    int fd = -1;
+    if (_sopen_s(&fd, tmpl, _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY,
+                 _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0)
+        return -1;
+    return fd;
+}
+
 /* Thread-local storage */
 #define _Thread_local __declspec(thread)
 
@@ -100,6 +137,7 @@ static inline int ib_clock_gettime(int clk, struct timespec* ts) {
 #define ib_munmap  munmap
 #define ib_open    open
 #define ib_read    read
+#define ib_write   write
 #define ib_close   close
 #define ib_fstat   fstat
 #define ib_stat    stat

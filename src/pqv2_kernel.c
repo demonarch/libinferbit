@@ -1384,6 +1384,22 @@ void pqv2_acc_tbl_int8_k256_chunks_skip(
     (void)skip_thresh;
     pqv2_acc_tbl_int8_k256_chunks(t, x, cb, l2_cb, acc, acc_l2, c_start, c_end);
 }
+/* Non-ARM fallback for the batched chunk accumulator — the ARM variant
+ * (inside the __ARM_NEON branch above) had no x86/scalar counterpart,
+ * which broke the Linux-x86_64 and macOS-Intel links. Same B-loop over
+ * the single-position chunks function as the ARM version. */
+void pqv2_acc_tbl_int8_k256_chunks_batch(
+    const pqv2_t *t, const float *x_batch, int B,
+    const float *cb,
+    float *acc_batch,
+    uint32_t c_start, uint32_t c_end) {
+    if (t->K != 256) return;
+    for (int b = 0; b < B; b++) {
+        pqv2_acc_tbl_int8_k256_chunks(t, x_batch + (size_t)b * t->N, cb, NULL,
+                                      acc_batch + (size_t)b * t->M, NULL,
+                                      c_start, c_end);
+    }
+}
 void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
     pqv2_matvec_lut(t, x, y);
 }

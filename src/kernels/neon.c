@@ -16,9 +16,11 @@
 #if defined(_MSC_VER)
 #define IB_NOINLINE __declspec(noinline)
 #define IB_DOTPROD_NOINLINE __declspec(noinline)
+#define IB_UNUSED
 #else
 #define IB_NOINLINE __attribute__((noinline))
 #define IB_DOTPROD_NOINLINE __attribute__((target("dotprod"),noinline))
+#define IB_UNUSED __attribute__((unused))
 #endif
 
 /* ── INT8 matmul ────────────────────────────────────────────── */
@@ -596,7 +598,7 @@ static void neon_matmul_w4a8_blk32(
 
 /* Old single-row inline kernel — kept as `_legacy` for differential debugging
  * if a numerical regression is suspected. Currently unused. */
-__attribute__((unused))
+IB_UNUSED
 static void neon_matmul_w4a8_blk32_legacy(
     float* out, const void* weights, const float* scales_w_blk32,
     const int8_t* input, const float* scales_a, int M, int N

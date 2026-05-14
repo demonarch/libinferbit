@@ -5,14 +5,13 @@
  */
 
 #include "inferbit_internal.h"
+#include "platform.h"   /* pread + POSIX I/O shims (drive mode) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 /* W4A8 path is on by default. Set IB_W4A8=0 in env to force the FP32
  * activation fallback (used for A/B comparison and debugging). */
