@@ -14,8 +14,16 @@
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
+#include <stdio.h>      /* SEEK_SET / SEEK_CUR for the pread shim */
+#include <stdlib.h>     /* malloc — backs the aligned_alloc shim */
 #include <sys/stat.h>
 #include <sys/types.h>
+
+/* MSVC has no C11 aligned_alloc. The 64-byte alignment in this codebase
+ * is a SIMD-throughput hint, not a correctness requirement (and the
+ * NEON kernels that care aren't built on Windows anyway), so fall back
+ * to plain malloc — which keeps the matching free() calls valid. */
+#define aligned_alloc(alignment, size) malloc(size)
 
 /* ssize_t doesn't exist on Windows */
 #include <BaseTsd.h>

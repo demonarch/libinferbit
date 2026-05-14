@@ -224,14 +224,24 @@ if(NOT WIN32)
     foreach(b bench_pq_decode bench_pq_ffn bench_pq_model_mlp
               bench_pq_real_model bench_pq_pathd bench_pq_q8lut
               bench_pq_streaming bench_pq_dejavu bench_pq_bounded
-              bench_pqv2 test_pqv2_ibf test_pqv2_load bench_pqv2_gemm_b4
+              test_pqv2_ibf test_pqv2_load bench_pqv2_gemm_b4
               bench_pqv2_skip_k64 bench_pqv2_real_acts bench_pqv2_qkv_fusion
-              bench_pqv2_parallelism bench_int8_vdotq bench_pqv2_to_int8
-              bench_pqv2_path2 bench_pqv2_to_int4)
+              bench_pqv2_to_int4)
         add_executable(${b} tests/${b}.c)
         target_link_libraries(${b} inferbit_static ${PLATFORM_LIBS})
         target_include_directories(${b} PRIVATE include src)
     endforeach()
+
+    # ARM-NEON-only benches: these #include <arm_neon.h> directly and use
+    # NEON intrinsics, so they only build on aarch64 targets.
+    if(TARGET_ARCH MATCHES "arm64|aarch64")
+        foreach(b bench_pqv2 bench_pqv2_parallelism bench_int8_vdotq
+                  bench_pqv2_to_int8 bench_pqv2_path2)
+            add_executable(${b} tests/${b}.c)
+            target_link_libraries(${b} inferbit_static ${PLATFORM_LIBS})
+            target_include_directories(${b} PRIVATE include src)
+        endforeach()
+    endif()
 endif()
 
 if(IB_METAL_ENABLED)

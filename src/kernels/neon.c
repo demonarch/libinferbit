@@ -12,14 +12,21 @@
 #include <math.h>
 #include <string.h>
 
-/* MSVC ARM64 doesn't grok GCC __attribute__ syntax. */
+/* MSVC ARM64 doesn't grok GCC __attribute__ syntax. And the
+ * function-level `target` attribute spells the dotprod feature
+ * differently between compilers: clang takes `dotprod`, GCC requires
+ * the `+dotprod` arch-extension form. */
 #if defined(_MSC_VER)
 #define IB_NOINLINE __declspec(noinline)
 #define IB_DOTPROD_NOINLINE __declspec(noinline)
 #define IB_UNUSED
-#else
+#elif defined(__clang__)
 #define IB_NOINLINE __attribute__((noinline))
 #define IB_DOTPROD_NOINLINE __attribute__((target("dotprod"),noinline))
+#define IB_UNUSED __attribute__((unused))
+#else  /* GCC */
+#define IB_NOINLINE __attribute__((noinline))
+#define IB_DOTPROD_NOINLINE __attribute__((target("+dotprod"),noinline))
 #define IB_UNUSED __attribute__((unused))
 #endif
 
