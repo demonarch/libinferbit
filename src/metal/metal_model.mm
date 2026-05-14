@@ -119,12 +119,27 @@ struct ib_metal_model_buffers {
      *
      * Bounded GPU RAM = max-matmul-indices × 2 — still independent of
      * model size, still tiny vs full per-tensor residency. */
-    void   *gpu_drive_idx_scratch[2];    /* 2 shared MTLBuffer slots */
+    void   *gpu_drive_idx_scratch[4];    /* up to 4 shared MTLBuffer slots */
     size_t  gpu_drive_idx_scratch_size;  /* size of EACH slot */
-    void   *gpu_drive_idx_staging[2];    /* 2 CPU pread → transpose buffers */
-    int     gpu_drive_idx_n_slots;       /* 0 = drive mode off, else N (currently 2) */
-    int     gpu_drive_idx_slot;          /* next slot to refill: 0 or 1 */
-    int     gpu_drive_idx_in_flight;     /* dispatches in current CB reading drive slots */
+    void   *gpu_drive_idx_staging[4];    /* up to 4 CPU pread → transpose buffers */
+    int     gpu_drive_idx_n_slots;       /* 0 = drive mode off, else N (1..4) */
+    int     gpu_drive_idx_slot;          /* legacy: kept-reset to 0, not read */
+    int     gpu_drive_idx_in_flight;     /* dispatches in current sub-ring */
+    /* Async commit (doc-35 feature 4) with 2-sub-ring layout: slots are
+     * split into N sub-rings of sr_size each (e.g. N=4 → 2 sub-rings of 2).
+     * Each sub-ring is consumed by ONE in-flight CB; when a sub-ring fills,
+     * we commit_async its CB, swap to the other sub-ring, and wait on its
+     * prior CB before reusing those physical slots. Keeps two CBs in flight
+     * without racing slot reads against slot writes.
+     *
+     * Validated 2026-05-14 on llama-3.2-1B PQv2 drive mode:
+     *   sync N=1 (no async):   PPL=12.641506, 6.64 tok/s
+     *   async N=4 (2sr × 2):   PPL=12.641506, 9.79 tok/s  → +47.4%
+     * PPL identical to 6 dec → zero correctness regression. */
+    int     gpu_drive_n_subrings;        /* 1 (sync fallback) or 2 (async) */
+    int     gpu_drive_sr_size;           /* slots per sub-ring (n_slots / n_subrings) */
+    int     gpu_drive_cur_sr;            /* current sub-ring (0..n_subrings-1) */
+    void   *gpu_drive_pending_cb;        /* CB of the OTHER sub-ring (in flight) */
 
     /* State buffers (reused across layers). */
     void *x;
@@ -684,7 +699,19 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
         if (max_idx > 0) {
             /* Page-align scratch size. */
             size_t scratch_sz = (max_idx + 16383u) & ~((size_t)16383u);
-            const int n_slots = 2;
+            /* Doc-35 feature 4: bump ring depth from 2 → 4 to keep more
+             * matmuls in flight before each commit-wait. Each slot adds
+             * scratch_sz GPU RAM; on 8B that's 263 MB × 4 = ~1 GB scratch
+             * (vs ~526 MB at N=2). Trade RAM for fewer GPU syncs. Env
+             * IB_DRIVE_RING_N can override (1..4). */
+            int n_slots = 4;
+            {
+                const char *env = getenv("IB_DRIVE_RING_N");
+                if (env) {
+                    int v = atoi(env);
+                    if (v >= 1 && v <= 4) n_slots = v;
+                }
+            }
             int alloc_ok = 1;
             for (int i = 0; i < n_slots; i++) {
                 b->gpu_drive_idx_scratch[i] = ib_metal_alloc(ctx, scratch_sz, NULL);
@@ -697,6 +724,18 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
             b->gpu_drive_idx_n_slots = alloc_ok ? n_slots : 0;
             b->gpu_drive_idx_slot = 0;
             b->gpu_drive_idx_in_flight = 0;
+            /* 2-sub-ring iff n_slots is even and >=2 (i.e. 2 or 4).
+             * sr_size = n_slots/2. Otherwise (n_slots==1 or 3): single
+             * sub-ring (sync checkpoint fallback). */
+            if (alloc_ok && n_slots >= 2 && (n_slots % 2) == 0) {
+                b->gpu_drive_n_subrings = 2;
+                b->gpu_drive_sr_size = n_slots / 2;
+            } else {
+                b->gpu_drive_n_subrings = 1;
+                b->gpu_drive_sr_size = n_slots;
+            }
+            b->gpu_drive_cur_sr = 0;
+            b->gpu_drive_pending_cb = NULL;
             if (!alloc_ok) {
                 fprintf(stderr, "ib_metal: GPU drive scratch alloc failed (%zu B × %d)\n",
                         scratch_sz, n_slots);
@@ -714,8 +753,8 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
                     REPOINT(lb->gate); REPOINT(lb->up); REPOINT(lb->down);
                 }
                 REPOINT(b->output_head);
-                fprintf(stderr, "ib_metal: GPU drive mode ON. %d-slot ring, %zu B/slot, %d tensors streamed\n",
-                        n_slots, scratch_sz, n_repointed);
+                fprintf(stderr, "ib_metal: GPU drive mode ON. %d slots (%d sub-rings × %d), %zu B/slot, %d tensors streamed\n",
+                        n_slots, b->gpu_drive_n_subrings, b->gpu_drive_sr_size, scratch_sz, n_repointed);
                 #undef REPOINT
             }
         }
@@ -874,7 +913,7 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     FR(b->token_embedding_pq_cb);
     FR(b->token_embedding_pq_idx);
     /* Free shared GPU drive mode 2-slot ring exactly once. */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         FR(b->gpu_drive_idx_scratch[i]);
         if (b->gpu_drive_idx_staging[i]) free(b->gpu_drive_idx_staging[i]);
     }
@@ -1010,14 +1049,41 @@ static void *drive_prepare_pq(ib_metal_recorder *r,
         return tb ? tb->pq_idx : NULL;
     }
     if (!b || b->gpu_drive_idx_n_slots < 1) return NULL;
-    int n = b->gpu_drive_idx_n_slots;
-    if (b->gpu_drive_idx_in_flight >= n) {
-        if (ib_metal_recorder_checkpoint(r) != 0) return NULL;
+    int n_sr  = b->gpu_drive_n_subrings;
+    int sr_sz = b->gpu_drive_sr_size;
+    /* Doc-35 feature 4 (proper): 2-sub-ring async commit. When the
+     * current sub-ring is full, commit its CB asynchronously, swap to
+     * the other sub-ring, and wait on its prior CB before reusing
+     * those physical slots. Pipeline depth = 2 in-flight CBs; CPU
+     * pread+transpose for the new sub-ring overlaps with GPU compute
+     * on the just-committed CB.
+     *
+     * Single sub-ring (n_sr == 1) is the legacy sync-checkpoint path,
+     * used when n_slots is odd or 1 (drive-RAM-min scenarios). */
+    if (b->gpu_drive_idx_in_flight >= sr_sz) {
+        if (n_sr > 1) {
+            void *just_committed = ib_metal_recorder_commit_async(r);
+            if (!just_committed) return NULL;
+            /* Wait on the OTHER sub-ring's prior CB before reusing it. */
+            if (b->gpu_drive_pending_cb) {
+                int rc = ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+                b->gpu_drive_pending_cb = NULL;
+                if (rc != 0) {
+                    /* Drop the just-committed too so we don't leak it. */
+                    (void)ib_metal_recorder_wait_committed(just_committed);
+                    return NULL;
+                }
+            }
+            b->gpu_drive_pending_cb = just_committed;
+            b->gpu_drive_cur_sr = (b->gpu_drive_cur_sr + 1) % n_sr;
+        } else {
+            /* n_sr == 1: sync fallback. */
+            if (ib_metal_recorder_checkpoint(r) != 0) return NULL;
+        }
         b->gpu_drive_idx_in_flight = 0;
     }
-    int slot = b->gpu_drive_idx_slot;
+    int slot = b->gpu_drive_cur_sr * sr_sz + b->gpu_drive_idx_in_flight;
     if (drive_load_pq_idx_to_slot(b, tb, slot) != 0) return NULL;
-    b->gpu_drive_idx_slot = (slot + 1) % n;
     b->gpu_drive_idx_in_flight++;
     return b->gpu_drive_idx_scratch[slot];
 }
@@ -1277,9 +1343,23 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
     /* Drive-mode ring counters start clean on each new recorder/CB. */
     b->gpu_drive_idx_in_flight = 0;
     b->gpu_drive_idx_slot = 0;
+    b->gpu_drive_cur_sr = 0;
+    /* Drain any pending CB from a previous forward (defensive — should
+     * already be NULL after a clean exit). */
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
 
     record_single_forward_step(r, b, pos);
 
+    /* Drain async-commit pending CB before the final commit. The final
+     * commit's wait covers the current CB; this covers the in-flight one
+     * (releasing its retained handle). */
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
     int rc = ib_metal_recorder_commit(r);
     if (rc != 0) return rc;
 
@@ -1331,6 +1411,11 @@ ib_metal_forward_decode_n(ib_metal_ctx *ctx,
         ib_metal_rec_argmax_logits(r, b->logits, out_slot, b->vocab);
     }
 
+    /* Drain async-commit pending CB before the final commit. */
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
     int rc = ib_metal_recorder_commit(r);
     if (rc != 0) { ib_metal_free(ctx, gpu_tokens); return rc; }
 
@@ -1584,6 +1669,13 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
     /* Drive-mode ring counters start clean on each new recorder/CB. */
     b->gpu_drive_idx_in_flight = 0;
     b->gpu_drive_idx_slot = 0;
+    b->gpu_drive_cur_sr = 0;
+    /* Drain any pending CB from a previous forward (defensive — should
+     * already be NULL after a clean exit). */
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
 
     #define ROW_F(buf, n, dim) ((float*)(buf) + (size_t)(n) * (dim))
 
@@ -1715,6 +1807,13 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
         b->xb, hidden, eps);
     rec_matmul_tb(r, b, &b->output_head, b->xb, b->logits, b->xq, b->xs, b->vocab, hidden);
 
+    /* Drain async-commit pending CB before the final commit. The final
+     * commit's wait covers the current CB; this covers the in-flight one
+     * (releasing its retained handle). */
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
     int rc = ib_metal_recorder_commit(r);
     if (rc != 0) return rc;
 
@@ -1776,6 +1875,12 @@ ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
     if (!r) { ib_metal_free(ctx, all_logits_gpu); return -1; }
     b->gpu_drive_idx_in_flight = 0;
     b->gpu_drive_idx_slot = 0;
+    b->gpu_drive_cur_sr = 0;
+    /* Drain any pending CB from a previous forward (defensive). */
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
 
     #define ROW_F(buf, n, dim) ((float*)(buf) + (size_t)(n) * (dim))
 
@@ -1870,6 +1975,11 @@ ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
         rec_matmul_batched(r, b->output_head.bits, b->output_head.blk32, b->xb_b,
                            b->output_head.w, b->output_head.s, all_logits_gpu, b->xq_b, b->xs_b, B_use, b->vocab, hidden);
 
+    /* Drain async-commit pending CB before the final commit. */
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
     int rc = ib_metal_recorder_commit(r);
     if (rc != 0) { ib_metal_free(ctx, all_logits_gpu); return rc; }
 

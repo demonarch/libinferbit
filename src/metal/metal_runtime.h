@@ -803,6 +803,12 @@ void ib_metal_reset_kv(ib_metal_model_buffers *bufs);
  * shared MTLBuffer scratch between dispatches. */
 int ib_metal_recorder_checkpoint(ib_metal_recorder *rec);
 
+/* Async-commit variant (doc-35 feature 4): commit without waiting,
+ * allocate fresh CB, return a handle for later wait. Used to overlap
+ * CPU pread/transpose with GPU compute on the prior CB. */
+void *ib_metal_recorder_commit_async(ib_metal_recorder *rec);
+int   ib_metal_recorder_wait_committed(void *cb_handle);
+
 /* All-logits variant of forward_prefill: outputs per-position logits
  * for all n_tokens (vs the standard last-token only). Used by
  * speculative decoding to verify each draft token in one batched

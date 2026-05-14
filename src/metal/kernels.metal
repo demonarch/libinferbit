@@ -3732,6 +3732,7 @@ kernel void attn_scores_qk_batched(
     constant     uint  &max_score_len  [[buffer(6)]],   /* row length = start_pos + B */
     constant     uint  &start_pos      [[buffer(7)]],
     constant     float &scale          [[buffer(8)]],
+    constant     uint  &attn_window    [[buffer(9)]],   /* 0 = full causal; >0 = sliding window */
     uint3               gid3           [[thread_position_in_grid]])
 {
     uint t = gid3.x;
@@ -3748,6 +3749,14 @@ kernel void attn_scores_qk_batched(
 
     uint causal_limit = start_pos + b;        /* position b sees [0, start_pos+b] */
     if (t > causal_limit) {
+        scores[row_off + t] = -INFINITY;
+        return;
+    }
+    /* Sliding window (doc 35 feature 5, opt-in): mask positions older
+     * than `attn_window` from the current. Note: PPL regression expected
+     * on models not pre-trained with sliding-window — use only for the
+     * "drive-mode at long context" RAM-bound scenario. */
+    if (attn_window != 0u && (t + attn_window) <= causal_limit) {
         scores[row_off + t] = -INFINITY;
         return;
     }

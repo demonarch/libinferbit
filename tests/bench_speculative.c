@@ -180,6 +180,10 @@ int main(int argc, char **argv) {
     int n_spec = 0;
     int accepted_sum = 0;
     int iterations = 0;
+    /* Per-iteration acceptance histogram: hist[k] = # iters with k accepted
+     * drafts (k in 0..K). Reveals whether speculative is winning broadly
+     * or only on a few high-streak iterations (dflash #17). */
+    int *hist = calloc((size_t)(K + 1), sizeof(int));
 
     double t1 = now_sec();
     pos = prompt_len;
@@ -263,6 +267,7 @@ int main(int argc, char **argv) {
         if (n_spec > 0) last_tok = tokens_spec[n_spec - 1];
         pos += produced;
         accepted_sum += accepted;
+        if (accepted >= 0 && accepted <= K) hist[accepted]++;
         iterations++;
     }
     double t_spec = now_sec() - t1;
@@ -274,13 +279,22 @@ int main(int argc, char **argv) {
     printf("TARGET=%s\n", target_path);
     printf("K=%d  N_GEN=%d  CTX=%d  PROMPT_LEN=%d\n", K, n_gen, ctx, prompt_len);
     printf("\n");
-    printf("TARGET_ALONE_TOKENS=%d  TARGET_ALONE_SEC=%.3f  TARGET_ALONE_TPS=%.2f\n",
-           n_alone, t_alone, tps_alone);
-    printf("SPECULATIVE_TOKENS=%d  SPECULATIVE_SEC=%.3f  SPECULATIVE_TPS=%.2f\n",
-           n_spec, t_spec, tps_spec);
+    double ms_per_tok_alone = (n_alone > 0) ? (t_alone * 1000.0 / (double)n_alone) : 0.0;
+    double ms_per_tok_spec  = (n_spec  > 0) ? (t_spec  * 1000.0 / (double)n_spec ) : 0.0;
+    printf("TARGET_ALONE_TOKENS=%d  TARGET_ALONE_SEC=%.3f  TARGET_ALONE_TPS=%.2f  TARGET_ALONE_MS_PER_TOK=%.2f\n",
+           n_alone, t_alone, tps_alone, ms_per_tok_alone);
+    printf("SPECULATIVE_TOKENS=%d  SPECULATIVE_SEC=%.3f  SPECULATIVE_TPS=%.2f  SPECULATIVE_MS_PER_TOK=%.2f\n",
+           n_spec, t_spec, tps_spec, ms_per_tok_spec);
     printf("SPECULATIVE_SPEEDUP=%.2fx\n", tps_spec / tps_alone);
     printf("ITERATIONS=%d  TOTAL_ACCEPTED=%d  AVG_ACCEPTED_PER_ITER=%.2f  (K=%d)\n",
            iterations, accepted_sum, (double)accepted_sum / iterations, K);
+    /* Per-iteration acceptance histogram. */
+    printf("ACCEPTANCE_HISTOGRAM:");
+    for (int k = 0; k <= K; k++) {
+        double pct = (iterations > 0) ? (100.0 * hist[k] / iterations) : 0.0;
+        printf(" %d:%d(%.0f%%)", k, hist[k], pct);
+    }
+    printf("\n");
     printf("\nGENERATED_ALONE: ");
     for (int i = 0; i < n_alone && i < 16; i++) printf("%d,", tokens_alone[i]);
     printf("\nGENERATED_SPEC:  ");
@@ -290,6 +304,7 @@ int main(int argc, char **argv) {
     /* Cleanup. */
     free(d_embed); free(t_embed); free(t_logits); free(d_logits);
     free(all_embeds); free(all_logits); free(drafts);
+    free(hist);
     ib_metal_release_model(mctx, dbufs);
     ib_metal_release_model(mctx, tbufs);
     ib_metal_destroy(mctx);

@@ -996,6 +996,48 @@ extern "C" int ib_metal_recorder_checkpoint(ib_metal_recorder *rec) {
     }
 }
 
+/* Async-commit pattern (doc-35 feature 4 real fix): commit the current
+ * CB and allocate a fresh one, WITHOUT waiting. Returns the just-
+ * committed CB so the caller can wait on it later (or chain another
+ * commit_async, building up an in-flight pipeline).
+ *
+ * Used by drive-mode to overlap CPU pread+transpose with GPU work:
+ *   1) Dispatch matmul into current CB
+ *   2) commit_async → CB enters GPU queue, new fresh CB allocated
+ *   3) CPU does pread for NEXT slot (while GPU runs the just-committed matmul)
+ *   4) When ready to dispatch NEXT matmul: wait on the prior CB
+ *      (the slot it reads from is now safe to overwrite)
+ *
+ * Returns NULL on error. Caller must wait on the returned handle
+ * before pread-ing into a slot that the in-flight CB reads. */
+extern "C" void *ib_metal_recorder_commit_async(ib_metal_recorder *rec) {
+    if (!rec) return NULL;
+    @autoreleasepool {
+        id<MTLCommandBuffer> committed = rec->cb;
+        [committed commit];
+        rec->cb = [rec->ctx->queue commandBuffer];
+        /* Retain so it survives outside this autoreleasepool until
+         * the caller waits + releases. */
+        CFRetain((__bridge CFTypeRef)committed);
+        return (__bridge void *)committed;
+    }
+}
+
+extern "C" int ib_metal_recorder_wait_committed(void *cb_handle) {
+    if (!cb_handle) return 0;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>)(CFTypeRef)cb_handle;
+        [cb waitUntilCompleted];
+        bool err = (cb.status == MTLCommandBufferStatusError);
+        if (err) {
+            fprintf(stderr, "Metal recorder wait_committed: cmd buffer error: %s\n",
+                    [[cb.error localizedDescription] UTF8String]);
+            return -1;
+        }
+        return 0;
+    }
+}
+
 static id<MTLBuffer> rec_pick(ib_metal_ctx *ctx, const void *p) {
     auto it = ctx->buffers.find((void *)p);
     return it == ctx->buffers.end() ? nil : it->second;
@@ -2680,7 +2722,18 @@ extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [enc endEncoding];
     }
-    /* 2. Scores with causal masking */
+    /* Sliding-window attention (doc 35 feature 5, opt-in).
+     * IB_ATTN_WINDOW=N sets the sliding window size; 0 = full causal
+     * (default). Mask is applied in attn_scores_qk_batched. */
+    static uint attn_window_cached = 0;
+    static int  attn_window_init = 0;
+    if (!attn_window_init) {
+        const char *env = getenv("IB_ATTN_WINDOW");
+        attn_window_cached = (env ? (uint)atoi(env) : 0u);
+        attn_window_init = 1;
+    }
+    uint attn_window = attn_window_cached;
+    /* 2. Scores with causal masking (and optional sliding window) */
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
         [enc setComputePipelineState:ps_score];
@@ -2693,6 +2746,7 @@ extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
         [enc setBytes:&max_score_len length:sizeof(max_score_len) atIndex:6];
         [enc setBytes:&sp length:sizeof(sp) atIndex:7];
         [enc setBytes:&scale length:sizeof(scale) atIndex:8];
+        [enc setBytes:&attn_window length:sizeof(attn_window) atIndex:9];
         [enc dispatchThreads:MTLSizeMake(max_score_len, nh, (NSUInteger)B)
            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [enc endEncoding];
