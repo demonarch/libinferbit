@@ -5,6 +5,10 @@
 #include <string.h>
 #include <unistd.h>   /* close() for drive_fd_pretransposed */
 
+#ifdef IB_HAS_METAL
+#include "metal/metal_runtime.h"   /* lazy Metal ctx cleanup (phase 4.1) */
+#endif
+
 /* Defined in ibf_loader.c */
 inferbit_model* ibf_load(const char* path, const inferbit_config* config);
 /* Defined in pqv2_model.c — detects IBF v6 magic, falls back to v5 */
@@ -45,6 +49,19 @@ inferbit_model* inferbit_load(const char* path, const inferbit_config* config) {
 
 void inferbit_free(inferbit_model* model) {
     if (!model) return;
+
+#ifdef IB_HAS_METAL
+    /* Lazily-created Metal context + buffers (doc 36 phase 4.1). */
+    if (model->metal_bufs) {
+        ib_metal_release_model((ib_metal_ctx*)model->metal_ctx,
+                               (ib_metal_model_buffers*)model->metal_bufs);
+        model->metal_bufs = NULL;
+    }
+    if (model->metal_ctx) {
+        ib_metal_destroy((ib_metal_ctx*)model->metal_ctx);
+        model->metal_ctx = NULL;
+    }
+#endif
 
     /* IBF v6 backing — release before clearing weight_data so we don't
      * double-free the mmap region (which is owned by the pqv2_file). */

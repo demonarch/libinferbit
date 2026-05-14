@@ -3647,10 +3647,12 @@ kernel void kv_cache_write_fp16(
     device       float *v_cache [[buffer(3)]],
     constant     uint  &pos     [[buffer(4)]],
     constant     uint  &kv_dim  [[buffer(5)]],
+    constant     uint  &kv_window [[buffer(6)]],   /* 0 = linear; >0 = ring */
     uint                gid     [[thread_position_in_grid]])
 {
     if (gid >= kv_dim) return;
-    size_t off = (size_t)pos * kv_dim + gid;
+    uint slot = (kv_window != 0u) ? (pos % kv_window) : pos;
+    size_t off = (size_t)slot * kv_dim + gid;
     k_cache[off] = k[gid];
     v_cache[off] = v[gid];
 }
@@ -3665,6 +3667,7 @@ kernel void attn_scores_qk(
     constant     uint  &head_dim       [[buffer(5)]],
     constant     uint  &seq_pos_p1     [[buffer(6)]],
     constant     float &scale          [[buffer(7)]],
+    constant     uint  &kv_window      [[buffer(8)]],   /* 0 = full; >0 = ring */
     uint                gid            [[thread_position_in_grid]])
 {
     uint total = n_heads * seq_pos_p1;
@@ -3675,8 +3678,18 @@ kernel void attn_scores_qk(
     uint kv_h = h / heads_per_kv;
     uint kv_dim = n_kv_heads * head_dim;
 
+    /* Rotating KV window (doc 36 phase 2.2): the current query is at
+     * logical position seq_pos_p1-1; positions more than kv_window back
+     * have been evicted from the ring, so mask them. Live positions read
+     * physical slot t % kv_window. */
+    if (kv_window != 0u && (t + kv_window) <= (seq_pos_p1 - 1u)) {
+        scores[(size_t)h * seq_pos_p1 + t] = -INFINITY;
+        return;
+    }
+    uint k_slot = (kv_window != 0u) ? (t % kv_window) : t;
+
     device const float *q_h = q + h * head_dim;
-    device const float *k_t = k_cache + (size_t)t * kv_dim + kv_h * head_dim;
+    device const float *k_t = k_cache + (size_t)k_slot * kv_dim + kv_h * head_dim;
     float s = 0.0f;
     for (uint d = 0; d < head_dim; d++) {
         s += q_h[d] * k_t[d];
@@ -3702,7 +3715,10 @@ kernel void attn_scores_qk(
  * softmax gives 0 for those positions.
  */
 
-/* Batched KV write: B positions written starting at start_pos. */
+/* Batched KV write: B positions written starting at start_pos.
+ * kv_window (doc 36 phase 2.2): 0 = linear write at logical position;
+ * >0 = ring buffer, logical position p written to physical slot
+ * p % kv_window. */
 kernel void kv_cache_write_fp16_batched(
     device const float *k         [[buffer(0)]],
     device const float *v         [[buffer(1)]],
@@ -3710,12 +3726,15 @@ kernel void kv_cache_write_fp16_batched(
     device       float *v_cache   [[buffer(3)]],
     constant     uint  &start_pos [[buffer(4)]],
     constant     uint  &kv_dim    [[buffer(5)]],
+    constant     uint  &kv_window [[buffer(6)]],
     uint2               gid2      [[thread_position_in_grid]])
 {
     uint d = gid2.x;
     uint b = gid2.y;
     if (d >= kv_dim) return;
-    size_t cache_off = (size_t)(start_pos + b) * kv_dim + d;
+    uint logical = start_pos + b;
+    uint slot    = (kv_window != 0u) ? (logical % kv_window) : logical;
+    size_t cache_off = (size_t)slot * kv_dim + d;
     size_t src_off   = (size_t)b * kv_dim + d;
     k_cache[cache_off] = k[src_off];
     v_cache[cache_off] = v[src_off];
@@ -3752,17 +3771,18 @@ kernel void attn_scores_qk_batched(
         scores[row_off + t] = -INFINITY;
         return;
     }
-    /* Sliding window (doc 35 feature 5, opt-in): mask positions older
-     * than `attn_window` from the current. Note: PPL regression expected
-     * on models not pre-trained with sliding-window — use only for the
-     * "drive-mode at long context" RAM-bound scenario. */
+    /* Rotating KV window (doc 36 phase 2.2): mask positions older than
+     * `attn_window` from the current — they've been evicted from the
+     * ring buffer. For positions still in the window, the K row lives
+     * at physical slot t % attn_window. */
     if (attn_window != 0u && (t + attn_window) <= causal_limit) {
         scores[row_off + t] = -INFINITY;
         return;
     }
+    uint k_slot = (attn_window != 0u) ? (t % attn_window) : t;
 
     device const float *q_h = q + (size_t)b * (size_t)n_heads * (size_t)head_dim + (size_t)h * head_dim;
-    device const float *k_t = k_cache + (size_t)t * kv_dim + (size_t)kv_h * head_dim;
+    device const float *k_t = k_cache + (size_t)k_slot * kv_dim + (size_t)kv_h * head_dim;
     float s = 0.0f;
     for (uint d = 0; d < head_dim; d++) {
         s += q_h[d] * k_t[d];
@@ -3770,7 +3790,10 @@ kernel void attn_scores_qk_batched(
     scores[row_off + t] = s * scale;
 }
 
-/* Batched weighted_v. Grid: (head_dim, n_heads, B). */
+/* Batched weighted_v. Grid: (head_dim, n_heads, B).
+ * kv_window (doc 36 phase 2.2): 0 = linear v_cache; >0 = ring buffer,
+ * iterate only the most recent kv_window positions, read physical slot
+ * t % kv_window. */
 kernel void attn_weighted_v_batched(
     device const float *scores         [[buffer(0)]],
     device const float *v_cache        [[buffer(1)]],
@@ -3780,6 +3803,7 @@ kernel void attn_weighted_v_batched(
     constant     uint  &head_dim       [[buffer(5)]],
     constant     uint  &max_score_len  [[buffer(6)]],
     constant     uint  &start_pos      [[buffer(7)]],
+    constant     uint  &kv_window      [[buffer(8)]],
     uint3               gid3           [[thread_position_in_grid]])
 {
     uint d = gid3.x;
@@ -3792,15 +3816,18 @@ kernel void attn_weighted_v_batched(
     uint kv_dim = n_kv_heads * head_dim;
 
     /* Sum over valid positions only — masked positions had -inf, so
-     * softmax made them 0 already, but summing them anyway is wasted
-     * work for long sequences. Hard cap at causal_limit+1. */
-    uint causal_limit_p1 = start_pos + b + 1u;
+     * softmax made them 0 already. With a rotating window, only the most
+     * recent kv_window positions are live; older ones were evicted. */
+    uint causal_limit = start_pos + b;
+    uint t_lo = (kv_window != 0u && causal_limit + 1u > kv_window)
+        ? (causal_limit + 1u - kv_window) : 0u;
     size_t s_row_off = ((size_t)b * (size_t)n_heads + (size_t)h) * (size_t)max_score_len;
     device const float *s_row = scores + s_row_off;
 
     float acc = 0.0f;
-    for (uint t = 0; t < causal_limit_p1; t++) {
-        acc += s_row[t] * v_cache[(size_t)t * kv_dim + (size_t)kv_h * head_dim + d];
+    for (uint t = t_lo; t <= causal_limit; t++) {
+        uint v_slot = (kv_window != 0u) ? (t % kv_window) : t;
+        acc += s_row[t] * v_cache[(size_t)v_slot * kv_dim + (size_t)kv_h * head_dim + d];
     }
     attn_out[(size_t)b * (size_t)n_heads * (size_t)head_dim
               + (size_t)h * head_dim + d] = acc;
@@ -3831,6 +3858,7 @@ kernel void attn_softmax_wv_fp16(
     constant     uint  &n_kv_heads  [[buffer(4)]],
     constant     uint  &head_dim    [[buffer(5)]],
     constant     uint  &seq_pos_p1  [[buffer(6)]],
+    constant     uint  &kv_window   [[buffer(7)]],   /* 0 = linear; >0 = ring */
     threadgroup float  *tg_row      [[threadgroup(0)]],
     uint                tg_id       [[threadgroup_position_in_grid]],
     uint                tid         [[thread_position_in_threadgroup]],
@@ -3897,12 +3925,15 @@ kernel void attn_softmax_wv_fp16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     /* ── Step 3: weighted-V using normalized scores in TG memory ── */
-    /* Each thread computes one (or more) (h, d) output cell. */
+    /* Each thread computes one (or more) (h, d) output cell. scores stay
+     * logical-indexed; v_cache is physical-indexed t % kv_window when a
+     * rotating window is active (masked positions carry score 0). */
     for (uint d = tid; d < head_dim; d += TG_THREADS) {
         float acc = 0.0f;
         for (uint t = 0; t < seq_pos_p1; t++) {
             float s = tg_row[t];
-            float v = v_cache[(size_t)t * kv_dim + (size_t)kv_h * head_dim + d];
+            uint v_slot = (kv_window != 0u) ? (t % kv_window) : t;
+            float v = v_cache[(size_t)v_slot * kv_dim + (size_t)kv_h * head_dim + d];
             acc += s * v;
         }
         attn_out[(size_t)h * head_dim + d] = acc;
@@ -3933,6 +3964,7 @@ kernel void attn_softmax_wv_fp16_batched(
     constant     uint  &n_kv_heads  [[buffer(5)]],
     constant     uint  &head_dim    [[buffer(6)]],
     constant     uint  &max_score_len [[buffer(7)]],
+    constant     uint  &kv_window   [[buffer(8)]],   /* 0 = linear; >0 = ring */
     threadgroup float  *tg_row      [[threadgroup(0)]],
     uint                tg_id       [[threadgroup_position_in_grid]],
     uint                tid         [[thread_position_in_threadgroup]],
@@ -4000,12 +4032,17 @@ kernel void attn_softmax_wv_fp16_batched(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    /* Step 3: weighted-V using normalized scores in TG memory. */
+    /* Step 3: weighted-V using normalized scores in TG memory.
+     * scores stay logical-indexed (tg_row[t]); v_cache is physical-
+     * indexed t % kv_window when a rotating window is active. Masked
+     * positions have score 0, so the (possibly wrong) v_cache slot they
+     * read contributes nothing. */
     for (uint d = tid; d < head_dim; d += TG_THREADS) {
         float acc = 0.0f;
         for (uint t = 0; t < max_score_len; t++) {
             float s = tg_row[t];
-            float v = v_cache[(size_t)t * kv_dim + (size_t)kv_h * head_dim + d];
+            uint v_slot = (kv_window != 0u) ? (t % kv_window) : t;
+            float v = v_cache[(size_t)v_slot * kv_dim + (size_t)kv_h * head_dim + d];
             acc += s * v;
         }
         attn_out[((size_t)b * n_heads + h) * head_dim + d] = acc;
@@ -4177,6 +4214,7 @@ kernel void attn_weighted_v(
     constant     uint  &n_kv_heads  [[buffer(4)]],
     constant     uint  &head_dim    [[buffer(5)]],
     constant     uint  &seq_pos_p1  [[buffer(6)]],
+    constant     uint  &kv_window   [[buffer(7)]],   /* 0 = linear; >0 = ring */
     uint                gid         [[thread_position_in_grid]])
 {
     uint total = n_heads * head_dim;
@@ -4190,7 +4228,8 @@ kernel void attn_weighted_v(
     device const float *s_row = scores + (size_t)h * seq_pos_p1;
     float acc = 0.0f;
     for (uint t = 0; t < seq_pos_p1; t++) {
-        acc += s_row[t] * v_cache[(size_t)t * kv_dim + kv_h * head_dim + d];
+        uint v_slot = (kv_window != 0u) ? (t % kv_window) : t;
+        acc += s_row[t] * v_cache[(size_t)v_slot * kv_dim + kv_h * head_dim + d];
     }
     attn_out[(size_t)h * head_dim + d] = acc;
 }

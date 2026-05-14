@@ -279,7 +279,7 @@ int main(int argc, char **argv) {
     ib_metal_rec_rope_inplace(r, g_q, n_heads,    head_dim, pos, theta);
     ib_metal_rec_rope_inplace(r, g_k, n_kv_heads, head_dim, pos, theta);
     ib_metal_rec_attention_block_fp16(r, g_q, g_k, g_v, g_kc, g_vc, g_scores, g_attn_out,
-                                        n_heads, n_kv_heads, head_dim, seq_len, pos);
+                                        n_heads, n_kv_heads, head_dim, seq_len, pos, 0);
     ib_metal_rec_matmul_w4a8_fp32_in(r, g_attn_out, gw_o_proj_w, gw_o_proj_s, g_xb2, g_xq, g_xs, hidden, hidden);
     ib_metal_rec_residual_add(r, g_x, g_xb2, hidden);
     ib_metal_rec_rmsnorm_fp16(r, g_x, gw_post_norm, g_xb, hidden, eps);
@@ -318,7 +318,7 @@ int main(int argc, char **argv) {
         ib_metal_rec_rope_inplace(rr, g_q, n_heads,    head_dim, pos, theta);
         ib_metal_rec_rope_inplace(rr, g_k, n_kv_heads, head_dim, pos, theta);
         ib_metal_rec_attention_block_fp16(rr, g_q, g_k, g_v, g_kc, g_vc, g_scores, g_attn_out,
-                                           n_heads, n_kv_heads, head_dim, seq_len, pos);
+                                           n_heads, n_kv_heads, head_dim, seq_len, pos, 0);
         ib_metal_rec_matmul_w4a8_fp32_in(rr, g_attn_out, gw_o_proj_w, gw_o_proj_s, g_xb2, g_xq, g_xs, hidden, hidden);
         ib_metal_rec_residual_add(rr, g_x, g_xb2, hidden);
         ib_metal_rec_rmsnorm_fp16(rr, g_x, gw_post_norm, g_xb, hidden, eps);
@@ -342,7 +342,7 @@ int main(int argc, char **argv) {
         ib_metal_rec_rope_inplace(rr, g_q, n_heads,    head_dim, pos, theta);
         ib_metal_rec_rope_inplace(rr, g_k, n_kv_heads, head_dim, pos, theta);
         ib_metal_rec_attention_block_fp16(rr, g_q, g_k, g_v, g_kc, g_vc, g_scores, g_attn_out,
-                                           n_heads, n_kv_heads, head_dim, seq_len, pos);
+                                           n_heads, n_kv_heads, head_dim, seq_len, pos, 0);
         ib_metal_rec_matmul_w4a8_fp32_in(rr, g_attn_out, gw_o_proj_w, gw_o_proj_s, g_xb2, g_xq, g_xs, hidden, hidden);
         ib_metal_rec_residual_add(rr, g_x, g_xb2, hidden);
         ib_metal_rec_rmsnorm_fp16(rr, g_x, gw_post_norm, g_xb, hidden, eps);

@@ -209,6 +209,20 @@ struct inferbit_model {
      *
      * Off by default. Enable via IB_RESIDENCY_MODE=drive at model load. */
     int    residency_mode;
+
+    /* Rotating KV-cache window (doc 36 phase 2.2), copied from config at
+     * load. 0 = full causal cache. >0 = each layer's KV cache is a ring
+     * of `kv_window` physical slots; logical position p lives at slot
+     * p % kv_window. Attention only reads the most recent kv_window
+     * positions. Peak KV RAM becomes O(kv_window) instead of O(seq_len). */
+    int    kv_window;
+
+    /* Lazily-created Metal context + uploaded GPU buffers (doc 36 phase
+     * 4.1). Allocated on the first inferbit_forward_with_hiddens call and
+     * cached for reuse; freed in inferbit_free. Opaque void* so this
+     * header stays free of metal_runtime.h. NULL until first use. */
+    void  *metal_ctx;
+    void  *metal_bufs;
     int    drive_fd;                  /* fd of the IBF, F_NOCACHE set on Darwin */
     void  *drive_indices_scratch;     /* page-aligned shared buffer */
     size_t drive_indices_scratch_size;
@@ -229,6 +243,12 @@ struct inferbit_config {
     bool kv_dynamic;
     bool native_parse;
     int  native_bits;
+    /* Rotating KV-cache window (doc 36 phase 2.2). 0 = full causal cache
+     * (default). >0 = ring buffer of `kv_window` token slots; logical
+     * position p maps to physical slot p % kv_window. Bounds KV RAM at
+     * long context for the (acceptable) cost of a sliding-window
+     * attention horizon. */
+    int  kv_window;
 };
 
 /* ── SIMD dispatch ──────────────────────────────────────────── */

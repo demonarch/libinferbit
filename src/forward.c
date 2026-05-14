@@ -128,7 +128,10 @@ static void fp16_weights_to_fp32(float* out, const void* fp16_data, int count) {
 
 /* ── Embedding lookup ───────────────────────────────────────── */
 
-static void embedding_lookup(const inferbit_model* m, int token_id, float* out) {
+/* Non-static: also used by inferbit_forward_with_hiddens (forward_hiddens.c)
+ * to decode token IDs into fp32 embeddings for the Metal prefill path. */
+void ib_embedding_lookup(const inferbit_model* m, int token_id, float* out);
+void ib_embedding_lookup(const inferbit_model* m, int token_id, float* out) {
     int hidden = m->header.hidden_size;
     const ib_tensor_meta* emb = &m->token_embedding;
 
@@ -754,17 +757,21 @@ static inline void kv_read_int4_row(float* out, const uint8_t* src, float scale,
 static void kv_cache_write(ib_kv_cache* kv, int pos,
                            const float* key, const float* value,
                            int kv_dim, int n_kv_heads, int head_dim, int kv_bits) {
+    /* Rotating KV window (doc 36 phase 2.2): logical position `pos` lands
+     * in physical slot pos % capacity. When not windowed, capacity is the
+     * full context so pos < capacity and this is the identity map. */
+    int phys = (kv->capacity > 0) ? (pos % kv->capacity) : pos;
     if (kv_bits >= 16) {
         float* k_store = (float*)kv->key_data;
         float* v_store = (float*)kv->value_data;
-        memcpy(k_store + (size_t)pos * kv_dim, key, kv_dim * sizeof(float));
-        memcpy(v_store + (size_t)pos * kv_dim, value, kv_dim * sizeof(float));
+        memcpy(k_store + (size_t)phys * kv_dim, key, kv_dim * sizeof(float));
+        memcpy(v_store + (size_t)phys * kv_dim, value, kv_dim * sizeof(float));
         return;
     }
 
     if (kv_bits == 8) {
-        int8_t* k_store = (int8_t*)kv->key_data + (size_t)pos * kv_dim;
-        int8_t* v_store = (int8_t*)kv->value_data + (size_t)pos * kv_dim;
+        int8_t* k_store = (int8_t*)kv->key_data + (size_t)phys * kv_dim;
+        int8_t* v_store = (int8_t*)kv->value_data + (size_t)phys * kv_dim;
         for (int h = 0; h < n_kv_heads; h++) {
             const float* k_h = key + h * head_dim;
             const float* v_h = value + h * head_dim;
@@ -775,8 +782,8 @@ static void kv_cache_write(ib_kv_cache* kv, int pos,
             }
             float k_scale = k_max / 127.0f; if (k_scale < 1e-8f) k_scale = 1e-8f;
             float v_scale = v_max / 127.0f; if (v_scale < 1e-8f) v_scale = 1e-8f;
-            kv->key_scales[(size_t)pos * n_kv_heads + h] = k_scale;
-            kv->value_scales[(size_t)pos * n_kv_heads + h] = v_scale;
+            kv->key_scales[(size_t)phys * n_kv_heads + h] = k_scale;
+            kv->value_scales[(size_t)phys * n_kv_heads + h] = v_scale;
             float k_inv = 1.0f / k_scale;
             float v_inv = 1.0f / v_scale;
             for (int d = 0; d < head_dim; d++) {
@@ -793,8 +800,8 @@ static void kv_cache_write(ib_kv_cache* kv, int pos,
 
     if (kv_bits == 4) {
         size_t row_bytes = (size_t)(kv_dim + 1) / 2;
-        uint8_t* k_store = (uint8_t*)kv->key_data + (size_t)pos * row_bytes;
-        uint8_t* v_store = (uint8_t*)kv->value_data + (size_t)pos * row_bytes;
+        uint8_t* k_store = (uint8_t*)kv->key_data + (size_t)phys * row_bytes;
+        uint8_t* v_store = (uint8_t*)kv->value_data + (size_t)phys * row_bytes;
         for (int h = 0; h < n_kv_heads; h++) {
             const float* k_h = key + h * head_dim;
             const float* v_h = value + h * head_dim;
@@ -805,8 +812,8 @@ static void kv_cache_write(ib_kv_cache* kv, int pos,
             }
             float k_scale = k_max / 7.0f; if (k_scale < 1e-8f) k_scale = 1e-8f;
             float v_scale = v_max / 7.0f; if (v_scale < 1e-8f) v_scale = 1e-8f;
-            kv->key_scales[(size_t)pos * n_kv_heads + h] = k_scale;
-            kv->value_scales[(size_t)pos * n_kv_heads + h] = v_scale;
+            kv->key_scales[(size_t)phys * n_kv_heads + h] = k_scale;
+            kv->value_scales[(size_t)phys * n_kv_heads + h] = v_scale;
             kv_write_int4_row(k_store + (size_t)h * ((head_dim + 1) / 2), k_h, k_scale, head_dim);
             kv_write_int4_row(v_store + (size_t)h * ((head_dim + 1) / 2), v_h, v_scale, head_dim);
         }
@@ -817,19 +824,22 @@ static void kv_cache_write(ib_kv_cache* kv, int pos,
 static void kv_cache_read_head(const ib_kv_cache* kv, int is_key, int pos, int kv_head,
                                int kv_dim, int n_kv_heads, int head_dim, int kv_bits,
                                float* out_head) {
+    /* Rotating KV window: logical position -> physical slot pos % capacity
+     * (identity map when not windowed). */
+    int phys = (kv->capacity > 0) ? (pos % kv->capacity) : pos;
     if (kv_bits >= 16) {
         const float* src = is_key ? (const float*)kv->key_data : (const float*)kv->value_data;
-        const float* row = src + (size_t)pos * kv_dim + kv_head * head_dim;
+        const float* row = src + (size_t)phys * kv_dim + kv_head * head_dim;
         memcpy(out_head, row, head_dim * sizeof(float));
         return;
     }
 
     if (kv_bits == 8) {
         const int8_t* src = is_key ? (const int8_t*)kv->key_data : (const int8_t*)kv->value_data;
-        const int8_t* row = src + (size_t)pos * kv_dim + kv_head * head_dim;
+        const int8_t* row = src + (size_t)phys * kv_dim + kv_head * head_dim;
         float scale = is_key
-            ? kv->key_scales[(size_t)pos * n_kv_heads + kv_head]
-            : kv->value_scales[(size_t)pos * n_kv_heads + kv_head];
+            ? kv->key_scales[(size_t)phys * n_kv_heads + kv_head]
+            : kv->value_scales[(size_t)phys * n_kv_heads + kv_head];
         for (int d = 0; d < head_dim; d++) out_head[d] = (float)row[d] * scale;
         return;
     }
@@ -837,10 +847,10 @@ static void kv_cache_read_head(const ib_kv_cache* kv, int is_key, int pos, int k
     if (kv_bits == 4) {
         size_t row_bytes = (size_t)(kv_dim + 1) / 2;
         const uint8_t* src = is_key ? (const uint8_t*)kv->key_data : (const uint8_t*)kv->value_data;
-        const uint8_t* row = src + (size_t)pos * row_bytes + (size_t)kv_head * ((head_dim + 1) / 2);
+        const uint8_t* row = src + (size_t)phys * row_bytes + (size_t)kv_head * ((head_dim + 1) / 2);
         float scale = is_key
-            ? kv->key_scales[(size_t)pos * n_kv_heads + kv_head]
-            : kv->value_scales[(size_t)pos * n_kv_heads + kv_head];
+            ? kv->key_scales[(size_t)phys * n_kv_heads + kv_head]
+            : kv->value_scales[(size_t)phys * n_kv_heads + kv_head];
         kv_read_int4_row(out_head, row, scale, head_dim);
         return;
     }
@@ -868,33 +878,46 @@ static void ib_attn_head_task(void* arg, int tid, int start, int end) {
     float k_tmp[256];
     float v_tmp[256];
 
+    /* Rotating KV window (doc 36 phase 2.2): only the most recent
+     * `capacity` positions are physically live; older ones were evicted.
+     * When not windowed, capacity is the full context so t_lo is 0 and
+     * this attends to everything (unchanged behaviour). The att row is
+     * compacted into [0, n_valid) so softmax + weighted-V operate on the
+     * live window only; logical position t reads physical slot t % cap. */
+    int cap = c->kv->capacity;
+    int t_lo = (cap > 0 && c->pos + 1 > cap) ? (c->pos + 1 - cap) : 0;
+    int n_valid = c->pos + 1 - t_lo;
+
     for (int h = start; h < end; h++) {
         float* q_h = c->q + h * c->head_dim;
         int kv_h = h / c->heads_per_kv;
+        float* att_h = c->att + h * (c->pos + 1);
 
-        for (int t = 0; t <= c->pos; t++) {
+        for (int t = t_lo; t <= c->pos; t++) {
+            int phys = (cap > 0) ? (t % cap) : t;
             float score = 0.0f;
             if (c->kv_bits >= 16) {
                 float* k_cache = (float*)c->kv->key_data;
-                float* k_t = k_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
+                float* k_t = k_cache + (size_t)phys * c->kv_dim + kv_h * c->head_dim;
                 for (int d = 0; d < c->head_dim; d++) score += q_h[d] * k_t[d];
             } else {
                 kv_cache_read_head(c->kv, 1, t, kv_h, c->kv_dim, c->n_kv_heads,
                                    c->head_dim, c->kv_bits, k_tmp);
                 for (int d = 0; d < c->head_dim; d++) score += q_h[d] * k_tmp[d];
             }
-            c->att[h * (c->pos + 1) + t] = score * c->scale;
+            att_h[t - t_lo] = score * c->scale;
         }
 
-        ib_kern.softmax(c->att + h * (c->pos + 1), c->pos + 1);
+        ib_kern.softmax(att_h, n_valid);
 
         float* out_h = c->xb2 + h * c->head_dim;
         memset(out_h, 0, c->head_dim * sizeof(float));
-        for (int t = 0; t <= c->pos; t++) {
-            float a = c->att[h * (c->pos + 1) + t];
+        for (int t = t_lo; t <= c->pos; t++) {
+            int phys = (cap > 0) ? (t % cap) : t;
+            float a = att_h[t - t_lo];
             if (c->kv_bits >= 16) {
                 float* v_cache = (float*)c->kv->value_data;
-                float* v_t = v_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
+                float* v_t = v_cache + (size_t)phys * c->kv_dim + kv_h * c->head_dim;
                 for (int d = 0; d < c->head_dim; d++) out_h[d] += a * v_t[d];
             } else {
                 kv_cache_read_head(c->kv, 0, t, kv_h, c->kv_dim, c->n_kv_heads,
@@ -957,7 +980,7 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
     float* scale_buf = att + (size_t)n_heads * (pos + 1);
 
     /* Embedding lookup */
-    embedding_lookup(m, token_id, x);
+    ib_embedding_lookup(m, token_id, x);
 
     /* Transformer layers */
     for (int l = 0; l < n_layers; l++) {
@@ -1120,7 +1143,7 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
 
     /* Embed each token (cheap, per-position). */
     for (int b = 0; b < B; b++) {
-        embedding_lookup(m, tokens[b], x + (size_t)b * hidden);
+        ib_embedding_lookup(m, tokens[b], x + (size_t)b * hidden);
     }
 
     for (int l = 0; l < n_layers; l++) {

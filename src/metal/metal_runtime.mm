@@ -2677,13 +2677,18 @@ extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
                                                             void *scores_fp32,
                                                             void *attn_out_fp32,
                                                             int B, int n_heads, int n_kv_heads,
-                                                            int head_dim, int seq_len, int start_pos)
+                                                            int head_dim, int seq_len, int start_pos,
+                                                            int kv_window)
 {
     if (!rec) return -1;
     if (!q_fp32 || !k_fp32 || !v_fp32 || !k_cache_fp16 || !v_cache_fp16
         || !scores_fp32 || !attn_out_fp32) return -1;
     if (B <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return -1;
-    if (start_pos < 0 || start_pos + B > seq_len) return -1;
+    /* With a rotating KV window (kv_window>0), start_pos is a logical
+     * position that legitimately exceeds the physical KV ring (seq_len).
+     * Only bounds-check against the physical ring when not windowed. */
+    if (start_pos < 0) return -1;
+    if (kv_window <= 0 && start_pos + B > seq_len) return -1;
     if (n_heads % n_kv_heads != 0) return -1;
 
     id<MTLComputePipelineState> ps_write = get_pipeline(rec->ctx, "kv_cache_write_fp16_batched");
@@ -2708,6 +2713,12 @@ extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
     uint kv_dim = nkh * hd;
     float scale = 1.0f / sqrtf((float)head_dim);
 
+    /* Rotating KV window (doc 36 phase 2.2): kv_window from the model
+     * config. 0 = full causal cache. >0 = ring buffer of kv_window
+     * physical slots; KV writes/reads use logical_pos % kv_window and
+     * attention masks positions older than kv_window. */
+    uint attn_window = (kv_window > 0) ? (uint)kv_window : 0u;
+
     /* 1. KV write (B positions in parallel) */
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
@@ -2718,21 +2729,11 @@ extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
         [enc setBuffer:b_vc offset:ovc atIndex:3];
         [enc setBytes:&sp     length:sizeof(sp)     atIndex:4];
         [enc setBytes:&kv_dim length:sizeof(kv_dim) atIndex:5];
+        [enc setBytes:&attn_window length:sizeof(attn_window) atIndex:6];
         [enc dispatchThreads:MTLSizeMake(kv_dim, (NSUInteger)B, 1)
            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [enc endEncoding];
     }
-    /* Sliding-window attention (doc 35 feature 5, opt-in).
-     * IB_ATTN_WINDOW=N sets the sliding window size; 0 = full causal
-     * (default). Mask is applied in attn_scores_qk_batched. */
-    static uint attn_window_cached = 0;
-    static int  attn_window_init = 0;
-    if (!attn_window_init) {
-        const char *env = getenv("IB_ATTN_WINDOW");
-        attn_window_cached = (env ? (uint)atoi(env) : 0u);
-        attn_window_init = 1;
-    }
-    uint attn_window = attn_window_cached;
     /* 2. Scores with causal masking (and optional sliding window) */
     {
         id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
@@ -2770,6 +2771,7 @@ extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
         [enc setBytes:&nkh length:sizeof(nkh) atIndex:5];
         [enc setBytes:&hd  length:sizeof(hd)  atIndex:6];
         [enc setBytes:&max_score_len length:sizeof(max_score_len) atIndex:7];
+        [enc setBytes:&attn_window length:sizeof(attn_window) atIndex:8];
         [enc setThreadgroupMemoryLength:(NSUInteger)max_score_len * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)B * nh, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -2799,6 +2801,7 @@ extern "C" int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
         [enc setBytes:&hd length:sizeof(hd) atIndex:5];
         [enc setBytes:&max_score_len length:sizeof(max_score_len) atIndex:6];
         [enc setBytes:&sp length:sizeof(sp) atIndex:7];
+        [enc setBytes:&attn_window length:sizeof(attn_window) atIndex:8];
         [enc dispatchThreads:MTLSizeMake(hd, nh, (NSUInteger)B)
            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [enc endEncoding];
@@ -2815,14 +2818,19 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
                                                    void *scores_fp32,
                                                    void *attn_out_fp32,
                                                    int n_heads, int n_kv_heads,
-                                                   int head_dim, int seq_len, int pos)
+                                                   int head_dim, int seq_len, int pos,
+                                                   int kv_window)
 {
     if (!rec) return -1;
     if (!q_fp32 || !k_fp32 || !v_fp32 || !k_cache_fp16 || !v_cache_fp16
         || !scores_fp32 || !attn_out_fp32) return -1;
     if (n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || seq_len <= 0) return -1;
-    if (pos < 0 || pos >= seq_len) return -1;
+    /* With a rotating KV window, pos is logical and may exceed the
+     * physical ring (seq_len); only bounds-check when not windowed. */
+    if (pos < 0) return -1;
+    if (kv_window <= 0 && pos >= seq_len) return -1;
     if (n_heads % n_kv_heads != 0) return -1;
+    uint kv_win_u = (kv_window > 0) ? (uint)kv_window : 0u;
 
     id<MTLComputePipelineState> ps_write = get_pipeline(rec->ctx, "kv_cache_write_fp16");
     id<MTLComputePipelineState> ps_score = get_pipeline(rec->ctx, "attn_scores_qk");
@@ -2855,6 +2863,7 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
         [enc setBuffer:b_vc offset:ovc atIndex:3];
         [enc setBytes:&p length:sizeof(p) atIndex:4];
         [enc setBytes:&kv_dim length:sizeof(kv_dim) atIndex:5];
+        [enc setBytes:&kv_win_u length:sizeof(kv_win_u) atIndex:6];
         const NSUInteger TG = 64;
         NSUInteger n_tg = (kv_dim + TG - 1) / TG;
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
@@ -2873,6 +2882,7 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
         [enc setBytes:&hd length:sizeof(hd) atIndex:5];
         [enc setBytes:&p1 length:sizeof(p1) atIndex:6];
         [enc setBytes:&scale length:sizeof(scale) atIndex:7];
+        [enc setBytes:&kv_win_u length:sizeof(kv_win_u) atIndex:8];
         const NSUInteger TG = 128;
         NSUInteger total = (NSUInteger)nh * (NSUInteger)p1;
         NSUInteger n_tg = (total + TG - 1) / TG;
@@ -2901,6 +2911,7 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
         [enc setBytes:&nkh length:sizeof(nkh) atIndex:4];
         [enc setBytes:&hd length:sizeof(hd) atIndex:5];
         [enc setBytes:&p1 length:sizeof(p1) atIndex:6];
+        [enc setBytes:&kv_win_u length:sizeof(kv_win_u) atIndex:7];
         [enc setThreadgroupMemoryLength:(NSUInteger)p1 * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nh, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -2927,6 +2938,7 @@ extern "C" int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
             [enc setBytes:&nkh length:sizeof(nkh) atIndex:4];
             [enc setBytes:&hd length:sizeof(hd) atIndex:5];
             [enc setBytes:&p1 length:sizeof(p1) atIndex:6];
+            [enc setBytes:&kv_win_u length:sizeof(kv_win_u) atIndex:7];
             const NSUInteger TG = 64;
             NSUInteger total = (NSUInteger)nh * (NSUInteger)hd;
             NSUInteger n_tg = (total + TG - 1) / TG;

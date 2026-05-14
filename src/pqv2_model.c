@@ -246,6 +246,7 @@ static inferbit_model* pqv2_load_internal(const char* path,
         ctx_len    = config->context_length > 0 ? config->context_length : ctx_len;
         kv_dynamic = config->kv_dynamic;
         threads    = config->threads > 0 ? config->threads : 4;
+        m->kv_window = config->kv_window;
     }
     m->num_threads = threads;
 

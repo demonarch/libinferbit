@@ -231,6 +231,18 @@ int ib_alloc_kv_caches(inferbit_model* model, int context_length, int dynamic) {
     int kv_bits     = model->header.kv_bits;
     int capacity    = context_length > 0 ? context_length : model->header.max_context_length;
 
+    /* Rotating KV window (doc 36 phase 2.2): when set and smaller than
+     * the full context, the physical cache is just `kv_window` slots —
+     * this is what bounds KV RAM at long context. Logical position p
+     * lives at physical slot p % capacity. Clamp the window to the
+     * context so p % capacity stays a valid index; a window >= context
+     * is a no-op (treated as full causal). */
+    if (model->kv_window > 0 && model->kv_window < capacity) {
+        capacity = model->kv_window;
+    } else {
+        model->kv_window = 0;
+    }
+
     model->kv_caches = calloc(num_layers, sizeof(ib_kv_cache));
     if (!model->kv_caches) return -1;
 
@@ -516,6 +528,7 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
         ctx_len    = config->context_length;
         kv_dynamic = config->kv_dynamic;
         threads    = config->threads > 0 ? config->threads : 4;
+        model->kv_window = config->kv_window;
     }
     model->num_threads = threads;
 

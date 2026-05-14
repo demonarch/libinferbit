@@ -242,25 +242,31 @@ int main(int argc, char **argv) {
             tokens_spec[n_spec++] = correction;
         }
 
-        /* Step 5: align draft KV with target.
+        /* Step 5: crop both KV caches back to the accepted boundary
+         * (doc 36 phase 2.3 — explicit ib_kv_crop instead of the old
+         * "stale KV is harmless until overwritten" trick).
          *
-         * Draft wrote KV at positions [pos..pos+K-1] for tokens
-         * drafts[0..K-1]. After verify, only positions [pos..pos+accepted-1]
-         * are valid (drafts[0..accepted-1] were accepted). Position
-         * pos+accepted in the draft holds drafts[accepted] which is WRONG
-         * (target said correction). Positions pos+accepted+1..pos+K-1
-         * are also wrong but won't be read until they're overwritten
-         * by the next iteration's drafting forward_token calls — those
-         * naturally overwrite at the right positions. So we only need
-         * to fix position pos+accepted by running ONE forward_token on
-         * the draft with the correction token.
+         * Draft wrote KV at positions [pos..pos+K-1] for drafts[0..K-1].
+         * After verify only [pos..pos+accepted-1] are valid; the draft's
+         * KV at pos+accepted holds the wrong token and pos+accepted+1..
+         * pos+K-1 are speculative garbage. The old code relied on those
+         * positions being causally-future (hence masked) until the next
+         * iteration overwrites them — but that assumption breaks once a
+         * rotating KV window (phase 2.2) can wrap and surface a stale
+         * slot. inferbit_kv_truncate makes the eviction explicit: it
+         * resets each cache's logical length so the bookkeeping matches
+         * the real accepted prefix length.
          *
-         * Stale entries at positions > pos+accepted are not read by
-         * attention (which masks positions > current pos), so they're
-         * harmless until overwritten. */
+         * crop_to = the number of fully-committed tokens after this
+         * iteration. The draft additionally needs position pos+accepted
+         * refilled with the CORRECTION token (target's pick), so we crop
+         * the draft to pos+accepted and re-run one forward_token. */
+        int crop_to = pos + accepted;
+        inferbit_kv_truncate(draft,  crop_to);
+        inferbit_kv_truncate(target, crop_to);
         if (correction >= 0) {
             cpu_embed_lookup(draft, correction, d_embed);
-            ib_metal_forward_token(mctx, dbufs, d_embed, pos + accepted, d_logits);
+            ib_metal_forward_token(mctx, dbufs, d_embed, crop_to, d_logits);
         }
 
         /* Update target's "last_tok" to the last produced token. */

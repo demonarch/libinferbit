@@ -572,6 +572,10 @@ int ib_metal_rec_embed_lookup_fp16(ib_metal_recorder *rec,
                                      void *out_fp32);
 
 /* Records the full attention block (kv_write + scores + softmax + weighted_v). */
+/* kv_window (doc 36 phase 2.2): 0 = full causal cache; >0 = rotating
+ * ring buffer of kv_window physical slots — KV writes/reads use
+ * logical_pos % kv_window and attention only attends to the most recent
+ * kv_window positions. When >0, `pos` is logical and may exceed seq_len. */
 int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
                                         const void *q_fp32,
                                         const void *k_fp32,
@@ -581,12 +585,13 @@ int ib_metal_rec_attention_block_fp16(ib_metal_recorder *rec,
                                         void *scores_fp32,
                                         void *attn_out_fp32,
                                         int n_heads, int n_kv_heads,
-                                        int head_dim, int seq_len, int pos);
+                                        int head_dim, int seq_len, int pos,
+                                        int kv_window);
 
 /* Batched fp16-KV attention: runs B prefill positions in 4 dispatches
  * (vs. 4×B in the per-position variant). Causal mask handled internally.
  * q/k/v are [B][...]; scores is [B][n_heads][start_pos+B]; attn_out is
- * [B][n_heads*head_dim]. */
+ * [B][n_heads*head_dim]. kv_window: see the per-position variant above. */
 int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
                                                 const void *q_fp32,
                                                 const void *k_fp32,
@@ -596,7 +601,8 @@ int ib_metal_rec_attention_block_fp16_batched(ib_metal_recorder *rec,
                                                 void *scores_fp32,
                                                 void *attn_out_fp32,
                                                 int B, int n_heads, int n_kv_heads,
-                                                int head_dim, int seq_len, int start_pos);
+                                                int head_dim, int seq_len, int start_pos,
+                                                int kv_window);
 
 /* INT8 KV variant of the attention block. */
 int ib_metal_rec_attention_block_int8(ib_metal_recorder *rec,

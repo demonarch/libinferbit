@@ -85,7 +85,9 @@ struct ib_metal_model_buffers {
     int head_dim;
     int kv_dim;
     int vocab;
-    int seq_len;
+    int seq_len;       /* physical KV ring size (== kv_window when windowed) */
+    int max_logical_pos; /* logical context bound for start_pos checks */
+    int kv_window;     /* 0 = full causal; >0 = ring buffer size (== seq_len) */
     int kv_bits;       /* 16 (fp32 KV) or 8 (int8 KV) */
     float rope_theta;
     float eps;
@@ -611,6 +613,16 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
      * buffers identically. */
     b->seq_len      = m->kv_caches ? m->kv_caches[0].capacity : m->header.max_context_length;
     if (b->seq_len <= 0) b->seq_len = m->header.max_context_length;
+    /* Rotating KV window (doc 36 phase 2.2). m->kv_window is normalized
+     * by ib_alloc_kv_caches: 0 = full causal, else == the physical ring
+     * size (which is what kv_caches[0].capacity / b->seq_len already
+     * reflect). When windowed, start_pos may exceed the physical ring,
+     * so bounds checks use max_logical_pos (the model's true context),
+     * while KV addressing uses pos % seq_len. */
+    b->kv_window    = m->kv_window;
+    b->max_logical_pos = (b->kv_window > 0)
+        ? m->header.max_context_length
+        : b->seq_len;
     b->kv_bits      = m->header.kv_bits;
     b->rope_theta   = m->header.rope_theta;
     b->eps          = m->header.norm_epsilon;
@@ -773,7 +785,13 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
     b->attn_out = ib_metal_alloc(ctx, (size_t)b->n_heads * b->head_dim * sizeof(float), NULL);
     b->hb       = ib_metal_alloc(ctx, (size_t)b->intermediate * sizeof(float), NULL);
     b->hb2      = ib_metal_alloc(ctx, (size_t)b->intermediate * sizeof(float), NULL);
-    b->scores   = ib_metal_alloc(ctx, (size_t)b->n_heads * b->seq_len * sizeof(float), NULL);
+    /* Scores stay LOGICAL-indexed (position 0..max_logical_pos), even
+     * with a rotating KV window — the kernels mask out-of-window
+     * positions to -INF. Only the KV cache itself is bounded to the
+     * physical ring (b->seq_len). The scores buffer is a single transient
+     * scratch, so O(context) here is acceptable; O(context) per-layer KV
+     * is what windowing eliminates. */
+    b->scores   = ib_metal_alloc(ctx, (size_t)b->n_heads * b->max_logical_pos * sizeof(float), NULL);
     b->xq       = ib_metal_alloc(ctx, (size_t)max_n, NULL);
     b->xs       = ib_metal_alloc(ctx, (size_t)xs_groups * sizeof(float), NULL);
     b->logits   = ib_metal_alloc(ctx, (size_t)b->vocab * sizeof(float), NULL);
@@ -803,7 +821,7 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
         b->xq_b       = ib_metal_alloc(ctx, bm * (size_t)max_n, NULL);
         b->xs_b       = ib_metal_alloc(ctx, bm * (size_t)xs_groups * sizeof(float), NULL);
         b->scores_b   = ib_metal_alloc(ctx,
-            bm * (size_t)b->n_heads * (size_t)b->seq_len * sizeof(float), NULL);
+            bm * (size_t)b->n_heads * (size_t)b->max_logical_pos * sizeof(float), NULL);
     }
 
     return b;
@@ -1223,7 +1241,7 @@ static void record_single_forward_step(ib_metal_recorder *r,
             ib_metal_rec_attention_block_fp16(r, b->q, b->k, b->v,
                                                 lb->k_cache, lb->v_cache,
                                                 b->scores, b->attn_out,
-                                                nh, nkh, hd, sl, pos);
+                                                nh, nkh, hd, sl, pos, b->kv_window);
         } else {
             ib_metal_rec_attention_block_int8(r, b->q, b->k, b->v,
                                                 lb->k_cache, lb->v_cache,
@@ -1334,7 +1352,7 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
                         float *logits_out)
 {
     if (!ctx || !b || !cpu_embed_in || !logits_out) return -1;
-    if (pos < 0 || pos >= b->seq_len) return -1;
+    if (pos < 0 || pos >= b->max_logical_pos) return -1;
 
     memcpy(b->x, cpu_embed_in, (size_t)b->hidden * sizeof(float));
 
@@ -1375,7 +1393,7 @@ ib_metal_forward_decode_n(ib_metal_ctx *ctx,
                            int *out_tokens)
 {
     if (!ctx || !b || !init_input_embed_fp32 || !out_tokens || n_steps <= 0) return -1;
-    if (start_pos < 0 || start_pos + n_steps > b->seq_len) return -1;
+    if (start_pos < 0 || start_pos + n_steps > b->max_logical_pos) return -1;
     /* GPU embed feedback requires PQ-encoded token embedding. */
     if (!b->token_embedding_is_pq) return -2;
 
@@ -1626,7 +1644,7 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
 {
     if (!ctx || !b || !cpu_embeds_in || !last_logits_out) return -1;
     if (n_tokens < 1) return -1;
-    if (start_pos < 0 || start_pos + n_tokens > b->seq_len) return -1;
+    if (start_pos < 0 || start_pos + n_tokens > b->max_logical_pos) return -1;
     if (!model_supports_batched_prefill(b)) return -2;
 
     /* Auto-chunk when the prompt exceeds the preallocated batched
@@ -1730,7 +1748,7 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
                 b->q_b, b->k_b, b->v_b,
                 lb->k_cache, lb->v_cache,
                 b->scores_b, b->attn_out_b,
-                B, nh, nkh, hd, sl, start_pos);
+                B, nh, nkh, hd, sl, start_pos, b->kv_window);
         } else {
             /* INT8 KV: batched path not implemented yet, fall back to
              * per-position loop. */
@@ -1845,7 +1863,7 @@ forward_prefill_logits_all_impl(ib_metal_ctx *ctx,
 {
     if (!ctx || !b || !cpu_embeds_in || !all_logits_out) return -1;
     if (n_tokens < 1) return -1;
-    if (start_pos < 0 || start_pos + n_tokens > b->seq_len) return -1;
+    if (start_pos < 0 || start_pos + n_tokens > b->max_logical_pos) return -1;
     if (!model_supports_batched_prefill(b)) return -2;
     /* No auto-chunk: speculative draft length is small (K ≤ 8). */
     if (n_tokens > b->b_max) return -3;
@@ -1929,7 +1947,7 @@ forward_prefill_logits_all_impl(ib_metal_ctx *ctx,
             ib_metal_rec_attention_block_fp16_batched(r,
                 b->q_b, b->k_b, b->v_b, lb->k_cache, lb->v_cache,
                 b->scores_b, b->attn_out_b,
-                B_use, nh, nkh, hd, sl, start_pos);
+                B_use, nh, nkh, hd, sl, start_pos, b->kv_window);
         } else {
             for (int bb = 0; bb < B_use; bb++) {
                 int pos = start_pos + bb;

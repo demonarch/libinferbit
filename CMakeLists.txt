@@ -42,6 +42,7 @@ set(INFERBIT_SOURCES
     src/kernels/neon.c
     src/kernels/ternary.c
     src/forward.c
+    src/forward_hiddens.c
     src/threading.c
     src/ibf_loader.c
     src/gguf.c

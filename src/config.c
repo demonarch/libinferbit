@@ -13,6 +13,7 @@ inferbit_config* inferbit_config_create(void) {
     config->kv_dynamic     = false;
     config->native_parse   = false;
     config->native_bits    = 4;
+    config->kv_window      = 0;  /* 0 = full causal cache */
     return config;
 }
 
@@ -38,4 +39,8 @@ void inferbit_config_set_native_parse(inferbit_config* config, int enabled) {
 
 void inferbit_config_set_native_bits(inferbit_config* config, int bits) {
     if (config) config->native_bits = bits;
+}
+
+void inferbit_config_set_kv_window(inferbit_config* config, int window) {
+    if (config) config->kv_window = (window > 0) ? window : 0;
 }
