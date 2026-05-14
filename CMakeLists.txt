@@ -320,6 +320,11 @@ if(IB_METAL_ENABLED)
     target_link_libraries(bench_speculative inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
     target_include_directories(bench_speculative PRIVATE src include)
     add_dependencies(bench_speculative metal_kernels_header inferbit_static)
+
+    add_executable(test_hidden_states_capture tests/test_hidden_states_capture.c)
+    target_link_libraries(test_hidden_states_capture inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_hidden_states_capture PRIVATE src include)
+    add_dependencies(test_hidden_states_capture metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()
