@@ -353,7 +353,8 @@ static inferbit_model* pqv2_load_internal(const char* path,
              *
              * CPU drive path (chunk-major in-file) unaffected: still
              * preads from drive_fd at indices_file_offset. */
-            pqv2_t *mpq_list[nslots];
+            /* Heap-allocated (not a VLA — MSVC has no C99 VLA support). */
+            pqv2_t **mpq_list = (pqv2_t **)malloc((size_t)nslots * sizeof(pqv2_t *));
             for (int i = 0; i < nslots; i++) {
                 mpq_list[i] = (pqv2_t *)tslots[i]->pq;
             }
@@ -369,7 +370,9 @@ static inferbit_model* pqv2_load_internal(const char* path,
                  * pointer (no redirect) — only the sidecar entry is
                  * added. embed_lookup checks sidecar_offset != 0 and
                  * preads if available. */
-                pqv2_t *sidecar_list[nslots + 1];
+                /* Heap-allocated (not a VLA — MSVC compatibility). */
+                pqv2_t **sidecar_list =
+                    (pqv2_t **)malloc((size_t)(nslots + 1) * sizeof(pqv2_t *));
                 int sidecar_n = 0;
                 for (int i = 0; i < nslots; i++) sidecar_list[sidecar_n++] = mpq_list[i];
                 if (m->token_embedding.pq) {
@@ -386,7 +389,9 @@ static inferbit_model* pqv2_load_internal(const char* path,
                 if (rc != 0) {
                     fprintf(stderr, "ib pqv2: pre-transposed sidecar build failed (rc=%d); GPU drive will use per-matmul transpose fallback\n", rc);
                 }
+                free(sidecar_list);
             }
+            free(mpq_list);
             fprintf(stderr, "ib pqv2: drive mode ON. scratch=%zu B, fd=%d, sidecar_fd=%d, %d tensors\n",
                     scratch_size, m->drive_fd, m->drive_fd_pretransposed, nslots);
         }
