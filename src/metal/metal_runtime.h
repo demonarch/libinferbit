@@ -821,6 +821,22 @@ int ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
                                           int n_tokens, int start_pos,
                                           float *all_logits_out);
 
+/* Phase 3.1: variant of forward_prefill_logits_all that ALSO captures
+ * each layer's post-residual hidden state to caller-provided buffers.
+ * hidden_states_out is an array of num_layers float pointers; each
+ * non-NULL pointer must hold at least n_tokens * hidden floats. NULL
+ * entries (including hidden_states_out itself == NULL) are skipped.
+ *
+ * Capture forces a CB drain per captured layer — slower than the
+ * no-capture path. Intended for Phase 4 DFlash hybrid speculative
+ * orchestration, not fast-path inference. */
+int ib_metal_forward_prefill_logits_all_ex(ib_metal_ctx *ctx,
+                                             ib_metal_model_buffers *b,
+                                             const float *cpu_embeds_in,
+                                             int n_tokens, int start_pos,
+                                             float *all_logits_out,
+                                             float **hidden_states_out);
+
 /* Paginated greedy decode: runs `n_steps` autoregressive forwards on the
  * GPU in a single command buffer, with argmax + embedding-lookup also
  * on the GPU. CPU pays only one waitUntilCompleted (instead of n_steps).

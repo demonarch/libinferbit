@@ -1830,12 +1830,18 @@ ib_metal_forward_prefill(ib_metal_ctx *ctx,
  * Output layout: all_logits_out[i] is the vocab-length logit vector
  * for the (start_pos + i)-th position, i = 0..n_tokens-1. Caller
  * must allocate n_tokens * vocab * sizeof(float) bytes. */
-extern "C" int
-ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
-                                      ib_metal_model_buffers *b,
-                                      const float *cpu_embeds_in,
-                                      int n_tokens, int start_pos,
-                                      float *all_logits_out)
+/* Internal implementation shared by both forward_prefill_logits_all and
+ * forward_prefill_logits_all_ex. When hidden_states_out is non-NULL,
+ * captures each layer's post-residual hidden state at a small perf cost
+ * (one checkpoint per layer to drain the CB before memcpy from shared
+ * MTLBuffer). NULL = original fast path. */
+static int
+forward_prefill_logits_all_impl(ib_metal_ctx *ctx,
+                                  ib_metal_model_buffers *b,
+                                  const float *cpu_embeds_in,
+                                  int n_tokens, int start_pos,
+                                  float *all_logits_out,
+                                  float **hidden_states_out)
 {
     if (!ctx || !b || !cpu_embeds_in || !all_logits_out) return -1;
     if (n_tokens < 1) return -1;
@@ -1967,6 +1973,25 @@ ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
         if (rec_matmul_batched_tb(r, b, &lb->down, b->hb_b, b->xb_b, b->xq_b, b->xs_b, B_use, hidden, inter) != 0)
             rec_matmul_batched(r, lb->down.bits, lb->down.blk32, b->hb_b, lb->down.w, lb->down.s, b->xb_b, b->xq_b, b->xs_b, B_use, hidden, inter);
         ib_metal_rec_residual_add_batched(r, b->x_b, b->xb_b, B_use, hidden);
+
+        /* Phase 3.1: capture per-layer hidden state for callers that need
+         * it (e.g. DFlash hybrid orchestrator). Requires a CB drain at
+         * each layer so the shared MTLBuffer's CPU view of b->x_b is
+         * up-to-date; NULL skips this for the fast path. */
+        if (hidden_states_out && hidden_states_out[L]) {
+            if (b->gpu_drive_pending_cb) {
+                (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+                b->gpu_drive_pending_cb = NULL;
+            }
+            if (ib_metal_recorder_checkpoint(r) != 0) {
+                ib_metal_free(ctx, all_logits_gpu);
+                return -1;
+            }
+            b->gpu_drive_idx_in_flight = 0;
+            b->gpu_drive_cur_sr = 0;
+            memcpy(hidden_states_out[L], b->x_b,
+                   (size_t)B_use * hidden * sizeof(float));
+        }
     }
 
     /* Final batched RMSNorm + batched lm_head — outputs B_use × vocab. */
@@ -1988,4 +2013,46 @@ ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
     ib_metal_free(ctx, all_logits_gpu);
     return 0;
     #undef ROW_F
+}
+
+/* Public API: original fast path (no hidden-state capture). Delegates to
+ * the impl with NULL — exact same behavior as before. */
+extern "C" int
+ib_metal_forward_prefill_logits_all(ib_metal_ctx *ctx,
+                                      ib_metal_model_buffers *b,
+                                      const float *cpu_embeds_in,
+                                      int n_tokens, int start_pos,
+                                      float *all_logits_out)
+{
+    return forward_prefill_logits_all_impl(ctx, b, cpu_embeds_in,
+                                             n_tokens, start_pos,
+                                             all_logits_out, NULL);
+}
+
+/* Public API: same as forward_prefill_logits_all, but additionally
+ * captures each layer's post-residual hidden state into the caller-
+ * provided buffers. hidden_states_out must be an array of n_layers
+ * float* pointers; each non-NULL pointer must point to at least
+ * n_tokens * hidden floats. NULL entries are skipped (caller can
+ * selectively capture only specific layers). hidden_states_out itself
+ * being NULL takes the fast path.
+ *
+ * Use case: DFlash-style hybrid speculative decoding where the draft
+ * model conditions on the target's mid-stack hidden states.
+ *
+ * Note: capture forces a CB drain per captured layer, so this is
+ * substantially slower than the no-capture path (~2-3x measured on
+ * 1B at B=8). Don't enable for fast-path inference. */
+extern "C" int
+ib_metal_forward_prefill_logits_all_ex(ib_metal_ctx *ctx,
+                                         ib_metal_model_buffers *b,
+                                         const float *cpu_embeds_in,
+                                         int n_tokens, int start_pos,
+                                         float *all_logits_out,
+                                         float **hidden_states_out)
+{
+    return forward_prefill_logits_all_impl(ctx, b, cpu_embeds_in,
+                                             n_tokens, start_pos,
+                                             all_logits_out,
+                                             hidden_states_out);
 }
