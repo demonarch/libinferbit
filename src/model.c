@@ -1,10 +1,18 @@
 #include "inferbit_internal.h"
+#include "pqv2_format.h"
 #include "platform.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>   /* close() for drive_fd_pretransposed */
+
+#ifdef IB_HAS_METAL
+#include "metal/metal_runtime.h"   /* lazy Metal ctx cleanup (phase 4.1) */
+#endif
 
 /* Defined in ibf_loader.c */
 inferbit_model* ibf_load(const char* path, const inferbit_config* config);
+/* Defined in pqv2_model.c — detects IBF v6 magic, falls back to v5 */
+inferbit_model* pqv2_or_legacy_load(const char* path, const inferbit_config* config);
 
 /* ── Check file extension ───────────────────────────────────── */
 
@@ -34,13 +42,53 @@ inferbit_model* inferbit_load(const char* path, const inferbit_config* config) {
         return NULL;
     }
 
-    return ibf_load(path, config);
+    return pqv2_or_legacy_load(path, config);
 }
 
 /* ── Free ───────────────────────────────────────────────────── */
 
 void inferbit_free(inferbit_model* model) {
     if (!model) return;
+
+#ifdef IB_HAS_METAL
+    /* Lazily-created Metal context + buffers (doc 36 phase 4.1). */
+    if (model->metal_bufs) {
+        ib_metal_release_model((ib_metal_ctx*)model->metal_ctx,
+                               (ib_metal_model_buffers*)model->metal_bufs);
+        model->metal_bufs = NULL;
+    }
+    if (model->metal_ctx) {
+        ib_metal_destroy((ib_metal_ctx*)model->metal_ctx);
+        model->metal_ctx = NULL;
+    }
+#endif
+
+    /* IBF v6 backing — release before clearing weight_data so we don't
+     * double-free the mmap region (which is owned by the pqv2_file). */
+    if (model->pqv2_file_backing) {
+        ib_pqv2_file_free(model->pqv2_file_backing);
+        free(model->pqv2_file_backing);
+        model->pqv2_file_backing = NULL;
+        /* The IBF v6 path owns the mmap; skip the legacy unmap below. */
+        model->weight_data = NULL;
+        model->weight_data_mmap = false;
+        model->mmap_fd = -1;
+    }
+    if (model->pqv2_thread_acc_pool) {
+        free(model->pqv2_thread_acc_pool);
+        model->pqv2_thread_acc_pool = NULL;
+    }
+    if (model->drive_indices_scratch) {
+        free(model->drive_indices_scratch);
+        model->drive_indices_scratch = NULL;
+        model->drive_indices_scratch_size = 0;
+    }
+    /* model->drive_fd is owned by pqv2_file_backing — don't close here. */
+    /* model->drive_fd_pretransposed IS owned here (unlinked tmpfile). */
+    if (model->drive_fd_pretransposed >= 0) {
+        close(model->drive_fd_pretransposed);
+        model->drive_fd_pretransposed = -1;
+    }
 
     /* Unmap weight data */
     if (model->weight_data_mmap && model->weight_data) {
@@ -59,6 +107,15 @@ void inferbit_free(inferbit_model* model) {
             }
             ib_close(model->mmap_fd);
         }
+    }
+
+    /* Stripped-mmap path: weight_data is now an offset into a malloc'd
+     * embedding-only buffer (set by ib_metal_strip_cpu_mmap). Free the
+     * buffer rather than munmap'ing. */
+    if (model->embed_strip_buffer) {
+        free(model->embed_strip_buffer);
+        model->embed_strip_buffer = NULL;
+        model->weight_data = NULL;
     }
 
     /* Destroy thread pool */

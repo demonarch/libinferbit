@@ -8,6 +8,7 @@
 
 #include "../inferbit_internal.h"
 #include <arm_neon.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 
@@ -28,6 +29,50 @@ static void neon_matmul_int8(
 ) {
     const int8_t* w = (const int8_t*)weights;
 
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* vdotq_s32 fast path: quantize fp32 input to INT8 with per-group
+     * scales (group=IB_W4A8_GROUP=128, mirrors the w4a8 path), then run
+     * 16-INT8-MAC-per-cycle dot product. ~3× faster than the older
+     * widen-to-fp32 + vfmaq_f32 path. Quality cost from input quant is
+     * the same as w4a8's, which is well-validated. */
+    int n_groups = (N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
+    int8_t  stack_q[4096];
+    float   stack_s[4096 / IB_W4A8_GROUP + 1];
+    int8_t *x_q;
+    float  *x_sc;
+    if (N <= (int)(sizeof stack_q / sizeof *stack_q)) {
+        x_q = stack_q; x_sc = stack_s;
+    } else {
+        x_q  = (int8_t*)malloc((size_t)N);
+        x_sc = (float*)malloc((size_t)n_groups * sizeof(float));
+    }
+    ib_quantize_input_int8_g128(input, x_q, x_sc, N);
+
+    for (int i = 0; i < M; i++) {
+        const int8_t* row = w + (size_t)i * N;
+        float row_acc = 0.0f;
+        for (int g = 0; g < n_groups; g++) {
+            int start = g * IB_W4A8_GROUP;
+            int end   = (start + IB_W4A8_GROUP > N) ? N : start + IB_W4A8_GROUP;
+            int32x4_t acc = vdupq_n_s32(0);
+            int j = start;
+            for (; j + 15 < end; j += 16) {
+                int8x16_t w16 = vld1q_s8(row + j);
+                int8x16_t x16 = vld1q_s8(x_q + j);
+                acc = vdotq_s32(acc, w16, x16);
+            }
+            int32_t group_int = vaddvq_s32(acc);
+            for (; j < end; j++) group_int += (int32_t)row[j] * (int32_t)x_q[j];
+            row_acc += (float)group_int * x_sc[g];
+        }
+        out[i] = row_acc * scales[i];
+    }
+
+    if (x_q != stack_q) free(x_q);
+    if (x_sc != stack_s) free(x_sc);
+#else
+    /* Fallback: original widen-to-fp32 + vfmaq_f32 path for older NEON
+     * without the dotprod extension. */
     for (int i = 0; i < M; i++) {
         const int8_t* row = w + (size_t)i * N;
         float32x4_t acc0 = vdupq_n_f32(0.0f);
@@ -35,37 +80,28 @@ static void neon_matmul_int8(
 
         int j = 0;
         for (; j + 7 < N; j += 8) {
-            /* Load 8 INT8 weights */
             int8x8_t w8 = vld1_s8(row + j);
-            /* Widen to INT16 */
             int16x8_t w16 = vmovl_s8(w8);
-            /* Split and widen to INT32 */
             int32x4_t w32_lo = vmovl_s16(vget_low_s16(w16));
             int32x4_t w32_hi = vmovl_s16(vget_high_s16(w16));
-            /* Convert to float */
             float32x4_t wf_lo = vcvtq_f32_s32(w32_lo);
             float32x4_t wf_hi = vcvtq_f32_s32(w32_hi);
-
-            /* Load 8 input floats */
             float32x4_t in_lo = vld1q_f32(input + j);
             float32x4_t in_hi = vld1q_f32(input + j + 4);
-
-            /* FMA */
             acc0 = vfmaq_f32(acc0, wf_lo, in_lo);
             acc1 = vfmaq_f32(acc1, wf_hi, in_hi);
         }
 
-        /* Horizontal sum */
         float32x4_t sum = vaddq_f32(acc0, acc1);
         float result = vaddvq_f32(sum);
 
-        /* Scalar tail */
         for (; j < N; j++) {
             result += (float)row[j] * input[j];
         }
 
         out[i] = result * scales[i];
     }
+#endif
 }
 
 /* ── INT4 matmul ────────────────────────────────────────────── */
@@ -320,6 +356,339 @@ static void neon_matmul_w4a8(
         }
 
         out[i] = row_acc * scales_w[i];
+    }
+}
+
+/* W4A8 with per-32-element block weight scales — unrolled by 4 blocks.
+ *
+ * scales_w has length M*(N/32) (one fp32 per 32 weight elements per row).
+ * Activation grouping (128) is unchanged.
+ *
+ * The 4 weight blocks within each 128-element activation group are
+ * processed in parallel: 4 separate int32x4_t accumulators, all loads
+ * + vdotq issued before any horizontal reduction. The compiler/CPU
+ * can then schedule the 4 vdotq pairs (8 instructions) and 4 vaddvq
+ * reductions in parallel through Apple Silicon's wide SIMD pipelines,
+ * hiding the ~6-cycle reduction latency that previously stalled the
+ * loop after each block.
+ *
+ * Empirically this lifts the per-block-32 throughput close to per-row
+ * NEON, eliminating most of the cost of finer-granularity scaling.
+ */
+#if IB_HAS_DOTPROD
+IB_DOTPROD_NOINLINE
+#endif
+/* Single-row helper: used as the odd-row tail of the 2-row interleave path
+ * and for when M < 2. Same semantics as the previous neon_matmul_w4a8_blk32. */
+static inline void neon_matmul_w4a8_blk32_one_row(
+    float* out_row,
+    const uint8_t* row, const float* row_scales,
+    const int8_t* input, const float* scales_a,
+    int N, const uint8x16_t mask_lo, const int8x16_t bias
+) {
+    const int G_a = IB_W4A8_GROUP;
+    const int groups = N / G_a;
+    float row_acc = 0.0f;
+
+    for (int g = 0; g < groups; g++) {
+        const int j0 = g * G_a;
+        const int wb_base = j0 / 32;
+        const float a_scale = scales_a[g];
+
+        int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+        int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
+
+        #define BLOCK1(B, ACC) do { \
+            int j = j0 + (B) * 32; \
+            uint8x16_t packed = vld1q_u8(row + j / 2); \
+            uint8x16_t lo_u8 = vandq_u8(packed, mask_lo); \
+            uint8x16_t hi_u8 = vshrq_n_u8(packed, 4); \
+            int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias); \
+            int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias); \
+            int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8); \
+            int8x16_t a0 = vld1q_s8(input + j); \
+            int8x16_t a1 = vld1q_s8(input + j + 16); \
+            ACC = vdotq_s32(ACC, zipped.val[0], a0); \
+            ACC = vdotq_s32(ACC, zipped.val[1], a1); \
+        } while (0)
+
+        #define BLOCK1_FALLBACK(B, ACC) do { \
+            int j = j0 + (B) * 32; \
+            uint8x16_t packed = vld1q_u8(row + j / 2); \
+            uint8x16_t lo_u8 = vandq_u8(packed, mask_lo); \
+            uint8x16_t hi_u8 = vshrq_n_u8(packed, 4); \
+            int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias); \
+            int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias); \
+            int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8); \
+            int8x16_t a0 = vld1q_s8(input + j); \
+            int8x16_t a1 = vld1q_s8(input + j + 16); \
+            int16x8_t p0 = vmull_s8(vget_low_s8(zipped.val[0]), vget_low_s8(a0)); \
+            p0 = vmlal_s8(p0, vget_high_s8(zipped.val[0]), vget_high_s8(a0)); \
+            int16x8_t p1 = vmull_s8(vget_low_s8(zipped.val[1]), vget_low_s8(a1)); \
+            p1 = vmlal_s8(p1, vget_high_s8(zipped.val[1]), vget_high_s8(a1)); \
+            ACC = vpadalq_s16(ACC, p0); \
+            ACC = vpadalq_s16(ACC, p1); \
+        } while (0)
+
+#if IB_HAS_DOTPROD
+        BLOCK1(0, acc0); BLOCK1(1, acc1); BLOCK1(2, acc2); BLOCK1(3, acc3);
+#else
+        BLOCK1_FALLBACK(0, acc0); BLOCK1_FALLBACK(1, acc1);
+        BLOCK1_FALLBACK(2, acc2); BLOCK1_FALLBACK(3, acc3);
+#endif
+        #undef BLOCK1
+        #undef BLOCK1_FALLBACK
+
+        int32x4_t sums01 = vpaddq_s32(acc0, acc1);
+        int32x4_t sums23 = vpaddq_s32(acc2, acc3);
+        int32x4_t all_sums = vpaddq_s32(sums01, sums23);
+        float32x4_t fp_sums = vcvtq_f32_s32(all_sums);
+        float32x4_t w_scales_v = vld1q_f32(row_scales + wb_base);
+        row_acc += vaddvq_f32(vmulq_f32(fp_sums, w_scales_v)) * a_scale;
+    }
+    *out_row = row_acc;
+}
+
+/* 2-row-interleave blk32 W4A8 matmul.
+ *
+ * Why: the scalar/per-row blk32 kernel is bandwidth-bound on weight + activation
+ * loads. By processing two output rows at once we share the activation loads
+ * (a0, a1) across both rows for every block, halving activation traffic and
+ * letting the dotprod pipeline stay full while weight loads stream from L1.
+ *
+ * Register budget on M-class (32 NEON regs):
+ *   - 4 int32x4_t accumulators × 2 rows = 8 regs (kept live across all blocks
+ *     within a group to avoid serial dep on the reduction tree)
+ *   - mask_lo + bias = 2 const regs
+ *   - per-block transients (packed, lo_u8/hi_u8, lo_s8/hi_s8, zipped, a0/a1)
+ *     ≈ 6-8 transient regs
+ *   Comfortably fits, no spill.
+ *
+ * Caller guarantees N % 128 == 0 (and therefore N % 32 == 0). M can be odd —
+ * the last row falls through to the single-row helper.
+ */
+static void neon_matmul_w4a8_blk32(
+    float* out, const void* weights, const float* scales_w_blk32,
+    const int8_t* input, const float* scales_a, int M, int N
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+    const int G_a = IB_W4A8_GROUP;       /* 128 */
+    const int n_w_blocks = N / 32;
+    const int groups = N / G_a;
+
+    int i = 0;
+    for (; i + 1 < M; i += 2) {
+        const uint8_t* row0 = w + (size_t)i       * (N / 2);
+        const uint8_t* row1 = w + (size_t)(i + 1) * (N / 2);
+        const float* scales0 = scales_w_blk32 + (size_t)i       * n_w_blocks;
+        const float* scales1 = scales_w_blk32 + (size_t)(i + 1) * n_w_blocks;
+        float row0_acc = 0.0f, row1_acc = 0.0f;
+
+        for (int g = 0; g < groups; g++) {
+            const int j0 = g * G_a;
+            const int wb_base = j0 / 32;
+            const float a_scale = scales_a[g];
+
+            int32x4_t r0_b0 = vdupq_n_s32(0), r0_b1 = vdupq_n_s32(0);
+            int32x4_t r0_b2 = vdupq_n_s32(0), r0_b3 = vdupq_n_s32(0);
+            int32x4_t r1_b0 = vdupq_n_s32(0), r1_b1 = vdupq_n_s32(0);
+            int32x4_t r1_b2 = vdupq_n_s32(0), r1_b3 = vdupq_n_s32(0);
+
+            #define BLOCK2(B, R0_ACC, R1_ACC) do { \
+                int j = j0 + (B) * 32; \
+                int8x16_t a0 = vld1q_s8(input + j); \
+                int8x16_t a1 = vld1q_s8(input + j + 16); \
+                /* row 0 */ \
+                uint8x16_t p0 = vld1q_u8(row0 + j / 2); \
+                uint8x16_t lo0 = vandq_u8(p0, mask_lo); \
+                uint8x16_t hi0 = vshrq_n_u8(p0, 4); \
+                int8x16_t l0 = vsubq_s8(vreinterpretq_s8_u8(lo0), bias); \
+                int8x16_t h0 = vsubq_s8(vreinterpretq_s8_u8(hi0), bias); \
+                int8x16x2_t z0 = vzipq_s8(l0, h0); \
+                R0_ACC = vdotq_s32(R0_ACC, z0.val[0], a0); \
+                R0_ACC = vdotq_s32(R0_ACC, z0.val[1], a1); \
+                /* row 1 — same a0, a1 */ \
+                uint8x16_t p1 = vld1q_u8(row1 + j / 2); \
+                uint8x16_t lo1 = vandq_u8(p1, mask_lo); \
+                uint8x16_t hi1 = vshrq_n_u8(p1, 4); \
+                int8x16_t l1 = vsubq_s8(vreinterpretq_s8_u8(lo1), bias); \
+                int8x16_t h1 = vsubq_s8(vreinterpretq_s8_u8(hi1), bias); \
+                int8x16x2_t z1 = vzipq_s8(l1, h1); \
+                R1_ACC = vdotq_s32(R1_ACC, z1.val[0], a0); \
+                R1_ACC = vdotq_s32(R1_ACC, z1.val[1], a1); \
+            } while (0)
+
+            #define BLOCK2_FALLBACK(B, R0_ACC, R1_ACC) do { \
+                int j = j0 + (B) * 32; \
+                int8x16_t a0 = vld1q_s8(input + j); \
+                int8x16_t a1 = vld1q_s8(input + j + 16); \
+                uint8x16_t p0 = vld1q_u8(row0 + j / 2); \
+                uint8x16_t lo0 = vandq_u8(p0, mask_lo); \
+                uint8x16_t hi0 = vshrq_n_u8(p0, 4); \
+                int8x16_t l0 = vsubq_s8(vreinterpretq_s8_u8(lo0), bias); \
+                int8x16_t h0 = vsubq_s8(vreinterpretq_s8_u8(hi0), bias); \
+                int8x16x2_t z0 = vzipq_s8(l0, h0); \
+                int16x8_t q00 = vmull_s8(vget_low_s8(z0.val[0]), vget_low_s8(a0)); \
+                q00 = vmlal_s8(q00, vget_high_s8(z0.val[0]), vget_high_s8(a0)); \
+                int16x8_t q01 = vmull_s8(vget_low_s8(z0.val[1]), vget_low_s8(a1)); \
+                q01 = vmlal_s8(q01, vget_high_s8(z0.val[1]), vget_high_s8(a1)); \
+                R0_ACC = vpadalq_s16(R0_ACC, q00); \
+                R0_ACC = vpadalq_s16(R0_ACC, q01); \
+                uint8x16_t p1 = vld1q_u8(row1 + j / 2); \
+                uint8x16_t lo1 = vandq_u8(p1, mask_lo); \
+                uint8x16_t hi1 = vshrq_n_u8(p1, 4); \
+                int8x16_t l1 = vsubq_s8(vreinterpretq_s8_u8(lo1), bias); \
+                int8x16_t h1 = vsubq_s8(vreinterpretq_s8_u8(hi1), bias); \
+                int8x16x2_t z1 = vzipq_s8(l1, h1); \
+                int16x8_t q10 = vmull_s8(vget_low_s8(z1.val[0]), vget_low_s8(a0)); \
+                q10 = vmlal_s8(q10, vget_high_s8(z1.val[0]), vget_high_s8(a0)); \
+                int16x8_t q11 = vmull_s8(vget_low_s8(z1.val[1]), vget_low_s8(a1)); \
+                q11 = vmlal_s8(q11, vget_high_s8(z1.val[1]), vget_high_s8(a1)); \
+                R1_ACC = vpadalq_s16(R1_ACC, q10); \
+                R1_ACC = vpadalq_s16(R1_ACC, q11); \
+            } while (0)
+
+#if IB_HAS_DOTPROD
+            BLOCK2(0, r0_b0, r1_b0);
+            BLOCK2(1, r0_b1, r1_b1);
+            BLOCK2(2, r0_b2, r1_b2);
+            BLOCK2(3, r0_b3, r1_b3);
+#else
+            BLOCK2_FALLBACK(0, r0_b0, r1_b0);
+            BLOCK2_FALLBACK(1, r0_b1, r1_b1);
+            BLOCK2_FALLBACK(2, r0_b2, r1_b2);
+            BLOCK2_FALLBACK(3, r0_b3, r1_b3);
+#endif
+            #undef BLOCK2
+            #undef BLOCK2_FALLBACK
+
+            /* Reduce row 0 */
+            int32x4_t s01_0 = vpaddq_s32(r0_b0, r0_b1);
+            int32x4_t s23_0 = vpaddq_s32(r0_b2, r0_b3);
+            int32x4_t all_0 = vpaddq_s32(s01_0, s23_0);
+            float32x4_t fps_0 = vcvtq_f32_s32(all_0);
+            float32x4_t ws_0 = vld1q_f32(scales0 + wb_base);
+            row0_acc += vaddvq_f32(vmulq_f32(fps_0, ws_0)) * a_scale;
+
+            /* Reduce row 1 */
+            int32x4_t s01_1 = vpaddq_s32(r1_b0, r1_b1);
+            int32x4_t s23_1 = vpaddq_s32(r1_b2, r1_b3);
+            int32x4_t all_1 = vpaddq_s32(s01_1, s23_1);
+            float32x4_t fps_1 = vcvtq_f32_s32(all_1);
+            float32x4_t ws_1 = vld1q_f32(scales1 + wb_base);
+            row1_acc += vaddvq_f32(vmulq_f32(fps_1, ws_1)) * a_scale;
+        }
+
+        out[i]     = row0_acc;
+        out[i + 1] = row1_acc;
+    }
+
+    /* Odd-M tail: last row uses the single-row helper. */
+    if (i < M) {
+        const uint8_t* row = w + (size_t)i * (N / 2);
+        const float* row_scales = scales_w_blk32 + (size_t)i * n_w_blocks;
+        neon_matmul_w4a8_blk32_one_row(&out[i], row, row_scales, input,
+                                       scales_a, N, mask_lo, bias);
+    }
+}
+
+/* Old single-row inline kernel — kept as `_legacy` for differential debugging
+ * if a numerical regression is suspected. Currently unused. */
+__attribute__((unused))
+static void neon_matmul_w4a8_blk32_legacy(
+    float* out, const void* weights, const float* scales_w_blk32,
+    const int8_t* input, const float* scales_a, int M, int N
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    const uint8x16_t mask_lo = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+    const int G_a = IB_W4A8_GROUP;       /* 128 */
+    const int n_w_blocks = N / 32;
+    const int groups = N / G_a;
+
+    for (int i = 0; i < M; i++) {
+        const uint8_t* row = w + (size_t)i * (N / 2);
+        const float* row_scales = scales_w_blk32 + (size_t)i * n_w_blocks;
+        float row_acc = 0.0f;
+
+        for (int g = 0; g < groups; g++) {
+            const int j0 = g * G_a;
+            const int wb_base = j0 / 32;   /* 4 blocks per group */
+            const float a_scale = scales_a[g];
+
+            /* Load + unpack + dot for ALL 4 blocks before any reduction.
+             * 4 independent int32 accumulators — register pressure stays
+             * within the 32 NEON regs. */
+            int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+            int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
+
+            #define BLOCK(B, ACC) do { \
+                int j = j0 + (B) * 32; \
+                uint8x16_t packed = vld1q_u8(row + j / 2); \
+                uint8x16_t lo_u8 = vandq_u8(packed, mask_lo); \
+                uint8x16_t hi_u8 = vshrq_n_u8(packed, 4); \
+                int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias); \
+                int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias); \
+                int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8); \
+                int8x16_t a0 = vld1q_s8(input + j); \
+                int8x16_t a1 = vld1q_s8(input + j + 16); \
+                ACC = vdotq_s32(ACC, zipped.val[0], a0); \
+                ACC = vdotq_s32(ACC, zipped.val[1], a1); \
+            } while (0)
+
+            #define BLOCK_FALLBACK(B, ACC) do { \
+                int j = j0 + (B) * 32; \
+                uint8x16_t packed = vld1q_u8(row + j / 2); \
+                uint8x16_t lo_u8 = vandq_u8(packed, mask_lo); \
+                uint8x16_t hi_u8 = vshrq_n_u8(packed, 4); \
+                int8x16_t lo_s8 = vsubq_s8(vreinterpretq_s8_u8(lo_u8), bias); \
+                int8x16_t hi_s8 = vsubq_s8(vreinterpretq_s8_u8(hi_u8), bias); \
+                int8x16x2_t zipped = vzipq_s8(lo_s8, hi_s8); \
+                int8x16_t a0 = vld1q_s8(input + j); \
+                int8x16_t a1 = vld1q_s8(input + j + 16); \
+                int16x8_t p0 = vmull_s8(vget_low_s8(zipped.val[0]), vget_low_s8(a0)); \
+                p0 = vmlal_s8(p0, vget_high_s8(zipped.val[0]), vget_high_s8(a0)); \
+                int16x8_t p1 = vmull_s8(vget_low_s8(zipped.val[1]), vget_low_s8(a1)); \
+                p1 = vmlal_s8(p1, vget_high_s8(zipped.val[1]), vget_high_s8(a1)); \
+                ACC = vpadalq_s16(ACC, p0); \
+                ACC = vpadalq_s16(ACC, p1); \
+            } while (0)
+
+#if IB_HAS_DOTPROD
+            BLOCK(0, acc0);
+            BLOCK(1, acc1);
+            BLOCK(2, acc2);
+            BLOCK(3, acc3);
+#else
+            BLOCK_FALLBACK(0, acc0);
+            BLOCK_FALLBACK(1, acc1);
+            BLOCK_FALLBACK(2, acc2);
+            BLOCK_FALLBACK(3, acc3);
+#endif
+            #undef BLOCK
+            #undef BLOCK_FALLBACK
+
+            /* Vectorized cross-lane reduction: acc{0,1,2,3} each have 4
+             * partial sums in 4 lanes. Two vpaddq_s32 trees collapse
+             * them into a single int32x4_t [s0, s1, s2, s3]. Then
+             * convert + vector-multiply by the 4 weight scales (loaded
+             * with one vld1q_f32) + final vaddvq_f32. Replaces 4×
+             * vaddvq_s32 + 4 fmuls + 3 fadds with 3 vpaddq + 1 vcvt +
+             * 1 vmul + 1 vaddvq — cheaper and pipelines better. */
+            int32x4_t sums01 = vpaddq_s32(acc0, acc1);
+            int32x4_t sums23 = vpaddq_s32(acc2, acc3);
+            int32x4_t all_sums = vpaddq_s32(sums01, sums23);
+            float32x4_t fp_sums = vcvtq_f32_s32(all_sums);
+            float32x4_t w_scales_v = vld1q_f32(row_scales + wb_base);
+            float32x4_t scaled = vmulq_f32(fp_sums, w_scales_v);
+            float group_partial = vaddvq_f32(scaled);
+            row_acc += group_partial * a_scale;
+        }
+
+        /* Caller guarantees N % IB_W4A8_GROUP == 0 (and N % 32 == 0). */
+        out[i] = row_acc;
     }
 }
 
@@ -662,6 +1031,7 @@ void ib_init_kernels_neon(ib_kernels* kern) {
     kern->matmul_int8 = neon_matmul_int8;
     kern->matmul_w4a8 = neon_matmul_w4a8;
     kern->matmul_w4a8_batch = neon_matmul_w4a8_batch;
+    kern->matmul_w4a8_blk32 = neon_matmul_w4a8_blk32;
     kern->matmul_int8_batch = neon_matmul_int8_batch;
     kern->rmsnorm     = neon_rmsnorm;
     kern->rope        = neon_rope;

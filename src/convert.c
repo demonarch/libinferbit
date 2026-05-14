@@ -242,19 +242,81 @@ static size_t write_aligned(FILE* f, size_t current_offset) {
     return aligned;
 }
 
+/* Permute Q/K projection rows within each head from HF/Llama "split-half"
+ * layout to libinferbit's "interleaved" RoPE layout. Without this, Llama-
+ * family models silently produce wrong attention scores at non-trivial
+ * positions (PPL skyrockets after ~10 tokens of context).
+ *
+ * The permutation: within each head_dim block of n_heads heads, reorder
+ * rows so new[2i] = old[i] and new[2i+1] = old[head_dim/2 + i]. This
+ * matches the equivalence proven in scripts/poc/86_rope_perm_test.py. */
+static void *permute_qk_rows_alloc(const void *data, const char *dtype,
+                                     int rows, int cols, int head_dim, int n_heads) {
+    if (n_heads <= 0 || head_dim <= 0 || rows != n_heads * head_dim) return NULL;
+    int dtype_size = 0;
+    if (strcmp(dtype, "F32") == 0) dtype_size = 4;
+    else if (strcmp(dtype, "F16") == 0 || strcmp(dtype, "BF16") == 0) dtype_size = 2;
+    else return NULL;
+    size_t row_bytes = (size_t)cols * dtype_size;
+    size_t total = (size_t)rows * row_bytes;
+    void *perm = malloc(total);
+    if (!perm) return NULL;
+    int half = head_dim / 2;
+    for (int h = 0; h < n_heads; h++) {
+        for (int i = 0; i < half; i++) {
+            memcpy((char*)perm + (h * head_dim + 2 * i)     * row_bytes,
+                   (const char*)data + (h * head_dim + i)         * row_bytes, row_bytes);
+            memcpy((char*)perm + (h * head_dim + 2 * i + 1) * row_bytes,
+                   (const char*)data + (h * head_dim + half + i)  * row_bytes, row_bytes);
+        }
+    }
+    return perm;
+}
+
+static ib_written_tensor write_quantized_tensor_ts_perm(
+    FILE* f, size_t* offset,
+    const ib_tensor_source* ts, int shard, int tensor_idx,
+    int bits,
+    int qk_n_heads, int head_dim
+);
+
 static ib_written_tensor write_quantized_tensor_ts(
     FILE* f, size_t* offset,
     const ib_tensor_source* ts, int shard, int tensor_idx,
     int bits
 ) {
+    return write_quantized_tensor_ts_perm(f, offset, ts, shard, tensor_idx, bits, 0, 0);
+}
+
+static ib_written_tensor write_quantized_tensor_ts_perm(
+    FILE* f, size_t* offset,
+    const ib_tensor_source* ts, int shard, int tensor_idx,
+    int bits,
+    int qk_n_heads, int head_dim
+) {
     ib_written_tensor result = {0};
     if (tensor_idx < 0) return result;
 
-    const void* data = ib_ts_tensor_data(ts, shard, tensor_idx);
+    const void* raw_data = ib_ts_tensor_data(ts, shard, tensor_idx);
     const char* dtype = ib_ts_tensor_dtype(ts, shard, tensor_idx);
     int rows = ib_ts_tensor_shape(ts, shard, tensor_idx, 0);
     int cols = ib_ts_tensor_shape(ts, shard, tensor_idx, 1);
     if (cols == 0) cols = 1;
+
+    /* Apply Q/K row permutation if requested (lossless rearrange).
+     * Set IB_DISABLE_QK_PERM=1 to skip — diagnostic only; no model is
+     * known to require non-permuted Q/K weights at runtime. */
+    void *perm_buf = NULL;
+    const void *data = raw_data;
+    if (qk_n_heads > 0 && head_dim > 0) {
+        const char *e = getenv("IB_DISABLE_QK_PERM");
+        int disabled = (e && e[0] && e[0] != '0');
+        if (!disabled) {
+            perm_buf = permute_qk_rows_alloc(raw_data, dtype, rows, cols,
+                                                head_dim, qk_n_heads);
+            if (perm_buf) data = perm_buf;
+        }
+    }
 
     result.rows = rows;
     result.cols = cols;
@@ -287,22 +349,40 @@ static ib_written_tensor write_quantized_tensor_ts(
     } else if (bits == 4) {
         size_t w_size = (size_t)rows * cols / 2;
         uint8_t* qw = malloc(w_size);
-        uint16_t* scales = malloc(rows * sizeof(uint16_t));
 
-        ib_quantize_int4(qw, scales, data, dtype, rows, cols);
-
-        fwrite(qw, 1, w_size, f);
-        result.weight_size = w_size;
-        *offset += w_size;
-
-        *offset = write_aligned(f, *offset);
-        result.scale_offset = *offset;
-        result.scale_size = rows * 2;
-        fwrite(scales, 2, rows, f);
-        *offset += result.scale_size;
-
+        /* Per-block-32 INT4 (opt-in via IB_INT4_BLK32=1, requires cols%32==0).
+         * Stores M*(N/32) fp16 scales instead of M. Closes the per-row
+         * outlier-clipping quality gap on Llama-3-class models. */
+        const char *e_blk = getenv("IB_INT4_BLK32");
+        int use_blk32 = (e_blk && e_blk[0] && e_blk[0] != '0' && (cols % 32 == 0));
+        if (use_blk32) {
+            int n_blocks = cols / 32;
+            size_t scale_count = (size_t)rows * n_blocks;
+            uint16_t* scales = malloc(scale_count * sizeof(uint16_t));
+            ib_quantize_int4_blk32(qw, scales, data, dtype, rows, cols);
+            fwrite(qw, 1, w_size, f);
+            result.weight_size = w_size;
+            *offset += w_size;
+            *offset = write_aligned(f, *offset);
+            result.scale_offset = *offset;
+            result.scale_size = scale_count * 2;
+            fwrite(scales, 2, scale_count, f);
+            *offset += result.scale_size;
+            free(scales);
+        } else {
+            uint16_t* scales = malloc(rows * sizeof(uint16_t));
+            ib_quantize_int4(qw, scales, data, dtype, rows, cols);
+            fwrite(qw, 1, w_size, f);
+            result.weight_size = w_size;
+            *offset += w_size;
+            *offset = write_aligned(f, *offset);
+            result.scale_offset = *offset;
+            result.scale_size = rows * 2;
+            fwrite(scales, 2, rows, f);
+            *offset += result.scale_size;
+            free(scales);
+        }
         free(qw);
-        free(scales);
     } else if (bits == 2) {
         size_t w_size = (size_t)rows * cols / 4;
         uint8_t* qw = malloc(w_size);
@@ -335,6 +415,7 @@ static ib_written_tensor write_quantized_tensor_ts(
         free(fp16);
     }
 
+    if (perm_buf) free(perm_buf);
     return result;
 }
 
@@ -569,8 +650,19 @@ int inferbit_convert(
             } \
         } while(0)
 
-        CONVERT_TENSOR(lt[l].q, names.q_proj, sens);
-        CONVERT_TENSOR(lt[l].k, names.k_proj, sens);
+        /* Q/K projections need row permutation for libinferbit's interleaved
+         * RoPE — mirrors the fix already in pqv2_ibf_writer.py for IBF v6. */
+        #define CONVERT_TENSOR_QK(dst, name_suffix, bits_val, n_h) do { \
+            if (find_layer_tensor_ts(ts, &names, l, name_suffix, &s, &t) == 0) { \
+                dst = write_quantized_tensor_ts_perm(out, &offset, ts, s, t, \
+                                                       bits_val, (n_h), arch.head_dim); \
+                if (dst.weight_size > 0) dst.weight_offset -= weight_data_start; \
+                if (dst.scale_size > 0) dst.scale_offset -= weight_data_start; \
+            } \
+        } while(0)
+
+        CONVERT_TENSOR_QK(lt[l].q, names.q_proj, sens, arch.num_heads);
+        CONVERT_TENSOR_QK(lt[l].k, names.k_proj, sens, arch.num_kv_heads);
         CONVERT_TENSOR(lt[l].v, names.v_proj, sens);
         CONVERT_TENSOR(lt[l].o, names.o_proj, def);
         CONVERT_TENSOR(lt[l].gate, names.gate_proj, def);

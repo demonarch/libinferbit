@@ -67,6 +67,8 @@ typedef struct {
 
 /* ── Per-tensor metadata ────────────────────────────────────── */
 
+#include "pqv2_kernel.h"   /* pqv2_t */
+
 typedef struct {
     size_t offset;        /* Offset within weight data section */
     size_t size;          /* Size in bytes */
@@ -76,6 +78,10 @@ typedef struct {
     size_t scale_offset;  /* Offset of scale factors (0 = none) */
     size_t scale_size;    /* Size of scale data */
     bool   has_bias;
+    /* PQv2 dispatch: when non-NULL, matmul uses pqv2_matvec_*.
+     * Pointer is owned by the IBF v6 file backing (mmap or heap).
+     * NULL for legacy v5 / INT4 / INT8 / FP16 tensors. */
+    const pqv2_t* pq;
 } ib_tensor_meta;
 
 /* ── Per-layer metadata ─────────────────────────────────────── */
@@ -128,6 +134,25 @@ struct inferbit_model {
     bool   weight_data_mmap;     /* True if mmap'd, false if malloc'd */
     int    mmap_fd;              /* File descriptor if mmap'd */
 
+    /* Set after ib_metal_strip_cpu_mmap: a malloc'd buffer holding the
+     * embedding tensor's bytes that survive the original mmap being unmapped.
+     * weight_data points into this buffer (with the embedding offset baked in
+     * so cpu_embed_lookup keeps working). model_free is responsible for
+     * free()-ing this buffer when set. */
+    void*  embed_strip_buffer;
+
+    /* IBF v6 PQv2 file backing (NULL for v5 / non-PQv2 models).
+     * When set, pq tensor metadata in ib_tensor_meta points into this
+     * file's mmap region; freed in inferbit_model_free.
+     * Stored as opaque void* to avoid pulling pqv2_format.h here. */
+    void*  pqv2_file_backing;
+
+    /* Pre-allocated PQv2 threading scratch — sized for n_threads × max_M.
+     * Used by pqv2_threaded_matvec_k256 to avoid aligned_alloc/free on
+     * every matvec call (~154 calls per token in the hot path). */
+    float *pqv2_thread_acc_pool;
+    size_t pqv2_thread_acc_pool_floats;
+
     /* KV cache (one per layer) */
     ib_kv_cache* kv_caches;
 
@@ -171,6 +196,43 @@ struct inferbit_model {
     /* Threading */
     int num_threads;
     struct ib_thread_pool* thread_pool;
+
+    /* Residency mode (Path D, doc 23/24, executed via doc 32). Controls
+     * whether PQv2 indices pages stay RAM-resident or are streamed from
+     * disk per matmul.
+     *   0 = RAM (default): full model mmap'd; OS holds it hot.
+     *   1 = DRIVE: file fd is F_NOCACHE on Darwin / POSIX_FADV_RANDOM on
+     *       Linux. Before each PQv2 matmul we pread() the indices into
+     *       a single page-aligned scratch buffer; the kernel reads from
+     *       there. Peak indices residency = max-matmul-indices,
+     *       independent of model size.
+     *
+     * Off by default. Enable via IB_RESIDENCY_MODE=drive at model load. */
+    int    residency_mode;
+
+    /* Rotating KV-cache window (doc 36 phase 2.2), copied from config at
+     * load. 0 = full causal cache. >0 = each layer's KV cache is a ring
+     * of `kv_window` physical slots; logical position p lives at slot
+     * p % kv_window. Attention only reads the most recent kv_window
+     * positions. Peak KV RAM becomes O(kv_window) instead of O(seq_len). */
+    int    kv_window;
+
+    /* Lazily-created Metal context + uploaded GPU buffers (doc 36 phase
+     * 4.1). Allocated on the first inferbit_forward_with_hiddens call and
+     * cached for reuse; freed in inferbit_free. Opaque void* so this
+     * header stays free of metal_runtime.h. NULL until first use. */
+    void  *metal_ctx;
+    void  *metal_bufs;
+    int    drive_fd;                  /* fd of the IBF, F_NOCACHE set on Darwin */
+    void  *drive_indices_scratch;     /* page-aligned shared buffer */
+    size_t drive_indices_scratch_size;
+    /* Pre-transposed sidecar (doc 35 feature 3). Built once at drive-
+     * mode init from the original [c][s][m] indices, stores them in
+     * kernel-native [m][total] layout for GPU drive-mode preads —
+     * eliminates the per-matmul transpose that was the drive-mode
+     * CPU-bottleneck floor. CPU drive path continues to use drive_fd
+     * (chunk-major). -1 = no sidecar (CPU-only drive or build failed). */
+    int    drive_fd_pretransposed;
 };
 
 /* ── Config struct ──────────────────────────────────────────── */
@@ -181,6 +243,12 @@ struct inferbit_config {
     bool kv_dynamic;
     bool native_parse;
     int  native_bits;
+    /* Rotating KV-cache window (doc 36 phase 2.2). 0 = full causal cache
+     * (default). >0 = ring buffer of `kv_window` token slots; logical
+     * position p maps to physical slot p % kv_window. Bounds KV RAM at
+     * long context for the (acceptable) cost of a sliding-window
+     * attention horizon. */
+    int  kv_window;
 };
 
 /* ── SIMD dispatch ──────────────────────────────────────────── */
@@ -242,6 +310,21 @@ typedef struct {
      * when available. */
     void (*matmul_w4a8)(
         float* out, const void* weights, const float* scales_w,
+        const int8_t* input, const float* scales_a, int M, int N
+    );
+
+    /* W4A8 with per-32-element block scales on the WEIGHT side.
+     *
+     * scales_w has length M*(N/32) (one fp32 per 32 weight elements per row),
+     * vs the per-row scales_w[M] used by matmul_w4a8 above. Activation
+     * grouping is unchanged (per-IB_W4A8_GROUP=128). N must be a multiple
+     * of 32 (and IB_W4A8_GROUP must be a multiple of 32 — currently 128/32=4).
+     *
+     * Used to close the per-row outlier-clipping quality gap on Llama-3-class
+     * models where late-layer outliers spoil per-row scaling. May be NULL
+     * on backends that don't yet support it; callers should fall back. */
+    void (*matmul_w4a8_blk32)(
+        float* out, const void* weights, const float* scales_w_per_block,
         const int8_t* input, const float* scales_a, int M, int N
     );
 
@@ -401,6 +484,10 @@ void ib_quantize_int8(int8_t* out, uint16_t* scales, const void* src,
                       const char* dtype, int rows, int cols);
 void ib_quantize_int4(uint8_t* out, uint16_t* scales, const void* src,
                       const char* dtype, int rows, int cols);
+/* INT4 with per-32-element block scales. cols must be a multiple of 32.
+ * Output scale array is [rows * (cols/32)] fp16. */
+void ib_quantize_int4_blk32(uint8_t* out, uint16_t* scales, const void* src,
+                             const char* dtype, int rows, int cols);
 void ib_quantize_int2(uint8_t* out, uint16_t* scales, const void* src,
                       const char* dtype, int rows, int cols);
 void ib_copy_norm_fp16(uint16_t* out, const void* src, const char* dtype, int size);

@@ -6,8 +6,13 @@
 
 #include "inferbit_internal.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 /* W4A8 path is on by default. Set IB_W4A8=0 in env to force the FP32
  * activation fallback (used for A/B comparison and debugging). */
@@ -31,6 +36,42 @@ static inline const void* tensor_data(const inferbit_model* m, const ib_tensor_m
 static inline const void* tensor_scales_raw(const inferbit_model* m, const ib_tensor_meta* t) {
     if (t->scale_offset == 0 && t->scale_size == 0) return NULL;
     return (const uint8_t*)m->weight_data + t->scale_offset;
+}
+
+/* Path D (Solution 5): pread the indices for one PQv2 tensor from the
+ * on-disk file into the model's shared scratch buffer. The PQv2 kernel
+ * reads via pq->indices, which we redirected to scratch at load time
+ * (pqv2_model.c). Each matmul refills scratch from pq->indices_file_offset.
+ *
+ * Returns 0 on success. Falls back silently to a no-op if the model
+ * isn't in drive mode or the offset isn't set. */
+static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) {
+    if (!m || m->residency_mode != 1) return 0;
+    if (!t || !t->pq) return 0;
+    if (!m->drive_indices_scratch || m->drive_fd < 0) return 0;
+    const pqv2_t* pq = t->pq;
+    size_t bytes = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
+    if (bytes == 0 || bytes > m->drive_indices_scratch_size) return -1;
+    off_t off = (off_t)pq->indices_file_offset;
+    if (off == 0) return 0;     /* not redirected; mmap'd path */
+    /* pread fills scratch from disk. The fd has F_NOCACHE on Darwin so
+     * this read bypasses UBC entirely. */
+    size_t done = 0;
+    uint8_t *buf = (uint8_t *)m->drive_indices_scratch;
+    while (done < bytes) {
+        ssize_t r = pread(m->drive_fd, buf + done, bytes - done, off + (off_t)done);
+        if (r <= 0) {
+            if (r == -1 && errno == EINTR) continue;
+            return -1;
+        }
+        done += (size_t)r;
+    }
+#if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
+    /* Solution 4: on Linux, drop the just-read region from the page
+     * cache so subsequent matmuls aren't biased by it. No-op on Darwin. */
+    (void)posix_fadvise(m->drive_fd, off, (off_t)bytes, POSIX_FADV_DONTNEED);
+#endif
+    return 0;
 }
 
 /* ── FP16 conversion ────────────────────────────────────────── */
@@ -87,10 +128,75 @@ static void fp16_weights_to_fp32(float* out, const void* fp16_data, int count) {
 
 /* ── Embedding lookup ───────────────────────────────────────── */
 
-static void embedding_lookup(const inferbit_model* m, int token_id, float* out) {
+/* Non-static: also used by inferbit_forward_with_hiddens (forward_hiddens.c)
+ * to decode token IDs into fp32 embeddings for the Metal prefill path. */
+void ib_embedding_lookup(const inferbit_model* m, int token_id, float* out);
+void ib_embedding_lookup(const inferbit_model* m, int token_id, float* out) {
     int hidden = m->header.hidden_size;
     const ib_tensor_meta* emb = &m->token_embedding;
 
+    if (emb->pq) {
+        /* PQv2 embedding: decode one row. */
+        const pqv2_t* pq = emb->pq;
+        uint32_t G = pq->G;
+        uint32_t ns = pq->n_subchunks;
+        uint32_t K = pq->K;
+        uint32_t HALF = pq->half;
+        uint32_t nc = pq->N / G;
+        uint32_t total = nc * ns;
+        const int8_t* cb_q = (const int8_t*)pq->cb_q;           /* [ns][K][HALF] */
+        const uint16_t* cb_s = (const uint16_t*)pq->cb_scale;   /* [ns][K] */
+        float rs = pq->row_scale ? fp16_to_fp32(((const uint16_t*)pq->row_scale)[token_id]) : 1.0f;
+
+        /* Doc-35 feature 1: if the pre-transposed sidecar is built and
+         * the embedding has a sidecar entry, pread one ROW (total bytes)
+         * from the sidecar instead of mmap-reading `total` widely-strided
+         * single bytes. Sidecar layout is [token][total] so a row is
+         * one contiguous pread = ~1024 bytes. Keeps the source mmap
+         * region cold (cache-eviction-friendly). */
+        if (m->residency_mode == 1 && m->drive_fd_pretransposed >= 0
+            && pq->indices_pretransposed_offset != 0) {
+            uint8_t row_buf[2048];   /* nc*ns ≤ 2048 in practice */
+            if (total > sizeof(row_buf)) goto embed_mmap_path;
+            off_t off = (off_t)pq->indices_pretransposed_offset
+                      + (off_t)token_id * (off_t)total;
+            size_t done = 0;
+            while (done < total) {
+                ssize_t r = pread(m->drive_fd_pretransposed,
+                                  row_buf + done, total - done,
+                                  off + (off_t)done);
+                if (r <= 0) { if (r == -1 && errno == EINTR) continue; goto embed_mmap_path; }
+                done += (size_t)r;
+            }
+            for (uint32_t c = 0; c < nc; c++) {
+                for (uint32_t s = 0; s < ns; s++) {
+                    uint8_t k = row_buf[c * ns + s];
+                    float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
+                    for (uint32_t h = 0; h < HALF; h++) {
+                        int8_t q = cb_q[(s * K + k) * HALF + h];
+                        out[c * G + s * HALF + h] = (float)q * scl;
+                    }
+                }
+            }
+            return;
+        }
+
+embed_mmap_path:
+        {
+            const uint8_t* idx_base = (const uint8_t*)pq->indices;  /* [nc][ns][M] */
+            for (uint32_t c = 0; c < nc; c++) {
+                for (uint32_t s = 0; s < ns; s++) {
+                    uint8_t k = idx_base[((size_t)c * ns + s) * pq->M + token_id];
+                    float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
+                    for (uint32_t h = 0; h < HALF; h++) {
+                        int8_t q = cb_q[(s * K + k) * HALF + h];
+                        out[c * G + s * HALF + h] = (float)q * scl;
+                    }
+                }
+            }
+        }
+        return;
+    }
     if (emb->bits == 8) {
         /* INT8 embedding: dequantize row */
         const int8_t* data = (const int8_t*)tensor_data(m, emb);
@@ -141,19 +247,288 @@ static void embedding_lookup(const inferbit_model* m, int token_id, float* out) 
  * Handles bit-width dispatch and scale conversion.
  * `scale_buf` is a caller-provided temporary buffer of at least M floats.
  */
+static void pqv2_matvec_dispatch(const pqv2_t *t, const float *x, float *y) {
+    if (t->K == 256)      pqv2_matvec_tbl_int8_k256(t, x, y);
+    else if (t->K == 128) pqv2_matvec_tbl_int8_k128(t, x, y);
+    else if (t->K <= 64)  pqv2_matvec_tbl_int8(t, x, y);
+    else                  pqv2_matvec_lut(t, x, y);
+}
+
+/* Per-chunk threading: each worker processes a slice of chunks, accumulating
+ * into its own thread-local acc[M]. Main thread reduces across workers and
+ * applies row_scale + L2 contribution.
+ *
+ * Why per-chunk and not per-row: the kernel builds an LUT per (chunk, subchunk)
+ * that's INDEPENDENT of M but DEPENDS on x. Per-row threading would force
+ * each worker to redundantly rebuild every LUT (4× total LUT-build work).
+ * Per-chunk threading distributes LUT-build evenly with no redundancy. */
+typedef struct {
+    const pqv2_t *t;
+    const float  *x;
+    float        *acc_pool;
+    float        *acc_l2_pool;
+    uint32_t      M;
+    int           chunk_size;
+    int           n_slots;
+    float         skip_thresh;   /* 0 = no skip */
+} ib_pqv2_chunks_arg;
+
+static void ib_pqv2_chunks_task(void *arg, int tid, int start, int end) {
+    (void)tid;
+    const ib_pqv2_chunks_arg *a = (const ib_pqv2_chunks_arg*)arg;
+    int slot = start / a->chunk_size;
+    if (slot < 0) slot = 0;
+    if (slot >= a->n_slots) slot = a->n_slots - 1;
+    float *acc    = a->acc_pool    + (size_t)slot * a->M;
+    float *acc_l2 = a->acc_l2_pool ? a->acc_l2_pool + (size_t)slot * a->M : NULL;
+    if (a->skip_thresh > 0.0f) {
+        pqv2_acc_tbl_int8_k256_chunks_skip(a->t, a->x,
+                                              a->t->cb_fp32, a->t->l2_cb_fp32,
+                                              acc, acc_l2,
+                                              (uint32_t)start, (uint32_t)end,
+                                              a->skip_thresh);
+    } else {
+        pqv2_acc_tbl_int8_k256_chunks(a->t, a->x,
+                                        a->t->cb_fp32, a->t->l2_cb_fp32,
+                                        acc, acc_l2,
+                                        (uint32_t)start, (uint32_t)end);
+    }
+}
+
+/* Forward decl for the single-position threaded variant (defined below). */
+static void pqv2_threaded_matvec_k256(
+    const inferbit_model *m,
+    struct ib_thread_pool *tp, int n_threads,
+    const pqv2_t *t, const float *x, float *y);
+
+/* Batched-aware variant of the per-chunk threading. Same chunk-to-slot
+ * mapping as the single-position threaded path so each output position's
+ * fp32 summation order is bit-identical between single-token decode and
+ * spec verify. acc pool layout: [n_slots, B, M]. */
+typedef struct {
+    const pqv2_t *t;
+    const float  *x_batch;
+    int           B;
+    float        *acc_pool;
+    uint32_t      M;
+    int           chunk_size;
+    int           n_slots;
+} ib_pqv2_chunks_batch_arg;
+
+static void ib_pqv2_chunks_batch_task(void *arg, int tid, int start, int end) {
+    (void)tid;
+    const ib_pqv2_chunks_batch_arg *a = (const ib_pqv2_chunks_batch_arg*)arg;
+    int slot = start / a->chunk_size;
+    if (slot < 0) slot = 0;
+    if (slot >= a->n_slots) slot = a->n_slots - 1;
+    /* Slot owns a [B, M] block. */
+    float *acc = a->acc_pool + (size_t)slot * a->B * a->M;
+    pqv2_acc_tbl_int8_k256_chunks_batch(a->t, a->x_batch, a->B,
+                                          a->t->cb_fp32, acc,
+                                          (uint32_t)start, (uint32_t)end);
+}
+
+static void pqv2_threaded_matvec_k256_batch(
+    const inferbit_model *m,
+    struct ib_thread_pool *tp, int n_threads,
+    const pqv2_t *t, const float *x_batch, int B, float *y_batch)
+{
+    if (B <= 0) return;
+    if (B == 1) {
+        pqv2_threaded_matvec_k256(m, tp, n_threads, t, x_batch, y_batch);
+        return;
+    }
+    uint32_t M = t->M;
+    uint32_t n_chunks = t->N / t->G;
+    if (!tp || n_threads <= 1 || n_chunks < (uint32_t)n_threads ||
+        !t->cb_fp32 || t->K != 256 || B > 8) {
+        pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
+        return;
+    }
+    int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
+    int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
+    size_t pool_floats = (size_t)n_slots * B * M;
+    float *acc_pool = aligned_alloc(64,
+        (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+    if (!acc_pool) {
+        pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
+        return;
+    }
+    memset(acc_pool, 0, pool_floats * sizeof(float));
+    ib_pqv2_chunks_batch_arg arg = {
+        .t = t, .x_batch = x_batch, .B = B,
+        .acc_pool = acc_pool, .M = M,
+        .chunk_size = chunks_per_task, .n_slots = n_slots,
+    };
+    ib_pool_run(tp, ib_pqv2_chunks_batch_task, &arg,
+                 (int)n_chunks, chunks_per_task);
+
+    /* Reduce per-position: y[b,m] = (sum_s acc[s,b,m]) * row_scale[m].
+     * Slot order is fixed (s=0..n_slots-1) so this matches the
+     * single-position threaded reduction exactly when B=1. */
+    for (int b = 0; b < B; b++) {
+        float *yb = y_batch + (size_t)b * M;
+        for (uint32_t m = 0; m < M; m++) {
+            float a = 0.0f;
+            for (int s = 0; s < n_slots; s++) {
+                a += acc_pool[(size_t)s * B * M + (size_t)b * M + m];
+            }
+            float rs = pqv2_h2f(t->row_scale[m]);
+            yb[m] = a * rs;
+        }
+    }
+    free(acc_pool);
+}
+
+static void pqv2_threaded_matvec_k256(
+    const inferbit_model *m,
+    struct ib_thread_pool *tp, int n_threads,
+    const pqv2_t *t, const float *x, float *y)
+{
+    uint32_t M = t->M;
+    uint32_t n_chunks = t->N / t->G;
+    /* Bail out to single-thread when threading wouldn't pay off. */
+    if (!tp || n_threads <= 1 || n_chunks < (uint32_t)n_threads ||
+        !t->cb_fp32 || t->K != 256) {
+        pqv2_matvec_dispatch(t, x, y);
+        return;
+    }
+    int has_l2 = (t->l2_kind == 2 && t->l2_cb_fp32 && t->l2_K <= 64);
+    int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
+    int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
+    size_t pool_floats = (size_t)n_slots * M;
+    /* Use model-scope scratch to avoid per-call aligned_alloc. The
+     * scratch is sized for n_threads × max_M; fall back to a fresh
+     * malloc only if (somehow) the request exceeds that budget. */
+    float *acc_pool;
+    int acc_pool_owned = 0;
+    if (m && m->pqv2_thread_acc_pool && pool_floats <= m->pqv2_thread_acc_pool_floats) {
+        acc_pool = m->pqv2_thread_acc_pool;
+    } else {
+        acc_pool = aligned_alloc(64,
+            (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+        if (!acc_pool) { pqv2_matvec_dispatch(t, x, y); return; }
+        acc_pool_owned = 1;
+    }
+    memset(acc_pool, 0, pool_floats * sizeof(float));
+    float *acc_l2_pool = NULL;
+    int acc_l2_owned = 0;
+    if (has_l2) {
+        acc_l2_pool = aligned_alloc(64,
+            (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+        if (acc_l2_pool) {
+            memset(acc_l2_pool, 0, pool_floats * sizeof(float));
+            acc_l2_owned = 1;
+        }
+    }
+    /* Activation-aware skip: when IB_PQV2_SKIP env is set (e.g. "0.01"),
+     * skip (c,s) iters with max|x_slice| < ratio * max|x|. 1% threshold
+     * is essentially lossless on transformer activations. Skip rate
+     * naturally adapts: outlier-heavy early layers skip a lot, diffuse
+     * later layers skip little. */
+    float skip_thresh = 0.0f;
+    {
+        const char *env = getenv("IB_PQV2_SKIP");
+        if (env && env[0]) {
+            float ratio = (float)atof(env);
+            if (ratio > 0.0f && ratio < 1.0f) {
+                float xmax = 0.0f;
+                for (uint32_t i = 0; i < t->N; i++) {
+                    float v = x[i]; if (v < 0) v = -v;
+                    if (v > xmax) xmax = v;
+                }
+                skip_thresh = ratio * xmax;
+            }
+        }
+    }
+    ib_pqv2_chunks_arg arg = {
+        .t = t, .x = x,
+        .acc_pool = acc_pool, .acc_l2_pool = acc_l2_pool,
+        .M = M,
+        .chunk_size = chunks_per_task,
+        .n_slots = n_slots,
+        .skip_thresh = skip_thresh,
+    };
+    ib_pool_run(tp, ib_pqv2_chunks_task, &arg, (int)n_chunks, chunks_per_task);
+
+    /* Reduce: sum across deterministic slot order, then apply row_scale + L2 */
+    for (uint32_t m = 0; m < M; m++) {
+        float a = 0.0f, al2 = 0.0f;
+        for (int s = 0; s < n_slots; s++) {
+            a += acc_pool[(size_t)s * M + m];
+            if (acc_l2_pool) al2 += acc_l2_pool[(size_t)s * M + m];
+        }
+        float rs = pqv2_h2f(t->row_scale[m]);
+        y[m] = a * rs + al2;
+    }
+    if (acc_pool_owned) free(acc_pool);
+    if (acc_l2_owned) free(acc_l2_pool);
+}
+
 static void tensor_matmul(
     const inferbit_model* m, const ib_tensor_meta* t,
     float* out, const float* input, int M, int N,
     float* scale_buf
 ) {
+    /* PQv2 dispatch — takes precedence when present. Per-chunk threading
+     * for K=256; falls back to single-thread for other K or no pool. */
+    if (t->pq) {
+        const pqv2_t* pq = t->pq;
+        /* Path D drive mode (Solution 5): pread the indices from disk
+         * into the model's scratch buffer (which pq->indices was
+         * redirected to at load). Kernel then reads from scratch. */
+        if (m->residency_mode == 1) {
+            (void)drive_load_indices(m, t);
+        }
+        if (pq->K == 256 && m->thread_pool && m->num_threads > 1) {
+            pqv2_threaded_matvec_k256(m, m->thread_pool, m->num_threads,
+                                        pq, input, out);
+        } else {
+            pqv2_matvec_dispatch(pq, input, out);
+        }
+        return;
+    }
+
     const void* weights = tensor_data(m, t);
     const void* scales_raw = tensor_scales_raw(m, t);
 
-    if (scales_raw) {
+    /* Detect per-block-32 INT4 scaling: scale_size > rows*2 ⇒ N/32 fp16
+     * scales per row instead of one. Triggered by IB_INT4_BLK32 at convert
+     * time. The new kernel handles a flat fp32 buffer of M*(N/32) scales. */
+    int is_blk32_int4 = (t->bits == 4 && t->scale_size > (size_t)M * 2);
+    float *blk32_scales = NULL;
+    int n_w_blocks = 0;
+    if (is_blk32_int4) {
+        n_w_blocks = N / 32;
+        size_t total = (size_t)M * (size_t)n_w_blocks;
+        blk32_scales = (float*)malloc(total * sizeof(float));
+        if (blk32_scales) scales_to_fp32(blk32_scales, scales_raw, (int)total);
+        else is_blk32_int4 = 0;   /* fall back if alloc failed */
+    } else if (scales_raw) {
         scales_to_fp32(scale_buf, scales_raw, M);
     } else {
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
     }
+
+    if (is_blk32_int4 && ib_kern.matmul_w4a8_blk32) {
+        /* Per-block-32 INT4 path: quantize input as usual, dispatch to the
+         * blk32-aware kernel. No batched/parallel wrapper for now — the
+         * scalar kernel is single-threaded. */
+        int8_t stack_q[4096];
+        float  stack_s[4096 / IB_W4A8_GROUP + 1];
+        int n_groups = (N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
+        int8_t* q_buf = (N <= 4096) ? stack_q : (int8_t*)malloc((size_t)N);
+        float*  s_buf = (n_groups <= (int)(sizeof stack_s / sizeof *stack_s))
+                        ? stack_s
+                        : (float*)malloc((size_t)n_groups * sizeof(float));
+        ib_quantize_input_int8_g128(input, q_buf, s_buf, N);
+        ib_kern.matmul_w4a8_blk32(out, weights, blk32_scales, q_buf, s_buf, M, N);
+        if (q_buf != stack_q) free(q_buf);
+        if (s_buf != stack_s) free(s_buf);
+        free(blk32_scales);
+        return;
+    }
+    if (blk32_scales) free(blk32_scales);
 
     if (t->bits == 4 && w4a8_enabled() && ib_kern.matmul_w4a8) {
         /* Quantize input to INT8 per-group (IB_W4A8_GROUP elements per
@@ -209,6 +584,36 @@ static void tensor_matmul_batch(
         scales_to_fp32(scale_buf, scales_raw, M);
     } else {
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
+    }
+
+    /* PQv2 batched path: per-chunk threading shared across B positions.
+     * Each chunk slot contributes to ALL B output positions, so weight
+     * reads are amortised across B. Same chunk-to-slot partition as
+     * the single-position threaded path → identical fp32 sum order. */
+    if (t->pq) {
+        const pqv2_t* pq = t->pq;
+        /* Drive mode: pread indices ONCE for this tensor; the batched
+         * kernel below reuses the same scratch for all B positions. */
+        if (m->residency_mode == 1) {
+            (void)drive_load_indices(m, t);
+        }
+        if (pq->K == 256 && B >= 1 && B <= 8 &&
+            m->thread_pool && m->num_threads > 1) {
+            pqv2_threaded_matvec_k256_batch(m, m->thread_pool, m->num_threads,
+                                              pq, input, B, out);
+            return;
+        }
+        if (pq->K == 256 && B > 1 && B <= 8) {
+            pqv2_matvec_tbl_int8_k256_batch(pq, input, B, out);
+            return;
+        }
+        for (int b = 0; b < B; b++) {
+            /* Recursive call will re-pread; could optimize later by
+             * not re-loading scratch within the same tensor. */
+            tensor_matmul(m, t, out + (size_t)b * M, input + (size_t)b * N,
+                          M, N, scale_buf);
+        }
+        return;
     }
 
     if (t->bits == 4 && w4a8_enabled() && ib_kern.matmul_w4a8_batch && q_scratch && sa_scratch) {
@@ -352,17 +757,21 @@ static inline void kv_read_int4_row(float* out, const uint8_t* src, float scale,
 static void kv_cache_write(ib_kv_cache* kv, int pos,
                            const float* key, const float* value,
                            int kv_dim, int n_kv_heads, int head_dim, int kv_bits) {
+    /* Rotating KV window (doc 36 phase 2.2): logical position `pos` lands
+     * in physical slot pos % capacity. When not windowed, capacity is the
+     * full context so pos < capacity and this is the identity map. */
+    int phys = (kv->capacity > 0) ? (pos % kv->capacity) : pos;
     if (kv_bits >= 16) {
         float* k_store = (float*)kv->key_data;
         float* v_store = (float*)kv->value_data;
-        memcpy(k_store + (size_t)pos * kv_dim, key, kv_dim * sizeof(float));
-        memcpy(v_store + (size_t)pos * kv_dim, value, kv_dim * sizeof(float));
+        memcpy(k_store + (size_t)phys * kv_dim, key, kv_dim * sizeof(float));
+        memcpy(v_store + (size_t)phys * kv_dim, value, kv_dim * sizeof(float));
         return;
     }
 
     if (kv_bits == 8) {
-        int8_t* k_store = (int8_t*)kv->key_data + (size_t)pos * kv_dim;
-        int8_t* v_store = (int8_t*)kv->value_data + (size_t)pos * kv_dim;
+        int8_t* k_store = (int8_t*)kv->key_data + (size_t)phys * kv_dim;
+        int8_t* v_store = (int8_t*)kv->value_data + (size_t)phys * kv_dim;
         for (int h = 0; h < n_kv_heads; h++) {
             const float* k_h = key + h * head_dim;
             const float* v_h = value + h * head_dim;
@@ -373,8 +782,8 @@ static void kv_cache_write(ib_kv_cache* kv, int pos,
             }
             float k_scale = k_max / 127.0f; if (k_scale < 1e-8f) k_scale = 1e-8f;
             float v_scale = v_max / 127.0f; if (v_scale < 1e-8f) v_scale = 1e-8f;
-            kv->key_scales[(size_t)pos * n_kv_heads + h] = k_scale;
-            kv->value_scales[(size_t)pos * n_kv_heads + h] = v_scale;
+            kv->key_scales[(size_t)phys * n_kv_heads + h] = k_scale;
+            kv->value_scales[(size_t)phys * n_kv_heads + h] = v_scale;
             float k_inv = 1.0f / k_scale;
             float v_inv = 1.0f / v_scale;
             for (int d = 0; d < head_dim; d++) {
@@ -391,8 +800,8 @@ static void kv_cache_write(ib_kv_cache* kv, int pos,
 
     if (kv_bits == 4) {
         size_t row_bytes = (size_t)(kv_dim + 1) / 2;
-        uint8_t* k_store = (uint8_t*)kv->key_data + (size_t)pos * row_bytes;
-        uint8_t* v_store = (uint8_t*)kv->value_data + (size_t)pos * row_bytes;
+        uint8_t* k_store = (uint8_t*)kv->key_data + (size_t)phys * row_bytes;
+        uint8_t* v_store = (uint8_t*)kv->value_data + (size_t)phys * row_bytes;
         for (int h = 0; h < n_kv_heads; h++) {
             const float* k_h = key + h * head_dim;
             const float* v_h = value + h * head_dim;
@@ -403,8 +812,8 @@ static void kv_cache_write(ib_kv_cache* kv, int pos,
             }
             float k_scale = k_max / 7.0f; if (k_scale < 1e-8f) k_scale = 1e-8f;
             float v_scale = v_max / 7.0f; if (v_scale < 1e-8f) v_scale = 1e-8f;
-            kv->key_scales[(size_t)pos * n_kv_heads + h] = k_scale;
-            kv->value_scales[(size_t)pos * n_kv_heads + h] = v_scale;
+            kv->key_scales[(size_t)phys * n_kv_heads + h] = k_scale;
+            kv->value_scales[(size_t)phys * n_kv_heads + h] = v_scale;
             kv_write_int4_row(k_store + (size_t)h * ((head_dim + 1) / 2), k_h, k_scale, head_dim);
             kv_write_int4_row(v_store + (size_t)h * ((head_dim + 1) / 2), v_h, v_scale, head_dim);
         }
@@ -415,19 +824,22 @@ static void kv_cache_write(ib_kv_cache* kv, int pos,
 static void kv_cache_read_head(const ib_kv_cache* kv, int is_key, int pos, int kv_head,
                                int kv_dim, int n_kv_heads, int head_dim, int kv_bits,
                                float* out_head) {
+    /* Rotating KV window: logical position -> physical slot pos % capacity
+     * (identity map when not windowed). */
+    int phys = (kv->capacity > 0) ? (pos % kv->capacity) : pos;
     if (kv_bits >= 16) {
         const float* src = is_key ? (const float*)kv->key_data : (const float*)kv->value_data;
-        const float* row = src + (size_t)pos * kv_dim + kv_head * head_dim;
+        const float* row = src + (size_t)phys * kv_dim + kv_head * head_dim;
         memcpy(out_head, row, head_dim * sizeof(float));
         return;
     }
 
     if (kv_bits == 8) {
         const int8_t* src = is_key ? (const int8_t*)kv->key_data : (const int8_t*)kv->value_data;
-        const int8_t* row = src + (size_t)pos * kv_dim + kv_head * head_dim;
+        const int8_t* row = src + (size_t)phys * kv_dim + kv_head * head_dim;
         float scale = is_key
-            ? kv->key_scales[(size_t)pos * n_kv_heads + kv_head]
-            : kv->value_scales[(size_t)pos * n_kv_heads + kv_head];
+            ? kv->key_scales[(size_t)phys * n_kv_heads + kv_head]
+            : kv->value_scales[(size_t)phys * n_kv_heads + kv_head];
         for (int d = 0; d < head_dim; d++) out_head[d] = (float)row[d] * scale;
         return;
     }
@@ -435,10 +847,10 @@ static void kv_cache_read_head(const ib_kv_cache* kv, int is_key, int pos, int k
     if (kv_bits == 4) {
         size_t row_bytes = (size_t)(kv_dim + 1) / 2;
         const uint8_t* src = is_key ? (const uint8_t*)kv->key_data : (const uint8_t*)kv->value_data;
-        const uint8_t* row = src + (size_t)pos * row_bytes + (size_t)kv_head * ((head_dim + 1) / 2);
+        const uint8_t* row = src + (size_t)phys * row_bytes + (size_t)kv_head * ((head_dim + 1) / 2);
         float scale = is_key
-            ? kv->key_scales[(size_t)pos * n_kv_heads + kv_head]
-            : kv->value_scales[(size_t)pos * n_kv_heads + kv_head];
+            ? kv->key_scales[(size_t)phys * n_kv_heads + kv_head]
+            : kv->value_scales[(size_t)phys * n_kv_heads + kv_head];
         kv_read_int4_row(out_head, row, scale, head_dim);
         return;
     }
@@ -466,33 +878,46 @@ static void ib_attn_head_task(void* arg, int tid, int start, int end) {
     float k_tmp[256];
     float v_tmp[256];
 
+    /* Rotating KV window (doc 36 phase 2.2): only the most recent
+     * `capacity` positions are physically live; older ones were evicted.
+     * When not windowed, capacity is the full context so t_lo is 0 and
+     * this attends to everything (unchanged behaviour). The att row is
+     * compacted into [0, n_valid) so softmax + weighted-V operate on the
+     * live window only; logical position t reads physical slot t % cap. */
+    int cap = c->kv->capacity;
+    int t_lo = (cap > 0 && c->pos + 1 > cap) ? (c->pos + 1 - cap) : 0;
+    int n_valid = c->pos + 1 - t_lo;
+
     for (int h = start; h < end; h++) {
         float* q_h = c->q + h * c->head_dim;
         int kv_h = h / c->heads_per_kv;
+        float* att_h = c->att + h * (c->pos + 1);
 
-        for (int t = 0; t <= c->pos; t++) {
+        for (int t = t_lo; t <= c->pos; t++) {
+            int phys = (cap > 0) ? (t % cap) : t;
             float score = 0.0f;
             if (c->kv_bits >= 16) {
                 float* k_cache = (float*)c->kv->key_data;
-                float* k_t = k_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
+                float* k_t = k_cache + (size_t)phys * c->kv_dim + kv_h * c->head_dim;
                 for (int d = 0; d < c->head_dim; d++) score += q_h[d] * k_t[d];
             } else {
                 kv_cache_read_head(c->kv, 1, t, kv_h, c->kv_dim, c->n_kv_heads,
                                    c->head_dim, c->kv_bits, k_tmp);
                 for (int d = 0; d < c->head_dim; d++) score += q_h[d] * k_tmp[d];
             }
-            c->att[h * (c->pos + 1) + t] = score * c->scale;
+            att_h[t - t_lo] = score * c->scale;
         }
 
-        ib_kern.softmax(c->att + h * (c->pos + 1), c->pos + 1);
+        ib_kern.softmax(att_h, n_valid);
 
         float* out_h = c->xb2 + h * c->head_dim;
         memset(out_h, 0, c->head_dim * sizeof(float));
-        for (int t = 0; t <= c->pos; t++) {
-            float a = c->att[h * (c->pos + 1) + t];
+        for (int t = t_lo; t <= c->pos; t++) {
+            int phys = (cap > 0) ? (t % cap) : t;
+            float a = att_h[t - t_lo];
             if (c->kv_bits >= 16) {
                 float* v_cache = (float*)c->kv->value_data;
-                float* v_t = v_cache + (size_t)t * c->kv_dim + kv_h * c->head_dim;
+                float* v_t = v_cache + (size_t)phys * c->kv_dim + kv_h * c->head_dim;
                 for (int d = 0; d < c->head_dim; d++) out_h[d] += a * v_t[d];
             } else {
                 kv_cache_read_head(c->kv, 0, t, kv_h, c->kv_dim, c->n_kv_heads,
@@ -555,7 +980,7 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
     float* scale_buf = att + (size_t)n_heads * (pos + 1);
 
     /* Embedding lookup */
-    embedding_lookup(m, token_id, x);
+    ib_embedding_lookup(m, token_id, x);
 
     /* Transformer layers */
     for (int l = 0; l < n_layers; l++) {
@@ -718,7 +1143,7 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
 
     /* Embed each token (cheap, per-position). */
     for (int b = 0; b < B; b++) {
-        embedding_lookup(m, tokens[b], x + (size_t)b * hidden);
+        ib_embedding_lookup(m, tokens[b], x + (size_t)b * hidden);
     }
 
     for (int l = 0; l < n_layers; l++) {

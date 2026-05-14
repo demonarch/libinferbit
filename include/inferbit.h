@@ -64,6 +64,14 @@ IB_API void inferbit_config_set_threads(inferbit_config* config, int threads);
 IB_API void inferbit_config_set_context_length(inferbit_config* config, int length);
 IB_API void inferbit_config_set_kv_cache_dynamic(inferbit_config* config, int dynamic);
 
+/* Rotating KV-cache window. 0 = full causal cache (default). >0 = each
+ * layer's KV cache is a ring buffer of `window` token slots; logical
+ * position p maps to physical slot p % window, and attention only
+ * attends to the most recent `window` positions. Peak KV RAM becomes
+ * O(window) instead of O(context_length) — the long-context bounded-RAM
+ * lever. Trade-off: attention horizon is capped at `window` tokens. */
+IB_API void inferbit_config_set_kv_window(inferbit_config* config, int window);
+
 /* Native parse mode (dev/debug only) */
 IB_API void inferbit_config_set_native_parse(inferbit_config* config, int enabled);
 IB_API void inferbit_config_set_native_bits(inferbit_config* config, int bits);
@@ -114,6 +122,44 @@ IB_API int inferbit_forward(
     int              num_tokens,
     float*           out_logits,
     int              vocab_size
+);
+
+/* ── Hidden-state capture (doc 36 phase 4.1) ────────────────────
+ *
+ * Prefill forward that ALSO returns per-layer post-residual hidden
+ * states — the hook the DFlash hybrid orchestrator needs to condition
+ * a draft model on the target's mid-stack activations.
+ *
+ *   tokens / n_tokens : input token IDs.
+ *   layer_ids         : which layer outputs to capture (0-based).
+ *   n_layer_ids       : length of layer_ids.
+ *   hiddens_out       : caller-allocated, laid out
+ *                       [n_layer_ids][n_tokens][hidden_size] fp32.
+ *                       Pass NULL (with n_layer_ids 0) for logits only.
+ *   logits_out        : caller-allocated [n_tokens][vocab_size] fp32.
+ *
+ * Runs on the Metal backend; the GPU context is created lazily on the
+ * first call and cached on the model. Returns INFERBIT_OK or an error
+ * code. */
+IB_API int inferbit_forward_with_hiddens(
+    inferbit_model*  model,
+    const int32_t*   tokens,
+    int              n_tokens,
+    const int*       layer_ids,
+    int              n_layer_ids,
+    float*           hiddens_out,
+    float*           logits_out
+);
+
+/* Evenly-spaced target-layer selection (mirrors dflash's
+ * build_target_layer_ids). Picks n_draft_layers indices spread across
+ * the target's depth, skipping the first/last 3 layers. Writes ascending
+ * indices into out_ids (caller provides n_draft_layers ints of space).
+ * Returns the count actually written. */
+IB_API int inferbit_build_target_layer_ids(
+    int  n_target_layers,
+    int  n_draft_layers,
+    int* out_ids
 );
 
 /* ── KV-cache control ───────────────────────────────────────── */

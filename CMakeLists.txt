@@ -42,6 +42,7 @@ set(INFERBIT_SOURCES
     src/kernels/neon.c
     src/kernels/ternary.c
     src/forward.c
+    src/forward_hiddens.c
     src/threading.c
     src/ibf_loader.c
     src/gguf.c
@@ -57,6 +58,9 @@ set(INFERBIT_SOURCES
     src/cJSON.c
     src/pq_decode.c
     src/pq_kmeans.c
+    src/pqv2_kernel.c
+    src/pqv2_format.c
+    src/pqv2_model.c
 )
 
 # Determine target architecture
@@ -99,22 +103,90 @@ else()
     set(PLATFORM_LIBS m)
 endif()
 
+# ── Apple Metal GPU support (optional) ───────────────────────────
+# Shader source lives in src/metal/kernels.metal. At build time we
+# embed it as a C string into kernels_metal_src.h via `xxd -i`, then
+# compile at runtime via [device newLibraryWithSource:]. This avoids
+# requiring full Xcode (the AOT `xcrun metal` toolchain) — only the
+# Command Line Tools are needed.
+#
+# Same pattern as llama.cpp / MLX / ggml on macOS.
+# Enable with -DIB_ENABLE_METAL=ON when configuring.
+option(IB_ENABLE_METAL "Build Apple Metal GPU backend" OFF)
+if(APPLE AND IB_ENABLE_METAL)
+    message(STATUS "Apple Metal backend: ENABLED (runtime shader compile)")
+    set(IB_METAL_ENABLED TRUE)
+    enable_language(OBJCXX)
+
+    set(METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/metal/kernels.metal)
+    set(METAL_HDR ${CMAKE_CURRENT_BINARY_DIR}/kernels_metal_src.h)
+    add_custom_command(
+        OUTPUT ${METAL_HDR}
+        COMMAND ${CMAKE_COMMAND} -E echo "/* auto-generated from kernels.metal */" > ${METAL_HDR}
+        COMMAND xxd -i -n ib_metal_kernels_src ${METAL_SRC} >> ${METAL_HDR}
+        # Append null-terminator macro so the C string is null-terminated for newLibraryWithSource
+        COMMAND ${CMAKE_COMMAND} -E echo "static const unsigned int ib_metal_kernels_src_len_z = ib_metal_kernels_src_len;" >> ${METAL_HDR}
+        DEPENDS ${METAL_SRC}
+        COMMENT "Embedding kernels.metal as C string"
+    )
+    add_custom_target(metal_kernels_header DEPENDS ${METAL_HDR})
+
+    # ObjC++ source — needs ARC + Metal/Foundation frameworks.
+    set_source_files_properties(src/metal/metal_runtime.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc -x objective-c++")
+    set_source_files_properties(src/metal/metal_model.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc -x objective-c++")
+    list(APPEND INFERBIT_SOURCES src/metal/metal_runtime.mm src/metal/metal_model.mm)
+    set(METAL_LINK_LIBS "-framework Metal" "-framework Foundation")
+    set(METAL_INCLUDES ${CMAKE_CURRENT_BINARY_DIR})
+    add_compile_definitions(IB_HAS_METAL=1)
+endif()
+
 # Shared library
 add_library(inferbit SHARED ${INFERBIT_SOURCES})
 target_include_directories(inferbit PUBLIC include)
 target_include_directories(inferbit PRIVATE src)
-target_link_libraries(inferbit ${PLATFORM_LIBS})
+target_link_libraries(inferbit ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+if(IB_METAL_ENABLED)
+    target_include_directories(inferbit PRIVATE ${METAL_INCLUDES})
+    add_dependencies(inferbit metal_kernels_header)
+endif()
 # On Windows, MSVC requires explicit dllexport for symbols to be visible
 # from the DLL. Internal headers (pq_decode.h, etc.) declare functions
 # without IB_API; auto-export all global symbols so Python ctypes /
 # dlsym can resolve them. POSIX is unaffected (no-op there).
 set_target_properties(inferbit PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+# Auto-copy the freshly-built shared library into the inferbit-py package
+# so Python conversions can never silently use a stale dylib. This was
+# the root cause of a recent quality regression (TinyLlama IBF: PPL went
+# 7.23 → 1955 because the bundled dylib pre-dated the Q/K row permutation
+# fix — see f8b47b3). Failure to copy is a build error, not a warning.
+set(IB_PY_BUNDLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../inferbit-py/inferbit")
+if(EXISTS "${IB_PY_BUNDLE_DIR}")
+    if(APPLE)
+        set(IB_PY_BUNDLE_NAME "libinferbit.dylib")
+    elseif(WIN32)
+        set(IB_PY_BUNDLE_NAME "inferbit.dll")
+    else()
+        set(IB_PY_BUNDLE_NAME "libinferbit.so")
+    endif()
+    add_custom_command(TARGET inferbit POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "$<TARGET_FILE:inferbit>"
+            "${IB_PY_BUNDLE_DIR}/${IB_PY_BUNDLE_NAME}"
+        COMMENT "Updating bundled libinferbit shared lib in inferbit-py")
+endif()
+
 # Static library
 add_library(inferbit_static STATIC ${INFERBIT_SOURCES})
 target_include_directories(inferbit_static PUBLIC include)
 target_include_directories(inferbit_static PRIVATE src)
-target_link_libraries(inferbit_static ${PLATFORM_LIBS})
+target_link_libraries(inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+if(IB_METAL_ENABLED)
+    target_include_directories(inferbit_static PRIVATE ${METAL_INCLUDES})
+    add_dependencies(inferbit_static metal_kernels_header)
+endif()
 set_target_properties(inferbit_static PROPERTIES OUTPUT_NAME inferbit)
 
 # Test executables
@@ -143,11 +215,117 @@ if(NOT WIN32)
 
     foreach(b bench_pq_decode bench_pq_ffn bench_pq_model_mlp
               bench_pq_real_model bench_pq_pathd bench_pq_q8lut
-              bench_pq_streaming bench_pq_dejavu bench_pq_bounded)
+              bench_pq_streaming bench_pq_dejavu bench_pq_bounded
+              bench_pqv2 test_pqv2_ibf test_pqv2_load bench_pqv2_gemm_b4
+              bench_pqv2_skip_k64 bench_pqv2_real_acts bench_pqv2_qkv_fusion
+              bench_pqv2_parallelism bench_int8_vdotq bench_pqv2_to_int8
+              bench_pqv2_path2 bench_pqv2_to_int4)
         add_executable(${b} tests/${b}.c)
         target_link_libraries(${b} inferbit_static ${PLATFORM_LIBS})
         target_include_directories(${b} PRIVATE include src)
     endforeach()
+endif()
+
+if(IB_METAL_ENABLED)
+    add_executable(test_metal_hello tests/test_metal_hello.c)
+    target_link_libraries(test_metal_hello inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_hello PRIVATE src)
+    add_dependencies(test_metal_hello metal_kernels_header inferbit_static)
+
+    add_executable(bench_metal_w4a8 tests/bench_metal_w4a8.c)
+    target_link_libraries(bench_metal_w4a8 inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_metal_w4a8 PRIVATE src)
+    add_dependencies(bench_metal_w4a8 metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_rmsnorm tests/test_metal_rmsnorm.c)
+    target_link_libraries(test_metal_rmsnorm inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_rmsnorm PRIVATE src)
+    add_dependencies(test_metal_rmsnorm metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_silu_mul tests/test_metal_silu_mul.c)
+    target_link_libraries(test_metal_silu_mul inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_silu_mul PRIVATE src)
+    add_dependencies(test_metal_silu_mul metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_rope tests/test_metal_rope.c)
+    target_link_libraries(test_metal_rope inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_rope PRIVATE src)
+    add_dependencies(test_metal_rope metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_softmax_embed tests/test_metal_softmax_embed.c)
+    target_link_libraries(test_metal_softmax_embed inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_softmax_embed PRIVATE src)
+    add_dependencies(test_metal_softmax_embed metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_attention tests/test_metal_attention.c)
+    target_link_libraries(test_metal_attention inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_attention PRIVATE src)
+    add_dependencies(test_metal_attention metal_kernels_header inferbit_static)
+
+    add_executable(bench_metal_recorder tests/bench_metal_recorder.c)
+    target_link_libraries(bench_metal_recorder inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_metal_recorder PRIVATE src)
+    add_dependencies(bench_metal_recorder metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_layer tests/test_metal_layer.c)
+    target_link_libraries(test_metal_layer inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_layer PRIVATE src)
+    add_dependencies(test_metal_layer metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_layer_diag tests/test_metal_layer_diag.c)
+    target_link_libraries(test_metal_layer_diag inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_layer_diag PRIVATE src)
+    add_dependencies(test_metal_layer_diag metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_o_isolated tests/test_metal_o_isolated.c)
+    target_link_libraries(test_metal_o_isolated inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_o_isolated PRIVATE src)
+    add_dependencies(test_metal_o_isolated metal_kernels_header inferbit_static)
+
+    add_executable(bench_metal_full_forward tests/bench_metal_full_forward.c)
+    target_link_libraries(bench_metal_full_forward inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_metal_full_forward PRIVATE src)
+    add_dependencies(bench_metal_full_forward metal_kernels_header inferbit_static)
+
+    add_executable(inspect_ibf tests/inspect_ibf.c)
+    target_link_libraries(inspect_ibf inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(inspect_ibf PRIVATE src include)
+    add_dependencies(inspect_ibf inferbit_static)
+
+    add_executable(bench_metal_real_model tests/bench_metal_real_model.c)
+    target_link_libraries(bench_metal_real_model inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_metal_real_model PRIVATE src include)
+    add_dependencies(bench_metal_real_model metal_kernels_header inferbit_static)
+
+    add_executable(test_metal_matmul_int8 tests/test_metal_matmul_int8.c)
+    target_link_libraries(test_metal_matmul_int8 inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_metal_matmul_int8 PRIVATE src)
+    add_dependencies(test_metal_matmul_int8 metal_kernels_header inferbit_static)
+
+    add_executable(bench_compare tests/bench_compare.c)
+    target_link_libraries(bench_compare inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_compare PRIVATE src include)
+    add_dependencies(bench_compare metal_kernels_header inferbit_static)
+
+    add_executable(bench_ppl_run tests/bench_ppl_run.c)
+    target_link_libraries(bench_ppl_run inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_ppl_run PRIVATE src include)
+    add_dependencies(bench_ppl_run metal_kernels_header inferbit_static)
+
+    add_executable(bench_mps_gemm tests/bench_mps_gemm.mm)
+    target_link_libraries(bench_mps_gemm
+        ${PLATFORM_LIBS} "-framework Metal" "-framework Foundation"
+        "-framework MetalPerformanceShaders")
+
+    add_executable(bench_speculative tests/bench_speculative.c)
+    target_link_libraries(bench_speculative inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(bench_speculative PRIVATE src include)
+    add_dependencies(bench_speculative metal_kernels_header inferbit_static)
+
+    add_executable(test_hidden_states_capture tests/test_hidden_states_capture.c)
+    target_link_libraries(test_hidden_states_capture inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+    target_include_directories(test_hidden_states_capture PRIVATE src include)
+    add_dependencies(test_hidden_states_capture metal_kernels_header inferbit_static)
 endif()
 
 enable_testing()

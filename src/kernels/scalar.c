@@ -67,6 +67,48 @@ static void scalar_matmul_w4a8(
     }
 }
 
+/* W4A8 with per-32-element block weight scales. scales_w has length
+ * M * (N/32). Activation grouping (128) is unchanged. */
+static void scalar_matmul_w4a8_blk32(
+    float* out, const void* weights, const float* scales_w,
+    const int8_t* input, const float* scales_a, int M, int N
+) {
+    const uint8_t* w = (const uint8_t*)weights;
+    const int G_a = IB_W4A8_GROUP;     /* 128 — activation group */
+    const int G_w = 32;                 /* weight block */
+    int n_w_blocks = N / G_w;          /* per-row scale count */
+
+    for (int i = 0; i < M; i++) {
+        float row_acc = 0.0f;
+        int g_a = 0;
+        int j = 0;
+        while (j < N) {
+            int act_end = j + G_a; if (act_end > N) act_end = N;
+            float a_scale = scales_a[g_a];
+            float group_partial = 0.0f;
+            for (int wb_start = j; wb_start < act_end; wb_start += G_w) {
+                int wb_end = wb_start + G_w; if (wb_end > act_end) wb_end = act_end;
+                int wb_idx = wb_start / G_w;
+                float w_scale = scales_w[(size_t)i * n_w_blocks + wb_idx];
+                int32_t block_int_sum = 0;
+                for (int jj = wb_start; jj < wb_end; jj += 2) {
+                    uint8_t byte = w[(size_t)i * (N / 2) + jj / 2];
+                    int8_t v0 = (int8_t)(byte & 0x0F) - 8;
+                    int8_t v1 = (int8_t)((byte >> 4) & 0x0F) - 8;
+                    block_int_sum += (int32_t)v0 * (int32_t)input[jj];
+                    if (jj + 1 < wb_end) {
+                        block_int_sum += (int32_t)v1 * (int32_t)input[jj + 1];
+                    }
+                }
+                group_partial += (float)block_int_sum * w_scale;
+            }
+            row_acc += group_partial * a_scale;
+            j = act_end; g_a++;
+        }
+        out[i] = row_acc;
+    }
+}
+
 static void scalar_matmul_int8_batch(
     float* out, const void* weights, const float* scales_w,
     const float* input, int M, int N, int B, int M_stride
@@ -195,6 +237,7 @@ void ib_init_kernels(ib_simd_level level) {
     ib_kern.matmul_int8 = scalar_matmul_int8;
     ib_kern.matmul_w4a8 = scalar_matmul_w4a8;
     ib_kern.matmul_w4a8_batch = scalar_matmul_w4a8_batch;
+    ib_kern.matmul_w4a8_blk32 = scalar_matmul_w4a8_blk32;
     ib_kern.matmul_int8_batch = scalar_matmul_int8_batch;
     ib_kern.matmul_int2 = NULL;  /* Set by ib_init_kernels_int2 */
     ib_kern.rmsnorm     = scalar_rmsnorm;
