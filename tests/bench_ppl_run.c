@@ -124,16 +124,17 @@ static double nll_from_logits(const float *logits, int target, int vocab) {
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s <model.ibf> <tokens.i32.bin> [--backend cpu|gpu] "
-                "[--warmup N] [--score N] [--ctx N]\n", argv[0]);
+                "[--warmup N] [--score N] [--ctx N] [--kv-window N]\n", argv[0]);
         return 1;
     }
     const char *backend = "cpu";
-    int warmup = 64, score = 512, ctx_len = 1024;
+    int warmup = 64, score = 512, ctx_len = 1024, kv_window = 0;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--backend") && i+1 < argc) backend = argv[++i];
         else if (!strcmp(argv[i], "--warmup") && i+1 < argc) warmup = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--score") && i+1 < argc) score = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i+1 < argc) ctx_len = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-window") && i+1 < argc) kv_window = atoi(argv[++i]);
     }
     int use_gpu = (strcmp(backend, "gpu") == 0);
 
@@ -153,6 +154,7 @@ int main(int argc, char **argv) {
 
     inferbit_config *cfg = inferbit_config_create();
     inferbit_config_set_context_length(cfg, ctx_len);
+    if (kv_window > 0) inferbit_config_set_kv_window(cfg, kv_window);
     inferbit_model *m = inferbit_load(argv[1], cfg);
     if (!m) { fprintf(stderr, "load failed\n"); return 4; }
     int vocab = m->header.vocab_size;
@@ -246,7 +248,7 @@ int main(int argc, char **argv) {
     printf("BACKEND=%s\n", use_gpu ? "libinferbit-gpu" : "libinferbit-cpu");
     printf("MODEL=%s\n", argv[1]);
     printf("VOCAB=%d HIDDEN=%d LAYERS=%d\n", vocab, hidden, m->header.num_layers);
-    printf("WARMUP=%d SCORE=%d CTX=%d\n", warmup, score, ctx_len);
+    printf("WARMUP=%d SCORE=%d CTX=%d KV_WINDOW=%d\n", warmup, score, ctx_len, kv_window);
     printf("PPL=%.6f\n", ppl);
     printf("N_SCORED=%d\n", n_scored);
     printf("SCORING_S=%.3f\n", elapsed);
