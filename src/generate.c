@@ -76,52 +76,7 @@ static void apply_repeat_penalty(float* logits, const int32_t* recent, int recen
     }
 }
 
-/* Top-K: zero out everything except top K logits */
-static void apply_top_k(float* logits, int vocab_size, int k) {
-    if (k <= 0 || k >= vocab_size) return;
-
-    /* Find the k-th largest value (simple partial sort) */
-    /* For correctness over speed — this is O(vocab * k) but vocab is small enough */
-    float threshold = -INFINITY;
-    for (int round = 0; round < k; round++) {
-        float best = -INFINITY;
-        for (int i = 0; i < vocab_size; i++) {
-            if (logits[i] > best && (round == 0 || logits[i] <= threshold || (logits[i] == threshold))) {
-                /* We need a more careful approach */
-                (void)0;
-            }
-        }
-        (void)best;
-    }
-
-    /* Simpler approach: sort indices, keep top-k */
-    /* Allocate temp array of (value, index) pairs */
-    /* For now, use a simpler threshold-finding method */
-
-    /* Find k-th largest by repeated scanning */
-    float kth = -INFINITY;
-    float prev_min = INFINITY;
-    for (int round = 0; round < k; round++) {
-        float best = -INFINITY;
-        for (int i = 0; i < vocab_size; i++) {
-            if (logits[i] < prev_min && logits[i] > best) {
-                best = logits[i];
-            } else if (logits[i] == prev_min && best < prev_min) {
-                best = logits[i];
-            }
-        }
-        prev_min = best;
-        kth = best;
-    }
-
-    for (int i = 0; i < vocab_size; i++) {
-        if (logits[i] < kth) {
-            logits[i] = -INFINITY;
-        }
-    }
-}
-
-/* Top-P (nucleus sampling): zero out tokens outside the nucleus */
+/* Convert logits to a probability distribution in place. */
 static void apply_softmax(float* logits, int vocab_size) {
     float max_val = logits[0];
     for (int i = 1; i < vocab_size; i++) {
@@ -138,62 +93,88 @@ static void apply_softmax(float* logits, int vocab_size) {
     }
 }
 
-static int sample_top_p(float* probs, int vocab_size, float top_p) {
-    /* Build (prob, index) pairs sorted descending by prob */
-    /* Simple insertion into a temp buffer */
-    /* For small vocabs this is fine; for large vocabs we'd use a heap */
+/* Max-heap sift-down over an index array `idx` of `n` elements rooted at
+ * `i`, keyed by probs[idx[.]] (largest probability at the root). */
+static void heap_sift_down_idx(int* idx, int n, int i, const float* probs) {
+    for (;;) {
+        int l = 2 * i + 1, r = 2 * i + 2, largest = i;
+        if (l < n && probs[idx[l]] > probs[idx[largest]]) largest = l;
+        if (r < n && probs[idx[r]] > probs[idx[largest]]) largest = r;
+        if (largest == i) break;
+        int t = idx[i]; idx[i] = idx[largest]; idx[largest] = t;
+        i = largest;
+    }
+}
 
-    /* Cumulative sum approach: walk sorted probs until we exceed top_p */
-    /* We need sorted indices — do a simple O(n^2) sort for correctness */
+/* Fused top-k + top-p nucleus sample. Selects at most `top_k` highest-
+ * probability tokens (k<=0 or k>=vocab means "no top-k limit"), walks
+ * them in descending probability accumulating until cumulative >= top_p,
+ * and samples one from that nucleus. Replaces the separate apply_top_k +
+ * sample_top_p two-heap sequence with a single partial-selection pass.
+ *
+ * Build one max-heap of indices keyed by probability (heapify is
+ * O(vocab)), then pop the largest repeatedly — recording nucleus
+ * indices and accumulating cumulative probability — until EITHER we have
+ * popped `top_k` entries (when top_k is a positive limit < vocab) OR
+ * cumulative >= top_p, whichever comes first. O(vocab + nucleus*log vocab),
+ * a single heap pass instead of two. Folding top-k into the post-softmax
+ * selection is equivalent to the old pre-softmax apply_top_k: softmax is
+ * monotonic, so the k highest probabilities are the k highest logits. */
+static int sample_top_k_top_p(float* probs, int vocab_size, int top_k, float top_p) {
+    /* Whether top_k acts as a real limit on the nucleus size. */
+    int k_limited = (top_k > 0 && top_k < vocab_size);
 
-    /* Allocate index array on stack if small enough, else heap */
-    int* indices = NULL;
-    int stack_buf[4096];
+    /* Two working arrays: the heap of indices and the nucleus list.
+     * Stack-allocate when the vocab is small, else one combined malloc. */
+    int stack_buf[2 * 4096];
+    int* heap;
+    int* nucleus;
+    int* alloc = NULL;
     if (vocab_size <= 4096) {
-        indices = stack_buf;
+        heap = stack_buf;
+        nucleus = stack_buf + vocab_size;
     } else {
-        indices = malloc(vocab_size * sizeof(int));
-        if (!indices) return sample_argmax(probs, vocab_size);
+        alloc = malloc((size_t)vocab_size * 2 * sizeof(int));
+        if (!alloc) return sample_argmax(probs, vocab_size);
+        heap = alloc;
+        nucleus = alloc + vocab_size;
     }
 
-    for (int i = 0; i < vocab_size; i++) indices[i] = i;
+    /* Build the index heap and heapify into a max-heap by probability. */
+    int heap_n = vocab_size;
+    for (int i = 0; i < vocab_size; i++) heap[i] = i;
+    for (int i = heap_n / 2 - 1; i >= 0; i--) {
+        heap_sift_down_idx(heap, heap_n, i, probs);
+    }
 
-    /* Selection sort (top elements only until we hit top_p) */
+    /* Pop largest-probability indices until the nucleus covers top_p, or
+     * until we have collected top_k entries (whichever comes first). */
     float cumulative = 0.0f;
-    int cutoff = vocab_size;
-    for (int i = 0; i < vocab_size; i++) {
-        /* Find max in remaining */
-        int best = i;
-        for (int j = i + 1; j < vocab_size; j++) {
-            if (probs[indices[j]] > probs[indices[best]]) {
-                best = j;
-            }
-        }
-        /* Swap */
-        int tmp = indices[i];
-        indices[i] = indices[best];
-        indices[best] = tmp;
-
-        cumulative += probs[indices[i]];
-        if (cumulative >= top_p) {
-            cutoff = i + 1;
-            break;
-        }
+    int nucleus_n = 0;
+    while (heap_n > 0) {
+        int top = heap[0];
+        nucleus[nucleus_n++] = top;
+        cumulative += probs[top];
+        /* Remove root: move last element up and sift down. */
+        heap[0] = heap[--heap_n];
+        if (heap_n > 0) heap_sift_down_idx(heap, heap_n, 0, probs);
+        if (cumulative >= top_p) break;
+        if (k_limited && nucleus_n >= top_k) break;
     }
 
-    /* Sample from the nucleus */
+    /* Sample from the recorded nucleus (same arithmetic as before). */
     float r = rng_float() * cumulative;
     float running = 0.0f;
-    int result = indices[0];
-    for (int i = 0; i < cutoff; i++) {
-        running += probs[indices[i]];
+    int result = nucleus[0];
+    for (int i = 0; i < nucleus_n; i++) {
+        running += probs[nucleus[i]];
         if (running >= r) {
-            result = indices[i];
+            result = nucleus[i];
             break;
         }
     }
 
-    if (indices != stack_buf) free(indices);
+    if (alloc) free(alloc);
     return result;
 }
 
@@ -210,14 +191,11 @@ static int sample_token(float* logits, int vocab_size, inferbit_sample_params pa
     /* Apply temperature */
     apply_temperature(logits, vocab_size, params.temperature);
 
-    /* Apply top-K */
-    apply_top_k(logits, vocab_size, params.top_k);
-
     /* Convert to probabilities */
     apply_softmax(logits, vocab_size);
 
-    /* Apply top-P and sample */
-    return sample_top_p(logits, vocab_size, params.top_p);
+    /* Fused top-K + top-P selection and sample */
+    return sample_top_k_top_p(logits, vocab_size, params.top_k, params.top_p);
 }
 
 /* ── Public API ─────────────────────────────────────────────── */

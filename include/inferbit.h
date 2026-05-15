@@ -180,6 +180,16 @@ IB_API size_t      inferbit_model_weight_memory(const inferbit_model* model);
 IB_API size_t      inferbit_model_kv_memory(const inferbit_model* model);
 IB_API size_t      inferbit_model_total_memory(const inferbit_model* model);
 
+/* Force the backend routing decision now (uploads the model to the GPU if
+ * Metal is available + the model is GPU-capable). Without this the upload
+ * happens lazily on the first forward, spiking time-to-first-token. Safe
+ * to call repeatedly — a no-op once resolved. Returns 0 always. */
+IB_API int         inferbit_model_warmup(inferbit_model* model);
+/* Returns the backend the model's forward path will use: "metal" (GPU-
+ * routed) or "cpu". Resolves the (otherwise lazy) routing decision, same
+ * as inferbit_model_warmup. */
+IB_API const char* inferbit_model_backend(inferbit_model* model);
+
 /* ── Speculative decoding ───────────────────────────────────── */
 
 IB_API void inferbit_set_draft_model(inferbit_model* model, inferbit_model* draft, int draft_tokens);

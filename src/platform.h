@@ -121,6 +121,16 @@ static inline int mkstemp(char* tmpl) {
     return fd;
 }
 
+/* Online logical CPU count, clamped to [1,64] with a safe fallback of 4. */
+static inline int ib_hardware_concurrency(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    int n = (int)si.dwNumberOfProcessors;
+    if (n <= 0) return 4;
+    if (n > 64) return 64;
+    return n;
+}
+
 /* Thread-local storage */
 #define _Thread_local __declspec(thread)
 
@@ -140,6 +150,9 @@ static inline int mkstemp(char* tmpl) {
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>   /* sysctlbyname — Apple Silicon P-core query */
+#endif
 
 #define ib_mmap    mmap
 #define ib_munmap  munmap
@@ -151,6 +164,29 @@ static inline int mkstemp(char* tmpl) {
 #define ib_stat    stat
 #define ib_struct_stat struct stat
 #define ib_clock_gettime clock_gettime
+
+/* Online logical CPU count, clamped to [1,64] with a safe fallback of 4.
+ * On Apple Silicon, prefers the performance-core count instead. */
+static inline int ib_hardware_concurrency(void) {
+    long n = -1;
+#if defined(__APPLE__)
+    /* Apple Silicon: prefer the performance-core count — E-cores are
+     * far slower for matmul and create scheduling stragglers. Falls
+     * back to the total online count on Intel Macs / older macOS. */
+    {
+        int pcores = 0;
+        size_t sz = sizeof(pcores);
+        if (sysctlbyname("hw.perflevel0.logicalcpu", &pcores, &sz, NULL, 0) == 0
+            && pcores >= 1) {
+            n = pcores;
+        }
+    }
+#endif
+    if (n < 1) n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) return 4;
+    if (n > 64) return 64;
+    return (int)n;
+}
 
 #define IB_API
 

@@ -4446,7 +4446,34 @@ kernel void matmul_pqv2_k256_half2(
     }
 }
 
-/* matmul_pqv2_k256_half2_cbtg — codebook-in-TG-memory variant of
+/* ── FINDINGS: codebook-in-threadgroup-memory staging (PQv2 derisk) ──
+ * Investigated as a candidate for the "PQv2 decode is ~half INT4 speed"
+ * bottleneck (docs 34/35: hypothesised random-access codebook/LUT reads
+ * are the memory-bound limiter). The TG-memory staging IS cleanly
+ * feasible here and is already implemented below as
+ * matmul_pqv2_k256_half2_cbtg, dispatch-wired in metal_runtime.mm and
+ * env-gated opt-in (IB_PQV2_CBTG=1, default OFF).
+ *
+ * RESULT: measured negative (-9..-12% vs the global-cb baseline). The
+ * per-(chunk,subchunk) codebook for a decode matmul is only ~16 KB
+ * (n_subchunks=16 × K=256 × HALF=2 × fp16) and is reused across every
+ * row, so Apple's L1/L2 already keeps it resident after the first few
+ * rows — global-memory cb reads hit cache, and the explicit TG copy
+ * just adds a cooperative-load + barrier on the critical path without
+ * removing real DRAM traffic. The genuine per-decode DRAM cost is the
+ * INDICES stream (M × total bytes, read exactly once, no reuse) plus
+ * the x activation slices — NOT the codebook.
+ *
+ * REAL CANDIDATE: the indices traffic. Either (a) widen index reads to
+ * uchar4/uint vectors for fewer/coalesced transactions (the layout is
+ * already pre-transposed to [M][total] so lanes read contiguous bytes),
+ * or (b) amortise indices across batch positions — see
+ * matmul_pqv2_k256_half2_batched, which reads each index row once and
+ * fans it out over B outputs. Codebook staging is a dead end; left
+ * in-tree only as a reproducible opt-in negative result.
+ * ────────────────────────────────────────────────────────────────────
+ *
+ * matmul_pqv2_k256_half2_cbtg — codebook-in-TG-memory variant of
  * PQv2 decode. Prefetches the per-matmul codebook (n_subchunks × K=256
  * × HALF=2 × fp16 = 16 KB for n_subchunks=16) into TG memory once at
  * kernel start, then the inner loop's index→cb lookup reads from

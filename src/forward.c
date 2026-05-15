@@ -13,6 +13,10 @@
 #include <errno.h>
 #include <fcntl.h>
 
+#ifdef IB_HAS_METAL
+#include "metal/metal_runtime.h"
+#endif
+
 /* W4A8 path is on by default. Set IB_W4A8=0 in env to force the FP32
  * activation fallback (used for A/B comparison and debugging). */
 static int w4a8_enabled(void) {
@@ -1098,13 +1102,20 @@ static int forward_single(inferbit_model* m, int token_id, int pos, float* logit
  * position's attention runs sequentially (each attends to its own prefix of
  * the KV cache, so there's no matmul-shape win from batching attention).
  *
- * If out_logits is non-NULL, writes per-position logits [B * vocab] row-major.
+ * If out_logits is non-NULL, writes logits there:
+ *   last_logits_only == 0 — per-position logits [B * vocab] row-major.
+ *   last_logits_only == 1 — only position B-1's logits, written to
+ *                           out_logits[0 .. vocab) (a [vocab]-sized buffer).
+ * In both cases the per-layer batched matmuls + KV writes for all B
+ * positions still run; last_logits_only only skips the output-head matmul
+ * for positions 0..B-2.
  *
  * Invariant: positions[b] = inferbit_kv_length(m) + b on entry (each position
  * gets appended to the KV cache as processed). Caller is responsible for
  * ensuring that's true. */
 static int forward_batch(inferbit_model* m, const int32_t* tokens,
-                         const int* positions, int B, float* out_logits) {
+                         const int* positions, int B, float* out_logits,
+                         int last_logits_only) {
     int hidden   = m->header.hidden_size;
     int n_layers = m->header.num_layers;
     int n_heads  = m->header.num_heads;
@@ -1256,18 +1267,151 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
 
     /* Final RMSNorm + LM head. */
     if (out_logits) {
-        for (int b = 0; b < B; b++) {
-            rmsnorm_fp16(x + (size_t)b * hidden, x + (size_t)b * hidden,
-                         tensor_data(m, &m->output_norm),
+        if (last_logits_only) {
+            /* Only position B-1's logits are needed — RMSNorm + a single
+             * output-head matmul for that one position. Skips B-1 vocab-
+             * sized matmuls (the most expensive op) vs the full path. */
+            float* x_last = x + (size_t)(B - 1) * hidden;
+            rmsnorm_fp16(x_last, x_last, tensor_data(m, &m->output_norm),
                          eps, hidden, scale_buf);
+            tensor_matmul(m, &m->output_head, out_logits, x_last,
+                          vocab, hidden, scale_buf);
+        } else {
+            for (int b = 0; b < B; b++) {
+                rmsnorm_fp16(x + (size_t)b * hidden, x + (size_t)b * hidden,
+                             tensor_data(m, &m->output_norm),
+                             eps, hidden, scale_buf);
+            }
+            tensor_matmul_batch(m, &m->output_head, out_logits, x, vocab, hidden, B,
+                                scale_buf, q_scratch, sa_scratch);
         }
-        tensor_matmul_batch(m, &m->output_head, out_logits, x, vocab, hidden, B,
-                            scale_buf, q_scratch, sa_scratch);
     }
 
     /* Scratch buffers are model-lifetime; no free here. */
     return INFERBIT_OK;
 }
+
+/* ── Metal backend routing ──────────────────────────────────── */
+
+#ifdef IB_HAS_METAL
+/* Decide once whether this model runs on the Metal backend, lazily
+ * creating + caching the GPU context/buffers on first use. Returns 1 if
+ * Metal-routed, 0 for the CPU path. IB_BACKEND=cpu forces CPU. Once a
+ * model is Metal-routed it stays Metal-routed for its whole life — we
+ * must never silently CPU-fall-back mid-stream, because KV state then
+ * lives in metal_bufs and the CPU kv_caches arrays are empty. */
+static int ib_metal_route(inferbit_model* m) {
+    static int forced_cpu = -1;
+    if (forced_cpu < 0) {
+        const char* e = getenv("IB_BACKEND");
+        forced_cpu = (e && strcmp(e, "cpu") == 0) ? 1 : 0;
+    }
+    if (forced_cpu) return 0;
+    if (m->metal_route_failed) return 0;
+    if (m->metal_bufs) return 1;
+    ib_metal_ctx* ctx = ib_metal_create();
+    if (!ctx) { m->metal_route_failed = 1; return 0; }
+    ib_metal_model_buffers* bufs = ib_metal_upload_model(ctx, m);
+    if (!bufs) { ib_metal_destroy(ctx); m->metal_route_failed = 1; return 0; }
+    m->metal_ctx  = ctx;
+    m->metal_bufs = bufs;
+    return 1;
+}
+
+/* Metal-backed ib_forward: prefill (n_tokens>1, last-token logits) or
+ * single-token decode. KV is written into metal_bufs at [kv_pos,
+ * kv_pos+n_tokens); we then advance the logical kv_caches[].length
+ * counter so inferbit_kv_length stays correct. */
+static int ib_forward_metal(inferbit_model* m, const int32_t* tokens,
+                            int num_tokens, int kv_pos, float* out_logits) {
+    int hidden = m->header.hidden_size;
+    float* embeds = (float*)malloc((size_t)num_tokens * hidden * sizeof(float));
+    if (!embeds) { ib_set_error("oom: metal embed buffer"); return INFERBIT_ERROR_MEMORY; }
+    for (int i = 0; i < num_tokens; i++)
+        ib_embedding_lookup(m, tokens[i], embeds + (size_t)i * hidden);
+
+    ib_metal_ctx* ctx = (ib_metal_ctx*)m->metal_ctx;
+    ib_metal_model_buffers* bufs = (ib_metal_model_buffers*)m->metal_bufs;
+    int rc;
+    if (num_tokens == 1) {
+        rc = ib_metal_forward_token(ctx, bufs, embeds, kv_pos, out_logits);
+    } else {
+        rc = ib_metal_forward_prefill(ctx, bufs, embeds, num_tokens, kv_pos, out_logits);
+        if (rc == -2) {
+            /* Batched prefill layout-incompatible — per-token GPU loop.
+             * forward_token writes out_logits each call, so after the
+             * loop out_logits holds the LAST token's logits (what prefill
+             * callers consume). */
+            rc = 0;
+            for (int i = 0; i < num_tokens && rc == 0; i++)
+                rc = ib_metal_forward_token(ctx, bufs, embeds + (size_t)i * hidden,
+                                            kv_pos + i, out_logits);
+        }
+    }
+    free(embeds);
+    if (rc != 0) { ib_set_error("metal forward failed (rc=%d)", rc); return INFERBIT_ERROR_INTERNAL; }
+    for (int L = 0; L < m->header.num_layers; L++)
+        m->kv_caches[L].length = kv_pos + num_tokens;
+    return INFERBIT_OK;
+}
+
+/* Metal-backed ib_forward_positions: per-position logits for num_tokens
+ * tokens at [kv_pos, kv_pos+num_tokens). out_logits is [num_tokens][vocab]. */
+static int ib_forward_positions_metal(inferbit_model* m, const int32_t* tokens,
+                                      int num_tokens, int kv_pos, float* out_logits) {
+    int hidden = m->header.hidden_size;
+    int vocab  = m->header.vocab_size;
+    float* embeds = (float*)malloc((size_t)num_tokens * hidden * sizeof(float));
+    if (!embeds) { ib_set_error("oom: metal embed buffer"); return INFERBIT_ERROR_MEMORY; }
+    for (int i = 0; i < num_tokens; i++)
+        ib_embedding_lookup(m, tokens[i], embeds + (size_t)i * hidden);
+
+    ib_metal_ctx* ctx = (ib_metal_ctx*)m->metal_ctx;
+    ib_metal_model_buffers* bufs = (ib_metal_model_buffers*)m->metal_bufs;
+    int rc = ib_metal_forward_prefill_logits_all(ctx, bufs, embeds, num_tokens,
+                                                 kv_pos, out_logits);
+    if (rc == -2) {
+        /* Layout-incompatible — per-token GPU loop, capturing each
+         * position's logits into its own out_logits slab. */
+        rc = 0;
+        for (int i = 0; i < num_tokens && rc == 0; i++)
+            rc = ib_metal_forward_token(ctx, bufs, embeds + (size_t)i * hidden,
+                                        kv_pos + i, out_logits + (size_t)i * vocab);
+    }
+    free(embeds);
+    if (rc != 0) { ib_set_error("metal forward_positions failed (rc=%d)", rc); return INFERBIT_ERROR_INTERNAL; }
+    for (int L = 0; L < m->header.num_layers; L++)
+        m->kv_caches[L].length = kv_pos + num_tokens;
+    return INFERBIT_OK;
+}
+#endif /* IB_HAS_METAL */
+
+/* ── Public: backend warmup + introspection ─────────────────── */
+
+#ifdef IB_HAS_METAL
+int inferbit_model_warmup(inferbit_model* model) {
+    if (!model) return 0;
+    /* Resolve routing now — this triggers the (otherwise lazy) GPU
+     * upload, moving the TTFT spike here instead of the first forward. */
+    ib_metal_route(model);
+    return 0;
+}
+
+const char* inferbit_model_backend(inferbit_model* model) {
+    if (!model) return "cpu";
+    return ib_metal_route(model) ? "metal" : "cpu";
+}
+#else
+int inferbit_model_warmup(inferbit_model* model) {
+    (void)model;
+    return 0;
+}
+
+const char* inferbit_model_backend(inferbit_model* model) {
+    (void)model;
+    return "cpu";
+}
+#endif /* IB_HAS_METAL */
 
 /* ── Public: forward pass ───────────────────────────────────── */
 
@@ -1293,36 +1437,41 @@ int ib_forward(inferbit_model* model, const int32_t* tokens, int num_tokens, flo
         }
     }
 
+#ifdef IB_HAS_METAL
+    if (ib_metal_route(model))
+        return ib_forward_metal(model, tokens, num_tokens, kv_pos, out_logits);
+#endif
+
     if (num_tokens == 1) {
         /* Single token — standard decode path */
         return forward_single(model, tokens[0], kv_pos, out_logits);
     }
 
     /*
-     * Batch prefill optimization:
-     * For multi-token input, we only need logits from the LAST token.
-     * Process tokens 0..N-2 through embed + projections + KV cache write only
-     * (skip attention output, MLP contributes to residual but we only need
-     * the final token's state for generation).
-     *
-     * Simplified approach: process all tokens sequentially but skip the
-     * output head matmul (the most expensive single op, vocab_size rows)
-     * for all but the last token.
+     * Batch prefill (CPU fallback path): process the prompt in chunks of
+     * IB_BATCH_MAX tokens through the batched forward engine. forward_batch
+     * advances kv_caches[].length itself; ib_forward only needs the LAST
+     * position's logits, so we pass last_logits_only=1 — each chunk writes
+     * just [vocab] into out_logits[0..vocab), and since chunks overwrite,
+     * the final chunk's last-position logits are what remain (correct).
      */
-    /*
-     * Batch prefill: skip the output head matmul (vocab_size x hidden)
-     * for all tokens except the last. The output head is typically the
-     * single most expensive matmul (32K x 4K = 128M ops for Mistral-7B).
-     * For a 100-token prompt, this saves 99 output head computations.
-     */
-    for (int i = 0; i < num_tokens - 1; i++) {
-        int pos = kv_pos + i;
-        int rc = forward_single_ex(model, tokens[i], pos, out_logits, 0, NULL);
-        if (rc != INFERBIT_OK) return rc;
+    int offset = 0;
+    while (offset < num_tokens) {
+        int remaining = num_tokens - offset;
+        int B = remaining < IB_BATCH_MAX ? remaining : IB_BATCH_MAX;
+        /* forward_batch advanced kv_caches[].length on the prior chunk;
+         * recompute the base position fresh each iteration. */
+        int base = inferbit_kv_length(model);
+        int positions[IB_BATCH_MAX];
+        for (int j = 0; j < B; j++) positions[j] = base + j;
+        int rc = forward_batch(model, tokens + offset, positions, B,
+                               out_logits, 1);
+        if (rc != INFERBIT_OK) {
+            return rc;
+        }
+        offset += B;
     }
-
-    /* Last token — full forward with logits */
-    return forward_single_ex(model, tokens[num_tokens - 1], kv_pos + num_tokens - 1, out_logits, 1, NULL);
+    return INFERBIT_OK;
 }
 
 int ib_forward_positions(inferbit_model* model, const int32_t* tokens,
@@ -1355,9 +1504,14 @@ int ib_forward_positions(inferbit_model* model, const int32_t* tokens,
         return INFERBIT_ERROR_PARAM;
     }
 
+#ifdef IB_HAS_METAL
+    if (ib_metal_route(model))
+        return ib_forward_positions_metal(model, tokens, num_tokens, kv_pos, out_logits);
+#endif
+
     /* Fill absolute positions in the preallocated scratch buffer. */
     int* positions = model->bb_positions;
     for (int i = 0; i < num_tokens; i++) positions[i] = kv_pos + i;
 
-    return forward_batch(model, tokens, positions, num_tokens, out_logits);
+    return forward_batch(model, tokens, positions, num_tokens, out_logits, 0);
 }

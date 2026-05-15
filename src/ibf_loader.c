@@ -523,11 +523,11 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     /* Apply config */
     int ctx_len = 0;
     int kv_dynamic = 0;
-    int threads = 4;
+    int threads = ib_hardware_concurrency();
     if (config) {
         ctx_len    = config->context_length;
         kv_dynamic = config->kv_dynamic;
-        threads    = config->threads > 0 ? config->threads : 4;
+        threads    = config->threads > 0 ? config->threads : ib_hardware_concurrency();
         model->kv_window = config->kv_window;
     }
     model->num_threads = threads;

@@ -223,6 +223,7 @@ struct inferbit_model {
      * header stays free of metal_runtime.h. NULL until first use. */
     void  *metal_ctx;
     void  *metal_bufs;
+    int    metal_route_failed;  /* 1 = ib_metal_upload_model failed or backend forced CPU; never retry */
     int    drive_fd;                  /* fd of the IBF, F_NOCACHE set on Darwin */
     void  *drive_indices_scratch;     /* page-aligned shared buffer */
     size_t drive_indices_scratch_size;

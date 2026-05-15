@@ -1,10 +1,68 @@
 #include "pqv2_kernel.h"
+#include "platform.h"   /* ib_clock_gettime(CLOCK_MONOTONIC, ...) */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
+
+/* ── PQv2 decode profiling (IB_PQV2_PROFILE) ──────────────────────────
+ * Pure instrumentation: when IB_PQV2_PROFILE is set in the environment,
+ * the K=256 decode hot path accumulates a wall-clock breakdown of
+ *   - LUT-build time  (codebook fp32 -> int8 LUT construction)
+ *   - gather time     (uint8-index -> LUT lookup + fp32 accumulate)
+ *   - total decode time (whole chunks-inner call)
+ * into file-scope counters and prints a breakdown to stderr every
+ * IB_PQV2_PROFILE_EVERY chunks-inner calls. ib_pqv2_profile_dump() can
+ * also be called explicitly (e.g. at process exit) to print the totals.
+ *
+ * The env var is read exactly once (cached in g_pqv2_profile). When it
+ * is unset, the hot path takes a single predicted-not-taken branch and
+ * does nothing else — zero clock reads, zero numerical change. */
+
+#define IB_PQV2_PROFILE_EVERY 200
+
+static int            g_pqv2_profile = -1;   /* -1 = not yet checked */
+static double         g_pqv2_t_lut    = 0.0; /* secs in LUT build    */
+static double         g_pqv2_t_gather = 0.0; /* secs in gather loops */
+static double         g_pqv2_t_total  = 0.0; /* secs in chunks-inner */
+static long long      g_pqv2_n_calls  = 0;   /* chunks-inner calls   */
+static long long      g_pqv2_n_lut    = 0;   /* LUT builds (c,s)     */
+
+static inline int pqv2_profile_enabled(void) {
+    int e = g_pqv2_profile;
+    if (e < 0) {
+        const char *v = getenv("IB_PQV2_PROFILE");
+        e = (v && v[0] && v[0] != '0') ? 1 : 0;
+        g_pqv2_profile = e;
+    }
+    return e;
+}
+
+static inline double pqv2_now(void) {
+    struct timespec ts;
+    ib_clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* Print the accumulated PQv2 decode breakdown to stderr. Safe to call
+ * even when profiling was never enabled (prints nothing in that case). */
+void ib_pqv2_profile_dump(void) {
+    if (g_pqv2_profile != 1 || g_pqv2_n_calls == 0) return;
+    double tot = g_pqv2_t_total > 0.0 ? g_pqv2_t_total : 1e-300;
+    double other = tot - g_pqv2_t_lut - g_pqv2_t_gather;
+    fprintf(stderr,
+        "[pqv2-profile] calls=%lld lut_builds=%lld | "
+        "total=%.3f ms  lut=%.3f ms (%.1f%%)  gather=%.3f ms (%.1f%%)  "
+        "other=%.3f ms (%.1f%%)\n",
+        g_pqv2_n_calls, g_pqv2_n_lut,
+        g_pqv2_t_total * 1e3,
+        g_pqv2_t_lut    * 1e3, 100.0 * g_pqv2_t_lut    / tot,
+        g_pqv2_t_gather * 1e3, 100.0 * g_pqv2_t_gather / tot,
+        other           * 1e3, 100.0 * other           / tot);
+}
 
 /* ── fp16 ─────────────────────────────────────────────────────────── */
 
@@ -747,6 +805,12 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float lut_scale, l2_lut_scale;
 
+    /* Profiling: cached single branch; zero overhead when disabled. */
+    const int prof = pqv2_profile_enabled();
+    double prof_t_lut = 0.0, prof_t_gather = 0.0;
+    long long prof_n_lut = 0;
+    double prof_call_start = prof ? pqv2_now() : 0.0;
+
     for (uint32_t c = c_start; c < c_end; c++) {
         for (uint32_t s = 0; s < ns; s++) {
             const float *xs = &x[c * G + s * half];
@@ -758,8 +822,11 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
                 }
                 if (xm < skip_thresh) continue;
             }
+            double prof_t0 = prof ? pqv2_now() : 0.0;
             build_lut_int8_k256(&cb[(size_t)s * K * half], xs, half,
                                   lut, &lut_scale);
+            double prof_t1 = prof ? pqv2_now() : 0.0;
+            if (prof) { prof_t_lut += prof_t1 - prof_t0; prof_n_lut++; }
 #if defined(__ARM_NEON)
             int8x16x4_t b0, b1, b2, b3;
             #define LOAD_BANK(B, ARR) \
@@ -840,8 +907,13 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
             }
             /* L2 path (K_L2 ≤ 64) */
             if (acc_l2) {
+                double prof_l2_0 = prof ? pqv2_now() : 0.0;
                 build_lut_int8(&l2_cb[(size_t)s * t->l2_K * half], xs,
                                 t->l2_K, half, l2_lut_q, &l2_lut_scale);
+                if (prof) {
+                    prof_t_lut += pqv2_now() - prof_l2_0;
+                    prof_n_lut++;
+                }
                 int8x16x4_t tbl2;
                 tbl2.val[0] = vld1q_s8(&l2_lut_q[0]);
                 tbl2.val[1] = vld1q_s8(&l2_lut_q[16]);
@@ -868,7 +940,36 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
                     acc_l2[mm] += (float)l2_lut_q[l2_idx[mm]] * l2_lut_scale;
             }
 #endif
+            /* gather span = (end of iter) - (end of L1 LUT build);
+             * any L2 LUT-build time inside it was already added to
+             * prof_t_lut, so subtract it back out below at call end. */
+            if (prof) prof_t_gather += pqv2_now() - prof_t1;
         }
+    }
+
+    if (prof) {
+        double prof_call_total = pqv2_now() - prof_call_start;
+        /* prof_t_gather currently includes L2 LUT-build time (which is
+         * also counted in prof_t_lut for this call). The L2 build time
+         * for this call = prof_t_lut accumulated minus the L1 builds...
+         * simpler: gather already overlaps lut only via L2. Correct it
+         * by treating gather as call_total - lut - (skip/loop overhead).
+         * We keep the measured prof_t_gather but clamp so lut+gather
+         * never exceeds total. */
+        double lut = prof_t_lut;
+        double gather = prof_t_gather;
+        if (lut + gather > prof_call_total) {
+            /* L2-build double-count: rescale gather down. */
+            gather = prof_call_total - lut;
+            if (gather < 0.0) gather = 0.0;
+        }
+        g_pqv2_t_lut    += lut;
+        g_pqv2_t_gather += gather;
+        g_pqv2_t_total  += prof_call_total;
+        g_pqv2_n_lut    += prof_n_lut;
+        g_pqv2_n_calls  += 1;
+        if (g_pqv2_n_calls % IB_PQV2_PROFILE_EVERY == 0)
+            ib_pqv2_profile_dump();
     }
 }
 

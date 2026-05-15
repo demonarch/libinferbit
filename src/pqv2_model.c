@@ -240,11 +240,11 @@ static inferbit_model* pqv2_load_internal(const char* path,
     /* Runtime state init: same as legacy ibf_load post-load path. */
     int ctx_len = m->header.max_context_length;
     int kv_dynamic = 0;
-    int threads = 4;
+    int threads = ib_hardware_concurrency();
     if (config) {
         ctx_len    = config->context_length > 0 ? config->context_length : ctx_len;
         kv_dynamic = config->kv_dynamic;
-        threads    = config->threads > 0 ? config->threads : 4;
+        threads    = config->threads > 0 ? config->threads : ib_hardware_concurrency();
         m->kv_window = config->kv_window;
     }
     m->num_threads = threads;

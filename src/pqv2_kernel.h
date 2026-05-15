@@ -165,4 +165,11 @@ void pqv2_acc_tbl_int8_k256_chunks_batch(
 float pqv2_h2f(uint16_t h);
 uint16_t pqv2_f2h(float f);
 
+/* PQv2 decode profiling (IB_PQV2_PROFILE). When the env var is set, the
+ * K=256 decode hot path accumulates a LUT-build / gather / total
+ * wall-clock breakdown and auto-prints to stderr every N chunks-inner
+ * calls. This getter prints the accumulated totals on demand (e.g. at
+ * process exit). No-op when profiling was never enabled. */
+void ib_pqv2_profile_dump(void);
+
 #endif
