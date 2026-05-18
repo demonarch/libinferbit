@@ -111,6 +111,23 @@ typedef struct {
      * Diagnostic-grade for v1 — the kernel already dispatches on
      * `pq->l2_kind` per tensor, so the runtime needs nothing else. */
     int tensor_format;
+    /* Perf: pre-decoded fp32 scale arrays. The on-disk fp16 scale buffer
+     * is a STATIC property of the weight tensor, so we decode it ONCE at
+     * model load instead of paying fp16→fp32 conversion on every matmul
+     * (~154 calls per decode token on a 28-layer Llama). NULL when the
+     * tensor has no scales (pq path, fp16 weights without per-row scale).
+     *
+     *   scales_fp32       — [M] per-row scales (legacy INT4/INT8 path).
+     *   blk32_scales_fp32 — [M * (N/32)] per-block scales (INT4 blk32
+     *                       path; only set when t->scale_size > M*2).
+     *   norm_fp32         — [N] fully-decoded fp32 norm weight, used by
+     *                       rmsnorm_fp16. Only set for norm tensors
+     *                       (input_norm / post_attn_norm / output_norm).
+     *
+     * Owned by the model; freed in inferbit_free. */
+    float *scales_fp32;
+    float *blk32_scales_fp32;
+    float *norm_fp32;
 } ib_tensor_meta;
 
 /* ── Per-layer metadata ─────────────────────────────────────── */
@@ -222,6 +239,14 @@ struct inferbit_model {
     float *pqv2_thread_acc_pool;
     size_t pqv2_thread_acc_pool_floats;
 
+    /* Companion L2 scratch for pyramid (l2_kind==2) tensors. Same size as
+     * pqv2_thread_acc_pool; allocated only when at least one PQv2 tensor
+     * has l2_kind==2. NULL on flat models — keeps the existing alloc path
+     * as a no-op fallback. Avoids ~88 aligned_alloc/free per decode token
+     * on pyramid models (44-176 MB churn per token). */
+    float *pqv2_thread_acc_l2_pool;
+    size_t pqv2_thread_acc_l2_pool_floats;
+
     /* KV cache (one per layer) */
     ib_kv_cache* kv_caches;
 
@@ -251,6 +276,15 @@ struct inferbit_model {
     int8_t* bb_qscratch;         /* [B_MAX * max(hidden,intermediate)] */
     float*  bb_sa;               /* [B_MAX * groups_max] */
     int*    bb_positions;        /* [B_MAX] */
+
+    /* Precomputed RoPE cos/sin tables (perf: avoids per-token sinf/cosf).
+     * Sized [rope_table_ctx * (head_dim/2)] each. Populated by
+     * ib_alloc_buffers at load using header.rope_theta + head_dim. Optional:
+     * when NULL the kernels fall back to live sinf/cosf, so older models or
+     * fast bringup paths still work. Freed in inferbit_model_free. */
+    float* rope_cos;
+    float* rope_sin;
+    int    rope_table_ctx;       /* capacity (positions) of the tables; 0 = none */
 
     /* Speculative decoding */
     inferbit_model* draft_model;
@@ -294,8 +328,19 @@ struct inferbit_model {
     void  *metal_bufs;
     int    metal_route_failed;  /* 1 = ib_metal_upload_model failed or backend forced CPU; never retry */
     int    drive_fd;                  /* fd of the IBF, F_NOCACHE set on Darwin */
-    void  *drive_indices_scratch;     /* page-aligned shared buffer */
+    void  *drive_indices_scratch;     /* page-aligned shared buffer (slot 0) */
+    void  *drive_indices_scratch2;    /* page-aligned shared buffer (slot 1) — prefetch ring */
     size_t drive_indices_scratch_size;
+    /* 2-slot prefetch ring (perf fix). The scratch buffers above act as a
+     * double-buffer: while the kernel reads from one slot, a worker thread
+     * preads the NEXT tensor's indices into the other slot. drive_pf_state
+     * is an opaque pointer to the prefetcher's runtime state (lazy init).
+     * drive_pq_order[] is the static decode-order list (Q,K,V,O,gate,up,
+     * down per layer; last entry = output_head) used to predict the next
+     * pread target. Built at drive-mode init. */
+    void  *drive_pf_state;
+    const ib_tensor_meta **drive_pq_order;
+    int     drive_pq_order_len;
     /* Pre-transposed sidecar (doc 35 feature 3). Built once at drive-
      * mode init from the original [c][s][m] indices, stores them in
      * kernel-native [m][total] layout for GPU drive-mode preads —
@@ -404,9 +449,14 @@ typedef struct {
         float eps, int N
     );
 
-    /* RoPE: apply rotary position encoding in-place */
+    /* RoPE: apply rotary position encoding in-place.
+     * If cos_tab/sin_tab are non-NULL, they are looked up as
+     *   cos_tab[pos * (head_dim/2) + i/2], sin_tab[pos * (head_dim/2) + i/2]
+     * to avoid the per-call sinf/cosf cost (precomputed at model load).
+     * Passing NULL for both falls back to live sinf/cosf computation. */
     void (*rope)(
-        float* q, float* k, int head_dim, int pos, float theta
+        float* q, float* k, int head_dim, int pos, float theta,
+        const float* cos_tab, const float* sin_tab
     );
 
     /* Softmax: in-place softmax over N elements */

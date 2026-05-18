@@ -14,8 +14,10 @@
 #include "inferbit_internal.h"
 #include "platform.h"
 #include "cJSON.h"
+#include "pq_decode.h"   /* ib_fp16_to_fp32 — used for static scale caching */
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -365,6 +367,100 @@ int ib_alloc_kv_caches(inferbit_model* model, int context_length, int dynamic) {
     return 0;
 }
 
+/* ── Static fp32 caches (perf) ───────────────────────────────── */
+
+/* Decode the fp16 on-disk scale (and norm) buffers into fp32 ONCE at load
+ * time. forward.c::tensor_matmul + rmsnorm_fp16 then pick up the cached
+ * fp32 pointers and skip the per-call fp16→fp32 conversion (~154 calls
+ * per decode token on a 28-layer Llama).
+ *
+ * Bit-identical to the runtime conversion (ib_fp16_to_fp32 and forward.c's
+ * static fp16_to_fp32 are both IEEE-correct).
+ *
+ * Safe to call multiple times — already-cached fields are skipped. */
+static void cache_one_tensor(inferbit_model* m, ib_tensor_meta* t,
+                             int is_norm) {
+    if (!t) return;
+    /* No on-disk fp16 scale buffer for PQv2 tensors (bits == -1) or for
+     * tensors that simply have no quantization scales. */
+    if (t->bits == 0 || t->bits < 0) {
+        if (!is_norm) return;
+    }
+    if (is_norm) {
+        /* Norm weights: stored as fp16 in the weight blob (no separate
+         * scale buffer; bits == 16, size == N * 2). */
+        if (t->norm_fp32 || t->bits != 16 || t->size == 0) return;
+        int N = (t->ndim > 0 && t->shape[0] > 0) ? t->shape[0]
+                                                  : (int)(t->size / 2);
+        if (N <= 0) return;
+        float* dst = (float*)malloc((size_t)N * sizeof(float));
+        if (!dst) return;
+        const uint16_t* src = (const uint16_t*)((const uint8_t*)m->weight_data
+                                                + t->offset);
+        for (int i = 0; i < N; i++) dst[i] = ib_fp16_to_fp32(src[i]);
+        t->norm_fp32 = dst;
+        return;
+    }
+    /* Weight scales: only present for INT2/4/8 quantized tensors. */
+    if (t->scale_size == 0 || t->scale_offset == 0) return;
+    if (t->scales_fp32 || t->blk32_scales_fp32) return;
+    int M = (t->ndim > 0) ? t->shape[0] : 0;
+    if (M <= 0) return;
+    const uint16_t* src = (const uint16_t*)((const uint8_t*)m->weight_data
+                                            + t->scale_offset);
+    /* Per-block-32 INT4: scale_size > M*2 bytes (M * (N/32) fp16 entries). */
+    if (t->bits == 4 && t->scale_size > (size_t)M * 2) {
+        int N = (t->ndim > 1) ? t->shape[1] : 0;
+        if (N <= 0 || (N % 32) != 0) return;
+        size_t total = (size_t)M * (size_t)(N / 32);
+        float* dst = (float*)malloc(total * sizeof(float));
+        if (!dst) return;
+        for (size_t i = 0; i < total; i++) dst[i] = ib_fp16_to_fp32(src[i]);
+        t->blk32_scales_fp32 = dst;
+        return;
+    }
+    /* Per-row scale (legacy INT4/INT8/INT2): M fp16 entries. */
+    float* dst = (float*)malloc((size_t)M * sizeof(float));
+    if (!dst) return;
+    for (int i = 0; i < M; i++) dst[i] = ib_fp16_to_fp32(src[i]);
+    t->scales_fp32 = dst;
+}
+
+/* Walk every tensor slot on the model and pre-decode its static fp32
+ * scales/norm buffer. Called once at the end of every load path
+ * (ibf_load + pqv2_load_internal) so both legacy v5 and PQv2 v6 models
+ * get the optimization. */
+void ib_cache_model_static_fp32(inferbit_model* m);
+void ib_cache_model_static_fp32(inferbit_model* m) {
+    if (!m) return;
+    /* Globals: token_embedding has per-row scales when quantized; output
+     * head ditto; output_norm is fp16. token_embedding usually doesn't go
+     * through tensor_matmul, but caching is cheap. */
+    cache_one_tensor(m, &m->token_embedding, 0);
+    cache_one_tensor(m, &m->output_head,     0);
+    cache_one_tensor(m, &m->output_norm,     1);
+    for (int li = 0; li < m->header.num_layers; li++) {
+        ib_layer_meta* L = &m->layers[li];
+        cache_one_tensor(m, &L->q_proj,    0);
+        cache_one_tensor(m, &L->k_proj,    0);
+        cache_one_tensor(m, &L->v_proj,    0);
+        cache_one_tensor(m, &L->o_proj,    0);
+        cache_one_tensor(m, &L->gate_proj, 0);
+        cache_one_tensor(m, &L->up_proj,   0);
+        cache_one_tensor(m, &L->down_proj, 0);
+        cache_one_tensor(m, &L->input_norm,     1);
+        cache_one_tensor(m, &L->post_attn_norm, 1);
+        /* MoME experts (Stage 3a). Skip if absent. */
+        if (L->mome_experts > 1) {
+            for (int e = 0; e < L->mome_experts; e++) {
+                if (L->gate_proj_experts) cache_one_tensor(m, &L->gate_proj_experts[e], 0);
+                if (L->up_proj_experts)   cache_one_tensor(m, &L->up_proj_experts[e],   0);
+                if (L->down_proj_experts) cache_one_tensor(m, &L->down_proj_experts[e], 0);
+            }
+        }
+    }
+}
+
 /* ── Allocate activation buffers ────────────────────────────── */
 
 int ib_alloc_buffers(inferbit_model* model);
@@ -430,6 +526,39 @@ int ib_alloc_buffers(inferbit_model* model) {
         !model->bb_scale || !model->bb_att || !model->bb_qscratch ||
         !model->bb_sa || !model->bb_positions) {
         return -1;
+    }
+
+    /* Precomputed RoPE cos/sin tables (perf: removes per-token sinf/cosf
+     * cost from the attention path). Table layout is
+     *   tab[pos * (head_dim/2) + i/2]  for i in {0, 2, 4, ..., head_dim-2}
+     * matching the kernel rotation step. theta comes from header.rope_theta
+     * (10000.0 for Llama-2/TinyLlama, 500000.0 for Llama-3). Allocation
+     * failure is non-fatal: kernels fall back to live sinf/cosf when
+     * rope_cos/rope_sin are NULL. */
+    if (head_dim > 1 && max_ctx > 0) {
+        int half = head_dim / 2;
+        size_t cells = (size_t)max_ctx * (size_t)half;
+        model->rope_cos = calloc(cells, sizeof(float));
+        model->rope_sin = calloc(cells, sizeof(float));
+        if (model->rope_cos && model->rope_sin) {
+            float theta = model->header.rope_theta > 0.0f
+                          ? model->header.rope_theta : 10000.0f;
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(theta,
+                                         (float)(2 * i) / (float)head_dim);
+                for (int p = 0; p < max_ctx; p++) {
+                    float angle = (float)p * freq;
+                    model->rope_cos[(size_t)p * half + i] = cosf(angle);
+                    model->rope_sin[(size_t)p * half + i] = sinf(angle);
+                }
+            }
+            model->rope_table_ctx = max_ctx;
+        } else {
+            /* OOM is non-fatal — kernels handle NULL via sinf/cosf fallback. */
+            free(model->rope_cos); model->rope_cos = NULL;
+            free(model->rope_sin); model->rope_sin = NULL;
+            model->rope_table_ctx = 0;
+        }
     }
 
     return 0;
@@ -638,6 +767,10 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
 
     /* Create thread pool (NULL if single-threaded) */
     model->thread_pool = ib_pool_create(threads);
+
+    /* Perf: pre-decode fp16 weight-scales and norm weights into fp32 so
+     * forward.c::tensor_matmul + rmsnorm_fp16 skip per-call conversion. */
+    ib_cache_model_static_fp32(model);
 
     return model;
 }

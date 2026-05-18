@@ -1246,11 +1246,17 @@ static int push_pqv2_expert_rows(ib6_manifest *mf, const char *base_name,
     snprintf(nm, sizeof(nm), "%s.expert%d", base_name, expert_idx);
     /* Sub-rows are contiguous: pointer arithmetic suffices. */
     const float *W_slice = W_full + (size_t)row_offset * (size_t)N;
+    /* E1 fix: all experts share the SAME k-means init seed. The previous
+     * per-expert XOR differentiator produced statistically-independent
+     * codebook errors across experts → summing K experts compounded the
+     * noise rather than averaging it → PPL 5074 vs flat 6.26. Same seed
+     * gives correlated (not identical, since input rows differ) codebooks
+     * whose errors partially cancel. */
     return push_pqv2_tensor(mf, nm, W_slice, M_per, N, G, K, half,
                              pyramid, residency_hint,
                              scale_precision, codebook_dedup,
                              /*idx_layout_rowmajor=*/0,
-                             seed ^ (uint32_t)(expert_idx * 2654435761u));
+                             seed);
 }
 
 /* Slice down_proj's column range [e * N_per, (e+1) * N_per) and push
@@ -1281,11 +1287,12 @@ static int push_pqv2_expert_cols(ib6_manifest *mf, const char *base_name,
     }
     char nm[128];
     snprintf(nm, sizeof(nm), "%s.expert%d", base_name, expert_idx);
+    /* E1 fix: same shared seed across experts (see push_pqv2_expert_rows). */
     int rc = push_pqv2_tensor(mf, nm, tile, M, N_per, G, K, half,
                                pyramid, residency_hint,
                                scale_precision, codebook_dedup,
                                /*idx_layout_rowmajor=*/0,
-                               seed ^ (uint32_t)(expert_idx * 2654435761u));
+                               seed);
     free(tile);
     return rc;
 }

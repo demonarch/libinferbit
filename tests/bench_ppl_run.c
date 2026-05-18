@@ -138,6 +138,23 @@ int main(int argc, char **argv) {
     }
     int use_gpu = (strcmp(backend, "gpu") == 0);
 
+    /* When --backend cpu is requested, also force the libinferbit Metal
+     * router to bail (IB_BACKEND=cpu). Without this, ib_forward()
+     * auto-routes single-token decode + prefill through ib_metal_route
+     * even though the bench only uses the CPU streaming loop. On pyramid
+     * PQv2 (l2_kind=2) models that silently dispatches through the Metal
+     * fused QKV/gateup pipelines whose L2-residual coverage isn't bit-
+     * identical to the CPU reference, blowing PPL by ~70% in RAM mode
+     * while drive-mode (which fails Metal upload via model_is_supported)
+     * gives the correct number (e.g. 9.47 vs 5.91 on tl-pyramid.ibf). */
+    if (!use_gpu) {
+#if defined(_WIN32)
+        _putenv_s("IB_BACKEND", "cpu");
+#else
+        setenv("IB_BACKEND", "cpu", 1);
+#endif
+    }
+
     /* Load tokens. */
     FILE *fp = fopen(argv[2], "rb");
     if (!fp) { fprintf(stderr, "open tokens failed\n"); return 2; }

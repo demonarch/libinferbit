@@ -260,6 +260,12 @@ static id<MTLComputePipelineState> get_pipeline(ib_metal_ctx *ctx,
     return ps;
 }
 
+// NAIVE: per-call CB + waitUntilCompleted serializes CPU+GPU. Acceptable
+// only because callers are tests/benches (see grep over /tests/); the
+// per-token forward path uses the recorder (one CB per token). The same
+// caveat applies to every other one-shot helper in this file (matmul_w4a8*,
+// matmul_int8_fp32_in, rmsnorm_fp16, silu_mul, rope_inplace, softmax_rows,
+// embed_lookup_fp16, residual_add, quantize_input_int8_g128, attention_*).
 extern "C" int ib_metal_vec_mul2(ib_metal_ctx *ctx,
                                    const void *gpu_in, void *gpu_out, int n) {
     if (!ctx || !gpu_in || !gpu_out || n <= 0) return -1;

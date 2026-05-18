@@ -19,6 +19,48 @@ static int build_pretransposed_sidecar(inferbit_model *m,
                                          const uint8_t *file_base,
                                          pqv2_t **pq_list, int n_pq);
 
+/* Strict parser for MoME expert tensor names of the form
+ *   "L<li>.mlp.<proj>.expert<eidx>"
+ * with NO trailing characters after <eidx>.
+ *
+ * Background — round-3 C1 precedent in set_pq_meta: a sscanf using
+ * "L%d.mlp.router" returned 1 (number of converted specifiers) as long
+ * as %d converted; it did NOT report whether the trailing literal
+ * ".mlp.router" matched, so any "L<N>.…" silently hit the router branch.
+ * The same pitfall applies to "L%d.mlp.%[^.].expert%d": %d at the tail
+ * stops at the first non-digit, so "expert3.foo" or "expert3bar" still
+ * yield 3 conversions with eidx=3 and trailing garbage silently dropped.
+ *
+ * Fix mirrors the round-3 pattern: capture the tail with %63s and
+ * validate the entire suffix structure ourselves. proj_out must point
+ * at a buffer of at least 32 bytes. Returns 1 on strict match, 0
+ * otherwise. */
+static int parse_mome_expert_name(const char *name,
+                                   int *li_out,
+                                   char proj_out[32],
+                                   int *eidx_out) {
+    int li = 0;
+    char proj[32];
+    char tail[64];
+    /* "L%d.mlp.%31[^.].%63s" — last %63s captures "expert<N>" with any
+     * (illegal) trailing characters. We then enforce structure on tail. */
+    if (sscanf(name, "L%d.mlp.%31[^.].%63s", &li, proj, tail) != 3) return 0;
+    /* tail must be exactly "expert" + 1+ digits, nothing else. */
+    if (strncmp(tail, "expert", 6) != 0) return 0;
+    const char *digits = tail + 6;
+    if (*digits == '\0') return 0;
+    int eidx = 0;
+    for (const char *p = digits; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;   /* trailing non-digit → reject */
+        eidx = eidx * 10 + (*p - '0');
+        if (eidx < 0) return 0;               /* overflow guard */
+    }
+    *li_out = li;
+    memcpy(proj_out, proj, sizeof(proj));
+    *eidx_out = eidx;
+    return 1;
+}
+
 #define IB_PQV2_MAGIC "IBFV6PQ2"
 
 extern inferbit_model* ibf_load(const char* path, const inferbit_config* config);
@@ -27,6 +69,8 @@ int ib_alloc_kv_caches(inferbit_model* model, int context_length, int dynamic);
 int ib_alloc_buffers(inferbit_model* model);
 /* Stage 3b: kv_format → kv_bits bridge, shared with ibf_loader.c. */
 void ib_apply_kv_format(inferbit_model* model, const inferbit_config* config);
+/* Perf: pre-decode static fp16 scale/norm buffers, shared with ibf_loader.c. */
+void ib_cache_model_static_fp32(inferbit_model* m);
 /* SIMD + thread pool — declared in inferbit_internal.h with the right
  * types (ib_simd_level, ib_thread_pool); already in scope. */
 
@@ -100,10 +144,12 @@ static int detect_arch_from_tensors(const ib_pqv2_file* f, ib_ibf_header* h) {
          * 0. We rely on this scan running over every tensor; the count
          * tracks how many `L0.mlp.gate_proj.expert{e}` we saw. */
         {
+            /* Round-3 C1 precedent: sscanf("…expert%d") accepts trailing
+             * garbage after %d (e.g. "expert3.foo"), silently corrupting
+             * eidx. Use strict parser that rejects any non-digit tail. */
             int li2, eidx2;
             char mproj2[32];
-            if (sscanf(nt->name, "L%d.mlp.%31[^.].expert%d",
-                        &li2, mproj2, &eidx2) == 3 &&
+            if (parse_mome_expert_name(nt->name, &li2, mproj2, &eidx2) &&
                 li2 == 0 && strcmp(mproj2, "gate_proj") == 0) {
                 if (gate_proj_expert_M == 0) gate_proj_expert_M = t_M;
                 gate_proj_expert_count++;
@@ -289,8 +335,10 @@ static inferbit_model* pqv2_load_internal(const char* path,
         const ib_pqv2_named_tensor* nt = &f->tensors[i];
         int li, eidx;
         char proj[32];
-        if (sscanf(nt->name, "L%d.mlp.%31[^.].expert%d",
-                    &li, proj, &eidx) == 3 &&
+        /* Round-3 C1 precedent: %d at tail of sscanf accepts trailing
+         * garbage, so "expert3.foo" silently parses eidx=3. Strict
+         * parser rejects any non-digit tail. */
+        if (parse_mome_expert_name(nt->name, &li, proj, &eidx) &&
             li >= 0 && li < m->header.num_layers && eidx >= 0) {
             ib_layer_meta* L = &m->layers[li];
             int want = eidx + 1;
@@ -334,10 +382,14 @@ static inferbit_model* pqv2_load_internal(const char* path,
              * route it into the right slot in the K-stacked expert
              * array on the owning layer. */
             {
+                /* Round-3 C1 precedent: strict tail validation. The
+                 * previous sscanf("…expert%d") accepted trailing junk
+                 * because %d stops at first non-digit and sscanf
+                 * doesn't report unmatched literal tails — would route
+                 * garbage tensor names into a real expert slot. */
                 int li, eidx;
                 char mproj[32];
-                if (sscanf(n, "L%d.mlp.%31[^.].expert%d",
-                            &li, mproj, &eidx) == 3 &&
+                if (parse_mome_expert_name(n, &li, mproj, &eidx) &&
                     li >= 0 && li < m->header.num_layers && eidx >= 0) {
                     ib_layer_meta* L = &m->layers[li];
                     if (L->mome_experts > 1 && eidx < L->mome_experts) {
@@ -598,6 +650,7 @@ static inferbit_model* pqv2_load_internal(const char* path,
      * across all PQv2 tensors × n_threads. Reused per matvec to avoid
      * per-call aligned_alloc in the hot path. */
     uint32_t max_M = 0;
+    int has_any_l2 = 0;
     for (int li = 0; li < m->header.num_layers; li++) {
         ib_layer_meta *L = &m->layers[li];
         const ib_tensor_meta *slots[7] = {
@@ -605,8 +658,17 @@ static inferbit_model* pqv2_load_internal(const char* path,
             &L->gate_proj, &L->up_proj, &L->down_proj,
         };
         for (int si = 0; si < 7; si++) {
-            if (slots[si]->pq && slots[si]->pq->M > max_M) max_M = slots[si]->pq->M;
+            if (slots[si]->pq) {
+                if (slots[si]->pq->M > max_M) max_M = slots[si]->pq->M;
+                if (slots[si]->pq->l2_kind == 2) has_any_l2 = 1;
+            }
         }
+    }
+    /* output_head also goes through tensor_matmul → pqv2_threaded_matvec_k256,
+     * so include it when sizing the scratch and probing for l2_kind. */
+    if (m->output_head.pq) {
+        if (m->output_head.pq->M > max_M) max_M = m->output_head.pq->M;
+        if (m->output_head.pq->l2_kind == 2) has_any_l2 = 1;
     }
     if (max_M > 0) {
         size_t n_threads_eff = (threads > 1) ? (size_t)threads : 1;
@@ -614,6 +676,12 @@ static inferbit_model* pqv2_load_internal(const char* path,
         size_t pool_bytes  = (pool_floats * sizeof(float) + 63) & ~(size_t)63;
         m->pqv2_thread_acc_pool = aligned_alloc(64, pool_bytes);
         m->pqv2_thread_acc_pool_floats = pool_floats;
+        /* Companion L2 scratch — same shape, only on pyramid models. Avoids
+         * ~88 aligned_alloc/free per decode token on pyramid checkpoints. */
+        if (has_any_l2) {
+            m->pqv2_thread_acc_l2_pool = aligned_alloc(64, pool_bytes);
+            m->pqv2_thread_acc_l2_pool_floats = pool_floats;
+        }
     }
 
     /* Path D drive mode setup (Solution 5): allocate one shared indices
@@ -664,6 +732,10 @@ static inferbit_model* pqv2_load_internal(const char* path,
         } else {
             m->drive_indices_scratch = scratch;
             m->drive_indices_scratch_size = scratch_size;
+            /* Perf fix: allocate a second slot for the 2-slot prefetch
+             * ring. If it fails we silently degrade to single-slot
+             * synchronous load (same as before the perf fix). */
+            m->drive_indices_scratch2 = aligned_alloc((size_t)ps, scratch_size);
             m->drive_fd = f->_fd;
             m->drive_fd_pretransposed = -1;
             /* Second pass: rewrite pq->indices to point at scratch (CPU
@@ -675,6 +747,29 @@ static inferbit_model* pqv2_load_internal(const char* path,
                 mpq->indices = (const uint8_t *)scratch;
                 mpq->indices_pretransposed_offset = 0;
             }
+            /* Build the decode-order tensor list used by the prefetcher to
+             * predict the next pread target. Order: per layer Q,K,V,O,
+             * gate,up,down; output_head appended last. Same order as the
+             * layer loop in forward.c. */
+            int order_cap = m->header.num_layers * 7 + 1;
+            const ib_tensor_meta **order = (const ib_tensor_meta **)
+                malloc((size_t)order_cap * sizeof(*order));
+            int order_n = 0;
+            if (order) {
+                for (int li = 0; li < m->header.num_layers; li++) {
+                    ib_layer_meta *L = &m->layers[li];
+                    const ib_tensor_meta *s7[7] = {
+                        &L->q_proj, &L->k_proj, &L->v_proj, &L->o_proj,
+                        &L->gate_proj, &L->up_proj, &L->down_proj,
+                    };
+                    for (int i = 0; i < 7; i++) {
+                        if (s7[i]->pq) order[order_n++] = s7[i];
+                    }
+                }
+                if (m->output_head.pq) order[order_n++] = &m->output_head;
+            }
+            m->drive_pq_order = order;
+            m->drive_pq_order_len = order_n;
             /* Build pre-transposed sidecar for the GPU drive path. Writes
              * each tensor's indices in kernel-native [M][total] layout to
              * an unlinked tmpfile and sets indices_pretransposed_offset
@@ -727,6 +822,10 @@ static inferbit_model* pqv2_load_internal(const char* path,
                     scratch_size, m->drive_fd, m->drive_fd_pretransposed, nslots);
         }
     }
+    /* Perf: pre-decode fp16 scale/norm buffers (covers raw-fp16 norm
+     * tensors and any legacy quantized sub-tensors a hybrid PQv2 file
+     * might carry). PQv2 tensors (bits == -1) are skipped automatically. */
+    ib_cache_model_static_fp32(m);
     return m;
 
 fail:

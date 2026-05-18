@@ -208,6 +208,23 @@ static int model_is_supported(const inferbit_model *m, char *err, size_t err_sz)
     int kvb = m->header.kv_bits;
     CHECK(kvb == 16 || kvb == 8, "Metal forward requires kv_bits=16 or kv_bits=8");
     CHECK(m->output_norm.bits == 16, "output_norm must be fp16");
+    /* MoME FFN is not implemented on the Metal forward kernel. The upload
+     * loop intentionally leaves lb->gate/up/down zeroed for MoME layers
+     * (the per-expert tensors live in lm->*_proj_experts), but
+     * ib_metal_forward_token / ib_metal_forward_prefill unconditionally
+     * dispatch matmuls against those slots — producing garbage logits
+     * (PPL=1e5+) without crashing because the calloc-zero buffers are
+     * valid Metal allocations. Refuse Metal up-front so the caller falls
+     * back to CPU, where mome_dispatch_ffn handles MoME correctly. */
+     for (int L = 0; L < m->header.num_layers; L++) {
+         if (m->layers[L].mome_experts > 1) {
+             snprintf(err, err_sz,
+                 "Metal forward not supported for MoME models (layer %d has %d experts); "
+                 "set IB_BACKEND=cpu or use a non-MoME IBF",
+                 L, m->layers[L].mome_experts);
+             return 0;
+         }
+     }
     if (m->output_head.pq) {
         CHECK(m->output_head.pq->K == 256 && m->output_head.pq->half == 2,
               "PQv2 GPU path requires K=256 and half=2 on output_head");

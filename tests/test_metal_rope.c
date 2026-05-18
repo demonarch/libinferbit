@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
      * fresh dummy K each time and ignore the K result). */
     for (int h = 0; h < n_heads; h++) {
         memset(k_dummy, 0, sizeof(k_dummy));  /* irrelevant — discarded */
-        ib_kern.rope(cpu_q + h * head_dim, k_dummy, head_dim, pos, theta);
+        ib_kern.rope(cpu_q + h * head_dim, k_dummy, head_dim, pos, theta, NULL, NULL);
     }
 
     void *g_t = ib_metal_alloc(ctx, (size_t)N * sizeof(float), gpu_q);

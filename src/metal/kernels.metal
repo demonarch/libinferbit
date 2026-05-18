@@ -3658,6 +3658,9 @@ kernel void kv_cache_write_fp16(
 }
 
 /* Attention scores: scores[h, t] = (Q[h] · K_cache[t, kv_h]) * scale. */
+// NAIVE: serial scalar dot-product per thread — head_dim sequential FMAs
+// inside one lane. Should use one SIMDgroup per (h,t) with simd_sum-reduced
+// cooperative dot to use all 32 lanes (head_dim=64..128 → 2–4 elts/lane).
 kernel void attn_scores_qk(
     device const float *q              [[buffer(0)]],
     device const float *k_cache        [[buffer(1)]],
@@ -3928,6 +3931,10 @@ kernel void attn_softmax_wv_fp16(
     /* Each thread computes one (or more) (h, d) output cell. scores stay
      * logical-indexed; v_cache is physical-indexed t % kv_window when a
      * rotating window is active (masked positions carry score 0). */
+    // NAIVE (long-context): only head_dim threads of the 256-thread TG do
+    // work in step 3 (head_dim=64..128 → 128..192 idle lanes). For long
+    // seq_pos_p1 the per-thread serial t-loop dominates; could be
+    // parallelized as (d, t_chunk) → partial-sum tree-reduce in TG memory.
     for (uint d = tid; d < head_dim; d += TG_THREADS) {
         float acc = 0.0f;
         for (uint t = 0; t < seq_pos_p1; t++) {
@@ -4320,6 +4327,15 @@ kernel void matmul_pqv2_simdmat_decode(
     uint total = nc * n_subchunks;
     uint n_tiles = N / TILE;
 
+    /* Hoist row_scale: each TG only needs 8 fp16 values (m_base..m_base+7).
+     * Previously each W-element load did `cb_v * row_scale[m_global]`, so
+     * row_scale was re-fetched 8 * TILE * n_tiles times per TG instead of
+     * 8 times. Cache the 8 values in a per-SIMDgroup register array via
+     * simd_broadcast — no TG memory or barrier needed because we're a
+     * single-SIMDgroup TG. */
+    half rs_local = (half)0;
+    if (lane < 8u && (m_base + lane) < M) rs_local = row_scale[m_base + lane];
+
     for (uint t = 0; t < n_tiles; t++) {
         uint k_start = t * TILE;
 
@@ -4330,6 +4346,11 @@ kernel void matmul_pqv2_simdmat_decode(
             uint m_global = m_base + m_local;
             uint n_global = k_start + k_local;
 
+            /* Hoist row_scale lookup OUT of the divergent branch so all
+             * lanes participate uniformly in the simd_broadcast (required
+             * by the MSL spec for the result to be well-defined). */
+            half rs_m = simd_broadcast(rs_local, m_local);
+
             half v = (half)0;
             if (m_global < M && n_global < N) {
                 uint c = n_global / G;
@@ -4338,7 +4359,7 @@ kernel void matmul_pqv2_simdmat_decode(
                 uint h = within - s * HALF;
                 uint k_idx = (uint)indices[(size_t)m_global * total + c * n_subchunks + s];
                 half cb_v = cb_fp16[(s * K + k_idx) * HALF + h];
-                v = cb_v * row_scale[m_global];
+                v = cb_v * rs_m;
             }
             tg_W_fp16[i] = v;
         }
@@ -4751,6 +4772,13 @@ kernel void matmul_pqv2_k256_half2_iwide(
  * packed layout we transpose to [total][ceil(M/4)*3] on upload — i.e.
  * indices for slot `i` of all rows are contiguous, and within a slot
  * each group of 4 rows shares a 3-byte triple. */
+// NAIVE: 6-bit packed L2 path lane-reads 3 contiguous bytes at a slot-varying
+// offset — each lane lands in a DIFFERENT slot's 3-byte group, so the SIMD's
+// 32 reads are NOT coalesced like the L1 path's [i, i+32) byte stripe.
+// Fix candidates: (a) read uchar4 quads per lane (4 packed groups = 12 bytes,
+// covering 16 row indices at slots {q,q+1,q+2,q+3}), or (b) re-transpose on
+// upload so each lane's slot-byte triples are interleaved. Both keep the
+// 4-in-3-byte bit layout but restore coalesced loads.
 inline uint pqv2_l2_unpack_6bit(device const uchar *row_base,
                                   uint stride_packed_bytes,
                                   uint slot, uint m)

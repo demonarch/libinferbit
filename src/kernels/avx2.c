@@ -254,13 +254,23 @@ static void avx2_silu_mul(float* out, const float* gate, const float* up, int N)
 
 /* RoPE is hard to vectorize well due to sin/cos, keep scalar */
 static void avx2_rope(
-    float* q, float* k, int head_dim, int pos, float theta
+    float* q, float* k, int head_dim, int pos, float theta,
+    const float* cos_tab, const float* sin_tab
 ) {
+    const int half = head_dim / 2;
+    const float* cos_row = cos_tab ? (cos_tab + (size_t)pos * (size_t)half) : NULL;
+    const float* sin_row = sin_tab ? (sin_tab + (size_t)pos * (size_t)half) : NULL;
     for (int i = 0; i < head_dim; i += 2) {
-        float freq = 1.0f / powf(theta, (float)i / (float)head_dim);
-        float angle = (float)pos * freq;
-        float cos_a = cosf(angle);
-        float sin_a = sinf(angle);
+        float cos_a, sin_a;
+        if (cos_row && sin_row) {
+            cos_a = cos_row[i >> 1];
+            sin_a = sin_row[i >> 1];
+        } else {
+            float freq = 1.0f / powf(theta, (float)i / (float)head_dim);
+            float angle = (float)pos * freq;
+            cos_a = cosf(angle);
+            sin_a = sinf(angle);
+        }
 
         float q0 = q[i], q1 = q[i + 1];
         q[i]     = q0 * cos_a - q1 * sin_a;

@@ -91,10 +91,29 @@ void inferbit_free(inferbit_model* model) {
         free(model->pqv2_thread_acc_pool);
         model->pqv2_thread_acc_pool = NULL;
     }
+    if (model->pqv2_thread_acc_l2_pool) {
+        free(model->pqv2_thread_acc_l2_pool);
+        model->pqv2_thread_acc_l2_pool = NULL;
+    }
+    /* Stop the prefetcher worker (if any) BEFORE freeing scratch / order
+     * array so the worker can't dereference dead memory. Implemented in
+     * forward.c — see ib_drive_prefetch_shutdown. Forward-declare to avoid
+     * pulling forward.c internals into model.c. */
+    extern void ib_drive_prefetch_shutdown(inferbit_model *m);
+    ib_drive_prefetch_shutdown(model);
     if (model->drive_indices_scratch) {
         free(model->drive_indices_scratch);
         model->drive_indices_scratch = NULL;
         model->drive_indices_scratch_size = 0;
+    }
+    if (model->drive_indices_scratch2) {
+        free(model->drive_indices_scratch2);
+        model->drive_indices_scratch2 = NULL;
+    }
+    if (model->drive_pq_order) {
+        free(model->drive_pq_order);
+        model->drive_pq_order = NULL;
+        model->drive_pq_order_len = 0;
     }
     /* model->drive_fd is owned by pqv2_file_backing — don't close here. */
     /* model->drive_fd_pretransposed IS owned here (unlinked tmpfile). */
@@ -155,6 +174,11 @@ void inferbit_free(inferbit_model* model) {
     free(model->buf_logits);
     free(model->buf_qkv);
 
+    /* Free precomputed RoPE tables (NULL-safe: allocated lazily and may
+     * have been left NULL on OOM/old-bringup paths). */
+    free(model->rope_cos);
+    free(model->rope_sin);
+
     /* Free batched-forward scratch */
     free(model->bb_x);
     free(model->bb_xb);
@@ -169,6 +193,41 @@ void inferbit_free(inferbit_model* model) {
     free(model->bb_qscratch);
     free(model->bb_sa);
     free(model->bb_positions);
+
+    /* Free pre-decoded fp32 scale/norm caches (perf, doc 36).
+     * Allocated by ib_cache_model_static_fp32 in ibf_loader.c. MUST come
+     * before the MoME expert-array free below — those arrays own per-expert
+     * ib_tensor_meta slots that carry their own caches. */
+#define FREE_TENSOR_CACHES(t) do { \
+        free((t)->scales_fp32);       (t)->scales_fp32 = NULL;       \
+        free((t)->blk32_scales_fp32); (t)->blk32_scales_fp32 = NULL; \
+        free((t)->norm_fp32);         (t)->norm_fp32 = NULL;         \
+    } while (0)
+    FREE_TENSOR_CACHES(&model->token_embedding);
+    FREE_TENSOR_CACHES(&model->output_norm);
+    FREE_TENSOR_CACHES(&model->output_head);
+    if (model->layers) {
+        for (int li = 0; li < model->header.num_layers; li++) {
+            ib_layer_meta *L = &model->layers[li];
+            FREE_TENSOR_CACHES(&L->q_proj);
+            FREE_TENSOR_CACHES(&L->k_proj);
+            FREE_TENSOR_CACHES(&L->v_proj);
+            FREE_TENSOR_CACHES(&L->o_proj);
+            FREE_TENSOR_CACHES(&L->gate_proj);
+            FREE_TENSOR_CACHES(&L->up_proj);
+            FREE_TENSOR_CACHES(&L->down_proj);
+            FREE_TENSOR_CACHES(&L->input_norm);
+            FREE_TENSOR_CACHES(&L->post_attn_norm);
+            if (L->mome_experts > 1) {
+                for (int e = 0; e < L->mome_experts; e++) {
+                    if (L->gate_proj_experts) FREE_TENSOR_CACHES(&L->gate_proj_experts[e]);
+                    if (L->up_proj_experts)   FREE_TENSOR_CACHES(&L->up_proj_experts[e]);
+                    if (L->down_proj_experts) FREE_TENSOR_CACHES(&L->down_proj_experts[e]);
+                }
+            }
+        }
+    }
+#undef FREE_TENSOR_CACHES
 
     /* Free MoME per-layer expert arrays (Stage 3a, docs/v2/00_CORRECTION.md).
      * Each *_proj_experts is either NULL (mome_experts == 1) or a

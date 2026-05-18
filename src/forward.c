@@ -192,13 +192,262 @@ static inline const void* tensor_scales_raw(const inferbit_model* m, const ib_te
     return (const uint8_t*)m->weight_data + t->scale_offset;
 }
 
-/* Path D (Solution 5): pread the indices for one PQv2 tensor from the
- * on-disk file into the model's shared scratch buffer. The PQv2 kernel
- * reads via pq->indices, which we redirected to scratch at load time
- * (pqv2_model.c). Each matmul refills scratch from pq->indices_file_offset.
+/* ── Path D drive mode + 2-slot prefetch ring (perf fix) ─────────
  *
- * Returns 0 on success. Falls back silently to a no-op if the model
- * isn't in drive mode or the offset isn't set. */
+ * Background: every PQv2 matmul in drive mode pread()s its indices
+ * from disk into a shared scratch buffer the kernel reads from.
+ * Per token: 22 layers × 7 matmuls = 154 synchronous preads, each
+ * blocking on storage. The matmul kernel and the I/O were strictly
+ * serialised → effective decode throughput floored at ~7-10 t/s.
+ *
+ * Fix: two scratch slots + a single background pread() worker. Before
+ * each matmul we kick a prefetch for the NEXT tensor (decode order is
+ * static — Q,K,V,O,gate,up,down per layer; output_head at the end). By
+ * the time the kernel needs slot N, the worker is already filling slot
+ * (N+1 % 2). The current matmul therefore overlaps with the next
+ * tensor's I/O, hiding most of the pread() latency behind the kernel
+ * compute. The model.c free path stops the worker via the public
+ * ib_drive_prefetch_shutdown shim.
+ *
+ * The kernel reads from `pq->indices`. We MUST repoint `pq->indices`
+ * to the slot whose data corresponds to the tensor about to run.
+ * Worker writes into the *other* slot, so the active matmul never
+ * races with the prefetch. */
+
+#ifdef _WIN32
+/* Reuse the Windows pthread shim already defined by threading.c. Including
+ * it here would double-define; we replicate the minimal subset we need. */
+#include <windows.h>
+typedef HANDLE pthread_t;
+typedef SRWLOCK pthread_mutex_t;
+typedef CONDITION_VARIABLE pthread_cond_t;
+#define pthread_mutex_init(m, a)     (InitializeSRWLock(m), 0)
+#define pthread_mutex_destroy(m)     ((void)0)
+#define pthread_mutex_lock(m)        AcquireSRWLockExclusive(m)
+#define pthread_mutex_unlock(m)      ReleaseSRWLockExclusive(m)
+#define pthread_cond_init(c, a)      (InitializeConditionVariable(c), 0)
+#define pthread_cond_destroy(c)      ((void)0)
+#define pthread_cond_wait(c, m)      SleepConditionVariableSRW(c, m, INFINITE, 0)
+#define pthread_cond_signal(c)       WakeConditionVariable(c)
+#define pthread_cond_broadcast(c)    WakeAllConditionVariable(c)
+typedef DWORD (WINAPI *win_thread_fn_pf)(LPVOID);
+static int pthread_create(pthread_t* t, void* attr, void* (*fn)(void*), void* arg) {
+    (void)attr; *t = CreateThread(NULL, 0, (win_thread_fn_pf)fn, arg, 0, NULL);
+    return (*t == NULL) ? -1 : 0;
+}
+static int pthread_join(pthread_t t, void** retval) {
+    (void)retval; WaitForSingleObject(t, INFINITE); CloseHandle(t); return 0;
+}
+#else
+#include <pthread.h>
+#endif
+
+typedef struct ib_drive_pf_state {
+    pthread_t      thread;
+    pthread_mutex_t mu;
+    pthread_cond_t  req_cv;    /* main → worker: a request is pending */
+    pthread_cond_t  done_cv;   /* worker → main: request complete */
+    /* Request state (protected by mu). */
+    const ib_tensor_meta *req_tensor;   /* what to prefetch */
+    int             req_slot;           /* which slot to fill (0 or 1) */
+    int             req_pending;        /* 1 when worker should service the request */
+    int             req_in_flight;      /* 1 between dequeue and completion */
+    /* Result of the most recently completed request. */
+    const ib_tensor_meta *done_tensor;
+    int             done_slot;
+    /* Cached pointers for the worker (set once at init). */
+    int             fd;
+    void           *scratch[2];
+    size_t          scratch_size;
+    /* Shutdown flag. */
+    int             stop;
+} ib_drive_pf_state;
+
+static void *ib_drive_pf_worker(void *arg) {
+    ib_drive_pf_state *st = (ib_drive_pf_state *)arg;
+    pthread_mutex_lock(&st->mu);
+    for (;;) {
+        while (!st->stop && !st->req_pending) {
+            pthread_cond_wait(&st->req_cv, &st->mu);
+        }
+        if (st->stop) break;
+        const ib_tensor_meta *t = st->req_tensor;
+        int slot = st->req_slot;
+        st->req_pending = 0;
+        st->req_in_flight = 1;
+        pthread_mutex_unlock(&st->mu);
+
+        int ok = 0;
+        if (t && t->pq && slot >= 0 && slot < 2 && st->scratch[slot]) {
+            const pqv2_t *pq = t->pq;
+            size_t bytes = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
+            off_t off = (off_t)pq->indices_file_offset;
+            if (bytes > 0 && bytes <= st->scratch_size && off != 0) {
+                uint8_t *buf = (uint8_t *)st->scratch[slot];
+                size_t done = 0;
+                ok = 1;
+                while (done < bytes) {
+                    ssize_t r = pread(st->fd, buf + done, bytes - done,
+                                      off + (off_t)done);
+                    if (r <= 0) {
+                        if (r == -1 && errno == EINTR) continue;
+                        ok = 0;
+                        break;
+                    }
+                    done += (size_t)r;
+                }
+            }
+        }
+
+        pthread_mutex_lock(&st->mu);
+        st->req_in_flight = 0;
+        st->done_tensor = ok ? t : NULL;
+        st->done_slot = ok ? slot : -1;
+        pthread_cond_broadcast(&st->done_cv);
+    }
+    pthread_mutex_unlock(&st->mu);
+    return NULL;
+}
+
+/* Wait for any in-flight prefetch to finish (called under mu) and clear
+ * the result. */
+static void pf_wait_idle_locked(ib_drive_pf_state *st) {
+    while (st->req_pending || st->req_in_flight) {
+        pthread_cond_wait(&st->done_cv, &st->mu);
+    }
+}
+
+/* Lazily init the prefetcher on the first matmul. Falls back silently to
+ * the legacy synchronous pread path on init failure. */
+static ib_drive_pf_state *drive_pf_get(const inferbit_model *m) {
+    /* We mutate the cached pointer through (inferbit_model*) — the
+     * "const" on m is decorative inside this module; matmul callers pass
+     * const for read-only weight access, not because m is genuinely
+     * immutable (drive scratch buffer is also overwritten). */
+    inferbit_model *mm = (inferbit_model *)m;
+    if (mm->drive_pf_state) return (ib_drive_pf_state *)mm->drive_pf_state;
+    /* Disable prefetcher when IB_DRIVE_PF_OFF=1 — used for A/B baseline
+     * comparison. Falls back to legacy synchronous load. */
+    {
+        const char *off = getenv("IB_DRIVE_PF_OFF");
+        if (off && off[0] == '1') return NULL;
+    }
+    if (!mm->drive_indices_scratch || !mm->drive_indices_scratch2 ||
+        !mm->drive_pq_order || mm->drive_pq_order_len <= 0 ||
+        mm->drive_fd < 0) {
+        return NULL;
+    }
+    ib_drive_pf_state *st = (ib_drive_pf_state *)calloc(1, sizeof(*st));
+    if (!st) return NULL;
+    if (pthread_mutex_init(&st->mu, NULL) != 0) { free(st); return NULL; }
+    if (pthread_cond_init(&st->req_cv, NULL) != 0) {
+        pthread_mutex_destroy(&st->mu); free(st); return NULL;
+    }
+    if (pthread_cond_init(&st->done_cv, NULL) != 0) {
+        pthread_cond_destroy(&st->req_cv);
+        pthread_mutex_destroy(&st->mu); free(st); return NULL;
+    }
+    st->fd = mm->drive_fd;
+    st->scratch[0] = mm->drive_indices_scratch;
+    st->scratch[1] = mm->drive_indices_scratch2;
+    st->scratch_size = mm->drive_indices_scratch_size;
+    st->done_slot = -1;
+    if (pthread_create(&st->thread, NULL, ib_drive_pf_worker, st) != 0) {
+        pthread_cond_destroy(&st->done_cv);
+        pthread_cond_destroy(&st->req_cv);
+        pthread_mutex_destroy(&st->mu);
+        free(st);
+        return NULL;
+    }
+    mm->drive_pf_state = st;
+    if (getenv("IB_DRIVE_PF_DEBUG")) {
+        fprintf(stderr, "[ib drive-pf] prefetcher init: scratch_size=%zu order_len=%d fd=%d\n",
+                (size_t)st->scratch_size, mm->drive_pq_order_len, st->fd);
+    }
+    /* Warm-start: prefetch the very first tensor so the first matmul of
+     * the first decode step doesn't have to sync-load (matters only for
+     * short generations; negligible for long ones but ~free). */
+    if (mm->drive_pq_order && mm->drive_pq_order_len > 0) {
+        pthread_mutex_lock(&st->mu);
+        st->req_tensor = mm->drive_pq_order[0];
+        st->req_slot = 0;
+        st->req_pending = 1;
+        pthread_cond_signal(&st->req_cv);
+        pthread_mutex_unlock(&st->mu);
+    }
+    return st;
+}
+
+/* Public shim called from model.c during inferbit_free. Stops the worker
+ * and tears down its sync primitives. Safe to call when no prefetcher
+ * was ever initialised. */
+void ib_drive_prefetch_shutdown(inferbit_model *m);
+void ib_drive_prefetch_shutdown(inferbit_model *m) {
+    if (!m || !m->drive_pf_state) return;
+    ib_drive_pf_state *st = (ib_drive_pf_state *)m->drive_pf_state;
+    pthread_mutex_lock(&st->mu);
+    pf_wait_idle_locked(st);
+    st->stop = 1;
+    pthread_cond_broadcast(&st->req_cv);
+    pthread_mutex_unlock(&st->mu);
+    pthread_join(st->thread, NULL);
+    pthread_cond_destroy(&st->done_cv);
+    pthread_cond_destroy(&st->req_cv);
+    pthread_mutex_destroy(&st->mu);
+    free(st);
+    m->drive_pf_state = NULL;
+}
+
+/* Find the index of `t` in m->drive_pq_order[] (linear scan over ~150
+ * pointers — single cache-line walk on average). Returns -1 if not in
+ * the list (sparsity-masked / non-drive / etc.). */
+static int drive_order_index(const inferbit_model *m, const ib_tensor_meta *t) {
+    int n = m->drive_pq_order_len;
+    const ib_tensor_meta **arr = m->drive_pq_order;
+    for (int i = 0; i < n; i++) {
+        if (arr[i] == t) return i;
+    }
+    return -1;
+}
+
+/* Synchronously pread tensor t's indices into `slot`. Returns 0 on ok. */
+static int drive_sync_load_to_slot(const inferbit_model *m,
+                                   const ib_tensor_meta *t,
+                                   int slot) {
+    if (!t || !t->pq) return -1;
+    void *dst = (slot == 1) ? m->drive_indices_scratch2 : m->drive_indices_scratch;
+    if (!dst) return -1;
+    const pqv2_t *pq = t->pq;
+    size_t bytes = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
+    if (bytes == 0 || bytes > m->drive_indices_scratch_size) return -1;
+    off_t off = (off_t)pq->indices_file_offset;
+    if (off == 0) return -1;
+    uint8_t *buf = (uint8_t *)dst;
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t r = pread(m->drive_fd, buf + done, bytes - done, off + (off_t)done);
+        if (r <= 0) {
+            if (r == -1 && errno == EINTR) continue;
+            return -1;
+        }
+        done += (size_t)r;
+    }
+    return 0;
+}
+
+/* Repoint pq->indices for tensor t to the buffer in `slot`. The kernel
+ * reads via pq->indices; this is the swap step of the ring. Safe because
+ * the kernel is single-threaded per matmul and we only mutate before
+ * dispatching. */
+static void drive_repoint_indices(const ib_tensor_meta *t, void *slot_buf) {
+    pqv2_t *mpq = (pqv2_t *)t->pq;
+    mpq->indices = (const uint8_t *)slot_buf;
+}
+
+/* Replacement for the old drive_load_indices. Ensures the active scratch
+ * slot has tensor t's indices loaded and pq->indices points at it. Then
+ * kicks off a background prefetch for the next tensor in decode order
+ * (so the next matmul's I/O overlaps with this matmul's compute). */
 static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) {
     if (!m || m->residency_mode != 1) return 0;
     if (!t || !t->pq) return 0;
@@ -208,18 +457,64 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
     if (bytes == 0 || bytes > m->drive_indices_scratch_size) return -1;
     off_t off = (off_t)pq->indices_file_offset;
     if (off == 0) return 0;     /* not redirected; mmap'd path */
-    /* pread fills scratch from disk. The fd has F_NOCACHE on Darwin so
-     * this read bypasses UBC entirely. */
-    size_t done = 0;
-    uint8_t *buf = (uint8_t *)m->drive_indices_scratch;
-    while (done < bytes) {
-        ssize_t r = pread(m->drive_fd, buf + done, bytes - done, off + (off_t)done);
-        if (r <= 0) {
-            if (r == -1 && errno == EINTR) continue;
-            return -1;
-        }
-        done += (size_t)r;
+
+    ib_drive_pf_state *st = drive_pf_get(m);
+    if (!st) {
+        /* Prefetcher unavailable → legacy synchronous path into slot 0. */
+        int rc = drive_sync_load_to_slot(m, t, 0);
+        if (rc == 0) drive_repoint_indices(t, m->drive_indices_scratch);
+#if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
+        (void)posix_fadvise(m->drive_fd, off, (off_t)bytes, POSIX_FADV_DONTNEED);
+#endif
+        return rc;
     }
+
+    int ready_slot = -1;
+    pthread_mutex_lock(&st->mu);
+    /* Wait for any pending prefetch to land — it may or may not be for
+     * us. We don't preemptively cancel because a partial pread of an
+     * unrelated tensor is harmless (just wasted I/O for a single tensor;
+     * the case is rare — only on the very first call). */
+    pf_wait_idle_locked(st);
+    if (st->done_tensor == t && st->done_slot >= 0) {
+        ready_slot = st->done_slot;
+        st->done_tensor = NULL;
+        st->done_slot = -1;
+    } else {
+        st->done_tensor = NULL;
+        st->done_slot = -1;
+    }
+    pthread_mutex_unlock(&st->mu);
+
+    if (ready_slot < 0) {
+        /* Prefetch missed (first matmul, sparsity-masked detour, etc.).
+         * Sync-load into slot 0 — slot 1 is now free for the next
+         * prefetch kick below. */
+        if (drive_sync_load_to_slot(m, t, 0) != 0) return -1;
+        ready_slot = 0;
+    }
+    void *active_buf = (ready_slot == 1)
+                       ? m->drive_indices_scratch2
+                       : m->drive_indices_scratch;
+    drive_repoint_indices(t, active_buf);
+
+    /* Kick the prefetch for the NEXT tensor in decode order, into the
+     * OTHER slot. If t isn't in the order list (sparse / output_head
+     * tail) we just skip — the next call will sync-load. */
+    int idx = drive_order_index(m, t);
+    if (idx >= 0) {
+        int next = idx + 1;
+        if (next >= m->drive_pq_order_len) next = 0;   /* wrap to next decode step */
+        const ib_tensor_meta *t_next = m->drive_pq_order[next];
+        int next_slot = ready_slot ^ 1;
+        pthread_mutex_lock(&st->mu);
+        st->req_tensor = t_next;
+        st->req_slot = next_slot;
+        st->req_pending = 1;
+        pthread_cond_signal(&st->req_cv);
+        pthread_mutex_unlock(&st->mu);
+    }
+
 #if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
     /* Solution 4: on Linux, drop the just-read region from the page
      * cache so subsequent matmuls aren't biased by it. No-op on Darwin. */
@@ -549,17 +844,27 @@ static void pqv2_threaded_matvec_k256_batch(
     }
     memset(acc_pool, 0, pool_floats * sizeof(float));
     float *acc_l2_pool = NULL;
+    int acc_l2_owned = 0;
     if (has_l2) {
-        acc_l2_pool = aligned_alloc(64,
-            (pool_floats * sizeof(float) + 63) & ~(size_t)63);
-        if (!acc_l2_pool) {
-            /* L2 alloc failed: fall back to the per-position path that
-             * routes through the single-position matvec (which handles
-             * L2 correctly), so we never silently drop the pyramid
-             * residual. */
-            free(acc_pool);
-            pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
-            return;
+        /* Reuse model-scope L2 scratch when it fits (typical for B=1
+         * decode where pool_floats = n_slots × M ≤ n_threads × max_M).
+         * Larger batches (B>1) fall through to a fresh aligned_alloc. */
+        if (m && m->pqv2_thread_acc_l2_pool &&
+            pool_floats <= m->pqv2_thread_acc_l2_pool_floats) {
+            acc_l2_pool = m->pqv2_thread_acc_l2_pool;
+        } else {
+            acc_l2_pool = aligned_alloc(64,
+                (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+            if (!acc_l2_pool) {
+                /* L2 alloc failed: fall back to the per-position path that
+                 * routes through the single-position matvec (which handles
+                 * L2 correctly), so we never silently drop the pyramid
+                 * residual. */
+                free(acc_pool);
+                pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
+                return;
+            }
+            acc_l2_owned = 1;
         }
         memset(acc_l2_pool, 0, pool_floats * sizeof(float));
     }
@@ -591,7 +896,7 @@ static void pqv2_threaded_matvec_k256_batch(
         }
     }
     free(acc_pool);
-    if (acc_l2_pool) free(acc_l2_pool);
+    if (acc_l2_owned) free(acc_l2_pool);
 }
 
 static void pqv2_threaded_matvec_k256(
@@ -628,29 +933,37 @@ static void pqv2_threaded_matvec_k256(
     float *acc_l2_pool = NULL;
     int acc_l2_owned = 0;
     if (has_l2) {
-        acc_l2_pool = aligned_alloc(64,
-            (pool_floats * sizeof(float) + 63) & ~(size_t)63);
-        if (acc_l2_pool) {
-            memset(acc_l2_pool, 0, pool_floats * sizeof(float));
-            acc_l2_owned = 1;
+        /* Prefer model-scope L2 scratch (sized n_threads × max_M, same as
+         * acc_pool). Falls back to fresh aligned_alloc only if the request
+         * somehow exceeds the budget. Eliminates ~88 aligned_alloc/free per
+         * decode token on pyramid models. */
+        if (m && m->pqv2_thread_acc_l2_pool &&
+            pool_floats <= m->pqv2_thread_acc_l2_pool_floats) {
+            acc_l2_pool = m->pqv2_thread_acc_l2_pool;
         } else {
-            /* L2 alloc failed: do NOT silently run the threaded path with
-             * acc_l2_pool=NULL — the kernel would skip the L2 path entirely
-             * (see ib_pqv2_chunks_task → pqv2_acc_tbl_int8_k256_chunks_inner;
-             * acc_l2==NULL means "no L2"), which DROPS the pyramid residual
-             * and degrades a pyramid (l2_kind==2) model to a flat one
-             * (60% PPL regression observed on tl-pyramid.ibf in RAM mode
-             * where the mmap'd weights leave less headroom for the
-             * per-matmul aligned_alloc; drive mode evicts those pages and
-             * the alloc succeeds, which is why drive PPL was BETTER than
-             * RAM PPL — the bug is RAM-mode-only). Fall back to the
-             * single-threaded matvec, which uses one acc/acc_l2 pair the
-             * size of a single matvec (M floats each) and is allocated
-             * fresh inside pqv2_matvec_tbl_int8_k256. */
-            if (acc_pool_owned) free(acc_pool);
-            pqv2_matvec_dispatch(t, x, y);
-            return;
+            acc_l2_pool = aligned_alloc(64,
+                (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+            if (!acc_l2_pool) {
+                /* L2 alloc failed: do NOT silently run the threaded path with
+                 * acc_l2_pool=NULL — the kernel would skip the L2 path entirely
+                 * (see ib_pqv2_chunks_task → pqv2_acc_tbl_int8_k256_chunks_inner;
+                 * acc_l2==NULL means "no L2"), which DROPS the pyramid residual
+                 * and degrades a pyramid (l2_kind==2) model to a flat one
+                 * (60% PPL regression observed on tl-pyramid.ibf in RAM mode
+                 * where the mmap'd weights leave less headroom for the
+                 * per-matmul aligned_alloc; drive mode evicts those pages and
+                 * the alloc succeeds, which is why drive PPL was BETTER than
+                 * RAM PPL — the bug is RAM-mode-only). Fall back to the
+                 * single-threaded matvec, which uses one acc/acc_l2 pair the
+                 * size of a single matvec (M floats each) and is allocated
+                 * fresh inside pqv2_matvec_tbl_int8_k256. */
+                if (acc_pool_owned) free(acc_pool);
+                pqv2_matvec_dispatch(t, x, y);
+                return;
+            }
+            acc_l2_owned = 1;
         }
+        memset(acc_l2_pool, 0, pool_floats * sizeof(float));
     }
     /* Activation-aware skip: when IB_PQV2_SKIP env is set (e.g. "0.01"),
      * skip (c,s) iters with max|x_slice| < ratio * max|x|. 1% threshold
@@ -725,59 +1038,110 @@ static void tensor_matmul(
 
     /* Detect per-block-32 INT4 scaling: scale_size > rows*2 ⇒ N/32 fp16
      * scales per row instead of one. Triggered by IB_INT4_BLK32 at convert
-     * time. The new kernel handles a flat fp32 buffer of M*(N/32) scales. */
+     * time. The new kernel handles a flat fp32 buffer of M*(N/32) scales.
+     *
+     * Perf (doc 36): the fp16 scale buffer is a STATIC property of the
+     * weight tensor — pre-decoded into t->scales_fp32 / t->blk32_scales_fp32
+     * by ib_cache_model_static_fp32() at load time. We pick those up here
+     * and skip the per-call fp16→fp32 conversion. The local fallback path
+     * stays in place for the (rare) case where the cache wasn't built. */
     int is_blk32_int4 = (t->bits == 4 && t->scale_size > (size_t)M * 2);
-    float *blk32_scales = NULL;
-    int n_w_blocks = 0;
+    const float* scales_eff = NULL;       /* per-row scales (M) */
+    const float* blk32_scales = NULL;     /* M * (N/32) scales */
+    float* blk32_owned = NULL;            /* malloc'd fallback only */
     if (is_blk32_int4) {
-        n_w_blocks = N / 32;
-        size_t total = (size_t)M * (size_t)n_w_blocks;
-        blk32_scales = (float*)malloc(total * sizeof(float));
-        if (blk32_scales) scales_to_fp32(blk32_scales, scales_raw, (int)total);
-        else is_blk32_int4 = 0;   /* fall back if alloc failed */
+        if (t->blk32_scales_fp32) {
+            blk32_scales = t->blk32_scales_fp32;
+        } else {
+            size_t total = (size_t)M * (size_t)(N / 32);
+            blk32_owned = (float*)malloc(total * sizeof(float));
+            if (blk32_owned) {
+                scales_to_fp32(blk32_owned, scales_raw, (int)total);
+                blk32_scales = blk32_owned;
+            } else {
+                is_blk32_int4 = 0;   /* fall back if alloc failed */
+            }
+        }
+    }
+    /* Per-row scales used by all non-blk32 paths AND as a safety fallback
+     * if is_blk32_int4 is set but matmul_w4a8_blk32 is unavailable
+     * (matches the original code's fall-through). */
+    if (t->scales_fp32) {
+        scales_eff = t->scales_fp32;
     } else if (scales_raw) {
         scales_to_fp32(scale_buf, scales_raw, M);
+        scales_eff = scale_buf;
     } else {
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
+        scales_eff = scale_buf;
     }
 
     if (is_blk32_int4 && ib_kern.matmul_w4a8_blk32) {
         /* Per-block-32 INT4 path: quantize input as usual, dispatch to the
          * blk32-aware kernel. No batched/parallel wrapper for now — the
-         * scalar kernel is single-threaded. */
+         * scalar kernel is single-threaded.
+         *
+         * Hot-path scratch: prefer model-lifetime bb_qscratch/bb_sa (sized
+         * for IB_BATCH_MAX*n_max, which always covers a single-position
+         * matmul) over per-call malloc. Stack fallback retained for the
+         * case where the model wasn't built with batch scratch. */
         int8_t stack_q[4096];
         float  stack_s[4096 / IB_W4A8_GROUP + 1];
         int n_groups = (N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
-        int8_t* q_buf = (N <= 4096) ? stack_q : (int8_t*)malloc((size_t)N);
-        float*  s_buf = (n_groups <= (int)(sizeof stack_s / sizeof *stack_s))
+        int8_t* q_buf;
+        float*  s_buf;
+        int q_buf_owned = 0, s_buf_owned = 0;
+        if (m->bb_qscratch && m->bb_sa) {
+            q_buf = m->bb_qscratch;
+            s_buf = m->bb_sa;
+        } else {
+            q_buf = (N <= 4096) ? stack_q : (int8_t*)malloc((size_t)N);
+            s_buf = (n_groups <= (int)(sizeof stack_s / sizeof *stack_s))
                         ? stack_s
                         : (float*)malloc((size_t)n_groups * sizeof(float));
+            q_buf_owned = (q_buf != stack_q);
+            s_buf_owned = (s_buf != stack_s);
+        }
         ib_quantize_input_int8_g128(input, q_buf, s_buf, N);
-        ib_kern.matmul_w4a8_blk32(out, weights, blk32_scales, q_buf, s_buf, M, N);
-        if (q_buf != stack_q) free(q_buf);
-        if (s_buf != stack_s) free(s_buf);
-        free(blk32_scales);
+        ib_kern.matmul_w4a8_blk32(out, weights, blk32_scales,
+                                  q_buf, s_buf, M, N);
+        if (q_buf_owned) free(q_buf);
+        if (s_buf_owned) free(s_buf);
+        if (blk32_owned) free(blk32_owned);
         return;
     }
-    if (blk32_scales) free(blk32_scales);
+    if (blk32_owned) free(blk32_owned);
 
     if (t->bits == 4 && w4a8_enabled() && ib_kern.matmul_w4a8) {
         /* Quantize input to INT8 per-group (IB_W4A8_GROUP elements per
-         * scale). Small N uses stack; larger N heap-allocates. */
+         * scale). Prefer model-lifetime scratch (bb_qscratch/bb_sa) so the
+         * hot decode loop does no malloc for N > 4096 (e.g. MLP up/gate
+         * with N=intermediate). Stack fallback retained for legacy paths
+         * where the model isn't initialised with batch scratch. */
         int8_t stack_q[4096];
         float  stack_s[4096 / IB_W4A8_GROUP + 1];
         int n_groups = (N + IB_W4A8_GROUP - 1) / IB_W4A8_GROUP;
-        int8_t* q_buf = (N <= 4096) ? stack_q : (int8_t*)malloc((size_t)N);
-        float*  s_buf = (n_groups <= (int)(sizeof stack_s / sizeof *stack_s))
+        int8_t* q_buf;
+        float*  s_buf;
+        int q_buf_owned = 0, s_buf_owned = 0;
+        if (m->bb_qscratch && m->bb_sa) {
+            q_buf = m->bb_qscratch;
+            s_buf = m->bb_sa;
+        } else {
+            q_buf = (N <= 4096) ? stack_q : (int8_t*)malloc((size_t)N);
+            s_buf = (n_groups <= (int)(sizeof stack_s / sizeof *stack_s))
                         ? stack_s
                         : (float*)malloc((size_t)n_groups * sizeof(float));
+            q_buf_owned = (q_buf != stack_q);
+            s_buf_owned = (s_buf != stack_s);
+        }
         ib_quantize_input_int8_g128(input, q_buf, s_buf, N);
-        ib_parallel_matmul_w4a8(m->thread_pool, out, weights, scale_buf,
+        ib_parallel_matmul_w4a8(m->thread_pool, out, weights, scales_eff,
                                 q_buf, s_buf, M, N);
-        if (q_buf != stack_q) free(q_buf);
-        if (s_buf != stack_s) free(s_buf);
+        if (q_buf_owned) free(q_buf);
+        if (s_buf_owned) free(s_buf);
     } else if (t->bits == 2 || t->bits == 4 || t->bits == 8) {
-        ib_parallel_matmul(m->thread_pool, out, weights, scale_buf, input, M, N, t->bits);
+        ib_parallel_matmul(m->thread_pool, out, weights, scales_eff, input, M, N, t->bits);
     } else if (t->bits == 16) {
         const uint16_t* w = (const uint16_t*)weights;
         for (int i = 0; i < M; i++) {
@@ -821,10 +1185,16 @@ static void tensor_matmul_batch(
     const void* weights = tensor_data(m, t);
     const void* scales_raw = tensor_scales_raw(m, t);
 
-    if (scales_raw) {
+    /* Perf: prefer load-time-cached fp32 scales (see ib_cache_model_static_fp32). */
+    const float* scales_eff;
+    if (t->scales_fp32) {
+        scales_eff = t->scales_fp32;
+    } else if (scales_raw) {
         scales_to_fp32(scale_buf, scales_raw, M);
+        scales_eff = scale_buf;
     } else {
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
+        scales_eff = scale_buf;
     }
 
     /* PQv2 batched path: per-chunk threading shared across B positions.
@@ -864,10 +1234,10 @@ static void tensor_matmul_batch(
                                         q_scratch + (size_t)b * N,
                                         sa_scratch + (size_t)b * n_groups, N);
         }
-        ib_parallel_matmul_w4a8_batch(m->thread_pool, out, weights, scale_buf,
+        ib_parallel_matmul_w4a8_batch(m->thread_pool, out, weights, scales_eff,
                                       q_scratch, sa_scratch, M, N, B);
     } else if (t->bits == 8 && ib_kern.matmul_int8_batch) {
-        ib_parallel_matmul_int8_batch(m->thread_pool, out, weights, scale_buf,
+        ib_parallel_matmul_int8_batch(m->thread_pool, out, weights, scales_eff,
                                       input, M, N, B);
     } else {
         /* Fallback: per-position sequential. */
@@ -875,7 +1245,7 @@ static void tensor_matmul_batch(
             float* out_b = out + (size_t)b * M;
             const float* in_b = input + (size_t)b * N;
             if (t->bits == 2 || t->bits == 4 || t->bits == 8) {
-                ib_parallel_matmul(m->thread_pool, out_b, weights, scale_buf,
+                ib_parallel_matmul(m->thread_pool, out_b, weights, scales_eff,
                                    in_b, M, N, t->bits);
             } else if (t->bits == 16) {
                 const uint16_t* w = (const uint16_t*)weights;
@@ -925,10 +1295,16 @@ static void tensor_matmul_sparse(
     const void* weights = tensor_data(m, t);
     const void* scales_raw = tensor_scales_raw(m, t);
 
-    if (scales_raw) {
+    /* Perf: prefer the load-time-cached fp32 scales. */
+    const float* scales_eff;
+    if (t->scales_fp32) {
+        scales_eff = t->scales_fp32;
+    } else if (scales_raw) {
         scales_to_fp32(scale_buf, scales_raw, M);
+        scales_eff = scale_buf;
     } else {
         for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
+        scales_eff = scale_buf;
     }
 
     /* Zero entire output first */
@@ -959,7 +1335,7 @@ static void tensor_matmul_sparse(
                 if (j+3 < N) sum += (float)(((byte >> 6) & 0x03) - 1) * input[j+3];
             }
         }
-        out[i] = sum * scale_buf[i];
+        out[i] = sum * scales_eff[i];
     }
 }
 
@@ -970,6 +1346,20 @@ static void rmsnorm_fp16(float* out, const float* input,
                          float* weight_buf) {
     fp16_weights_to_fp32(weight_buf, weight_fp16, N);
     ib_kern.rmsnorm(out, input, weight_buf, eps, N);
+}
+
+/* Tensor-aware RMSNorm: prefer the load-time-cached fp32 norm weight
+ * (t->norm_fp32) and skip the per-call fp16→fp32 conversion. Falls back
+ * to the legacy decode path when no cache is present. */
+static inline void rmsnorm_fp16_t(float* out, const float* input,
+                                  const inferbit_model* m,
+                                  const ib_tensor_meta* t,
+                                  float eps, int N, float* weight_buf) {
+    if (t->norm_fp32) {
+        ib_kern.rmsnorm(out, input, t->norm_fp32, eps, N);
+    } else {
+        rmsnorm_fp16(out, input, tensor_data(m, t), eps, N, weight_buf);
+    }
 }
 
 /* ── KV cache quantization helpers ──────────────────────────── */
@@ -1229,8 +1619,8 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
         ib_kv_cache* kv = &m->kv_caches[l];
 
         /* RMSNorm before attention */
-        rmsnorm_fp16(xb, x, tensor_data(m, &layer->input_norm),
-                     eps, hidden, scale_buf);
+        rmsnorm_fp16_t(xb, x, m, &layer->input_norm,
+                       eps, hidden, scale_buf);
 
         /* Q/K/V projections */
         tensor_matmul(m, &layer->q_proj, q, xb, hidden, hidden, scale_buf);
@@ -1240,17 +1630,21 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
         /* RoPE: apply to each Q head paired with its corresponding K head.
          * For GQA, multiple Q heads share one K head. Apply RoPE to each
          * K head only once (on the first Q head that maps to it). */
+        /* Precomputed RoPE tables (NULL = kernel falls back to live sinf/cosf). */
+        const float* rope_cos_tab = (m->rope_cos && pos < m->rope_table_ctx) ? m->rope_cos : NULL;
+        const float* rope_sin_tab = (m->rope_sin && pos < m->rope_table_ctx) ? m->rope_sin : NULL;
         for (int h = 0; h < n_heads; h++) {
             int kv_h = h / heads_per_kv;
             int is_first = (h % heads_per_kv == 0);
             if (is_first) {
                 ib_kern.rope(q + h * head_dim, k + kv_h * head_dim,
-                             head_dim, pos, theta);
+                             head_dim, pos, theta, rope_cos_tab, rope_sin_tab);
             } else {
                 /* Apply RoPE to Q only — use a scratch buffer for K */
                 float k_scratch[256];
                 memcpy(k_scratch, k + kv_h * head_dim, head_dim * sizeof(float));
-                ib_kern.rope(q + h * head_dim, k_scratch, head_dim, pos, theta);
+                ib_kern.rope(q + h * head_dim, k_scratch, head_dim, pos, theta,
+                             rope_cos_tab, rope_sin_tab);
                 /* Discard k_scratch — K was already rotated */
             }
         }
@@ -1288,8 +1682,8 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
         }
 
         /* RMSNorm before MLP */
-        rmsnorm_fp16(xb, x, tensor_data(m, &layer->post_attn_norm),
-                     eps, hidden, scale_buf);
+        rmsnorm_fp16_t(xb, x, m, &layer->post_attn_norm,
+                       eps, hidden, scale_buf);
 
         /* MLP: gate + up + silu_mul + down
          * With sparsity: skip masked intermediate neurons entirely.
@@ -1349,13 +1743,17 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
                                        router_logits, active, top_n,
                                        scale_buf);
                 } else {
-                    /* Zero router → run all experts with weight 1.0.
-                     * `active = NULL` tells mome_dispatch_ffn to iterate
-                     * 0..K-1 directly. */
+                    /* Zero router → honor IB_MOME_TOP_N even without a router.
+                     * Pick the first top_n experts; mome_dispatch_ffn scales
+                     * each weight by K/n_active (mome.c:178-180) so top_n=K
+                     * reconstructs the full FFN exactly. */
+                    int top_n = mome_get_top_n(K_ex);
+                    int active[IB_MOME_MAX_TOP_N];
+                    for (int i = 0; i < top_n; i++) active[i] = i;
                     mome_dispatch_ffn(m, layer, xb, hb, hb2, xb,
                                        /*router_logits=*/NULL,
-                                       /*active=*/NULL,
-                                       /*n_active=*/K_ex,
+                                       active,
+                                       /*n_active=*/top_n,
                                        scale_buf);
                 }
                 mome_handled = 1;
@@ -1397,8 +1795,8 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
     if (compute_logits || hidden_out) {
         if (hidden_out) {
             /* Final RMSNorm into x (in place), then snapshot before LM head. */
-            rmsnorm_fp16(x, x, tensor_data(m, &m->output_norm),
-                         eps, hidden, scale_buf);
+            rmsnorm_fp16_t(x, x, m, &m->output_norm,
+                           eps, hidden, scale_buf);
             memcpy(hidden_out, x, (size_t)hidden * sizeof(float));
             if (compute_logits) {
                 tensor_matmul(m, &m->output_head, logits, x, vocab, hidden, scale_buf);
@@ -1439,8 +1837,8 @@ void ib_apply_lm_head_finalize(const inferbit_model* model,
     /* Cast away const: the helper writes into model-owned scratch via the
      * matmul dispatch path. The model identity itself is unchanged. */
     inferbit_model* m = (inferbit_model*)model;
-    rmsnorm_fp16(hidden_io, hidden_io, tensor_data(m, &m->output_norm),
-                 eps, hidden, scale_buf);
+    rmsnorm_fp16_t(hidden_io, hidden_io, m, &m->output_norm,
+                   eps, hidden, scale_buf);
     tensor_matmul(m, &m->output_head, logits_out, hidden_io, vocab, hidden, scale_buf);
 }
 
@@ -1509,11 +1907,11 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
         ib_layer_meta* layer = &m->layers[l];
         ib_kv_cache* kv = &m->kv_caches[l];
 
-        /* RMSNorm per position. Uses rmsnorm_fp16 to handle FP16 weights. */
+        /* RMSNorm per position. Uses rmsnorm_fp16_t to pick up cached fp32 norm weights. */
         for (int b = 0; b < B; b++) {
-            rmsnorm_fp16(xb + (size_t)b * hidden, x + (size_t)b * hidden,
-                         tensor_data(m, &layer->input_norm),
-                         eps, hidden, scale_buf);
+            rmsnorm_fp16_t(xb + (size_t)b * hidden, x + (size_t)b * hidden,
+                           m, &layer->input_norm,
+                           eps, hidden, scale_buf);
         }
 
         /* Q/K/V projections — batched. */
@@ -1533,16 +1931,19 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
             float* vb = v + (size_t)b * kv_dim;
 
             /* RoPE: same pattern as forward_single_ex. */
+            const float* rope_cos_tab = (m->rope_cos && pos < m->rope_table_ctx) ? m->rope_cos : NULL;
+            const float* rope_sin_tab = (m->rope_sin && pos < m->rope_table_ctx) ? m->rope_sin : NULL;
             for (int h = 0; h < n_heads; h++) {
                 int kv_h = h / heads_per_kv;
                 int is_first = (h % heads_per_kv == 0);
                 if (is_first) {
                     ib_kern.rope(qb + h * head_dim, kb + kv_h * head_dim,
-                                 head_dim, pos, theta);
+                                 head_dim, pos, theta, rope_cos_tab, rope_sin_tab);
                 } else {
                     float k_scratch[256];
                     memcpy(k_scratch, kb + kv_h * head_dim, head_dim * sizeof(float));
-                    ib_kern.rope(qb + h * head_dim, k_scratch, head_dim, pos, theta);
+                    ib_kern.rope(qb + h * head_dim, k_scratch, head_dim, pos, theta,
+                                 rope_cos_tab, rope_sin_tab);
                 }
             }
 
@@ -1576,9 +1977,9 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
 
         /* RMSNorm before MLP, per position. */
         for (int b = 0; b < B; b++) {
-            rmsnorm_fp16(xb + (size_t)b * hidden, x + (size_t)b * hidden,
-                         tensor_data(m, &layer->post_attn_norm),
-                         eps, hidden, scale_buf);
+            rmsnorm_fp16_t(xb + (size_t)b * hidden, x + (size_t)b * hidden,
+                           m, &layer->post_attn_norm,
+                           eps, hidden, scale_buf);
         }
 
         /* MLP — batched gate/up/down. Sparsity is not applied here; if a
@@ -1621,15 +2022,15 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
              * output-head matmul for that one position. Skips B-1 vocab-
              * sized matmuls (the most expensive op) vs the full path. */
             float* x_last = x + (size_t)(B - 1) * hidden;
-            rmsnorm_fp16(x_last, x_last, tensor_data(m, &m->output_norm),
-                         eps, hidden, scale_buf);
+            rmsnorm_fp16_t(x_last, x_last, m, &m->output_norm,
+                           eps, hidden, scale_buf);
             tensor_matmul(m, &m->output_head, out_logits, x_last,
                           vocab, hidden, scale_buf);
         } else {
             for (int b = 0; b < B; b++) {
-                rmsnorm_fp16(x + (size_t)b * hidden, x + (size_t)b * hidden,
-                             tensor_data(m, &m->output_norm),
-                             eps, hidden, scale_buf);
+                rmsnorm_fp16_t(x + (size_t)b * hidden, x + (size_t)b * hidden,
+                               m, &m->output_norm,
+                               eps, hidden, scale_buf);
             }
             tensor_matmul_batch(m, &m->output_head, out_logits, x, vocab, hidden, B,
                                 scale_buf, q_scratch, sa_scratch);
