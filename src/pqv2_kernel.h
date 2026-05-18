@@ -100,6 +100,13 @@ typedef struct {
      * transpose. 0 = no sidecar; pread from drive_fd at
      * indices_file_offset (legacy chunk-major path). */
     size_t indices_pretransposed_offset;
+    /* Goal C3 — pyramid drive-mode L2 redirect. Byte offset of this
+     * tensor's L2 indices region (l2_kind == 2) within the on-disk IBF
+     * file. 0 = no L2 indices / not redirected (mmap path). Set at
+     * load time alongside indices_file_offset when the model is in
+     * drive mode; forward.c::drive_load_indices then preads L2 into
+     * a sibling scratch buffer and repoints pq->l2_indices to it. */
+    size_t l2_indices_file_offset;
 } pqv2_t;
 
 /* Load .pqv2 file into freshly-malloc'd buffers. Returns 0 on success.

@@ -110,6 +110,16 @@ void inferbit_free(inferbit_model* model) {
         free(model->drive_indices_scratch2);
         model->drive_indices_scratch2 = NULL;
     }
+    /* Goal C3 — free L2 indices scratch ring. */
+    if (model->drive_l2_indices_scratch) {
+        free(model->drive_l2_indices_scratch);
+        model->drive_l2_indices_scratch = NULL;
+    }
+    if (model->drive_l2_indices_scratch2) {
+        free(model->drive_l2_indices_scratch2);
+        model->drive_l2_indices_scratch2 = NULL;
+    }
+    model->drive_l2_indices_scratch_size = 0;
     if (model->drive_pq_order) {
         free(model->drive_pq_order);
         model->drive_pq_order = NULL;

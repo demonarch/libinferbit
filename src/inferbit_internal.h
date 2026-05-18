@@ -331,6 +331,16 @@ struct inferbit_model {
     void  *drive_indices_scratch;     /* page-aligned shared buffer (slot 0) */
     void  *drive_indices_scratch2;    /* page-aligned shared buffer (slot 1) — prefetch ring */
     size_t drive_indices_scratch_size;
+    /* Goal C3 — pyramid drive-mode L2 indices redirect. Parallel ring
+     * of two scratch buffers sized for the largest L2 indices region
+     * across all PQv2 pyramid tensors. The prefetch worker fills the L2
+     * slot alongside the L1 slot (same slot index), so each active-slot
+     * scratch tuple is (L1, L2) for one tensor. Allocated only when at
+     * least one drive-mode tensor carries l2_kind == 2; left NULL when
+     * the model has no L2 pyramid tensors (skips overhead). */
+    void  *drive_l2_indices_scratch;
+    void  *drive_l2_indices_scratch2;
+    size_t drive_l2_indices_scratch_size;
     /* 2-slot prefetch ring (perf fix). The scratch buffers above act as a
      * double-buffer: while the kernel reads from one slot, a worker thread
      * preads the NEXT tensor's indices into the other slot. drive_pf_state

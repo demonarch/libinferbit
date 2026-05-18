@@ -259,9 +259,42 @@ typedef struct ib_drive_pf_state {
     int             fd;
     void           *scratch[2];
     size_t          scratch_size;
+    /* Goal C3 — L2 indices scratch ring (parallel to L1 ring). NULL
+     * when the model has no L2 pyramid tensors or alloc failed. */
+    void           *l2_scratch[2];
+    size_t          l2_scratch_size;
     /* Shutdown flag. */
     int             stop;
 } ib_drive_pf_state;
+
+/* Goal C3 — total L2 indices bytes for tensor t (or 0 if no L2). */
+static inline size_t drive_l2_indices_bytes(const pqv2_t *pq) {
+    if (!pq || pq->l2_kind != 2) return 0;
+    uint32_t n_chunks = pq->N / pq->G;
+    if (pq->l2_idx_bits == 6) {
+        size_t per_row = ((size_t)pq->M + 3u) / 4u * 3u;
+        return (size_t)n_chunks * pq->n_subchunks * per_row;
+    }
+    /* 8-bit legacy: same shape as L1. */
+    return (size_t)pq->M * n_chunks * pq->n_subchunks;
+}
+
+/* Goal C3 — pread `bytes` from `fd` at `off` into `buf`. Returns 1 on
+ * success, 0 on failure. Shared by the worker (L1+L2 fill) and the
+ * synchronous fallback. */
+static int drive_pread_full(int fd, void *buf, size_t bytes, off_t off) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t r = pread(fd, p + done, bytes - done, off + (off_t)done);
+        if (r <= 0) {
+            if (r == -1 && errno == EINTR) continue;
+            return 0;
+        }
+        done += (size_t)r;
+    }
+    return 1;
+}
 
 static void *ib_drive_pf_worker(void *arg) {
     ib_drive_pf_state *st = (ib_drive_pf_state *)arg;
@@ -283,18 +316,21 @@ static void *ib_drive_pf_worker(void *arg) {
             size_t bytes = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
             off_t off = (off_t)pq->indices_file_offset;
             if (bytes > 0 && bytes <= st->scratch_size && off != 0) {
-                uint8_t *buf = (uint8_t *)st->scratch[slot];
-                size_t done = 0;
-                ok = 1;
-                while (done < bytes) {
-                    ssize_t r = pread(st->fd, buf + done, bytes - done,
-                                      off + (off_t)done);
-                    if (r <= 0) {
-                        if (r == -1 && errno == EINTR) continue;
-                        ok = 0;
-                        break;
-                    }
-                    done += (size_t)r;
+                ok = drive_pread_full(st->fd, st->scratch[slot], bytes, off);
+            }
+            /* Goal C3 — fill the matching L2 slot too. Failure to load
+             * L2 is non-fatal: the kernel falls back to the existing
+             * pq->l2_indices pointer (mmap or previous slot contents),
+             * but we still report L1 success so the L1 hot path stays
+             * fast. The OS readahead also helps batch the adjacent L2
+             * region (indices are stored contiguously in the file). */
+            if (ok && st->l2_scratch[slot] && pq->l2_kind == 2 &&
+                pq->l2_indices_file_offset != 0) {
+                size_t l2_bytes = drive_l2_indices_bytes(pq);
+                if (l2_bytes > 0 && l2_bytes <= st->l2_scratch_size) {
+                    (void)drive_pread_full(st->fd, st->l2_scratch[slot],
+                                           l2_bytes,
+                                           (off_t)pq->l2_indices_file_offset);
                 }
             }
         }
@@ -351,6 +387,10 @@ static ib_drive_pf_state *drive_pf_get(const inferbit_model *m) {
     st->scratch[0] = mm->drive_indices_scratch;
     st->scratch[1] = mm->drive_indices_scratch2;
     st->scratch_size = mm->drive_indices_scratch_size;
+    /* Goal C3 — L2 scratch ring. May be NULL when the model has no L2. */
+    st->l2_scratch[0] = mm->drive_l2_indices_scratch;
+    st->l2_scratch[1] = mm->drive_l2_indices_scratch2;
+    st->l2_scratch_size = mm->drive_l2_indices_scratch_size;
     st->done_slot = -1;
     if (pthread_create(&st->thread, NULL, ib_drive_pf_worker, st) != 0) {
         pthread_cond_destroy(&st->done_cv);
@@ -410,7 +450,8 @@ static int drive_order_index(const inferbit_model *m, const ib_tensor_meta *t) {
     return -1;
 }
 
-/* Synchronously pread tensor t's indices into `slot`. Returns 0 on ok. */
+/* Synchronously pread tensor t's indices into `slot` (and L2 into the
+ * matching L2 slot when present). Returns 0 on ok. */
 static int drive_sync_load_to_slot(const inferbit_model *m,
                                    const ib_tensor_meta *t,
                                    int slot) {
@@ -422,26 +463,40 @@ static int drive_sync_load_to_slot(const inferbit_model *m,
     if (bytes == 0 || bytes > m->drive_indices_scratch_size) return -1;
     off_t off = (off_t)pq->indices_file_offset;
     if (off == 0) return -1;
-    uint8_t *buf = (uint8_t *)dst;
-    size_t done = 0;
-    while (done < bytes) {
-        ssize_t r = pread(m->drive_fd, buf + done, bytes - done, off + (off_t)done);
-        if (r <= 0) {
-            if (r == -1 && errno == EINTR) continue;
-            return -1;
+    if (!drive_pread_full(m->drive_fd, dst, bytes, off)) return -1;
+    /* Goal C3 — load L2 alongside L1 when this tensor has L2 indices
+     * and the L2 ring is allocated. Non-fatal on L2 read failure: the
+     * kernel still has a valid pq->l2_indices pointer (worst case the
+     * previous slot's contents — still cache-resident, no F_NOCACHE
+     * fault). */
+    void *l2_dst = (slot == 1) ? m->drive_l2_indices_scratch2
+                                : m->drive_l2_indices_scratch;
+    if (l2_dst && pq->l2_kind == 2 && pq->l2_indices_file_offset != 0) {
+        size_t l2_bytes = drive_l2_indices_bytes(pq);
+        if (l2_bytes > 0 && l2_bytes <= m->drive_l2_indices_scratch_size) {
+            (void)drive_pread_full(m->drive_fd, l2_dst, l2_bytes,
+                                   (off_t)pq->l2_indices_file_offset);
         }
-        done += (size_t)r;
     }
     return 0;
 }
 
-/* Repoint pq->indices for tensor t to the buffer in `slot`. The kernel
- * reads via pq->indices; this is the swap step of the ring. Safe because
- * the kernel is single-threaded per matmul and we only mutate before
- * dispatching. */
-static void drive_repoint_indices(const ib_tensor_meta *t, void *slot_buf) {
+/* Repoint pq->indices (and pq->l2_indices when pyramid) for tensor t to
+ * the buffers in `slot`. The kernel reads via these pointers; this is
+ * the swap step of the ring. Safe because the kernel is single-threaded
+ * per matmul and we only mutate before dispatching. */
+static void drive_repoint_indices(const inferbit_model *m,
+                                  const ib_tensor_meta *t, int slot) {
     pqv2_t *mpq = (pqv2_t *)t->pq;
-    mpq->indices = (const uint8_t *)slot_buf;
+    void *l1_buf = (slot == 1) ? m->drive_indices_scratch2
+                                : m->drive_indices_scratch;
+    mpq->indices = (const uint8_t *)l1_buf;
+    if (mpq->l2_kind == 2 && mpq->l2_indices_file_offset != 0 &&
+        m->drive_l2_indices_scratch) {
+        void *l2_buf = (slot == 1) ? m->drive_l2_indices_scratch2
+                                    : m->drive_l2_indices_scratch;
+        if (l2_buf) mpq->l2_indices = (const uint8_t *)l2_buf;
+    }
 }
 
 /* Replacement for the old drive_load_indices. Ensures the active scratch
@@ -462,7 +517,7 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
     if (!st) {
         /* Prefetcher unavailable → legacy synchronous path into slot 0. */
         int rc = drive_sync_load_to_slot(m, t, 0);
-        if (rc == 0) drive_repoint_indices(t, m->drive_indices_scratch);
+        if (rc == 0) drive_repoint_indices(m, t, 0);
 #if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
         (void)posix_fadvise(m->drive_fd, off, (off_t)bytes, POSIX_FADV_DONTNEED);
 #endif
@@ -493,10 +548,7 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
         if (drive_sync_load_to_slot(m, t, 0) != 0) return -1;
         ready_slot = 0;
     }
-    void *active_buf = (ready_slot == 1)
-                       ? m->drive_indices_scratch2
-                       : m->drive_indices_scratch;
-    drive_repoint_indices(t, active_buf);
+    drive_repoint_indices(m, t, ready_slot);
 
     /* Kick the prefetch for the NEXT tensor in decode order, into the
      * OTHER slot. If t isn't in the order list (sparse / output_head
@@ -1161,6 +1213,113 @@ static void tensor_matmul(
 void ib_tensor_matmul_cpu(const inferbit_model *m, const ib_tensor_meta *t,
                           float *out, const float *input, int M, int N,
                           float *scale_buf) {
+    tensor_matmul(m, t, out, input, M, N, scale_buf);
+}
+
+/* MoME expert-parallel matmul (Goal B2).
+ *
+ * Same dispatch as tensor_matmul but with explicit override of the
+ * thread pool and per-call private chunk-accumulator scratch. Used by
+ * src/mome.c when K expert pthreads each need their OWN thread pool +
+ * private acc scratch so the inner PQv2 threaded path is race-free
+ * across the concurrent expert dispatches.
+ *
+ *   pool         : private thread pool (or NULL for single-threaded).
+ *   n_threads    : number of workers in `pool`.
+ *   acc_pool     : caller-provided PQv2 chunk-acc scratch
+ *                  (n_slots × M floats; NULL → falls back to fresh alloc).
+ *   acc_pool_floats : capacity of acc_pool in floats.
+ *   acc_l2_pool  : companion L2 scratch (same size; NULL on flat models).
+ *   acc_l2_pool_floats : capacity of acc_l2_pool in floats.
+ *
+ * For non-PQv2 tensors falls through to the single-threaded matmul
+ * (MoME experts ship as PQv2 in the v6 encoder, so this path is
+ * the common case; non-PQv2 fallback exists only for safety). */
+void ib_tensor_matmul_cpu_isolated(const inferbit_model *m,
+                                   const ib_tensor_meta *t,
+                                   float *out, const float *input,
+                                   int M, int N, float *scale_buf,
+                                   struct ib_thread_pool *pool,
+                                   int n_threads,
+                                   float *acc_pool, size_t acc_pool_floats,
+                                   float *acc_l2_pool, size_t acc_l2_pool_floats)
+{
+    if (t->pq) {
+        const pqv2_t *pq = t->pq;
+        if (m->residency_mode == 1) {
+            (void)drive_load_indices(m, t);
+        }
+        if (pq->K == 256 && pool && n_threads > 1) {
+            /* Inline a private-scratch variant of pqv2_threaded_matvec_k256.
+             * Mirrors that function's body but uses caller-supplied
+             * acc_pool / acc_l2_pool instead of m->pqv2_thread_acc_pool*. */
+            uint32_t Mt = pq->M;
+            uint32_t n_chunks = pq->N / pq->G;
+            if (n_chunks < (uint32_t)n_threads || !pq->cb_fp32) {
+                pqv2_matvec_dispatch(pq, input, out);
+                return;
+            }
+            int has_l2 = (pq->l2_kind == 2 && pq->l2_cb_fp32 && pq->l2_K <= 64);
+            int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
+            int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
+            size_t need = (size_t)n_slots * Mt;
+            float *ap = NULL;
+            int ap_owned = 0;
+            if (acc_pool && need <= acc_pool_floats) {
+                ap = acc_pool;
+            } else {
+                ap = aligned_alloc(64,
+                    (need * sizeof(float) + 63) & ~(size_t)63);
+                if (!ap) { pqv2_matvec_dispatch(pq, input, out); return; }
+                ap_owned = 1;
+            }
+            memset(ap, 0, need * sizeof(float));
+            float *al2 = NULL;
+            int al2_owned = 0;
+            if (has_l2) {
+                if (acc_l2_pool && need <= acc_l2_pool_floats) {
+                    al2 = acc_l2_pool;
+                } else {
+                    al2 = aligned_alloc(64,
+                        (need * sizeof(float) + 63) & ~(size_t)63);
+                    if (!al2) {
+                        if (ap_owned) free(ap);
+                        pqv2_matvec_dispatch(pq, input, out);
+                        return;
+                    }
+                    al2_owned = 1;
+                }
+                memset(al2, 0, need * sizeof(float));
+            }
+            ib_pqv2_chunks_arg arg = {
+                .t = pq, .x = input,
+                .acc_pool = ap, .acc_l2_pool = al2,
+                .M = Mt,
+                .chunk_size = chunks_per_task,
+                .n_slots = n_slots,
+                .skip_thresh = 0.0f,
+            };
+            ib_pool_run(pool, ib_pqv2_chunks_task, &arg,
+                         (int)n_chunks, chunks_per_task);
+            for (uint32_t mm = 0; mm < Mt; mm++) {
+                float a = 0.0f, l2 = 0.0f;
+                for (int s = 0; s < n_slots; s++) {
+                    a += ap[(size_t)s * Mt + mm];
+                    if (al2) l2 += al2[(size_t)s * Mt + mm];
+                }
+                float rs = pqv2_h2f(pq->row_scale[mm]);
+                out[mm] = a * rs + l2;
+            }
+            if (ap_owned) free(ap);
+            if (al2_owned) free(al2);
+        } else {
+            pqv2_matvec_dispatch(pq, input, out);
+        }
+        return;
+    }
+    /* Non-PQv2 fallback: route through the regular tensor_matmul. NB:
+     * this uses m->thread_pool, which is shared across the K expert
+     * pthreads — non-PQv2 MoME tensors are not the design target. */
     tensor_matmul(m, t, out, input, M, N, scale_buf);
 }
 
@@ -1842,6 +2001,162 @@ void ib_apply_lm_head_finalize(const inferbit_model* model,
     tensor_matmul(m, &m->output_head, logits_out, hidden_io, vocab, hidden, scale_buf);
 }
 
+/* ── Batched MoME FFN dispatch ───────────────────────────────────
+ *
+ * Per-prefill performance bug: the previous batched path looped over B and
+ * called mome_dispatch_ffn per position, paying K * 3 matmul-dispatch setup
+ * per token × B tokens × n_layers. For B=64, K=8, 22 layers that is
+ * 22 × 64 × 8 × 3 = 33 792 individual matmul calls — TTFT dominated by
+ * dispatch overhead, not compute.
+ *
+ * This helper runs each expert's gate/up/down ONCE for all B positions via
+ * tensor_matmul_batch (weight read amortised across B), then does the
+ * per-position SiLU * up and the weighted accumulate in plain C.
+ *
+ * Routing-policy choice (documented per task):
+ *   - B == 1   : not used (forward_single_ex still owns the single-token
+ *                path, which keeps the calibrated-router top-N behaviour
+ *                bit-identical).
+ *   - B  > 1   : we run ALL K experts and gate each position with a
+ *                weight derived from its own router logits when the
+ *                router is calibrated, or the uniform zero-router scale
+ *                otherwise. Running the union (= all K) keeps the
+ *                weight read fully shared across B; selective per-
+ *                position dispatch would defeat the entire optimisation.
+ *                On Llama-family MoME files K ∈ {2,4,8}, so "all K
+ *                batched once" is ~K× cheaper than "top-N per position"
+ *                only when K ≤ top_n * (something) — but in practice the
+ *                top-N union over B=64 positions is virtually always the
+ *                full set anyway, so this loses nothing measurable.
+ *
+ * Scratch usage:
+ *   x_in_snap : [B * hidden] — written from xb_in BEFORE we zero xb_out.
+ *               Reuses bb_xb2 (free at this stage of the layer; see
+ *               forward_batch where xb2 last carries pre-O-proj data).
+ *   hb_e      : [B * rows_per_expert] slice of bb_hb (rows_per_expert =
+ *               inter / K ≤ inter, so it fits B × inter exactly).
+ *   hb2_e     : [B * rows_per_expert] slice of bb_hb2 (same shape).
+ *   hb_out_e  : [B * hidden] — reuses bb_hb (only after we are done with
+ *               hb_e for this expert). We re-slot bb_hb for the down
+ *               output because nothing else aliases it once SiLU*up has
+ *               been folded in.
+ */
+static void mome_dispatch_ffn_batch(
+    inferbit_model* m, const ib_layer_meta* layer,
+    const float* xb_in, float* hb, float* hb2,
+    float* xb_out, int B,
+    float* x_in_snap,
+    float* scale_buf, int8_t* q_scratch, float* sa_scratch)
+{
+    if (!m || !layer || B <= 0) return;
+    if (layer->mome_experts <= 1 ||
+        !layer->gate_proj_experts || !layer->up_proj_experts ||
+        !layer->down_proj_experts) return;
+
+    const int K       = layer->mome_experts;
+    const int hidden  = m->header.hidden_size;
+    const int inter   = m->header.intermediate_size;
+    const int rows_per_expert = inter / K;
+    if (rows_per_expert <= 0) return;
+    if (K > IB_MOME_MAX_EXPERTS) return;
+
+    /* Snapshot input — xb_in may alias xb_out (callers in forward_batch
+     * pass xb for both). Aliasing-safe snapshot, just like the per-
+     * position helper does on the stack. */
+    memcpy(x_in_snap, xb_in, (size_t)B * hidden * sizeof(float));
+
+    /* Per-position weights[b][e]. K is bounded, B is bounded by
+     * IB_BATCH_MAX (32); stack allocation is fine. */
+    float weights[IB_BATCH_MAX][IB_MOME_MAX_EXPERTS];
+
+    /* Decide weighting policy. */
+    int calibrated = mome_router_is_nonzero(m, &layer->router);
+    if (calibrated) {
+        /* Batched router matmul: [B * K] = (router [K, hidden]) @ x [B * hidden].
+         * Reuse bb_hb as the router-output scratch — B*K << B*inter. */
+        float* router_out = hb;
+        tensor_matmul_batch(m, &layer->router, router_out, x_in_snap,
+                            K, hidden, B,
+                            scale_buf, q_scratch, sa_scratch);
+        const int top_n = mome_get_top_n(K);
+        for (int b = 0; b < B; b++) {
+            float* logits_b = router_out + (size_t)b * K;
+            /* top-N selection over per-position logits. Inactive experts
+             * get weight 0; active experts get softmax over selected. */
+            int active[IB_MOME_MAX_TOP_N];
+            mome_top_n(logits_b, K, top_n, active);
+            float sel[IB_MOME_MAX_TOP_N];
+            for (int i = 0; i < top_n; i++) sel[i] = logits_b[active[i]];
+            /* softmax-inplace inlined (mome.c::mome_softmax_inplace is
+             * static; replicate the tiny loop here). */
+            float mx = sel[0];
+            for (int i = 1; i < top_n; i++) if (sel[i] > mx) mx = sel[i];
+            float s = 0.0f;
+            for (int i = 0; i < top_n; i++) { sel[i] = expf(sel[i] - mx); s += sel[i]; }
+            float inv = (s > 0.0f) ? (1.0f / s) : (1.0f / (float)top_n);
+            for (int e = 0; e < K; e++) weights[b][e] = 0.0f;
+            for (int i = 0; i < top_n; i++) weights[b][active[i]] = sel[i] * inv;
+        }
+    } else {
+        /* Zero-router fallback: uniform weight per IB_MOME_TOP_N policy.
+         * mome_dispatch_ffn scales by K/n_active so n_active==K → 1.0
+         * (exact reconstruction). For the batched union path we always
+         * activate all K experts (n_active = K), giving weight = 1.0 —
+         * matches the single-position zero-router invariant. */
+        for (int b = 0; b < B; b++) {
+            for (int e = 0; e < K; e++) weights[b][e] = 1.0f;
+        }
+    }
+
+    /* Zero the accumulator. */
+    memset(xb_out, 0, (size_t)B * hidden * sizeof(float));
+
+    /* For each expert: 3 batched matmuls + per-position SiLU/accumulate. */
+    for (int e = 0; e < K; e++) {
+        const ib_tensor_meta* gate_e = &layer->gate_proj_experts[e];
+        const ib_tensor_meta* up_e   = &layer->up_proj_experts[e];
+        const ib_tensor_meta* down_e = &layer->down_proj_experts[e];
+
+        if (gate_e->shape[0] != rows_per_expert ||
+            up_e->shape[0]   != rows_per_expert ||
+            down_e->shape[1] != rows_per_expert) {
+            continue;
+        }
+
+        /* gate_e @ x → hb [B * rows_per_expert]  (hb capacity is B*inter
+         * = B*rows_per_expert*K, so the B*rows_per_expert slice fits at
+         * the head of hb). */
+        tensor_matmul_batch(m, gate_e, hb,  x_in_snap,
+                            rows_per_expert, hidden, B,
+                            scale_buf, q_scratch, sa_scratch);
+        tensor_matmul_batch(m, up_e,   hb2, x_in_snap,
+                            rows_per_expert, hidden, B,
+                            scale_buf, q_scratch, sa_scratch);
+
+        /* SiLU(gate) * up — per position, on contiguous B*rows_per_expert. */
+        const size_t silu_n = (size_t)B * rows_per_expert;
+        for (size_t i = 0; i < silu_n; i++) {
+            float g = hb[i];
+            hb[i] = (g / (1.0f + expf(-g))) * hb2[i];
+        }
+
+        /* down_e @ ffn_e → hb2 [B * hidden]. hb2 is B*inter ≥ B*hidden
+         * on any Llama-family config (gated 4/3× MLP), so this fits. */
+        tensor_matmul_batch(m, down_e, hb2, hb,
+                            hidden, rows_per_expert, B,
+                            scale_buf, q_scratch, sa_scratch);
+
+        /* Accumulate with per-position weight. */
+        for (int b = 0; b < B; b++) {
+            const float w = weights[b][e];
+            if (w == 0.0f) continue;
+            float* dst = xb_out + (size_t)b * hidden;
+            const float* src = hb2 + (size_t)b * hidden;
+            for (int h = 0; h < hidden; h++) dst[h] += w * src[h];
+        }
+    }
+}
+
 /* ── Batched forward pass ───────────────────────────────────── */
 
 /* Process B tokens (at contiguous positions positions[0..B-1]) through the
@@ -1984,19 +2299,40 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
 
         /* MLP — batched gate/up/down. Sparsity is not applied here; if a
          * layer has sparsity we fall back to the single-position path per
-         * batch via tensor_matmul_sparse (rare for Llama, so OK). */
+         * batch via tensor_matmul_sparse (rare for Llama, so OK).
+         *
+         * MoME (mome_experts>1) routes through mome_dispatch_ffn_batch,
+         * which runs each expert's gate/up/down ONCE across all B
+         * positions (weight read amortised across B). The legacy
+         * gate_proj/up_proj/down_proj slots are EMPTY on MoME files —
+         * the MoME branch MUST come before the legacy fast-path below. */
         if (layer->sparsity_mask_size > 0) {
             const uint8_t* sp_mask = (const uint8_t*)m->weight_data + layer->sparsity_mask_offset;
             for (int b = 0; b < B; b++) {
                 float* xb_b = xb + (size_t)b * hidden;
                 float* hb_b = hb + (size_t)b * inter;
                 float* hb2_b = hb2 + (size_t)b * inter;
-                float* xb_out = xb + (size_t)b * hidden;  /* overwrite xb[b] with down output */
+                float* xb_out = xb + (size_t)b * hidden;
                 tensor_matmul_sparse(m, &layer->gate_proj, hb_b, xb_b, inter, hidden, scale_buf, sp_mask);
                 tensor_matmul_sparse(m, &layer->up_proj, hb2_b, xb_b, inter, hidden, scale_buf, sp_mask);
                 ib_kern.silu_mul(hb_b, hb_b, hb2_b, inter);
                 tensor_matmul(m, &layer->down_proj, xb_out, hb_b, hidden, inter, scale_buf);
             }
+        } else if (layer->mome_experts > 1 &&
+                   layer->gate_proj_experts && layer->up_proj_experts &&
+                   layer->down_proj_experts) {
+            /* Batched MoME dispatch — runs each expert's gate/up/down ONCE
+             * across all B positions via tensor_matmul_batch, then folds
+             * per-position SiLU and weighted accumulate in plain C.
+             *
+             * For B=64 / K=8 / 22 layers this drops the matmul count from
+             * 64 × 8 × 3 × 22 = 33 792 per prefill to 8 × 3 × 22 = 528,
+             * a ~64× reduction in dispatch overhead.
+             *
+             * xb2 is free at the FFN stage (last used pre-O-proj above)
+             * and serves as the aliasing-safe input snapshot. */
+            mome_dispatch_ffn_batch(m, layer, xb, hb, hb2, xb, B,
+                                    xb2, scale_buf, q_scratch, sa_scratch);
         } else {
             tensor_matmul_batch(m, &layer->gate_proj, hb, xb, inter, hidden, B,
                                 scale_buf, q_scratch, sa_scratch);

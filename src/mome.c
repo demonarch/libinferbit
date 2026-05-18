@@ -16,6 +16,17 @@
  *
  * The matmul itself is the existing PQv2 path — mome.c never touches
  * codebooks or indices, only routing and partial-sum accumulation.
+ *
+ * Perf (Goal B2): the K active experts are dispatched across K pthreads
+ * so each gets a slice of the available decode threads for its own
+ * chunk-parallel PQv2 matmul. The per-expert thread pools + private
+ * acc/L2 scratch are cached at process scope (lazy init on first
+ * dispatch, never destroyed) so the per-call overhead is just K-1
+ * pthread_create + pthread_join cycles. To stay race-free across
+ * concurrent experts, each pthread calls
+ * `ib_tensor_matmul_cpu_isolated` (forward.c) with its OWN pool +
+ * private acc/L2 buffer — the model-scope shared scratch is never
+ * touched by the worker pthreads.
  */
 
 #include "mome.h"
@@ -25,6 +36,33 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Goal B2 expert-parallel dispatch uses pthread. On Windows the
+ * existing pthread shim lives only in forward.c / threading.c — to
+ * avoid coupling those translation units, the parallel path here is
+ * POSIX-only. On Windows the file falls through to the sequential v1
+ * path (same behaviour as before this patch). */
+#ifndef _WIN32
+#  include <pthread.h>
+#  define MOME_HAS_PTHREAD 1
+#else
+#  define MOME_HAS_PTHREAD 0
+#endif
+
+/* Forward declarations from forward.c — kept here because the public
+ * inferbit_internal.h surface is intentionally untouched by this
+ * patch. The function signatures below MUST match forward.c. */
+extern void ib_tensor_matmul_cpu(const inferbit_model *m, const ib_tensor_meta *t,
+                                 float *out, const float *input, int M, int N,
+                                 float *scale_buf);
+extern void ib_tensor_matmul_cpu_isolated(const inferbit_model *m,
+                                          const ib_tensor_meta *t,
+                                          float *out, const float *input,
+                                          int M, int N, float *scale_buf,
+                                          struct ib_thread_pool *pool,
+                                          int n_threads,
+                                          float *acc_pool, size_t acc_pool_floats,
+                                          float *acc_l2_pool, size_t acc_l2_pool_floats);
 
 /* ── public helpers ──────────────────────────────────────────────── */
 
@@ -159,6 +197,197 @@ static void mome_softmax_inplace(float *v, int n) {
     else          { for (int i = 0; i < n; i++) v[i] = 1.0f / (float)n; }
 }
 
+/* ── expert-parallel infrastructure (Goal B2) ──────────────────────
+ *
+ * Per-expert "slot": owns one private thread pool of
+ * `threads_per_expert` workers and the matching PQv2 acc + L2 scratch
+ * buffers. Allocated lazily on first dispatch, reused for the process
+ * lifetime — Mac decode runs thousands of layer dispatches per token;
+ * the alternative (build pools every call) would burn far more time
+ * in pthread_create than it saves.
+ *
+ * Sizing is determined by the (n_threads_total, K, max_M) tuple
+ * captured on the first call. If a later call observes a larger
+ * max_M, the slot's scratch buffers are grown in place. K and the
+ * thread-fanout are fixed by the first call — re-loading the model
+ * with a different K (rare) would leak the previous slots; that's
+ * acceptable since the slots are tiny (a few hundred KB total).
+ *
+ * Disabled when IB_MOME_PARALLEL=0 (env override for A/B). When K==1
+ * or n_threads_total<=1 the fast path short-circuits to the existing
+ * sequential `ib_tensor_matmul_cpu` calls. */
+
+typedef struct mome_expert_slot {
+    struct ib_thread_pool *pool;       /* sized threads_per_expert */
+    int    threads_per_expert;
+    float *acc_pool;
+    size_t acc_pool_floats;
+    float *acc_l2_pool;
+    size_t acc_l2_pool_floats;
+    /* Per-expert private activation scratch (eliminates the per-call
+     * aligned_alloc that would otherwise run K × 32 layers × t tok/s
+     * times per second of decode). Sizes are upper-bounded by
+     * max(rows_per_expert, hidden); grown in mome_slots_prepare. */
+    float *hb;            /* size rows_per_expert (≤ scratch_floats) */
+    float *hb2;           /* size max(rows_per_expert, hidden) */
+    float *xb_partial;    /* size hidden */
+    float *scale_buf;     /* size hidden (unused on PQv2) */
+    size_t scratch_floats;   /* current capacity of the four scratch buffers */
+} mome_expert_slot;
+
+#define MOME_MAX_SLOTS  IB_MOME_MAX_EXPERTS
+
+#if MOME_HAS_PTHREAD
+static mome_expert_slot g_slots[MOME_MAX_SLOTS];
+static int              g_n_slots = 0;
+static pthread_mutex_t  g_slots_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int mome_parallel_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("IB_MOME_PARALLEL");
+        cached = (e && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+/* Lazily create/grow K slots so each has a pool of threads_per_expert
+ * workers and per-slot acc/L2 + activation scratch. Activation scratch
+ * uses one shared `scratch_floats` budget covering hb / hb2 /
+ * xb_partial / scale_buf — sized for max(rows_per_expert, hidden) ×
+ * the four buffers per expert. Returns 0 on success, non-zero on
+ * failure (caller falls back to sequential). */
+static int mome_slots_prepare(int n_active, int threads_per_expert,
+                              size_t needed_acc_floats,
+                              size_t needed_scratch_floats,
+                              int need_l2)
+{
+    if (n_active <= 0 || n_active > MOME_MAX_SLOTS) return -1;
+    pthread_mutex_lock(&g_slots_mu);
+    /* Grow the static slot count if K rises. */
+    if (n_active > g_n_slots) g_n_slots = n_active;
+    for (int i = 0; i < n_active; i++) {
+        mome_expert_slot *s = &g_slots[i];
+        if (!s->pool || s->threads_per_expert != threads_per_expert) {
+            if (s->pool) { ib_pool_destroy(s->pool); s->pool = NULL; }
+            if (threads_per_expert > 1) {
+                s->pool = ib_pool_create(threads_per_expert);
+                if (!s->pool) { pthread_mutex_unlock(&g_slots_mu); return -2; }
+            }
+            s->threads_per_expert = threads_per_expert;
+        }
+        if (s->acc_pool_floats < needed_acc_floats) {
+            free(s->acc_pool);
+            s->acc_pool = (float *)aligned_alloc(64,
+                (needed_acc_floats * sizeof(float) + 63) & ~(size_t)63);
+            if (!s->acc_pool) { s->acc_pool_floats = 0;
+                pthread_mutex_unlock(&g_slots_mu); return -3; }
+            s->acc_pool_floats = needed_acc_floats;
+        }
+        if (need_l2) {
+            if (s->acc_l2_pool_floats < needed_acc_floats) {
+                free(s->acc_l2_pool);
+                s->acc_l2_pool = (float *)aligned_alloc(64,
+                    (needed_acc_floats * sizeof(float) + 63) & ~(size_t)63);
+                if (!s->acc_l2_pool) { s->acc_l2_pool_floats = 0;
+                    pthread_mutex_unlock(&g_slots_mu); return -4; }
+                s->acc_l2_pool_floats = needed_acc_floats;
+            }
+        }
+        if (s->scratch_floats < needed_scratch_floats) {
+            free(s->hb);   s->hb = NULL;
+            free(s->hb2);  s->hb2 = NULL;
+            free(s->xb_partial); s->xb_partial = NULL;
+            free(s->scale_buf);  s->scale_buf = NULL;
+            /* One slab carved into four sub-buffers — keeps each slot
+             * within a single 64B-aligned allocation. */
+            float *slab = (float *)aligned_alloc(64,
+                (needed_scratch_floats * sizeof(float) + 63) & ~(size_t)63);
+            if (!slab) { s->scratch_floats = 0;
+                pthread_mutex_unlock(&g_slots_mu); return -5; }
+            /* Layout: each buffer gets the same `max_per` slot to
+             * keep the math trivial. needed_scratch_floats == 4 *
+             * max_per by construction in the caller, so the four
+             * pointers are evenly spaced and each can safely hold up
+             * to max_per floats. Wastes ≤ 3 × (max_per - hidden)
+             * floats per slot — a few hundred KB total at K=2,
+             * negligible. */
+            size_t per = needed_scratch_floats / 4;
+            s->hb         = slab + 0 * per;
+            s->hb2        = slab + 1 * per;
+            s->xb_partial = slab + 2 * per;
+            s->scale_buf  = slab + 3 * per;
+            s->scratch_floats = needed_scratch_floats;
+        }
+    }
+    pthread_mutex_unlock(&g_slots_mu);
+    return 0;
+}
+
+/* Per-expert pthread arg + worker. */
+typedef struct {
+    inferbit_model       *m;
+    const ib_layer_meta  *layer;
+    const float          *x_in;
+    int                   expert;          /* 0..K-1 */
+    int                   rows_per_expert;
+    int                   hidden;
+    float                *hb;              /* private, size rows_per_expert */
+    float                *hb2;             /* private, size max(rows_per_expert, hidden) */
+    float                *xb_partial;      /* private, size hidden */
+    float                *scale_buf_priv;  /* private, size hidden (unused for PQv2) */
+    mome_expert_slot     *slot;
+} mome_expert_arg;
+
+static void mome_expert_run(mome_expert_arg *a) {
+    const ib_tensor_meta *gate_e = &a->layer->gate_proj_experts[a->expert];
+    const ib_tensor_meta *up_e   = &a->layer->up_proj_experts[a->expert];
+    const ib_tensor_meta *down_e = &a->layer->down_proj_experts[a->expert];
+
+    if (gate_e->shape[0] != a->rows_per_expert ||
+        up_e->shape[0]   != a->rows_per_expert ||
+        down_e->shape[1] != a->rows_per_expert) {
+        /* Malformed expert slot — produce zero partial, master will
+         * silently drop. */
+        memset(a->xb_partial, 0, (size_t)a->hidden * sizeof(float));
+        return;
+    }
+
+    /* gate_e: [rows_per_expert, hidden] @ x_in[hidden] → hb */
+    ib_tensor_matmul_cpu_isolated(
+        a->m, gate_e, a->hb, a->x_in, a->rows_per_expert, a->hidden,
+        a->scale_buf_priv,
+        a->slot->pool, a->slot->threads_per_expert,
+        a->slot->acc_pool, a->slot->acc_pool_floats,
+        a->slot->acc_l2_pool, a->slot->acc_l2_pool_floats);
+    /* up_e: same shape */
+    ib_tensor_matmul_cpu_isolated(
+        a->m, up_e, a->hb2, a->x_in, a->rows_per_expert, a->hidden,
+        a->scale_buf_priv,
+        a->slot->pool, a->slot->threads_per_expert,
+        a->slot->acc_pool, a->slot->acc_pool_floats,
+        a->slot->acc_l2_pool, a->slot->acc_l2_pool_floats);
+
+    /* SiLU(gate) * up — element-wise on the per-expert slice. */
+    for (int r = 0; r < a->rows_per_expert; r++) {
+        a->hb[r] = mome_silu(a->hb[r]) * a->hb2[r];
+    }
+
+    /* down_e: [hidden, rows_per_expert] @ hb → xb_partial[hidden]. */
+    ib_tensor_matmul_cpu_isolated(
+        a->m, down_e, a->xb_partial, a->hb, a->hidden, a->rows_per_expert,
+        a->scale_buf_priv,
+        a->slot->pool, a->slot->threads_per_expert,
+        a->slot->acc_pool, a->slot->acc_pool_floats,
+        a->slot->acc_l2_pool, a->slot->acc_l2_pool_floats);
+}
+
+static void *mome_expert_thread(void *raw) {
+    mome_expert_run((mome_expert_arg *)raw);
+    return NULL;
+}
+#endif /* MOME_HAS_PTHREAD */
+
 /* ── dispatch ────────────────────────────────────────────────────── */
 
 void mome_dispatch_ffn(inferbit_model *m,
@@ -211,6 +440,129 @@ void mome_dispatch_ffn(inferbit_model *m,
     /* Zero the output — we accumulate per-expert contributions. */
     memset(xb_out, 0, (size_t)hidden * sizeof(float));
 
+    /* ── Decide path: parallel vs sequential ───────────────────────
+     *
+     * Parallel path: split the n_active experts across pthreads, each
+     * with a private (threads_per_expert)-worker pool. Falls back to
+     * sequential when:
+     *   - IB_MOME_PARALLEL=0
+     *   - n_active < 2 (nothing to parallelise)
+     *   - m->num_threads <= 1 (no concurrency budget)
+     *   - slot infrastructure failed to initialise
+     * Sequential path matches the original v1 behaviour exactly. */
+    int do_parallel = 0;
+#if MOME_HAS_PTHREAD
+    do_parallel = (mome_parallel_enabled() && n_active >= 2 &&
+                   m->num_threads > 1);
+#endif
+    int threads_per_expert = 0;
+    if (do_parallel) {
+        threads_per_expert = m->num_threads / n_active;
+        if (threads_per_expert < 1) threads_per_expert = 1;
+    }
+
+    /* Detect whether any of this layer's expert tensors uses L2
+     * (pyramid). Used to size the slot's L2 scratch. The cheapest
+     * proxy: peek at expert 0's gate_proj_experts; all experts in a
+     * layer share the same encoding kind. */
+    int need_l2 = 0;
+    if (do_parallel && layer->gate_proj_experts[0].pq) {
+        const pqv2_t *pq0 = layer->gate_proj_experts[0].pq;
+        if (pq0->l2_kind == 2 && pq0->l2_cb_fp32 && pq0->l2_K <= 64) {
+            need_l2 = 1;
+        }
+    }
+
+    /* Size the per-slot scratch. acc/L2 use threads_per_expert ×
+     * max_M floats (matches PQv2 threaded path's n_slots × M layout).
+     * Activation scratch uses 4 × max_M floats per slot (hb, hb2,
+     * xb_partial, scale_buf — each over-sized to max_M for trivial
+     * math; wastes a few hundred KB total, negligible). */
+    size_t max_M = (size_t)(rows_per_expert > hidden ? rows_per_expert : hidden);
+    size_t needed_acc_floats = (size_t)threads_per_expert * max_M;
+    size_t needed_scratch_floats = 4 * max_M;
+
+#if MOME_HAS_PTHREAD
+    if (do_parallel) {
+        if (mome_slots_prepare(n_active, threads_per_expert,
+                               needed_acc_floats, needed_scratch_floats,
+                               need_l2) != 0) {
+            do_parallel = 0;   /* fall back to sequential */
+        }
+    }
+#else
+    (void)threads_per_expert;
+    (void)max_M;
+    (void)needed_acc_floats;
+    (void)needed_scratch_floats;
+    (void)need_l2;
+#endif
+
+#if MOME_HAS_PTHREAD
+    if (do_parallel) {
+        /* Per-expert args live on stack (small — K ≤ 32, ~64 bytes
+         * each). Scratch buffers (hb, hb2, xb_partial, scale_buf) are
+         * static-lifetime per slot — eliminates the per-call
+         * aligned_alloc that would otherwise run ~64 times per
+         * decoded token (K experts × 32 layers). */
+        mome_expert_arg args[IB_MOME_MAX_EXPERTS];
+        pthread_t tids[IB_MOME_MAX_EXPERTS];
+        for (int i = 0; i < n_active; i++) {
+            const int e = active ? active[i] : i;
+            if (e < 0 || e >= K) {
+                args[i].expert = -1;
+                continue;
+            }
+            mome_expert_slot *slot = &g_slots[i];
+            args[i].m              = m;
+            args[i].layer          = layer;
+            args[i].x_in           = x_in;
+            args[i].expert         = e;
+            args[i].rows_per_expert= rows_per_expert;
+            args[i].hidden         = hidden;
+            args[i].hb             = slot->hb;
+            args[i].hb2            = slot->hb2;
+            args[i].xb_partial     = slot->xb_partial;
+            args[i].scale_buf_priv = slot->scale_buf;
+            args[i].slot           = slot;
+        }
+
+        /* Spawn workers for experts 1..n_active-1; the calling
+         * thread runs expert 0 itself to avoid the cost of a
+         * pthread_create+join cycle for the easy case. */
+        for (int i = 1; i < n_active; i++) {
+            if (args[i].expert < 0) continue;
+            if (pthread_create(&tids[i], NULL, mome_expert_thread,
+                               &args[i]) != 0) {
+                /* On thread-create failure, run the rest inline. */
+                for (int j = i; j < n_active; j++) {
+                    if (args[j].expert >= 0) mome_expert_run(&args[j]);
+                }
+                /* Join previously-spawned 1..i-1. */
+                for (int j = 1; j < i; j++) {
+                    if (args[j].expert >= 0) pthread_join(tids[j], NULL);
+                }
+                goto reduce;
+            }
+        }
+        if (args[0].expert >= 0) mome_expert_run(&args[0]);
+        for (int i = 1; i < n_active; i++) {
+            if (args[i].expert >= 0) pthread_join(tids[i], NULL);
+        }
+
+reduce:
+        /* Weighted reduce K partials → xb_out. */
+        for (int i = 0; i < n_active; i++) {
+            if (args[i].expert < 0) continue;
+            const float w_e = weights[i];
+            const float *p  = args[i].xb_partial;
+            for (int h = 0; h < hidden; h++) xb_out[h] += w_e * p[h];
+        }
+        return;
+    }
+#endif /* MOME_HAS_PTHREAD */
+
+    /* ── Sequential fallback (original v1 path) ──────────────────── */
     for (int i = 0; i < n_active; i++) {
         const int e = active ? active[i] : i;
         if (e < 0 || e >= K) continue;
@@ -220,10 +572,6 @@ void mome_dispatch_ffn(inferbit_model *m,
         const ib_tensor_meta *up_e   = &layer->up_proj_experts[e];
         const ib_tensor_meta *down_e = &layer->down_proj_experts[e];
 
-        /* gate_e: [rows_per_expert, hidden] @ x[hidden] → hb[rows_per_expert]
-         * up_e:   [rows_per_expert, hidden] @ x[hidden] → hb2[rows_per_expert]
-         * Sub-tensor sizes are validated by the loader; if a slot is
-         * malformed (M mismatch), fall back to skipping that expert. */
         if (gate_e->shape[0] != rows_per_expert ||
             up_e->shape[0]   != rows_per_expert ||
             down_e->shape[1] != rows_per_expert) {
@@ -233,17 +581,10 @@ void mome_dispatch_ffn(inferbit_model *m,
         ib_tensor_matmul_cpu(m, gate_e, hb,  x_in, rows_per_expert, hidden, scale_buf);
         ib_tensor_matmul_cpu(m, up_e,   hb2, x_in, rows_per_expert, hidden, scale_buf);
 
-        /* SiLU(gate) * up — element-wise on the per-expert slice. */
         for (int r = 0; r < rows_per_expert; r++) {
             hb[r] = mome_silu(hb[r]) * hb2[r];
         }
 
-        /* down_e: [hidden, rows_per_expert] @ hb[rows_per_expert]
-         *       → xb_tmp[hidden]. Accumulate into xb_out with w_e.
-         *
-         * Reuse hb2 as the per-expert down output scratch — it is at
-         * least `inter` floats long which is >= hidden on any
-         * reasonable Llama-family config; we only need `hidden`. */
         ib_tensor_matmul_cpu(m, down_e, hb2, hb, hidden, rows_per_expert,
                              scale_buf);
         for (int h = 0; h < hidden; h++) {

@@ -1231,70 +1231,85 @@ static int push_pqv2_tensor(ib6_manifest *mf, const char *name,
  * intermediate-size axis (M_total for gate/up, N_total for down) —
  * see docs/v2/00_CORRECTION.md §3a. */
 
-/* Slice gate/up's row range [e * M_per, (e+1) * M_per) and push as a
- * PQv2 tensor named `<base_name>.expert{e}`. */
-static int push_pqv2_expert_rows(ib6_manifest *mf, const char *base_name,
-                                  int expert_idx,
-                                  const float *W_full, int M_per,
-                                  int row_offset, int N,
-                                  int G, int K, int half,
-                                  int pyramid, int residency_hint,
-                                  int scale_precision, int codebook_dedup,
-                                  uint32_t seed)
-{
-    char nm[128];
-    snprintf(nm, sizeof(nm), "%s.expert%d", base_name, expert_idx);
-    /* Sub-rows are contiguous: pointer arithmetic suffices. */
-    const float *W_slice = W_full + (size_t)row_offset * (size_t)N;
-    /* E1 fix: all experts share the SAME k-means init seed. The previous
-     * per-expert XOR differentiator produced statistically-independent
-     * codebook errors across experts → summing K experts compounded the
-     * noise rather than averaging it → PPL 5074 vs flat 6.26. Same seed
-     * gives correlated (not identical, since input rows differ) codebooks
-     * whose errors partially cancel. */
-    return push_pqv2_tensor(mf, nm, W_slice, M_per, N, G, K, half,
-                             pyramid, residency_hint,
-                             scale_precision, codebook_dedup,
-                             /*idx_layout_rowmajor=*/0,
-                             seed);
-}
+/* Shared-codebook MoME encoder (Stage 3a.shared, supersedes the
+ * round 1-5 per-expert independent codebook approach).
+ *
+ * The earlier path called pqv2_encode_flat / pqv2_encode_pyramid
+ * separately for each expert's slice. Each k-means converged to its
+ * own local minimum → quantization errors for different experts were
+ * statistically INDEPENDENT. Sum-of-experts had variance K·Var(err),
+ * with per-row RMSE of ~17% (E1 round-5 probe). Compounded over 22
+ * layers, that's α^22 ≈ 800× PPL degradation (observed 5074 vs flat
+ * 6.26).
+ *
+ * The fix: encode the FULL un-split W ONCE to get one shared
+ * (cb_q, cb_scale, row_scale, indices) tuple. Then per expert we
+ * slice the appropriate (row_scale, L1 idx, L2 idx) and emit a blob
+ * that REUSES the same (cb_q, cb_scale, l2_cb_q, l2_cb_scale) bytes.
+ *
+ * Why this works:
+ *   - PQv2 codebooks are indexed by SUBCHUNK SLOT (n_sub codebooks
+ *     total), NOT by chunk or row. Every chunk and every row of the
+ *     full tensor decodes against the same per-subchunk codebooks.
+ *   - For ROW-SPLIT (gate/up, [inter, hidden]): each expert covers
+ *     rows [e*M_per, (e+1)*M_per). Indices are chunk-major
+ *     [n_chunks][n_sub][M]; we copy the M-axis slice [e*M_per..]. The
+ *     row_scale for this slice is the FULL-tensor row_scale[e*M_per..]
+ *     (same as flat) — preserves bit-exact decoding of every row.
+ *   - For COL-SPLIT (down, [hidden, inter]): each expert covers a
+ *     contiguous CHUNK range. Indices [n_chunks][n_sub][M] slice as a
+ *     contiguous chunk range. row_scale stays the FULL hidden-length
+ *     buffer (every expert sees every row of W_down; the codebook +
+ *     row_scale combo from the full encode is already correct).
+ *
+ * Result: sum-of-experts == flat reconstruction (modulo float-add
+ * order). Errors are CORRELATED (shared codebook → shared rounding
+ * grid) so they cancel, not compound. Expected MoME PPL ≈ flat PPL.
+ *
+ * File-size cost: K-1 extra cb_q + cb_scale per FFN tensor (a few
+ * KB per layer at K=2). Index byte count is identical to a single
+ * flat encode (slicing only redistributes; total bytes = M·n_c·n_s
+ * either way). row_scale is duplicated for col-split (K * hidden
+ * fp16) but that's <5 KB per layer.
+ */
 
-/* Slice down_proj's column range [e * N_per, (e+1) * N_per) and push
- * as a PQv2 tensor named `<base_name>.expert{e}`. The source layout
- * is row-major [M][N_full]; we materialise a contiguous [M][N_per]
- * tile in a temporary buffer before handing to push_pqv2_tensor. */
-static int push_pqv2_expert_cols(ib6_manifest *mf, const char *base_name,
-                                  int expert_idx,
-                                  const float *W_full, int M, int N_full,
-                                  int N_per, int col_offset,
-                                  int G, int K, int half,
-                                  int pyramid, int residency_hint,
-                                  int scale_precision, int codebook_dedup,
-                                  uint32_t seed)
+/* Build a per-expert PQv2 blob from sliced row_scale + sliced L1/L2
+ * indices, reusing shared (cb_q, cb_scale, [l2_cb_q, l2_cb_scale])
+ * bytes from the full-tensor encode. Caller owns all input pointers.
+ * Returns 0 on success, -1 on error. */
+static int mome_emit_expert_blob(ib6_manifest *mf,
+                                  const char *base_name, int expert_idx,
+                                  int M_exp, int N_exp,
+                                  int G, int K_cb, int n_sub, int half,
+                                  int pyramid, int l2_K,
+                                  const uint16_t *row_scale_slice,
+                                  const int8_t   *cb_q_shared,
+                                  const uint16_t *cb_s_shared,
+                                  const uint8_t  *idx_l1_slice,
+                                  const int8_t   *l2_cb_q_shared,
+                                  const uint16_t *l2_cb_s_shared,
+                                  const uint8_t  *idx_l2_slice,
+                                  int residency_hint,
+                                  int scale_precision,
+                                  int codebook_dedup)
 {
-    if (N_per <= 0 || (N_per % G) != 0) {
-        ib_set_error("push_pqv2_expert_cols: N_per=%d not a multiple of G=%d",
-                     N_per, G);
-        return -1;
-    }
-    float *tile = (float *)malloc((size_t)M * (size_t)N_per * sizeof(float));
-    if (!tile) { ib_set_error("oom: down_proj expert tile"); return -1; }
-    for (int m = 0; m < M; m++) {
-        const float *src = W_full + (size_t)m * (size_t)N_full
-                            + (size_t)col_offset;
-        float *dst = tile + (size_t)m * (size_t)N_per;
-        memcpy(dst, src, (size_t)N_per * sizeof(float));
-    }
+    size_t blob_size = 0;
+    void *blob = build_pqv2_blob(M_exp, N_exp, G, K_cb, n_sub, half,
+                                  pyramid ? 2 : 0, l2_K,
+                                  row_scale_slice, cb_q_shared, cb_s_shared,
+                                  idx_l1_slice,
+                                  l2_cb_q_shared, l2_cb_s_shared, idx_l2_slice,
+                                  residency_hint, scale_precision, codebook_dedup,
+                                  /*l1_idx_layout=*/0,
+                                  &blob_size);
+    if (!blob) { ib_set_error("mome_emit_expert_blob: oom (build_pqv2_blob)"); return -1; }
     char nm[128];
     snprintf(nm, sizeof(nm), "%s.expert%d", base_name, expert_idx);
-    /* E1 fix: same shared seed across experts (see push_pqv2_expert_rows). */
-    int rc = push_pqv2_tensor(mf, nm, tile, M, N_per, G, K, half,
-                               pyramid, residency_hint,
-                               scale_precision, codebook_dedup,
-                               /*idx_layout_rowmajor=*/0,
-                               seed);
-    free(tile);
-    return rc;
+    int32_t shape[4] = { M_exp, N_exp, 1, 1 };
+    if (ib6_push(mf, nm, IB_PQV2_KIND_PQV2, 2, shape, blob, blob_size) != 0) {
+        free(blob); ib_set_error("mome_emit_expert_blob: manifest push (%s)", nm); return -1;
+    }
+    return 0;
 }
 
 /* Push a zero-init [K, hidden] raw fp16 router weight.
@@ -1400,32 +1415,120 @@ static int read_and_push_pqv2_mome_rows(ib6_manifest *mf,
     int rows = ib_ts_tensor_shape(ts, shard, t, 0);
     int cols = ib_ts_tensor_shape(ts, shard, t, 1);
     if (cols == 0) cols = 1;
-    if (K_experts <= 1) return +1;            /* not MoME */
-    if (rows <= 0 || (rows % K_experts) != 0) return +1;   /* row-split impossible */
+    if (K_experts <= 1) return +1;
+    if (rows <= 0 || (rows % K_experts) != 0) return +1;
     if ((cols % G) != 0) {
         ib_set_error("%s: cols=%d not divisible by G=%d", base_name, cols, G);
         return -1;
     }
-    int M_per = rows / K_experts;
-    float *W = (float *)malloc((size_t)rows * cols * sizeof(float));
+    int M_full = rows;
+    int N      = cols;
+    int M_per  = rows / K_experts;
+    int n_chunks = N / G;
+    int n_sub    = G / half;
+    int l2_K     = pyramid ? 64 : 0;
+
+    float *W = (float *)malloc((size_t)M_full * N * sizeof(float));
     if (!W) { ib_set_error("oom reading %s", base_name); return -1; }
-    if (pqv2_read_matrix_fp32(W, raw, dtype, rows, cols) != 0) {
+    if (pqv2_read_matrix_fp32(W, raw, dtype, M_full, N) != 0) {
         free(W);
         ib_set_error("%s: unsupported dtype %s", base_name, dtype);
         return -1;
     }
-    for (int e = 0; e < K_experts; e++) {
-        int row_off = e * M_per;
-        int rc = push_pqv2_expert_rows(mf, base_name, e,
-                                         W, M_per, row_off, cols,
-                                         G, K_cb, half, pyramid,
-                                         residency_hint,
-                                         scale_precision, codebook_dedup,
-                                         seed);
-        if (rc != 0) { free(W); return rc; }
+
+    /* One full-tensor encode → shared codebook + full row_scale + full
+     * indices. The per-expert blobs below slice the (row_scale,
+     * L1 idx, L2 idx) and reuse the same (cb_q, cb_scale, l2_cb_*).
+     */
+    size_t cb_q_n   = (size_t)n_sub * (size_t)K_cb * (size_t)half;
+    size_t cb_s_n   = (size_t)n_sub * (size_t)K_cb;
+    size_t idx_n    = (size_t)M_full * (size_t)n_chunks * (size_t)n_sub;
+    size_t cb_q_l2n = pyramid ? (size_t)n_sub * (size_t)l2_K * (size_t)half : 0;
+    size_t cb_s_l2n = pyramid ? (size_t)n_sub * (size_t)l2_K : 0;
+
+    int8_t   *cb_q     = (int8_t   *)calloc(cb_q_n ? cb_q_n : 1, 1);
+    uint16_t *cb_s     = (uint16_t *)calloc(cb_s_n ? cb_s_n : 1, 2);
+    uint16_t *row_s    = (uint16_t *)calloc((size_t)M_full, 2);
+    uint8_t  *idx_l1   = (uint8_t  *)calloc(idx_n ? idx_n : 1, 1);
+    int8_t   *cb_q_l2  = pyramid ? (int8_t   *)calloc(cb_q_l2n, 1) : NULL;
+    uint16_t *cb_s_l2  = pyramid ? (uint16_t *)calloc(cb_s_l2n, 2) : NULL;
+    uint8_t  *idx_l2   = pyramid ? (uint8_t  *)calloc(idx_n, 1)    : NULL;
+    if (!cb_q || !cb_s || !row_s || !idx_l1 ||
+        (pyramid && (!cb_q_l2 || !cb_s_l2 || !idx_l2))) {
+        free(W); free(cb_q); free(cb_s); free(row_s); free(idx_l1);
+        free(cb_q_l2); free(cb_s_l2); free(idx_l2);
+        ib_set_error("mome rows: oom (%s)", base_name); return -1;
+    }
+    int rc;
+    if (pyramid) {
+        rc = pqv2_encode_pyramid(W, M_full, N, G, 0, l2_K, half,
+                                  cb_q, cb_s, cb_q_l2, cb_s_l2,
+                                  row_s, idx_l1, idx_l2, seed);
+    } else {
+        rc = pqv2_encode_flat_impl(W, M_full, N, G, K_cb, half,
+                                    /*apply_row_scale=*/1,
+                                    cb_q, cb_s, row_s, idx_l1,
+                                    /*idx_layout_rowmajor=*/0,
+                                    NULL, seed);
     }
     free(W);
-    return 0;
+    if (rc != 0) {
+        free(cb_q); free(cb_s); free(row_s); free(idx_l1);
+        free(cb_q_l2); free(cb_s_l2); free(idx_l2);
+        return rc;
+    }
+
+    /* Per-expert scratch: sliced row_scale [M_per] + sliced L1 idx
+     * [n_chunks][n_sub][M_per] (+ same shape for L2). Reused across
+     * experts; sized for one expert. */
+    size_t slice_idx_n = (size_t)M_per * (size_t)n_chunks * (size_t)n_sub;
+    uint16_t *rs_e   = (uint16_t *)malloc((size_t)M_per * 2);
+    uint8_t  *idx_e  = (uint8_t  *)malloc(slice_idx_n);
+    uint8_t  *idxL2_e = pyramid ? (uint8_t *)malloc(slice_idx_n) : NULL;
+    if (!rs_e || !idx_e || (pyramid && !idxL2_e)) {
+        free(rs_e); free(idx_e); free(idxL2_e);
+        free(cb_q); free(cb_s); free(row_s); free(idx_l1);
+        free(cb_q_l2); free(cb_s_l2); free(idx_l2);
+        ib_set_error("mome rows: oom (slice)"); return -1;
+    }
+
+    int rc_final = 0;
+    for (int e = 0; e < K_experts; e++) {
+        size_t row_off = (size_t)e * (size_t)M_per;
+        memcpy(rs_e, row_s + row_off, (size_t)M_per * 2);
+        /* Slice L1 indices: chunk-major [n_chunks][n_sub][M_full] →
+         * [n_chunks][n_sub][M_per] with offset row_off along the M axis. */
+        for (int c = 0; c < n_chunks; c++) {
+            for (int s = 0; s < n_sub; s++) {
+                memcpy(idx_e + ((size_t)c * n_sub + s) * (size_t)M_per,
+                       idx_l1 + ((size_t)c * n_sub + s) * (size_t)M_full + row_off,
+                       (size_t)M_per);
+            }
+        }
+        if (pyramid) {
+            for (int c = 0; c < n_chunks; c++) {
+                for (int s = 0; s < n_sub; s++) {
+                    memcpy(idxL2_e + ((size_t)c * n_sub + s) * (size_t)M_per,
+                           idx_l2 + ((size_t)c * n_sub + s) * (size_t)M_full + row_off,
+                           (size_t)M_per);
+                }
+            }
+        }
+        if (mome_emit_expert_blob(mf, base_name, e,
+                                    M_per, N, G, K_cb, n_sub, half,
+                                    pyramid, l2_K,
+                                    rs_e, cb_q, cb_s, idx_e,
+                                    cb_q_l2, cb_s_l2, idxL2_e,
+                                    residency_hint, scale_precision,
+                                    codebook_dedup) != 0) {
+            rc_final = -1; break;
+        }
+    }
+
+    free(rs_e); free(idx_e); free(idxL2_e);
+    free(cb_q); free(cb_s); free(row_s); free(idx_l1);
+    free(cb_q_l2); free(cb_s_l2); free(idx_l2);
+    return rc_final;
 }
 
 /* MoME col-split FFN pusher (down_proj).
@@ -1452,28 +1555,100 @@ static int read_and_push_pqv2_mome_cols(ib6_manifest *mf,
     if (K_experts <= 1) return +1;
     if (cols <= 0 || (cols % K_experts) != 0) return +1;
     int N_per = cols / K_experts;
-    if ((N_per % G) != 0) return +1;           /* per-expert N_per must be
-                                                 G-aligned so PQv2 group
-                                                 size still divides cleanly */
-    float *W = (float *)malloc((size_t)rows * cols * sizeof(float));
+    if ((N_per % G) != 0) return +1;
+    int M_full   = rows;
+    int N_full   = cols;
+    int n_chunks = N_full / G;
+    int n_sub    = G / half;
+    int l2_K     = pyramid ? 64 : 0;
+    if ((n_chunks % K_experts) != 0) {
+        /* Shared-codebook col-split requires the chunk count to divide
+         * cleanly so each expert owns a contiguous CHUNK range (PQv2
+         * codebooks are per subchunk-slot, identical across chunks, so
+         * chunk-slicing the indices preserves the shared codebook
+         * contract). Fall back to non-MoME on this tensor. */
+        return +1;
+    }
+    int n_chunks_per_e = n_chunks / K_experts;
+
+    float *W = (float *)malloc((size_t)M_full * N_full * sizeof(float));
     if (!W) { ib_set_error("oom reading %s", base_name); return -1; }
-    if (pqv2_read_matrix_fp32(W, raw, dtype, rows, cols) != 0) {
+    if (pqv2_read_matrix_fp32(W, raw, dtype, M_full, N_full) != 0) {
         free(W);
         ib_set_error("%s: unsupported dtype %s", base_name, dtype);
         return -1;
     }
-    for (int e = 0; e < K_experts; e++) {
-        int col_off = e * N_per;
-        int rc = push_pqv2_expert_cols(mf, base_name, e,
-                                         W, rows, cols, N_per, col_off,
-                                         G, K_cb, half, pyramid,
-                                         residency_hint,
-                                         scale_precision, codebook_dedup,
-                                         seed);
-        if (rc != 0) { free(W); return rc; }
+
+    /* Encode full down_proj [hidden, inter] once. */
+    size_t cb_q_n   = (size_t)n_sub * (size_t)K_cb * (size_t)half;
+    size_t cb_s_n   = (size_t)n_sub * (size_t)K_cb;
+    size_t idx_n    = (size_t)M_full * (size_t)n_chunks * (size_t)n_sub;
+    size_t cb_q_l2n = pyramid ? (size_t)n_sub * (size_t)l2_K * (size_t)half : 0;
+    size_t cb_s_l2n = pyramid ? (size_t)n_sub * (size_t)l2_K : 0;
+
+    int8_t   *cb_q    = (int8_t   *)calloc(cb_q_n ? cb_q_n : 1, 1);
+    uint16_t *cb_s    = (uint16_t *)calloc(cb_s_n ? cb_s_n : 1, 2);
+    uint16_t *row_s   = (uint16_t *)calloc((size_t)M_full, 2);
+    uint8_t  *idx_l1  = (uint8_t  *)calloc(idx_n ? idx_n : 1, 1);
+    int8_t   *cb_q_l2 = pyramid ? (int8_t   *)calloc(cb_q_l2n, 1) : NULL;
+    uint16_t *cb_s_l2 = pyramid ? (uint16_t *)calloc(cb_s_l2n, 2) : NULL;
+    uint8_t  *idx_l2  = pyramid ? (uint8_t  *)calloc(idx_n, 1)    : NULL;
+    if (!cb_q || !cb_s || !row_s || !idx_l1 ||
+        (pyramid && (!cb_q_l2 || !cb_s_l2 || !idx_l2))) {
+        free(W); free(cb_q); free(cb_s); free(row_s); free(idx_l1);
+        free(cb_q_l2); free(cb_s_l2); free(idx_l2);
+        ib_set_error("mome cols: oom (%s)", base_name); return -1;
+    }
+    int rc;
+    if (pyramid) {
+        rc = pqv2_encode_pyramid(W, M_full, N_full, G, 0, l2_K, half,
+                                  cb_q, cb_s, cb_q_l2, cb_s_l2,
+                                  row_s, idx_l1, idx_l2, seed);
+    } else {
+        rc = pqv2_encode_flat_impl(W, M_full, N_full, G, K_cb, half,
+                                    /*apply_row_scale=*/1,
+                                    cb_q, cb_s, row_s, idx_l1,
+                                    /*idx_layout_rowmajor=*/0,
+                                    NULL, seed);
     }
     free(W);
-    return 0;
+    if (rc != 0) {
+        free(cb_q); free(cb_s); free(row_s); free(idx_l1);
+        free(cb_q_l2); free(cb_s_l2); free(idx_l2);
+        return rc;
+    }
+
+    /* Per-expert: slice a contiguous CHUNK range out of the full
+     * chunk-major index buffer. row_scale is shared (every expert
+     * sees every row of W_down; the full-tensor row_scale already
+     * captures max|row| over all inter cols, which is the correct
+     * scale because the codebook bytes were normalised against it). */
+    size_t exp_chunk_bytes = (size_t)n_chunks_per_e * (size_t)n_sub * (size_t)M_full;
+    int N_exp = n_chunks_per_e * G;
+
+    int rc_final = 0;
+    for (int e = 0; e < K_experts; e++) {
+        const uint8_t *idx_l1_src = idx_l1 + (size_t)e * (size_t)n_chunks_per_e
+                                                  * (size_t)n_sub * (size_t)M_full;
+        const uint8_t *idx_l2_src = pyramid
+            ? idx_l2 + (size_t)e * (size_t)n_chunks_per_e
+                                  * (size_t)n_sub * (size_t)M_full
+            : NULL;
+        if (mome_emit_expert_blob(mf, base_name, e,
+                                    M_full, N_exp, G, K_cb, n_sub, half,
+                                    pyramid, l2_K,
+                                    row_s, cb_q, cb_s, idx_l1_src,
+                                    cb_q_l2, cb_s_l2, idx_l2_src,
+                                    residency_hint, scale_precision,
+                                    codebook_dedup) != 0) {
+            rc_final = -1; break;
+        }
+        (void)exp_chunk_bytes;
+    }
+
+    free(cb_q); free(cb_s); free(row_s); free(idx_l1);
+    free(cb_q_l2); free(cb_s_l2); free(idx_l2);
+    return rc_final;
 }
 
 /* Read a (rows × cols) tensor from the source as fp32 with optional QK
@@ -1772,11 +1947,45 @@ resolve_format(const inferbit_convert_config *cfg, inferbit_tensor_class cls)
         return cfg->format;
     }
     inferbit_convert_format per = cfg->per_class_format[cls];
-    /* `per == INT4` (= 0) is the zero-init "no override" sentinel —
-     * fall back to the global selector. Any other value is an explicit
-     * caller-set override that wins over `cfg->format`. */
-    if (per == INFERBIT_CONVERT_INT4) return cfg->format;
-    return per;
+    /* Any non-zero per-class value is an explicit caller-set override
+     * that wins over `cfg->format` (and the class-default policy
+     * below). Honor it verbatim — including the case where the user
+     * explicitly opts attention/embed/lm_head into pyramid. */
+    if (per != INFERBIT_CONVERT_INT4) return per;
+
+    /* Class-default policy (Stage 5b.fix2, 2026-05-18): pyramid L2 is
+     * a costly residual stream (~50–66% size bloat) that only buys
+     * measurable quality on the large dense matmuls — i.e. the FFN
+     * projections, which dominate both parameter count and the PPL
+     * sensitivity to quantization error. Attention Q/K/V/O are
+     * smaller and head-split (per-head error averages out in the
+     * softmax); embedding and lm_head are row-lookup / final-projection
+     * tensors where the loader already encodes them flat regardless.
+     *
+     * So when the user picks `--format pyramid` globally and does NOT
+     * override per class, we apply pyramid ONLY to the FFN classes
+     * and quietly downgrade everything else to PQv2 flat. This drops
+     * the file size by roughly a third on a 1.1B model while keeping
+     * the PPL essentially unchanged (FFN-dominated). The user can
+     * still force pyramid on attention via the per-class override. */
+    if (cfg->format == INFERBIT_CONVERT_PQV2_PYRAMID) {
+        switch (cls) {
+            case INFERBIT_TENSOR_CLASS_FFN_GATE:
+            case INFERBIT_TENSOR_CLASS_FFN_UP:
+            case INFERBIT_TENSOR_CLASS_FFN_DOWN:
+                return INFERBIT_CONVERT_PQV2_PYRAMID;
+            case INFERBIT_TENSOR_CLASS_ATTN_Q:
+            case INFERBIT_TENSOR_CLASS_ATTN_K:
+            case INFERBIT_TENSOR_CLASS_ATTN_V:
+            case INFERBIT_TENSOR_CLASS_ATTN_O:
+            case INFERBIT_TENSOR_CLASS_EMBED:
+            case INFERBIT_TENSOR_CLASS_LM_HEAD:
+            default:
+                return INFERBIT_CONVERT_PQV2_FLAT;
+        }
+    }
+    /* Non-pyramid global selectors (INT4 / PQV2_FLAT) propagate as-is. */
+    return cfg->format;
 }
 
 static inline int

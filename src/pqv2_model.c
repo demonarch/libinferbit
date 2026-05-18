@@ -714,15 +714,31 @@ static inferbit_model* pqv2_load_internal(const char* path,
                 if (s7[i]->pq) tslots[nslots++] = s7[i];
             }
         }
+        size_t max_l2_idx_bytes = 0;
         for (int i = 0; i < nslots; i++) {
             const pqv2_t *pq = tslots[i]->pq;
             size_t b = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
             if (b > max_idx_bytes) max_idx_bytes = b;
+            /* Goal C3 — compute L2 indices size for pyramid tensors. */
+            if (pq->l2_kind == 2 && pq->l2_indices) {
+                uint32_t n_chunks = pq->N / pq->G;
+                size_t l2b;
+                if (pq->l2_idx_bits == 6) {
+                    /* ceil(M/4)*3 bytes per (chunk, subchunk) row. */
+                    size_t per_row = ((size_t)pq->M + 3u) / 4u * 3u;
+                    l2b = (size_t)n_chunks * pq->n_subchunks * per_row;
+                } else {
+                    /* 8-bit: same shape as L1. */
+                    l2b = (size_t)pq->M * n_chunks * pq->n_subchunks;
+                }
+                if (l2b > max_l2_idx_bytes) max_l2_idx_bytes = l2b;
+            }
         }
         /* Page-align the scratch. */
         long ps = sysconf(_SC_PAGESIZE);
         if (ps <= 0) ps = 4096;
         size_t scratch_size = (max_idx_bytes + (size_t)ps - 1) & ~((size_t)ps - 1);
+        size_t l2_scratch_size = (max_l2_idx_bytes + (size_t)ps - 1) & ~((size_t)ps - 1);
         void *scratch = NULL;
         if (scratch_size > 0) scratch = aligned_alloc((size_t)ps, scratch_size);
         if (!scratch) {
@@ -736,16 +752,43 @@ static inferbit_model* pqv2_load_internal(const char* path,
              * ring. If it fails we silently degrade to single-slot
              * synchronous load (same as before the perf fix). */
             m->drive_indices_scratch2 = aligned_alloc((size_t)ps, scratch_size);
+            /* Goal C3 — allocate L2 scratch ring iff the model has any
+             * L2 pyramid tensors. Failure is non-fatal: the legacy mmap
+             * path for L2 still works (just slower under F_NOCACHE). */
+            if (l2_scratch_size > 0) {
+                m->drive_l2_indices_scratch  = aligned_alloc((size_t)ps, l2_scratch_size);
+                m->drive_l2_indices_scratch2 = aligned_alloc((size_t)ps, l2_scratch_size);
+                if (m->drive_l2_indices_scratch && m->drive_l2_indices_scratch2) {
+                    m->drive_l2_indices_scratch_size = l2_scratch_size;
+                } else {
+                    if (m->drive_l2_indices_scratch)  { free(m->drive_l2_indices_scratch);  m->drive_l2_indices_scratch  = NULL; }
+                    if (m->drive_l2_indices_scratch2) { free(m->drive_l2_indices_scratch2); m->drive_l2_indices_scratch2 = NULL; }
+                    m->drive_l2_indices_scratch_size = 0;
+                    fprintf(stderr, "ib pqv2: drive mode L2 scratch alloc failed (%zu B) — L2 stays mmap'd\n",
+                            l2_scratch_size);
+                }
+            }
             m->drive_fd = f->_fd;
             m->drive_fd_pretransposed = -1;
             /* Second pass: rewrite pq->indices to point at scratch (CPU
-             * path). Record original file offset for CPU drive_load_indices. */
+             * path). Record original file offset for CPU drive_load_indices.
+             * Goal C3: also record l2_indices_file_offset for pyramid
+             * tensors and (when L2 scratch is available) repoint
+             * pq->l2_indices to the L2 scratch slot 0 so a stale mmap
+             * pointer is never dereferenced under F_NOCACHE. */
             for (int i = 0; i < nslots; i++) {
                 pqv2_t *mpq = (pqv2_t *)tslots[i]->pq;
                 size_t off = (const uint8_t *)mpq->indices - file_base;
                 mpq->indices_file_offset = off;
                 mpq->indices = (const uint8_t *)scratch;
                 mpq->indices_pretransposed_offset = 0;
+                if (mpq->l2_kind == 2 && mpq->l2_indices) {
+                    size_t l2_off = (const uint8_t *)mpq->l2_indices - file_base;
+                    mpq->l2_indices_file_offset = l2_off;
+                    if (m->drive_l2_indices_scratch) {
+                        mpq->l2_indices = (const uint8_t *)m->drive_l2_indices_scratch;
+                    }
+                }
             }
             /* Build the decode-order tensor list used by the prefetcher to
              * predict the next pread target. Order: per layer Q,K,V,O,
