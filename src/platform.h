@@ -131,6 +131,11 @@ static inline int ib_hardware_concurrency(void) {
     return n;
 }
 
+/* Windows has no separate P-core query in this API; total = hardware. */
+static inline int ib_total_logical_cpus(void) {
+    return ib_hardware_concurrency();
+}
+
 /* Thread-local storage */
 #define _Thread_local __declspec(thread)
 
@@ -140,6 +145,30 @@ static inline int ib_hardware_concurrency(void) {
 #else
 #define IB_API __declspec(dllimport)
 #endif
+
+/* ── Drive-mode shims (Win 8.1+) ──────────────────────────────
+ * OfferVirtualMemory is the closest Windows analog to MADV_DONTNEED:
+ * pages stay reclaimable; the OS gives them back to the process if
+ * they haven't been reclaimed by the time we next touch them.
+ *
+ * The file-open cache-bypass hint (FILE_FLAG_SEQUENTIAL_SCAN, the
+ * pragmatic stand-in for fcntl(F_NOCACHE) — FILE_FLAG_NO_BUFFERING
+ * requires sector-aligned reads which mmap can't honour) is *not*
+ * retrofitted here. The caller already opened the file via ib_open
+ * (which uses _open, no flag-passthrough); reopening from inside the
+ * fd-shim isn't worth the path tracking. TODO: introduce a dedicated
+ * `ib_open_drive_mode(path)` shim if Windows drive-mode peak RSS
+ * still tracks RAM-mode in practice. For now ib_set_drive_hint_fd
+ * is a no-op on Windows and the page-offer below carries the load. */
+static inline int ib_advise_dontneed(void *addr, size_t len) {
+    return OfferVirtualMemory(addr, (SIZE_T)len, VmOfferPriorityLow) == 0 ? 0 : -1;
+}
+
+static inline int ib_set_drive_hint_fd(int fd) {
+    /* No-op on Windows — see comment above. */
+    (void)fd;
+    return 0;
+}
 
 #else
 
@@ -165,6 +194,35 @@ static inline int ib_hardware_concurrency(void) {
 #define ib_struct_stat struct stat
 #define ib_clock_gettime clock_gettime
 
+/* ── Drive-mode shims (POSIX) ──────────────────────────────────
+ * Tell the kernel a mmap'd region is reclaimable. Prefer the
+ * POSIX-portable spelling; fall back to the Linux MADV_DONTNEED.
+ * On Darwin POSIX_MADV_DONTNEED is also defined and is honoured. */
+static inline int ib_advise_dontneed(void *addr, size_t len) {
+#if defined(POSIX_MADV_DONTNEED)
+    int rc = posix_madvise(addr, len, POSIX_MADV_DONTNEED);
+    if (rc == 0) return 0;
+#endif
+#if defined(MADV_DONTNEED)
+    return madvise(addr, len, MADV_DONTNEED);
+#else
+    (void)addr; (void)len;
+    return 0;
+#endif
+}
+
+/* Disable the OS page cache for subsequent reads on this fd.
+ * Darwin only — Linux has no per-fd equivalent (POSIX_FADV_RANDOM
+ * is set after mmap in ib_advise_dontneed's caller, not here). */
+static inline int ib_set_drive_hint_fd(int fd) {
+#if defined(F_NOCACHE)
+    return fcntl(fd, F_NOCACHE, 1);
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
 /* Online logical CPU count, clamped to [1,64] with a safe fallback of 4.
  * On Apple Silicon, prefers the performance-core count instead. */
 static inline int ib_hardware_concurrency(void) {
@@ -183,6 +241,20 @@ static inline int ib_hardware_concurrency(void) {
     }
 #endif
     if (n < 1) n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) return 4;
+    if (n > 64) return 64;
+    return (int)n;
+}
+
+/* Total online logical CPUs (P + E on Apple Silicon).
+ * Use this for embarrassingly-parallel offline work like the PQv2
+ * encoder's per-slot k-means, where E-cores contribute net speedup
+ * (work-stealing chunk=1 lets fast threads pull more work, no
+ * inter-thread bandwidth contention). For latency-sensitive online
+ * inference prefer ib_hardware_concurrency() — E-core stragglers
+ * there blow tail latency. */
+static inline int ib_total_logical_cpus(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n <= 0) return 4;
     if (n > 64) return 64;
     return (int)n;

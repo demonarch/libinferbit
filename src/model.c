@@ -50,6 +50,20 @@ void inferbit_free(inferbit_model* model) {
     if (!model) return;
 
 #ifdef IB_HAS_METAL
+    /* Stage 5d hybrid staging buffers — must be freed BEFORE metal_ctx
+     * (they were allocated via ib_metal_alloc against that ctx). */
+    if (model->metal_ctx) {
+        if (model->hybrid_x_buf) {
+            ib_metal_free((ib_metal_ctx*)model->metal_ctx, model->hybrid_x_buf);
+            model->hybrid_x_buf = NULL;
+            model->hybrid_x_buf_floats = 0;
+        }
+        if (model->hybrid_y_buf) {
+            ib_metal_free((ib_metal_ctx*)model->metal_ctx, model->hybrid_y_buf);
+            model->hybrid_y_buf = NULL;
+            model->hybrid_y_buf_floats = 0;
+        }
+    }
     /* Lazily-created Metal context + buffers (doc 36 phase 4.1). */
     if (model->metal_bufs) {
         ib_metal_release_model((ib_metal_ctx*)model->metal_ctx,
@@ -156,8 +170,26 @@ void inferbit_free(inferbit_model* model) {
     free(model->bb_sa);
     free(model->bb_positions);
 
+    /* Free MoME per-layer expert arrays (Stage 3a, docs/v2/00_CORRECTION.md).
+     * Each *_proj_experts is either NULL (mome_experts == 1) or a
+     * calloc'd array of K ib_tensor_meta — its members' pq pointers
+     * index into the IBF v6 file backing and are NOT owned here. */
+    if (model->layers) {
+        for (int li = 0; li < model->header.num_layers; li++) {
+            ib_layer_meta *L = &model->layers[li];
+            free(L->gate_proj_experts);
+            free(L->up_proj_experts);
+            free(L->down_proj_experts);
+        }
+    }
+
     /* Free layer metadata */
     free(model->layers);
+
+    /* DFlash orchestrator state (Phase 4). free(NULL) is a no-op, so this
+     * is safe whether or not inferbit_dflash_attach was ever called. */
+    free(model->dflash_cfg);
+    free(model->dflash_capture_buf);
 
     free(model);
 }

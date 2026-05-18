@@ -4558,6 +4558,312 @@ kernel void matmul_pqv2_k256_half2_cbtg(
     }
 }
 
+/* matmul_pqv2_k256_half2_iwide — indices-stream wide-load variant of
+ * the PQv2 decode kernel. Optimization target identified in the
+ * FINDINGS block above: the indices stream (M × total bytes, no
+ * reuse across rows) is the genuine per-decode DRAM cost. The
+ * baseline kernel reads indices one uchar per lane per loop step
+ * → 32 lanes × 1 byte = 32 bytes per memory transaction. This
+ * variant widens each lane's load to a uchar4 → 32 lanes × 4 bytes
+ * = 128 bytes per transaction, which both (a) increases per-lane
+ * load granularity (matches the GPU's preferred ≥4 B vector
+ * transaction width) and (b) cuts the number of distinct
+ * indices-stream loads issued by 4×. Two such uchar4 chains run
+ * concurrently (same 2-way ILP discipline as the baseline), so
+ * each lane consumes 8 indices per iteration instead of 2.
+ *
+ * Coverage equivalence: outer loop counts uchar4 quads. Chain 1
+ * reads quads [0, total/8); chain 2 reads quads
+ * [total/8, total/4). Byte coverage = [0, total) — identical to
+ * the baseline kernel's [0, half_total) ∪ [half_total, total).
+ *
+ * Alignment / divisibility constraints:
+ *   - `total = (N/G) * n_subchunks`. For all shipping PQv2
+ *     tensors n_subchunks = 16, so `total` is a multiple of 16
+ *     and `total/8` is integer.
+ *   - For the uchar4 cast to be lane-safe, every lane's base
+ *     offset within idx_row must be 4-byte aligned. Lane L's
+ *     byte base in chain 1 is 4 * (q_base + L) where q_base is
+ *     the iteration's quad counter — always a multiple of 4.
+ *   - Within a single uchar4, all four indices fall inside one
+ *     chunk c (since lane*4 mod 16 ∈ {0,4,8,12}, the 4 bytes
+ *     never cross a chunk boundary for n_subchunks=16).
+ *
+ * Guard: this kernel REQUIRES n_subchunks == 16 (the runtime
+ * dispatcher must check before selecting this variant). If
+ * n_subchunks != 16 we fall back to a safe scalar tail to keep
+ * the kernel correct, but the dispatcher should avoid calling
+ * us in that case. Default path (the non-iwide kernel above)
+ * remains 100% unchanged. */
+kernel void matmul_pqv2_k256_half2_iwide(
+    device const half  *row_scale  [[buffer(0)]],   /* [M] */
+    device const half  *cb_fp16    [[buffer(1)]],   /* [ns][K=256][2] */
+    device const uchar *indices    [[buffer(2)]],   /* [M][total] u8 */
+    device const float *x          [[buffer(3)]],   /* [N] */
+    device       float *out        [[buffer(4)]],   /* [M] */
+    constant     uint  &M          [[buffer(5)]],
+    constant     uint  &N          [[buffer(6)]],
+    constant     uint  &G          [[buffer(7)]],
+    constant     uint  &n_subchunks[[buffer(8)]],
+    uint                tg_id      [[threadgroup_position_in_grid]],
+    uint                sg_id      [[simdgroup_index_in_threadgroup]],
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                sgs_per_tg [[simdgroups_per_threadgroup]])
+{
+    uint my_m = tg_id * sgs_per_tg + sg_id;
+    if (my_m >= M) return;
+    constexpr uint K = 256u;
+    constexpr uint HALF = 2u;
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+
+    device const uchar *idx_row = indices + (size_t)my_m * total;
+    float acc = 0.0f;
+
+    /* Fast path: n_subchunks == 16 → wide uchar4 loads, 2-chain ILP.
+     * Both `total` and `total/8` are multiples of 4 by construction
+     * (total = 16 * nc, so total/8 = 2*nc is an integer; the
+     * per-lane quad index always lands on a 4-byte boundary). */
+    if (n_subchunks == 16u) {
+        uint total_quads      = total >> 2u;     /* total / 4   */
+        uint half_total_quads = total >> 3u;     /* total / 8   */
+        device const uchar4 *idx_row4 =
+            (device const uchar4 *)idx_row;
+
+        for (uint q = lane; q < half_total_quads; q += 32u) {
+            uint q2 = q + half_total_quads;
+            /* One coalesced uchar4 load per chain → 4 indices each. */
+            uchar4 b0 = idx_row4[q];
+            uchar4 b1 = idx_row4[q2];
+
+            /* Byte position of the first index in each quad. */
+            uint i0 = q  << 2u;
+            uint i1 = q2 << 2u;
+
+            /* All 4 bytes within a single uchar4 share the same
+             * chunk c (since (q<<2) is a multiple of 4 and
+             * n_subchunks=16, the quad never crosses a chunk
+             * boundary). s steps by 1 across the four bytes. */
+            uint c0 = i0 >> 4u, s0 = i0 & 15u;
+            uint c1 = i1 >> 4u, s1 = i1 & 15u;
+
+            /* Pre-resolve subchunk codebook base pointers and
+             * x-activation slices. The x activations for a chunk
+             * sit at x[c*G + s*HALF .. c*G + (s+4)*HALF) — 8
+             * contiguous floats. We load them as four float2's per
+             * chain. float4 was considered but s ∈ {0,4,8,12} for
+             * uchar4-aligned q means the byte offset c*G + s*HALF
+             * is only 8-byte aligned (not 16-byte aligned) for
+             * s=4 and s=12, which would violate float4 alignment.
+             * float2 needs 8-byte alignment, which is satisfied
+             * since G=32 and s*HALF is a multiple of 2 for all s. */
+            device const half2 *cb_b0 = (device const half2 *)(cb_fp16 + (size_t)s0 * K * HALF);
+            device const half2 *cb_b1 = (device const half2 *)(cb_fp16 + (size_t)s1 * K * HALF);
+            float2 xv00 = *((device const float2 *)(x + c0 * G + (s0 + 0u) * HALF));
+            float2 xv01 = *((device const float2 *)(x + c0 * G + (s0 + 1u) * HALF));
+            float2 xv02 = *((device const float2 *)(x + c0 * G + (s0 + 2u) * HALF));
+            float2 xv03 = *((device const float2 *)(x + c0 * G + (s0 + 3u) * HALF));
+            float2 xv10 = *((device const float2 *)(x + c1 * G + (s1 + 0u) * HALF));
+            float2 xv11 = *((device const float2 *)(x + c1 * G + (s1 + 1u) * HALF));
+            float2 xv12 = *((device const float2 *)(x + c1 * G + (s1 + 2u) * HALF));
+            float2 xv13 = *((device const float2 *)(x + c1 * G + (s1 + 3u) * HALF));
+
+            /* The (s+t) codebook table is at offset (K*HALF) halves
+             * past s's table; advance the half2 pointer by K per
+             * unit of t. */
+            half2 v00 = cb_b0[(uint)b0.x + 0u * K];
+            half2 v01 = cb_b0[(uint)b0.y + 1u * K];
+            half2 v02 = cb_b0[(uint)b0.z + 2u * K];
+            half2 v03 = cb_b0[(uint)b0.w + 3u * K];
+            half2 v10 = cb_b1[(uint)b1.x + 0u * K];
+            half2 v11 = cb_b1[(uint)b1.y + 1u * K];
+            half2 v12 = cb_b1[(uint)b1.z + 2u * K];
+            half2 v13 = cb_b1[(uint)b1.w + 3u * K];
+
+            acc += (float)v00.x * xv00.x + (float)v00.y * xv00.y
+                 + (float)v01.x * xv01.x + (float)v01.y * xv01.y
+                 + (float)v02.x * xv02.x + (float)v02.y * xv02.y
+                 + (float)v03.x * xv03.x + (float)v03.y * xv03.y
+                 + (float)v10.x * xv10.x + (float)v10.y * xv10.y
+                 + (float)v11.x * xv11.x + (float)v11.y * xv11.y
+                 + (float)v12.x * xv12.x + (float)v12.y * xv12.y
+                 + (float)v13.x * xv13.x + (float)v13.y * xv13.y;
+        }
+    } else {
+        /* Safety fallback (kept for correctness if the dispatcher
+         * ever routes here for n_subchunks != 16). Mirrors the
+         * baseline kernel's scalar inner loop exactly. */
+        uint half_total = total >> 1u;
+        for (uint i = lane; i < half_total; i += 32u) {
+            uint i2 = i + half_total;
+            uint c0 = i  / n_subchunks; uint s0 = i  - c0 * n_subchunks;
+            uint c1 = i2 / n_subchunks; uint s1 = i2 - c1 * n_subchunks;
+            uint k0 = (uint)idx_row[i];
+            uint k1 = (uint)idx_row[i2];
+            float2 xv0 = *((device const float2 *)(x + c0 * G + s0 * HALF));
+            float2 xv1 = *((device const float2 *)(x + c1 * G + s1 * HALF));
+            device const half2 *cb_s0 = (device const half2 *)(cb_fp16 + (size_t)s0 * K * HALF);
+            device const half2 *cb_s1 = (device const half2 *)(cb_fp16 + (size_t)s1 * K * HALF);
+            half2 vv0 = cb_s0[k0];
+            half2 vv1 = cb_s1[k1];
+            acc += (float)vv0.x * xv0.x + (float)vv0.y * xv0.y
+                 + (float)vv1.x * xv1.x + (float)vv1.y * xv1.y;
+        }
+    }
+
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        out[my_m] = acc * (float)row_scale[my_m];
+    }
+}
+
+/* matmul_pqv2_k256_half2_l2residual — PQv2 K=256 decode with the L2-PQ
+ * residual stage (pyramid format, l2_kind == 2).
+ *
+ * Mirrors the CPU NEON path (pqv2_kernel.c::pqv2_acc_tbl_int8_k256_chunks
+ * with l2_cb != NULL):
+ *
+ *   acc_l1[m] = sum_{c,s} L1_codebook[cb_l1[s][idx_l1[m,c,s]]] · x[c,s]
+ *   acc_l2[m] = sum_{c,s} L2_codebook[cb_l2[s][idx_l2[m,c,s]]] · x[c,s]
+ *   y[m]      = acc_l1[m] * row_scale[m] + acc_l2[m]
+ *
+ * L1 indices are uint8 (K_L1 == 256). L2 indices are also uint8 but
+ * with values < K_L2 ≤ 64 (the encoder caps L2 codebook size). L2 codewords
+ * absorb the row magnitude themselves, so they are NOT multiplied by
+ * row_scale — matches the CPU reference exactly.
+ *
+ * Same threadgroup geometry as the baseline matmul_pqv2_k256_half2:
+ * 1 SIMDgroup per output row, SGS_PER_TG SGs per TG, no TG memory. The
+ * inner loop now does two parallel idx→cb chains, one per pyramid level,
+ * both sharing the same (c, s) coordinate stream (so the x activation
+ * read is reused, and so is the index-stream coalescing pattern). */
+/* L2 index buffer layouts:
+ *   l2_idx_bits == 8: idx_l2 is uint8[M][total], one byte per index.
+ *   l2_idx_bits == 6: idx_l2 is bit-packed 4-indices-in-3-bytes along
+ *     the M axis. Per (c,s) "slot index" i in [0, total), the packed
+ *     row stride along M is ceil(M/4)*3 bytes. To read row m's index
+ *     for slot i we read 3 contiguous bytes at offset
+ *       (m/4)*3 + i*ceil(M/4)*3
+ *     and extract the (m%4)-th 6-bit field. (See pqv2_kernel.c
+ *     pqv2_l2_unpack_row for the CPU mirror.)
+ *
+ * NOTE: To preserve the L1 path (coalesced uint8 read per lane) on the
+ * packed layout we transpose to [total][ceil(M/4)*3] on upload — i.e.
+ * indices for slot `i` of all rows are contiguous, and within a slot
+ * each group of 4 rows shares a 3-byte triple. */
+inline uint pqv2_l2_unpack_6bit(device const uchar *row_base,
+                                  uint stride_packed_bytes,
+                                  uint slot, uint m)
+{
+    /* The packed row for slot `slot` starts at row_base + slot*stride. */
+    device const uchar *row = row_base + (size_t)slot * stride_packed_bytes;
+    uint group = m >> 2u;
+    uint lane  = m & 3u;
+    uint b0 = (uint)row[group * 3u + 0u];
+    uint b1 = (uint)row[group * 3u + 1u];
+    uint b2 = (uint)row[group * 3u + 2u];
+    switch (lane) {
+        case 0u: return b0 & 0x3Fu;
+        case 1u: return ((b0 >> 6u) & 0x03u) | ((b1 & 0x0Fu) << 2u);
+        case 2u: return ((b1 >> 4u) & 0x0Fu) | ((b2 & 0x03u) << 4u);
+        default: return (b2 >> 2u) & 0x3Fu;
+    }
+}
+
+kernel void matmul_pqv2_k256_half2_l2residual(
+    device const half  *row_scale  [[buffer(0)]],   /* [M] */
+    device const half  *cb_l1      [[buffer(1)]],   /* [ns][K_L1=256][2] fp16 */
+    device const uchar *idx_l1     [[buffer(2)]],   /* [M][total] u8 */
+    device const half  *cb_l2      [[buffer(3)]],   /* [ns][K_L2][2] fp16 */
+    device const uchar *idx_l2     [[buffer(4)]],   /* L2 indices (see below) */
+    device const float *x          [[buffer(5)]],   /* [N] */
+    device       float *out        [[buffer(6)]],   /* [M] */
+    constant     uint  &M          [[buffer(7)]],
+    constant     uint  &N          [[buffer(8)]],
+    constant     uint  &G          [[buffer(9)]],
+    constant     uint  &n_subchunks[[buffer(10)]],
+    constant     uint  &K_L2       [[buffer(11)]],
+    constant     uint  &l2_idx_bits[[buffer(12)]],
+    uint                tg_id      [[threadgroup_position_in_grid]],
+    uint                sg_id      [[simdgroup_index_in_threadgroup]],
+    uint                lane       [[thread_index_in_simdgroup]],
+    uint                sgs_per_tg [[simdgroups_per_threadgroup]])
+{
+    uint my_m = tg_id * sgs_per_tg + sg_id;
+    if (my_m >= M) return;
+    constexpr uint K_L1 = 256u;
+    constexpr uint HALF = 2u;
+    uint nc = N / G;
+    uint total = nc * n_subchunks;
+    uint half_total = total >> 1u;
+
+    device const uchar *idx_l1_row = idx_l1 + (size_t)my_m * total;
+    /* For the legacy 8-bit layout, idx_l2 is [M][total] (same transpose
+     * as idx_l1); for the 6-bit-packed layout, the upload keeps the
+     * on-disk [total][ceil(M/4)*3] layout (slot-major) so each slot's
+     * 3-byte group is contiguous and shared by 4 rows. */
+    bool l2_packed = (l2_idx_bits == 6u);
+    device const uchar *idx_l2_row = l2_idx_bits == 8u
+        ? (idx_l2 + (size_t)my_m * total) : idx_l2;
+    uint l2_packed_stride = (M + 3u) / 4u * 3u;
+
+    float acc_l1 = 0.0f;
+    float acc_l2 = 0.0f;
+
+    /* Same 2-way ILP discipline as the L1-only baseline kernel. Each
+     * lane runs two independent (c,s) → x slice fetches, then drives
+     * BOTH the L1 and L2 codebook lookups against the shared x pair. */
+    for (uint i = lane; i < half_total; i += 32u) {
+        uint i2 = i + half_total;
+        uint c0, s0, c1, s1;
+        if (n_subchunks == 16u) {
+            c0 = i  >> 4u; s0 = i  & 15u;
+            c1 = i2 >> 4u; s1 = i2 & 15u;
+        } else {
+            c0 = i  / n_subchunks; s0 = i  - c0 * n_subchunks;
+            c1 = i2 / n_subchunks; s1 = i2 - c1 * n_subchunks;
+        }
+
+        float2 xv0 = *((device const float2 *)(x + c0 * G + s0 * HALF));
+        float2 xv1 = *((device const float2 *)(x + c1 * G + s1 * HALF));
+
+        /* L1 path (K_L1 = 256). */
+        uint k0_l1 = (uint)idx_l1_row[i];
+        uint k1_l1 = (uint)idx_l1_row[i2];
+        device const half2 *cb_l1_s0 = (device const half2 *)(cb_l1 + (size_t)s0 * K_L1 * HALF);
+        device const half2 *cb_l1_s1 = (device const half2 *)(cb_l1 + (size_t)s1 * K_L1 * HALF);
+        half2 vv0_l1 = cb_l1_s0[k0_l1];
+        half2 vv1_l1 = cb_l1_s1[k1_l1];
+        acc_l1 += (float)vv0_l1.x * xv0.x + (float)vv0_l1.y * xv0.y
+                + (float)vv1_l1.x * xv1.x + (float)vv1_l1.y * xv1.y;
+
+        /* L2 path (K_L2 ≤ 64, runtime-variable). Codebook stride is
+         * K_L2 entries per subchunk; each entry is half2 (HALF=2 fp16). */
+        uint k0_l2, k1_l2;
+        if (l2_packed) {
+            k0_l2 = pqv2_l2_unpack_6bit(idx_l2_row, l2_packed_stride, i,  my_m);
+            k1_l2 = pqv2_l2_unpack_6bit(idx_l2_row, l2_packed_stride, i2, my_m);
+        } else {
+            k0_l2 = (uint)idx_l2_row[i];
+            k1_l2 = (uint)idx_l2_row[i2];
+        }
+        device const half2 *cb_l2_s0 = (device const half2 *)(cb_l2 + (size_t)s0 * K_L2 * HALF);
+        device const half2 *cb_l2_s1 = (device const half2 *)(cb_l2 + (size_t)s1 * K_L2 * HALF);
+        half2 vv0_l2 = cb_l2_s0[k0_l2];
+        half2 vv1_l2 = cb_l2_s1[k1_l2];
+        acc_l2 += (float)vv0_l2.x * xv0.x + (float)vv0_l2.y * xv0.y
+                + (float)vv1_l2.x * xv1.x + (float)vv1_l2.y * xv1.y;
+    }
+
+    acc_l1 = simd_sum(acc_l1);
+    acc_l2 = simd_sum(acc_l2);
+    if (lane == 0) {
+        /* y = acc_l1 * row_scale + acc_l2  (L2 has NO row_scale: by
+         * design the L2 codebook absorbs row magnitudes during encode). */
+        out[my_m] = acc_l1 * (float)row_scale[my_m] + acc_l2;
+    }
+}
+
 /* matmul_pqv2_k256_half2_ksplit — K-split variant of PQv2 decode.
  *
  * Instead of 1 SIMDgroup per output row, K_SPLIT (=4) SIMDgroups

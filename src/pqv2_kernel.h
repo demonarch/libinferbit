@@ -20,16 +20,66 @@ typedef struct {
     uint32_t M, N, G, K, n_subchunks, half;
     uint32_t l2_kind;   /* 0=none, 2=pq */
     uint32_t l2_K;
+    /* L2 on-disk index bit-width. 8 = legacy uint8 (one byte per index).
+     * 6 = bit-packed 4-indices-in-3-bytes layout (Stage 5h.1). Only valid
+     * when l2_kind == 2 and l2_K <= 64. Defaults to 8 for files written
+     * before the packing field existed. */
+    uint32_t l2_idx_bits;
 
-    /* fp16 stored as raw uint16 */
+    /* Stage 5k — scale precision encoding. 0 = legacy (row_scale fp16,
+     * cb_scale fp16). 2 = row_scale int8 + per-tensor fp16 row_max, and
+     * cb_scale fp8 (E4M3). Modes 1 and 3 are reserved per the doc but
+     * unimplemented in v1. The kernel ALWAYS reads `row_scale` and
+     * `cb_scale` as uint16 fp16 — when mode != 0, the loader decodes
+     * the on-disk int8/fp8 bytes into newly-allocated fp16 arrays at
+     * parse time, so the hot inner loops stay byte-identical. Cost
+     * absorbed in the load-time codebook prebuild. */
+    uint32_t scale_precision;
+
+    /* Stage 5j — codebook pool. When > 0 in the on-disk header, the file
+     * holds `cb_pool_size` codebooks and a per-slot `pool_id[n_subchunks]`
+     * mapping. The v1 loader EXPANDS the pool back into a per-slot
+     * codebook (size n_subchunks) at parse time, so the kernel reads
+     * `cb_q / cb_scale` as if pool_size == n_subchunks. These fields are
+     * informational — they record what was on disk so callers (e.g.
+     * inspect_ibf) can report dedup. A future kernel can switch to
+     * pool_id lookup directly, at which point the loader-side expansion
+     * can be skipped. v1 scaffolding ships pool_size == n_subchunks with
+     * an identity pool_id mapping (no actual clustering); real
+     * within-tensor clustering is a follow-up. */
+    uint32_t cb_pool_size;            /* L1 pool size on disk; 0 = no pool */
+    uint32_t l2_cb_pool_size;         /* L2 pool size on disk; 0 = no pool */
+
+    /* Stage 5g.2 — L1 index on-disk layout selector.
+     *   0 = chunk-major [n_chunks][n_subchunks][M] (legacy, NEON-friendly).
+     *   1 = row-major   [M][n_chunks][n_subchunks] (Metal zero-copy
+     *       friendly — the GPU SIMD kernel already reads row-major, so
+     *       the upload-time transpose becomes a no-op and the staging
+     *       malloc can be skipped via newBufferWithBytesNoCopy).
+     * Selected at encode time via IB_PQV2_L1_ROWMAJOR=1 (opt-in for v1).
+     * Defaults to 0 for files written before this field existed —
+     * disambiguated by the same blob-size heuristic that handles every
+     * other append-only header field. */
+    uint32_t l1_idx_layout;           /* 0 = chunk-major, 1 = row-major */
+
+    /* fp16 stored as raw uint16. After Stage 5k decode (mode != 0), this
+     * points at a loader-allocated buffer rather than the mmap'd file. */
     const uint16_t *row_scale;        /* [M] */
 
-    /* L1 codebooks */
-    const int8_t  *cb_q;              /* [n_subchunks * K * half] */
-    const uint16_t *cb_scale;         /* [n_subchunks * K] fp16 */
-    const uint8_t *indices;           /* [M * (N/G) * n_subchunks] */
+    /* L1 codebooks. Sized by `cb_pool_size > 0 ? cb_pool_size : n_subchunks`. */
+    const int8_t  *cb_q;              /* [rows * K * half] */
+    const uint16_t *cb_scale;         /* [rows * K] fp16 */
+    /* L1 indices. Logical extent is always M*(N/G)*n_subchunks bytes.
+     * Layout selected by `l1_idx_layout`:
+     *   0 → on-disk [n_chunks][n_subchunks][M], i.e. legacy chunk-major
+     *       (NEON kernel reads `indices[(c*ns + s)*M + m]`).
+     *   1 → on-disk [M][n_chunks][n_subchunks], i.e. row-major
+     *       (Metal upload becomes zero-copy; NEON kernel reads
+     *       `indices[m*total + c*ns + s]`, less optimal cache pattern). */
+    const uint8_t *indices;
 
-    /* L2-PQ codebooks (NULL if no L2) */
+    /* L2-PQ codebooks (NULL if no L2). Sized analogously by
+     * `l2_cb_pool_size > 0 ? l2_cb_pool_size : n_subchunks`. */
     const int8_t  *l2_cb_q;
     const uint16_t *l2_cb_scale;
     const uint8_t *l2_indices;
@@ -154,11 +204,12 @@ void pqv2_acc_tbl_int8_k256_chunks_skip(
 /* Batched chunk-range accumulator: B input positions, B output accumulators.
  * Same per-position summation order as the single-position chunks variant
  * (so a B=1 call is bitwise-equivalent to pqv2_acc_tbl_int8_k256_chunks).
- * acc_batch is laid out [B, M]. Caller zeroes acc and acc_l2 once. */
+ * acc_batch and acc_l2_batch are laid out [B, M]. Caller zeroes both once.
+ * Pass l2_cb=NULL and acc_l2_batch=NULL when the tensor has no L2 stage. */
 void pqv2_acc_tbl_int8_k256_chunks_batch(
     const pqv2_t *t, const float *x_batch, int B,
-    const float *cb,
-    float *acc_batch,
+    const float *cb, const float *l2_cb,
+    float *acc_batch, float *acc_l2_batch,
     uint32_t c_start, uint32_t c_end);
 
 /* fp16 helpers (IEEE half) */

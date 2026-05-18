@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>      /* getpagesize for zero-copy alignment check */
+#include <atomic>        /* atomic counters for IB_METAL_ZEROCOPY_TRACE */
 #include <string>
 #include <unordered_map>
 
@@ -123,6 +125,107 @@ extern "C" void *ib_metal_alloc(ib_metal_ctx *ctx, size_t bytes, const void *ini
         if (!b) return NULL;
         void *ptr = [b contents];
         ctx->buffers[ptr] = b;
+        return ptr;
+    }
+}
+
+/* Zero-copy / shared-mapping allocation for mmap'd weight pages (Stage 5g).
+ *
+ * When `init` is page-aligned AND `bytes` is a multiple of getpagesize(),
+ * route to Metal's `newBufferWithBytesNoCopy:length:options:deallocator:`
+ * with a no-op deallocator. The mmap region remains valid for the entire
+ * model lifetime (model unload releases Metal buffers BEFORE munmap'ing
+ * weight pages), so we never own the bytes — the deallocator block is
+ * intentionally empty.
+ *
+ * When alignment doesn't match (sub-tensor offsets that aren't page-
+ * aligned, small tensors, etc.) we fall back to the copying allocator
+ * so the caller's invariants are preserved.
+ *
+ * CALLER CONTRACT: `init` MUST point into an mmap'd region (or other
+ * storage that outlives every Metal buffer derived from it). NEVER pass
+ * a malloc'd / freed-after-call buffer here — use ib_metal_alloc for
+ * those. A malloc'd page-aligned large allocation would take the
+ * no-copy path and become a dangling reference when the caller frees.
+ *
+ * Trace: set IB_METAL_ZEROCOPY_TRACE=1 to print a one-shot summary at
+ * process exit reporting how many calls took the zero-copy path vs the
+ * copy fallback, and total bytes shared vs copied. */
+static std::atomic<size_t> g_zc_calls_zerocopy{0};
+static std::atomic<size_t> g_zc_calls_fallback{0};
+static std::atomic<size_t> g_zc_bytes_zerocopy{0};
+static std::atomic<size_t> g_zc_bytes_fallback{0};
+
+static int zerocopy_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("IB_METAL_ZEROCOPY_TRACE");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+        if (cached) {
+            atexit([]() {
+                fprintf(stderr,
+                    "[ib_metal_zerocopy] zero-copy=%zu calls / %zu bytes, "
+                    "fallback=%zu calls / %zu bytes\n",
+                    g_zc_calls_zerocopy.load(),
+                    g_zc_bytes_zerocopy.load(),
+                    g_zc_calls_fallback.load(),
+                    g_zc_bytes_fallback.load());
+            });
+        }
+    }
+    return cached;
+}
+
+extern "C" void *ib_metal_alloc_mmap(ib_metal_ctx *ctx, size_t bytes, const void *init) {
+    if (!ctx || bytes == 0) return NULL;
+    /* If caller passed NULL, behave like ib_metal_alloc(NULL). Zero-copy
+     * requires source bytes. */
+    if (!init) return ib_metal_alloc(ctx, bytes, NULL);
+
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = (long)getpagesize();
+    uintptr_t addr = (uintptr_t)init;
+    int aligned = (pg > 0)
+                  && ((addr & ((uintptr_t)pg - 1)) == 0)
+                  && ((bytes & ((size_t)pg - 1)) == 0);
+
+    @autoreleasepool {
+        id<MTLBuffer> b = nil;
+        if (aligned) {
+            /* No-op deallocator: mmap region's lifetime is managed by the
+             * caller (inferbit_unload runs after every MTLBuffer release).
+             * Empty block — do NOT munmap here; we don't own the pages. */
+            b = [ctx->device newBufferWithBytesNoCopy:(void *)init
+                                                length:bytes
+                                               options:MTLResourceStorageModeShared
+                                           deallocator:^(void *p, NSUInteger l) {
+                                               (void)p; (void)l;
+                                               /* No-op: caller-owned mmap. */
+                                           }];
+            if (b) {
+                void *ptr = [b contents];
+                ctx->buffers[ptr] = b;
+                if (zerocopy_trace_enabled()) {
+                    g_zc_calls_zerocopy.fetch_add(1);
+                    g_zc_bytes_zerocopy.fetch_add(bytes);
+                }
+                return ptr;
+            }
+            /* If newBufferWithBytesNoCopy returns nil (Apple may reject if
+             * the region crosses an unfavourable boundary), fall through
+             * to copy. */
+        }
+        /* Fallback: copy path. Either alignment doesn't qualify, or the
+         * zero-copy attempt was refused by Metal. */
+        b = [ctx->device newBufferWithBytes:init length:bytes
+                                      options:MTLResourceStorageModeShared];
+        if (!b) return NULL;
+        void *ptr = [b contents];
+        ctx->buffers[ptr] = b;
+        if (zerocopy_trace_enabled()) {
+            g_zc_calls_fallback.fetch_add(1);
+            g_zc_bytes_fallback.fetch_add(bytes);
+        }
         return ptr;
     }
 }
@@ -3053,19 +3156,35 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
     /* Decode variant selector:
      *   default: baseline — global-mem codebook reads. L1 caching makes
      *            this faster in practice than the TG-prefetch variants.
-     *   IB_PQV2_CBTG=1:   codebook prefetched into TG mem (opt-in
-     *                     negative result, -9-12% — L1 already handled cb well)
-     *   IB_PQV2_KSPLIT=1: K-split kernel (opt-in negative result, -1%) */
+     *   IB_PQV2_CBTG=1:          codebook prefetched into TG mem (opt-in
+     *                            negative result, -9-12% — L1 already handled cb well)
+     *   IB_PQV2_KSPLIT=1:        K-split kernel (opt-in negative result, -1%)
+     *   IB_PQV2_INDICES_WIDE=1:  uchar4 wide indices-stream loads
+     *                            (opt-in, default OFF). Targets the genuine
+     *                            per-decode DRAM cost (indices, no reuse).
+     *                            Requires n_subchunks == 16; for any other
+     *                            n_subchunks we fall back to the baseline
+     *                            kernel here so the dispatcher only ever
+     *                            picks the wide variant on shapes it
+     *                            handles correctly. */
     static int decode_variant = -1;
     if (decode_variant < 0) {
         const char *ksplit_env = getenv("IB_PQV2_KSPLIT");
         const char *cbtg_env   = getenv("IB_PQV2_CBTG");
-        if (cbtg_env && cbtg_env[0] == '1') decode_variant = 2;
+        const char *iwide_env  = getenv("IB_PQV2_INDICES_WIDE");
+        if (iwide_env && iwide_env[0] == '1') decode_variant = 3;
+        else if (cbtg_env && cbtg_env[0] == '1') decode_variant = 2;
         else if (ksplit_env && ksplit_env[0] == '1') decode_variant = 1;
         else decode_variant = 0;
     }
+    /* iwide kernel is only correct for n_subchunks == 16 in its fast
+     * path; route other shapes back to baseline to keep behavior
+     * byte-identical to the default for unsupported configurations. */
+    int chosen_variant = decode_variant;
+    if (chosen_variant == 3 && n_subchunks != 16) chosen_variant = 0;
     const char *ps_name;
-    switch (decode_variant) {
+    switch (chosen_variant) {
+        case 3:  ps_name = "matmul_pqv2_k256_half2_iwide"; break;
         case 2:  ps_name = "matmul_pqv2_k256_half2_cbtg"; break;
         case 1:  ps_name = "matmul_pqv2_k256_half2_ksplit"; break;
         default: ps_name = "matmul_pqv2_k256_half2"; break;
@@ -3093,14 +3212,14 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
     [enc setBytes:&G_u  length:sizeof(G_u)  atIndex:7];
     [enc setBytes:&ns_u length:sizeof(ns_u) atIndex:8];
 
-    if (decode_variant == 1) {
+    if (chosen_variant == 1) {
         /* K-split: 16 SGs/TG (K_SPLIT=4 × M_PER_TG=4); n_tg = ceil(M/4). */
         const NSUInteger SGPT = 16;
         const NSUInteger M_PER_TG = 4;
         NSUInteger n_tg = ((NSUInteger)M + M_PER_TG - 1) / M_PER_TG;
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
-    } else if (decode_variant == 2) {
+    } else if (chosen_variant == 2) {
         /* cbtg: SGPT SGs per TG, each TG loads 16KB codebook once into TG mem. */
         static NSUInteger SGPT_cached = 0;
         if (!SGPT_cached) {
@@ -3115,7 +3234,10 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
     } else {
-        /* baseline: SIMDgroups per TG via IB_PQV2_SGPT. Default 4 = 128 threads/TG. */
+        /* baseline AND iwide share threadgroup geometry: 1 SG per output
+         * row, SGPT (=4 default) SGs per TG, no TG memory. The iwide
+         * kernel differs only in inner-loop load width — buffer
+         * bindings, M-to-SG mapping, and reductions are identical. */
         static NSUInteger SGPT_cached = 0;
         if (!SGPT_cached) {
             const char *env_sgpt = getenv("IB_PQV2_SGPT");
@@ -3127,6 +3249,81 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
         [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
               threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
     }
+    [enc endEncoding];
+    return 0;
+}
+
+/* PQv2 K=256 decode with L2-PQ residual (pyramid format, l2_kind == 2).
+ * One dispatch, one kernel — does the L1 + L2 accumulation in a single
+ * pass with shared x activation reads. Threadgroup geometry mirrors the
+ * baseline matmul_pqv2_k256_half2 (1 SG per output row, SGPT SGs/TG). */
+extern "C" int ib_metal_rec_matmul_pqv2_k256_half2_l2residual(
+    ib_metal_recorder *rec,
+    const void *row_scale_fp16,
+    const void *cb_l1_fp16,
+    const void *idx_l1_u8,
+    const void *cb_l2_fp16,
+    const void *idx_l2_u8,
+    const void *x_fp32,
+    void *out_fp32,
+    int M, int N, int G, int n_subchunks, int K_L2,
+    int l2_idx_bits)
+{
+    if (!rec || !row_scale_fp16 || !cb_l1_fp16 || !idx_l1_u8
+        || !cb_l2_fp16 || !idx_l2_u8 || !x_fp32 || !out_fp32
+        || M <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0
+        || K_L2 <= 0 || K_L2 > 64) return -1;
+    if ((N % G) != 0) return -1;
+    /* Only legacy 8-bit and packed 6-bit L2 layouts are supported. */
+    if (l2_idx_bits != 6 && l2_idx_bits != 8) return -1;
+
+    id<MTLComputePipelineState> ps =
+        get_pipeline(rec->ctx, "matmul_pqv2_k256_half2_l2residual");
+    if (!ps) return -1;
+
+    NSUInteger ors=0, ocb1=0, oi1=0, ocb2=0, oi2=0, ox=0, oo=0;
+    id<MTLBuffer> b_rs   = rec_pick_off(rec->ctx, row_scale_fp16, &ors);
+    id<MTLBuffer> b_cb1  = rec_pick_off(rec->ctx, cb_l1_fp16,    &ocb1);
+    id<MTLBuffer> b_i1   = rec_pick_off(rec->ctx, idx_l1_u8,     &oi1);
+    id<MTLBuffer> b_cb2  = rec_pick_off(rec->ctx, cb_l2_fp16,    &ocb2);
+    id<MTLBuffer> b_i2   = rec_pick_off(rec->ctx, idx_l2_u8,     &oi2);
+    id<MTLBuffer> b_x    = rec_pick_off(rec->ctx, x_fp32,        &ox);
+    id<MTLBuffer> b_o    = rec_pick_off(rec->ctx, out_fp32,      &oo);
+    if (!b_rs || !b_cb1 || !b_i1 || !b_cb2 || !b_i2 || !b_x || !b_o) return -1;
+
+    uint M_u   = (uint)M;
+    uint N_u   = (uint)N;
+    uint G_u   = (uint)G;
+    uint ns_u  = (uint)n_subchunks;
+    uint k2_u  = (uint)K_L2;
+    uint bits_u = (uint)l2_idx_bits;
+
+    id<MTLComputeCommandEncoder> enc = [rec->cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:b_rs  offset:ors  atIndex:0];
+    [enc setBuffer:b_cb1 offset:ocb1 atIndex:1];
+    [enc setBuffer:b_i1  offset:oi1  atIndex:2];
+    [enc setBuffer:b_cb2 offset:ocb2 atIndex:3];
+    [enc setBuffer:b_i2  offset:oi2  atIndex:4];
+    [enc setBuffer:b_x   offset:ox   atIndex:5];
+    [enc setBuffer:b_o   offset:oo   atIndex:6];
+    [enc setBytes:&M_u   length:sizeof(M_u)   atIndex:7];
+    [enc setBytes:&N_u   length:sizeof(N_u)   atIndex:8];
+    [enc setBytes:&G_u   length:sizeof(G_u)   atIndex:9];
+    [enc setBytes:&ns_u  length:sizeof(ns_u)  atIndex:10];
+    [enc setBytes:&k2_u  length:sizeof(k2_u)  atIndex:11];
+    [enc setBytes:&bits_u length:sizeof(bits_u) atIndex:12];
+
+    static NSUInteger SGPT_cached = 0;
+    if (!SGPT_cached) {
+        const char *env_sgpt = getenv("IB_PQV2_SGPT");
+        SGPT_cached = env_sgpt ? (NSUInteger)atoi(env_sgpt) : 4;
+        if (SGPT_cached < 1 || SGPT_cached > 32) SGPT_cached = 4;
+    }
+    const NSUInteger SGPT = SGPT_cached;
+    NSUInteger n_tg = ((NSUInteger)M + SGPT - 1) / SGPT;
+    [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32 * SGPT, 1, 1)];
     [enc endEncoding];
     return 0;
 }

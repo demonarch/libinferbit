@@ -51,6 +51,22 @@ const char *ib_metal_device_name(ib_metal_ctx *ctx);
 void *ib_metal_alloc(ib_metal_ctx *ctx, size_t bytes, const void *init);
 void  ib_metal_free(ib_metal_ctx *ctx, void *buf);
 
+/* Zero-copy variant for mmap-backed sources (Stage 5g).
+ *
+ * When `init` is page-aligned AND `bytes` is a multiple of getpagesize(),
+ * Metal wraps the existing pages in an MTLBuffer instead of memcpying
+ * them — eliminating the ~2× peak-RSS spike of the copying path. Falls
+ * back to the copying allocator transparently when alignment doesn't
+ * qualify or Metal refuses the no-copy mapping.
+ *
+ * CALLER CONTRACT: `init` MUST outlive every MTLBuffer derived from it
+ * (a no-op deallocator is registered with Metal — the runtime never
+ * frees these bytes). Use ONLY for mmap'd file pages or other long-
+ * lived storage. NEVER pass a malloc'd buffer that the caller will
+ * free() — use ib_metal_alloc for those. Passing NULL behaves like
+ * ib_metal_alloc(ctx, bytes, NULL). */
+void *ib_metal_alloc_mmap(ib_metal_ctx *ctx, size_t bytes, const void *init);
+
 /* Hello-world test kernel: out[i] = in[i] * 2.0f. Synchronous. */
 int ib_metal_vec_mul2(ib_metal_ctx *ctx,
                        const void *gpu_in, void *gpu_out, int n);
@@ -666,6 +682,35 @@ int ib_metal_rec_matmul_pqv2_k256_half2(ib_metal_recorder *rec,
                                           void *out_fp32,
                                           int M, int N, int G, int n_subchunks);
 
+/* PQv2 K=256 decode with the L2-PQ residual stage (pyramid format,
+ * l2_kind == 2). Mirrors the CPU NEON path's two-level accumulation:
+ *
+ *   y[m] = (sum_{c,s} cb_l1[s][idx_l1[m,c,s]] · x[c,s]) * row_scale[m]
+ *        + (sum_{c,s} cb_l2[s][idx_l2[m,c,s]] · x[c,s])
+ *
+ * Buffer shapes:
+ *   row_scale_fp16:  [M] fp16
+ *   cb_l1_fp16:      [n_subchunks * 256 * 2] fp16 (pre-decoded L1 codebooks)
+ *   idx_l1_u8:       [M * n_chunks * n_subchunks] u8 (transposed, [m][total])
+ *   cb_l2_fp16:      [n_subchunks * K_L2 * 2] fp16 (pre-decoded L2 codebooks)
+ *   idx_l2_u8:       [M * n_chunks * n_subchunks] u8 (transposed, [m][total],
+ *                                                    values < K_L2 ≤ 64)
+ *   x_fp32:          [N] fp32
+ *   out_fp32:        [M] fp32
+ *
+ * Requires K=256 (L1), half=2, K_L2 ≤ 64. Returns 0 on success. */
+int ib_metal_rec_matmul_pqv2_k256_half2_l2residual(ib_metal_recorder *rec,
+                                          const void *row_scale_fp16,
+                                          const void *cb_l1_fp16,
+                                          const void *idx_l1_u8,
+                                          const void *cb_l2_fp16,
+                                          const void *idx_l2_u8,
+                                          const void *x_fp32,
+                                          void *out_fp32,
+                                          int M, int N, int G,
+                                          int n_subchunks, int K_L2,
+                                          int l2_idx_bits);
+
 /* fp16 weights × fp32 input → fp32 output. Plain matmul for lm_head
  * when stored as raw fp16 (PQv2 IBFs leave the head un-quantized). */
 int ib_metal_rec_matmul_fp16w_fp32x(ib_metal_recorder *rec,
@@ -762,6 +807,50 @@ int ib_metal_rec_matmul_pqv2_k256_half2_batched(ib_metal_recorder *rec,
                                                   void *out_fp32,
                                                   int B, int M, int N,
                                                   int G, int n_subchunks);
+
+/* Stage 5d (docs/v2/00_CORRECTION.md): one-shot synchronous matmul
+ * routed through the existing tensor-bufs uploaded in
+ * ib_metal_upload_model. Used by the CPU forward's hybrid hook to dispatch
+ * a SINGLE matmul to the GPU while the rest of the forward stays on CPU.
+ *
+ * Tensor selector (`which`):
+ *    IB_METAL_TB_Q_PROJ     0
+ *    IB_METAL_TB_K_PROJ     1
+ *    IB_METAL_TB_V_PROJ     2
+ *    IB_METAL_TB_O_PROJ     3
+ *    IB_METAL_TB_GATE_PROJ  4
+ *    IB_METAL_TB_UP_PROJ    5
+ *    IB_METAL_TB_DOWN_PROJ  6
+ *    IB_METAL_TB_OUTPUT_HEAD 7    (layer_idx ignored)
+ *
+ * Buffer contract:
+ *   x_gpu : MTLBuffer-backed fp32 pointer of at least N elements. Must
+ *           have been obtained from ib_metal_alloc on this `ctx`. Caller
+ *           must have already populated it with the input data; the
+ *           function does NOT copy from any CPU-side buffer.
+ *   y_gpu : MTLBuffer-backed fp32 pointer of at least M elements. The
+ *           result lands here. Caller reads it directly (unified memory).
+ *
+ * The function records ONE matmul (the same kernel used by the full
+ * GPU forward — INT4/INT8/PQv2/PQv2-pyramid auto-routing) into a fresh
+ * recorder, commits, and waits for completion before returning.
+ *
+ * Returns 0 on success; -1 on error; -2 if the model wasn't uploaded
+ * to the GPU (caller should fall back to CPU dispatch). */
+#define IB_METAL_TB_Q_PROJ       0
+#define IB_METAL_TB_K_PROJ       1
+#define IB_METAL_TB_V_PROJ       2
+#define IB_METAL_TB_O_PROJ       3
+#define IB_METAL_TB_GATE_PROJ    4
+#define IB_METAL_TB_UP_PROJ      5
+#define IB_METAL_TB_DOWN_PROJ    6
+#define IB_METAL_TB_OUTPUT_HEAD  7
+
+int ib_metal_run_single_matmul(ib_metal_ctx *ctx,
+                                 void *model_bufs_opaque,
+                                 int layer_idx, int which,
+                                 const void *x_gpu,
+                                 void *y_gpu);
 
 /* Forward one token. `cpu_embed_in` is fp32[hidden] — the result of
  * the CPU-side embedding lookup for the current token. `pos` is the

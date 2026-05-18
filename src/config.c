@@ -14,6 +14,7 @@ inferbit_config* inferbit_config_create(void) {
     config->native_parse   = false;
     config->native_bits    = 4;
     config->kv_window      = 0;  /* 0 = full causal cache */
+    config->kv_format      = (int)INFERBIT_KV_FP16; /* Stage 3b default */
     return config;
 }
 
@@ -43,4 +44,20 @@ void inferbit_config_set_native_bits(inferbit_config* config, int bits) {
 
 void inferbit_config_set_kv_window(inferbit_config* config, int window) {
     if (config) config->kv_window = (window > 0) ? window : 0;
+}
+
+void inferbit_config_set_kv_format(inferbit_config* config, inferbit_kv_format format) {
+    if (!config) return;
+    /* Clamp to the known set; out-of-range values fall back to FP16
+     * rather than producing an undefined storage layout downstream. */
+    switch (format) {
+        case INFERBIT_KV_FP16:
+        case INFERBIT_KV_INT8:
+        case INFERBIT_KV_PQ8:
+            config->kv_format = (int)format;
+            break;
+        default:
+            config->kv_format = (int)INFERBIT_KV_FP16;
+            break;
+    }
 }

@@ -17,6 +17,8 @@
 #include "metal/metal_runtime.h"
 #endif
 
+#include "mome.h"
+
 /* W4A8 path is on by default. Set IB_W4A8=0 in env to force the FP32
  * activation fallback (used for A/B comparison and debugging). */
 static int w4a8_enabled(void) {
@@ -26,6 +28,155 @@ static int w4a8_enabled(void) {
         cached = (e && e[0] == '0') ? 0 : 1;
     }
     return cached;
+}
+
+/* ── Stage 5d — hybrid CPU/GPU dispatch (docs/v2/00_CORRECTION.md) ──
+ *
+ * v1 ships a single env-var knob:
+ *   IB_HYBRID_FFN_GPU=1  → at first ib_forward call, tag every layer's
+ *                          gate_proj / up_proj / down_proj as
+ *                          INFERBIT_BACKEND_METAL. The CPU forward then
+ *                          routes those matmuls through a one-shot
+ *                          Metal dispatch while the rest of the layer
+ *                          (norms, attention, residuals, embed, lm_head)
+ *                          stays on CPU.
+ *
+ * Default (env unset) leaves every preferred_backend at AUTO (=0) which
+ * keeps the existing CPU-or-Metal end-to-end routing bit-identical to
+ * pre-Stage-5d behaviour.
+ *
+ * Lazy tag application + lazy ctx creation. */
+static int hybrid_ffn_gpu_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("IB_HYBRID_FFN_GPU");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+static void hybrid_apply_tags(inferbit_model *m) {
+    if (!m || m->hybrid_tags_applied) return;
+    m->hybrid_tags_applied = 1;
+    if (!hybrid_ffn_gpu_enabled()) return;
+    /* Tag FFN matmuls only. Attention stays AUTO so it follows the
+     * surrounding forward (CPU here). */
+    for (int L = 0; L < m->header.num_layers; L++) {
+        m->layers[L].gate_proj.preferred_backend = INFERBIT_BACKEND_METAL;
+        m->layers[L].up_proj.preferred_backend   = INFERBIT_BACKEND_METAL;
+        m->layers[L].down_proj.preferred_backend = INFERBIT_BACKEND_METAL;
+    }
+}
+
+#ifdef IB_HAS_METAL
+/* Forward decl from below: lazy Metal ctx/buf creation. Returns 1 if
+ * upload succeeded, 0 if Metal is unavailable or upload failed. */
+static int ib_metal_route(inferbit_model* m);
+
+/* Stage 5d helper: lazily create the Metal ctx + upload the model
+ * REGARDLESS of IB_BACKEND=cpu (which ib_metal_route honors). The
+ * hybrid hook needs the GPU available even when the surrounding
+ * forward runs on CPU. Returns 1 on success, 0 if Metal is unavailable
+ * or upload fails (caller falls back to CPU dispatch). */
+static int hybrid_metal_route(inferbit_model *m) {
+    if (m->metal_route_failed) return 0;
+    if (m->metal_bufs) return 1;
+    ib_metal_ctx *ctx = ib_metal_create();
+    if (!ctx) { m->metal_route_failed = 1; return 0; }
+    ib_metal_model_buffers *bufs = ib_metal_upload_model(ctx, m);
+    if (!bufs) { ib_metal_destroy(ctx); m->metal_route_failed = 1; return 0; }
+    m->metal_ctx  = ctx;
+    m->metal_bufs = bufs;
+    return 1;
+}
+
+/* Ensure model->hybrid_x_buf / hybrid_y_buf are Metal-shared and at
+ * least n_in / n_out floats long. Grow (re-alloc) if too small. Returns
+ * 0 on success; -1 on failure (caller should fall back to CPU dispatch). */
+static int hybrid_ensure_buffers(inferbit_model *m, size_t n_in, size_t n_out) {
+    ib_metal_ctx *ctx = (ib_metal_ctx*)m->metal_ctx;
+    if (!ctx) return -1;
+    if (!m->hybrid_x_buf || m->hybrid_x_buf_floats < n_in) {
+        if (m->hybrid_x_buf) ib_metal_free(ctx, m->hybrid_x_buf);
+        m->hybrid_x_buf = ib_metal_alloc(ctx, n_in * sizeof(float), NULL);
+        if (!m->hybrid_x_buf) { m->hybrid_x_buf_floats = 0; return -1; }
+        m->hybrid_x_buf_floats = n_in;
+    }
+    if (!m->hybrid_y_buf || m->hybrid_y_buf_floats < n_out) {
+        if (m->hybrid_y_buf) ib_metal_free(ctx, m->hybrid_y_buf);
+        m->hybrid_y_buf = ib_metal_alloc(ctx, n_out * sizeof(float), NULL);
+        if (!m->hybrid_y_buf) { m->hybrid_y_buf_floats = 0; return -1; }
+        m->hybrid_y_buf_floats = n_out;
+    }
+    return 0;
+}
+
+/* Selector lookup: which IB_METAL_TB_* index corresponds to this tensor
+ * within a layer. Returns -1 if the pointer isn't one of the known
+ * matmul slots of the given layer (in which case the caller falls back
+ * to CPU). */
+static int hybrid_tensor_which(const ib_layer_meta *L, const ib_tensor_meta *t,
+                               int *out_layer_idx, int layer_idx) {
+    *out_layer_idx = layer_idx;
+    if (t == &L->q_proj)    return IB_METAL_TB_Q_PROJ;
+    if (t == &L->k_proj)    return IB_METAL_TB_K_PROJ;
+    if (t == &L->v_proj)    return IB_METAL_TB_V_PROJ;
+    if (t == &L->o_proj)    return IB_METAL_TB_O_PROJ;
+    if (t == &L->gate_proj) return IB_METAL_TB_GATE_PROJ;
+    if (t == &L->up_proj)   return IB_METAL_TB_UP_PROJ;
+    if (t == &L->down_proj) return IB_METAL_TB_DOWN_PROJ;
+    return -1;
+}
+#endif /* IB_HAS_METAL */
+
+/* Forward decl of the CPU matmul (defined below). */
+static void tensor_matmul(
+    const inferbit_model* m, const ib_tensor_meta* t,
+    float* out, const float* input, int M, int N,
+    float* scale_buf
+);
+
+/* Hybrid-aware matmul dispatcher. If the tensor is METAL-tagged AND the
+ * model has (or can lazily acquire) a Metal context AND the layer was
+ * uploaded, dispatch this single matmul to the GPU; otherwise fall
+ * through to the CPU `tensor_matmul`. layer_idx is the owning layer
+ * index for selector resolution. Caller passes M=out_rows, N=in_cols.
+ *
+ * On any failure the implementation transparently falls back to CPU so
+ * the forward pass never crashes — the worst case is a one-time perf
+ * regression. */
+static void tensor_matmul_hybrid(
+    inferbit_model *m, int layer_idx, const ib_tensor_meta *t,
+    float *out, const float *input, int M, int N, float *scale_buf
+) {
+#ifdef IB_HAS_METAL
+    if (t->preferred_backend == INFERBIT_BACKEND_METAL) {
+        /* Lazy Metal ctx + upload. Use hybrid_metal_route — it ignores
+         * IB_BACKEND=cpu (the user explicitly opted into hybrid by
+         * tagging this tensor METAL). If Metal genuinely isn't
+         * available (no device, unsupported layout), fall back to CPU. */
+        if (hybrid_metal_route(m)) {
+            if (hybrid_ensure_buffers(m, (size_t)N, (size_t)M) == 0) {
+                int li = 0;
+                int which = hybrid_tensor_which(&m->layers[layer_idx], t, &li, layer_idx);
+                if (which >= 0) {
+                    memcpy(m->hybrid_x_buf, input, (size_t)N * sizeof(float));
+                    int rc = ib_metal_run_single_matmul(
+                        (ib_metal_ctx*)m->metal_ctx, m->metal_bufs,
+                        li, which, m->hybrid_x_buf, m->hybrid_y_buf);
+                    if (rc == 0) {
+                        memcpy(out, m->hybrid_y_buf, (size_t)M * sizeof(float));
+                        return;
+                    }
+                }
+            }
+        }
+        /* fallthrough → CPU */
+    }
+#else
+    (void)layer_idx;
+#endif
+    tensor_matmul(m, t, out, input, M, N, scale_buf);
 }
 
 /* ── Weight data access helpers ─────────────────────────────── */
@@ -186,14 +337,40 @@ void ib_embedding_lookup(const inferbit_model* m, int token_id, float* out) {
 
 embed_mmap_path:
         {
-            const uint8_t* idx_base = (const uint8_t*)pq->indices;  /* [nc][ns][M] */
-            for (uint32_t c = 0; c < nc; c++) {
-                for (uint32_t s = 0; s < ns; s++) {
-                    uint8_t k = idx_base[((size_t)c * ns + s) * pq->M + token_id];
-                    float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
-                    for (uint32_t h = 0; h < HALF; h++) {
-                        int8_t q = cb_q[(s * K + k) * HALF + h];
-                        out[c * G + s * HALF + h] = (float)q * scl;
+            const uint8_t* idx_base = (const uint8_t*)pq->indices;
+            /* Bug N16 — when the L1 indices on disk are row-major
+             * ([M][n_chunks][n_subchunks], opt-in via IB_PQV2_L1_ROWMAJOR=1),
+             * the per-token byte for (c, s) lives at
+             *   token_id * total + c * n_sub + s
+             * rather than the legacy chunk-major
+             *   (c * n_sub + s) * M + token_id
+             * Without this branch, embedding lookup reads garbage for every
+             * token, poisoning the rest of the forward and blowing PPL up
+             * (168450 on TinyLlama). Same logical byte is fetched in both
+             * layouts; the indices are byte-equivalent (see encoder
+             * pqv2_encode.c::pqv2_encode_slot_worker scatter). */
+            if (pq->l1_idx_layout == 1) {
+                size_t row_base = (size_t)token_id * (size_t)total;
+                for (uint32_t c = 0; c < nc; c++) {
+                    for (uint32_t s = 0; s < ns; s++) {
+                        uint8_t k = idx_base[row_base + c * ns + s];
+                        float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
+                        for (uint32_t h = 0; h < HALF; h++) {
+                            int8_t q = cb_q[(s * K + k) * HALF + h];
+                            out[c * G + s * HALF + h] = (float)q * scl;
+                        }
+                    }
+                }
+            } else {
+                /* Legacy chunk-major: idx[(c*ns+s)*M + token_id] */
+                for (uint32_t c = 0; c < nc; c++) {
+                    for (uint32_t s = 0; s < ns; s++) {
+                        uint8_t k = idx_base[((size_t)c * ns + s) * pq->M + token_id];
+                        float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
+                        for (uint32_t h = 0; h < HALF; h++) {
+                            int8_t q = cb_q[(s * K + k) * HALF + h];
+                            out[c * G + s * HALF + h] = (float)q * scl;
+                        }
                     }
                 }
             }
@@ -307,12 +484,15 @@ static void pqv2_threaded_matvec_k256(
 /* Batched-aware variant of the per-chunk threading. Same chunk-to-slot
  * mapping as the single-position threaded path so each output position's
  * fp32 summation order is bit-identical between single-token decode and
- * spec verify. acc pool layout: [n_slots, B, M]. */
+ * spec verify. acc pool layout: [n_slots, B, M]. acc_l2_pool (same
+ * layout, NULL when the tensor has no L2 stage) carries the pyramid
+ * residual contribution, folded into y at reduction time. */
 typedef struct {
     const pqv2_t *t;
     const float  *x_batch;
     int           B;
     float        *acc_pool;
+    float        *acc_l2_pool;
     uint32_t      M;
     int           chunk_size;
     int           n_slots;
@@ -324,10 +504,13 @@ static void ib_pqv2_chunks_batch_task(void *arg, int tid, int start, int end) {
     int slot = start / a->chunk_size;
     if (slot < 0) slot = 0;
     if (slot >= a->n_slots) slot = a->n_slots - 1;
-    /* Slot owns a [B, M] block. */
-    float *acc = a->acc_pool + (size_t)slot * a->B * a->M;
+    /* Slot owns a [B, M] block in each pool. */
+    float *acc    = a->acc_pool    + (size_t)slot * a->B * a->M;
+    float *acc_l2 = a->acc_l2_pool ? a->acc_l2_pool + (size_t)slot * a->B * a->M
+                                   : NULL;
     pqv2_acc_tbl_int8_k256_chunks_batch(a->t, a->x_batch, a->B,
-                                          a->t->cb_fp32, acc,
+                                          a->t->cb_fp32, a->t->l2_cb_fp32,
+                                          acc, acc_l2,
                                           (uint32_t)start, (uint32_t)end);
 }
 
@@ -343,11 +526,18 @@ static void pqv2_threaded_matvec_k256_batch(
     }
     uint32_t M = t->M;
     uint32_t n_chunks = t->N / t->G;
+    /* Match the single-position threaded path: L2 is engaged iff l2_kind==2,
+     * the fp32 L2 codebook is present, and l2_K <= 64 (kernel constraint).
+     * Otherwise the per-position fallback pqv2_matvec_tbl_int8_k256_batch
+     * routes through pqv2_matvec_tbl_int8_k256, which already handles L2
+     * correctly, so spec verify on pyramid tensors stays bit-identical
+     * to single-token decode for any tensor that bails out of threading. */
     if (!tp || n_threads <= 1 || n_chunks < (uint32_t)n_threads ||
         !t->cb_fp32 || t->K != 256 || B > 8) {
         pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
         return;
     }
+    int has_l2 = (t->l2_kind == 2 && t->l2_cb_fp32 && t->l2_K <= 64);
     int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
     int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
     size_t pool_floats = (size_t)n_slots * B * M;
@@ -358,29 +548,50 @@ static void pqv2_threaded_matvec_k256_batch(
         return;
     }
     memset(acc_pool, 0, pool_floats * sizeof(float));
+    float *acc_l2_pool = NULL;
+    if (has_l2) {
+        acc_l2_pool = aligned_alloc(64,
+            (pool_floats * sizeof(float) + 63) & ~(size_t)63);
+        if (!acc_l2_pool) {
+            /* L2 alloc failed: fall back to the per-position path that
+             * routes through the single-position matvec (which handles
+             * L2 correctly), so we never silently drop the pyramid
+             * residual. */
+            free(acc_pool);
+            pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
+            return;
+        }
+        memset(acc_l2_pool, 0, pool_floats * sizeof(float));
+    }
     ib_pqv2_chunks_batch_arg arg = {
         .t = t, .x_batch = x_batch, .B = B,
-        .acc_pool = acc_pool, .M = M,
+        .acc_pool = acc_pool, .acc_l2_pool = acc_l2_pool, .M = M,
         .chunk_size = chunks_per_task, .n_slots = n_slots,
     };
     ib_pool_run(tp, ib_pqv2_chunks_batch_task, &arg,
                  (int)n_chunks, chunks_per_task);
 
-    /* Reduce per-position: y[b,m] = (sum_s acc[s,b,m]) * row_scale[m].
+    /* Reduce per-position: y[b,m] = (sum_s acc[s,b,m]) * row_scale[m]
+     *                              + sum_s acc_l2[s,b,m].
      * Slot order is fixed (s=0..n_slots-1) so this matches the
-     * single-position threaded reduction exactly when B=1. */
+     * single-position threaded reduction at forward.c::pqv2_threaded_matvec_k256
+     * exactly when B=1. */
     for (int b = 0; b < B; b++) {
         float *yb = y_batch + (size_t)b * M;
-        for (uint32_t m = 0; m < M; m++) {
-            float a = 0.0f;
+        for (uint32_t mm = 0; mm < M; mm++) {
+            float a = 0.0f, al2 = 0.0f;
             for (int s = 0; s < n_slots; s++) {
-                a += acc_pool[(size_t)s * B * M + (size_t)b * M + m];
+                a += acc_pool[(size_t)s * B * M + (size_t)b * M + mm];
+                if (acc_l2_pool) {
+                    al2 += acc_l2_pool[(size_t)s * B * M + (size_t)b * M + mm];
+                }
             }
-            float rs = pqv2_h2f(t->row_scale[m]);
-            yb[m] = a * rs;
+            float rs = pqv2_h2f(t->row_scale[mm]);
+            yb[mm] = a * rs + al2;
         }
     }
     free(acc_pool);
+    if (acc_l2_pool) free(acc_l2_pool);
 }
 
 static void pqv2_threaded_matvec_k256(
@@ -422,6 +633,23 @@ static void pqv2_threaded_matvec_k256(
         if (acc_l2_pool) {
             memset(acc_l2_pool, 0, pool_floats * sizeof(float));
             acc_l2_owned = 1;
+        } else {
+            /* L2 alloc failed: do NOT silently run the threaded path with
+             * acc_l2_pool=NULL — the kernel would skip the L2 path entirely
+             * (see ib_pqv2_chunks_task → pqv2_acc_tbl_int8_k256_chunks_inner;
+             * acc_l2==NULL means "no L2"), which DROPS the pyramid residual
+             * and degrades a pyramid (l2_kind==2) model to a flat one
+             * (60% PPL regression observed on tl-pyramid.ibf in RAM mode
+             * where the mmap'd weights leave less headroom for the
+             * per-matmul aligned_alloc; drive mode evicts those pages and
+             * the alloc succeeds, which is why drive PPL was BETTER than
+             * RAM PPL — the bug is RAM-mode-only). Fall back to the
+             * single-threaded matvec, which uses one acc/acc_l2 pair the
+             * size of a single matvec (M floats each) and is allocated
+             * fresh inside pqv2_matvec_tbl_int8_k256. */
+            if (acc_pool_owned) free(acc_pool);
+            pqv2_matvec_dispatch(t, x, y);
+            return;
         }
     }
     /* Activation-aware skip: when IB_PQV2_SKIP env is set (e.g. "0.01"),
@@ -560,6 +788,16 @@ static void tensor_matmul(
             out[i] = sum;
         }
     }
+}
+
+/* Non-static thin wrapper exposing tensor_matmul to other TUs.
+ * Declared in inferbit_internal.h. Used by src/mome.c so the MoME
+ * dispatcher can run a per-expert matmul without forward.c growing
+ * a public PQv2/W4A8/etc. dispatch surface. */
+void ib_tensor_matmul_cpu(const inferbit_model *m, const ib_tensor_meta *t,
+                          float *out, const float *input, int M, int N,
+                          float *scale_buf) {
+    tensor_matmul(m, t, out, input, M, N, scale_buf);
 }
 
 /* Batched variant of tensor_matmul.
@@ -1054,37 +1292,121 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
                      eps, hidden, scale_buf);
 
         /* MLP: gate + up + silu_mul + down
-         * With sparsity: skip masked intermediate neurons entirely */
+         * With sparsity: skip masked intermediate neurons entirely.
+         *
+         * Stage 3a — MoME router hook (docs/v2/00_CORRECTION.md). When
+         * the layer carries mome_experts > 1 (= the file shipped K
+         * expert sub-tensors), branch BEFORE the normal FFN dispatch:
+         *
+         *   - Router non-zero (calibrated): compute router_logits =
+         *     xb @ router_weight, pick top-N indices via
+         *     softmax-weighted top-N selection, and run only those
+         *     experts through mome_dispatch_ffn. Output goes straight
+         *     into xb (overwriting the post-norm input — same role as
+         *     the legacy down_proj output).
+         *
+         *   - Router zero (v1 default, no calibration): run ALL K
+         *     experts with weight 1.0. On the trivial row-split that
+         *     produces the exact same result as the un-split FFN
+         *     matmul — preserving the v1 correctness invariant
+         *     ("MoME-enabled file = non-MoME file bit-for-bit, until a
+         *     real router lands").
+         *
+         * Stage 5d hybrid hook: when gate/up/down carry a METAL
+         * preferred_backend tag (set via IB_HYBRID_FFN_GPU=1) AND no
+         * sparsity mask is active for this layer, route each FFN
+         * matmul through tensor_matmul_hybrid which dispatches one
+         * GPU matmul and copies the fp32 result back. Falls back
+         * transparently to CPU when Metal is unavailable. The sparsity
+         * path stays CPU-only — the Metal recorder has no sparse mask
+         * variant yet, so sparsity wins when both are configured. */
         {
             const uint8_t* sp_mask = NULL;
             if (layer->sparsity_mask_size > 0) {
                 sp_mask = (const uint8_t*)m->weight_data + layer->sparsity_mask_offset;
             }
-            tensor_matmul_sparse(m, &layer->gate_proj, hb, xb, inter, hidden, scale_buf, sp_mask);
-            tensor_matmul_sparse(m, &layer->up_proj, hb2, xb, inter, hidden, scale_buf, sp_mask);
-            ib_kern.silu_mul(hb, hb, hb2, inter);
-            /* down_proj reads from hb which already has zeros for masked rows —
-             * the multiply by zero propagates naturally, no sparse path needed */
-            tensor_matmul(m, &layer->down_proj, xb, hb, hidden, inter, scale_buf);
+
+            int mome_handled = 0;
+            if (!sp_mask && layer->mome_experts > 1 &&
+                layer->gate_proj_experts && layer->up_proj_experts &&
+                layer->down_proj_experts) {
+                const int K_ex = layer->mome_experts;
+                if (mome_router_is_nonzero(m, &layer->router)) {
+                    /* Calibrated router. Compute logits via the existing
+                     * fp16-matmul fast path: layer->router is a raw
+                     * fp16 [hidden, K] tensor in IBF v6, so tensor_matmul
+                     * handles it via the bits==16 branch.
+                     *
+                     * Logits buffer lives on the stack since K is small
+                     * (≤ IB_MOME_MAX_EXPERTS = 32). */
+                    float router_logits[IB_MOME_MAX_EXPERTS];
+                    int active[IB_MOME_MAX_TOP_N];
+                    ib_tensor_matmul_cpu(m, &layer->router, router_logits,
+                                          xb, K_ex, hidden, scale_buf);
+                    int top_n = mome_get_top_n(K_ex);
+                    mome_top_n(router_logits, K_ex, top_n, active);
+                    mome_dispatch_ffn(m, layer, xb, hb, hb2, xb,
+                                       router_logits, active, top_n,
+                                       scale_buf);
+                } else {
+                    /* Zero router → run all experts with weight 1.0.
+                     * `active = NULL` tells mome_dispatch_ffn to iterate
+                     * 0..K-1 directly. */
+                    mome_dispatch_ffn(m, layer, xb, hb, hb2, xb,
+                                       /*router_logits=*/NULL,
+                                       /*active=*/NULL,
+                                       /*n_active=*/K_ex,
+                                       scale_buf);
+                }
+                mome_handled = 1;
+            }
+
+            if (!mome_handled) {
+                if (sp_mask) {
+                    tensor_matmul_sparse(m, &layer->gate_proj, hb, xb, inter, hidden, scale_buf, sp_mask);
+                    tensor_matmul_sparse(m, &layer->up_proj, hb2, xb, inter, hidden, scale_buf, sp_mask);
+                } else {
+                    tensor_matmul_hybrid(m, l, &layer->gate_proj, hb, xb, inter, hidden, scale_buf);
+                    tensor_matmul_hybrid(m, l, &layer->up_proj,   hb2, xb, inter, hidden, scale_buf);
+                }
+                ib_kern.silu_mul(hb, hb, hb2, inter);
+                /* down_proj reads from hb which already has zeros for masked rows —
+                 * the multiply by zero propagates naturally, no sparse path needed */
+                tensor_matmul_hybrid(m, l, &layer->down_proj, xb, hb, hidden, inter, scale_buf);
+            }
         }
 
         /* Residual connection */
         for (int i = 0; i < hidden; i++) {
             x[i] += xb[i];
         }
+
+        /* DFlash early-exit capture hook (Phase 4 / dflash_orchestrator.c).
+         * Normally NULL — see struct inferbit_model. When a DFlash config
+         * is attached we snapshot the post-residual hidden state at the
+         * configured early-exit layer, so the orchestrator can read its
+         * L2-norm as a "confidence" signal and (optionally on later steps)
+         * project it through the LM head to skip layers > l. The cost when
+         * inactive is one cmp+branch per layer. */
+        if (m->dflash_capture_buf && m->dflash_cfg
+            && l == m->dflash_cfg->early_exit_layer) {
+            memcpy(m->dflash_capture_buf, x, (size_t)hidden * sizeof(float));
+        }
     }
 
     if (compute_logits || hidden_out) {
-        /* Final RMSNorm */
-        rmsnorm_fp16(x, x, tensor_data(m, &m->output_norm),
-                     eps, hidden, scale_buf);
-
         if (hidden_out) {
+            /* Final RMSNorm into x (in place), then snapshot before LM head. */
+            rmsnorm_fp16(x, x, tensor_data(m, &m->output_norm),
+                         eps, hidden, scale_buf);
             memcpy(hidden_out, x, (size_t)hidden * sizeof(float));
-        }
-        if (compute_logits) {
-            /* Output head: logits = head @ x */
-            tensor_matmul(m, &m->output_head, logits, x, vocab, hidden, scale_buf);
+            if (compute_logits) {
+                tensor_matmul(m, &m->output_head, logits, x, vocab, hidden, scale_buf);
+            }
+        } else if (compute_logits) {
+            /* Common path: factored helper. Behaviorally equivalent to the
+             * previous inline RMSNorm + LM-head matmul. */
+            ib_apply_lm_head_finalize(m, x, logits, scale_buf);
         }
     }
 
@@ -1093,6 +1415,33 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
 
 static int forward_single(inferbit_model* m, int token_id, int pos, float* logits) {
     return forward_single_ex(m, token_id, pos, logits, 1, NULL);
+}
+
+/* Non-static wrapper. Lets dflash_orchestrator.c dispatch a full-forward
+ * decode step without going through ib_forward() (whose routing called the
+ * orchestrator in the first place). */
+int ib_forward_single(inferbit_model* m, int token_id, int pos, float* logits) {
+    return forward_single(m, token_id, pos, logits);
+}
+
+/* Factored: final-RMSNorm + LM-head matmul over a single hidden vector.
+ * Lifted verbatim from forward_single_ex; behavior-preserving. Used both
+ * by the standard decode path and by the DFlash orchestrator's early-exit
+ * projection (which feeds an early-layer hidden state through the same
+ * final-norm + output-head kernels). */
+void ib_apply_lm_head_finalize(const inferbit_model* model,
+                               float* hidden_io,
+                               float* logits_out,
+                               float* scale_buf) {
+    int hidden = model->header.hidden_size;
+    int vocab  = model->header.vocab_size;
+    float eps  = model->header.norm_epsilon;
+    /* Cast away const: the helper writes into model-owned scratch via the
+     * matmul dispatch path. The model identity itself is unchanged. */
+    inferbit_model* m = (inferbit_model*)model;
+    rmsnorm_fp16(hidden_io, hidden_io, tensor_data(m, &m->output_norm),
+                 eps, hidden, scale_buf);
+    tensor_matmul(m, &m->output_head, logits_out, hidden_io, vocab, hidden, scale_buf);
 }
 
 /* ── Batched forward pass ───────────────────────────────────── */
@@ -1301,18 +1650,41 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
  * must never silently CPU-fall-back mid-stream, because KV state then
  * lives in metal_bufs and the CPU kv_caches arrays are empty. */
 static int ib_metal_route(inferbit_model* m) {
+    fprintf(stderr, "[N15] ib_metal_route: enter (model=%p, name=%s)\n",
+            (void*)m, m ? m->header.name : "(null)");
     static int forced_cpu = -1;
     if (forced_cpu < 0) {
         const char* e = getenv("IB_BACKEND");
         forced_cpu = (e && strcmp(e, "cpu") == 0) ? 1 : 0;
     }
-    if (forced_cpu) return 0;
-    if (m->metal_route_failed) return 0;
-    if (m->metal_bufs) return 1;
+    if (forced_cpu) {
+        fprintf(stderr, "[N15] ib_metal_route: bail — IB_BACKEND=cpu forces CPU path\n");
+        return 0;
+    }
+    if (m->metal_route_failed) {
+        fprintf(stderr, "[N15] ib_metal_route: bail — metal_route_failed already set (sticky CPU after prior failure)\n");
+        return 0;
+    }
+    if (m->metal_bufs) {
+        fprintf(stderr, "[N15] ib_metal_route: already routed, returning metal_bufs=%p\n", m->metal_bufs);
+        return 1;
+    }
+    fprintf(stderr, "[N15] ib_metal_route: calling ib_metal_create()\n");
     ib_metal_ctx* ctx = ib_metal_create();
-    if (!ctx) { m->metal_route_failed = 1; return 0; }
+    if (!ctx) {
+        fprintf(stderr, "[N15] ib_metal_route: bail — ib_metal_create() returned NULL (no Metal device / ctx alloc failed)\n");
+        m->metal_route_failed = 1;
+        return 0;
+    }
+    fprintf(stderr, "[N15] ib_metal_route: ctx=%p, calling ib_metal_upload_model()\n", (void*)ctx);
     ib_metal_model_buffers* bufs = ib_metal_upload_model(ctx, m);
-    if (!bufs) { ib_metal_destroy(ctx); m->metal_route_failed = 1; return 0; }
+    if (!bufs) {
+        fprintf(stderr, "[N15] ib_metal_route: bail — ib_metal_upload_model() returned NULL (model unsupported / upload OOM / arch mismatch)\n");
+        ib_metal_destroy(ctx);
+        m->metal_route_failed = 1;
+        return 0;
+    }
+    fprintf(stderr, "[N15] ib_metal_route: success — bufs=%p, model routed to Metal\n", (void*)bufs);
     m->metal_ctx  = ctx;
     m->metal_bufs = bufs;
     return 1;
@@ -1421,6 +1793,12 @@ int ib_forward(inferbit_model* model, const int32_t* tokens, int num_tokens, flo
         return INFERBIT_ERROR_PARAM;
     }
 
+    /* Stage 5d: lazy-seed per-tensor preferred_backend from env vars
+     * (currently just IB_HYBRID_FFN_GPU). One-shot per model. Done here
+     * to avoid touching the loader files (pqv2_model.c / ibf_loader.c
+     * are in the "do not modify" list for this stage). */
+    hybrid_apply_tags(model);
+
     int kv_pos = inferbit_kv_length(model);
     int max_ctx = model->header.max_context_length;
 
@@ -1441,6 +1819,19 @@ int ib_forward(inferbit_model* model, const int32_t* tokens, int num_tokens, flo
     if (ib_metal_route(model))
         return ib_forward_metal(model, tokens, num_tokens, kv_pos, out_logits);
 #endif
+
+    /* DFlash hybrid orchestrator (Phase 4). CPU-only in v1, single-token
+     * decode only. Placed AFTER the Metal-route check so the orchestrator
+     * never sees Metal-routed calls. The orchestrator declines (handled=0)
+     * for prefill or when no DFlash config is attached; we then fall
+     * through to the existing CPU routing. The orchestrator's own
+     * dispatch goes via ib_forward_single (non-static wrapper) so there
+     * is no recursion through ib_forward. */
+    if (model->dflash_cfg) {
+        int handled = 0;
+        int rc = ib_dflash_try_route(model, tokens, num_tokens, out_logits, &handled);
+        if (handled) return rc;
+    }
 
     if (num_tokens == 1) {
         /* Single token — standard decode path */

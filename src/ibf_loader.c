@@ -220,6 +220,80 @@ static int parse_header_json(const char* json_str_buf, size_t json_len,
     return 0;
 }
 
+/* ── KV-format bridge (Stage 3b of docs/v2/00_CORRECTION.md) ──
+ *
+ * Reconcile the legacy `kv_bits` header field with the new
+ * `inferbit_kv_format` config knob and pin both onto the model header
+ * before KV allocation. The storage layout downstream is keyed on
+ * `header.kv_bits` (see ib_alloc_kv_caches + forward.c::kv_cache_write
+ * / kv_cache_read_head); `header.kv_format` is kept for diagnostics
+ * and for the future on-line PQ codebook fitter.
+ *
+ * Rules:
+ *   - kv_format == FP16 (default): preserve whatever kv_bits was in
+ *     the .ibf header (typically 16). No override.
+ *   - kv_format == INT8: force kv_bits = 8.
+ *   - kv_format == PQ8: v1 has no codebook fitter wired through the
+ *     production K/V write site (forward.c:794), so we cannot store
+ *     PQ indices in the cache without losing the K/V data. Fall back
+ *     to INT8 storage (kv_bits = 8) and emit a one-shot stderr
+ *     warning. The decoder primitives already exist in pq_decode.c
+ *     for the ib_pq_* mini-runtime (`storage_pyramid` path,
+ *     pq_decode.c:5010-5208) — wiring them through the production
+ *     inferbit_model attention path is the follow-up work.
+ *
+ * Exposed for pqv2_model.c which has its own load path. */
+void ib_apply_kv_format(inferbit_model* model, const inferbit_config* config);
+void ib_apply_kv_format(inferbit_model* model, const inferbit_config* config) {
+    if (!model) return;
+    int requested = config ? config->kv_format : (int)INFERBIT_KV_FP16;
+    /* Default of zero from a zero-initialised inferbit_config means
+     * FP16, which is the no-override path. */
+    switch (requested) {
+        case (int)INFERBIT_KV_FP16:
+            model->header.kv_format = (int)INFERBIT_KV_FP16;
+            /* Leave kv_bits as parsed (header default — fp16/fp32 path
+             * in forward.c treats anything >=16 the same). */
+            break;
+        case (int)INFERBIT_KV_INT8:
+            model->header.kv_format = (int)INFERBIT_KV_INT8;
+            model->header.kv_bits   = 8;
+            break;
+        case (int)INFERBIT_KV_PQ8: {
+            /* v1 fallback: PQ8 storage requires an on-line codebook
+             * fitter at the K/V write site (forward.c:794) and a
+             * matching decode at the read site (forward.c:861). The
+             * pyramid PQ encode/decode primitives live inline in
+             * pq_decode.c::forward_step_internal_sc (Phase 7) but
+             * are tied to the ib_pq_session raw codebook tensors —
+             * they aren't directly reusable for the inferbit_model
+             * path yet. Surface the API, fall back to INT8 storage
+             * cleanly, and record kv_format on the header for callers
+             * who want to detect the fallback after load.
+             * TODO: implement per-layer codebook fitting on first N
+             * tokens + nearest-neighbor encode at write, decode at
+             * read. The PPL invariant per docs/v2/00_CORRECTION.md
+             * §3b is "PPL bit-identical to INT8 KV"; meet it by
+             * falling back cleanly when the codebook isn't fit yet. */
+            static int warned = 0;
+            if (!warned) {
+                fprintf(stderr,
+                        "[inferbit] PQ8 KV cache: v1 falls back to INT8; "
+                        "on-line codebook fitting is a future enhancement.\n");
+                warned = 1;
+            }
+            model->header.kv_format = (int)INFERBIT_KV_PQ8;
+            model->header.kv_bits   = 8;
+            break;
+        }
+        default:
+            /* Unknown values from a zero-init or future enum: stay on
+             * the default FP16 path. */
+            model->header.kv_format = (int)INFERBIT_KV_FP16;
+            break;
+    }
+}
+
 /* ── Allocate KV caches ─────────────────────────────────────── */
 
 /* Exposed (was static) for PQv2 v6 loader to reuse. */
@@ -531,6 +605,11 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
         model->kv_window = config->kv_window;
     }
     model->num_threads = threads;
+
+    /* Stage 3b: resolve kv_format → kv_bits before KV alloc so the
+     * storage layout matches the chosen format (PQ8 falls back to
+     * INT8 here; FP16 keeps the header default). */
+    ib_apply_kv_format(model, config);
 
     /* Allocate KV caches */
     if (ib_alloc_kv_caches(model, ctx_len, kv_dynamic) != 0) {

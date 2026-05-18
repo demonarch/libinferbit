@@ -99,6 +99,122 @@ uint16_t pqv2_f2h(float f) {
     return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
 }
 
+/* ── L2 index bit-pack helpers (Stage 5h.1) ───────────────────────────
+ * When l2_idx_bits == 6, the on-disk L2 indices are packed 4-in-3 bytes
+ * along the M axis. Each (chunk, subchunk) row contains
+ *   ceil(M/4) * 3 bytes
+ * laid out (LSB-first):
+ *   byte0 = (i0 & 0x3F)            | ((i1 & 0x03) << 6)
+ *   byte1 = ((i1 >> 2) & 0x0F)     | ((i2 & 0x0F) << 4)
+ *   byte2 = ((i2 >> 4) & 0x03)     | ((i3 & 0x3F) << 2)
+ *
+ * The kernel hot paths consume contiguous uint8 indices; rather than
+ * fork every NEON inner loop, we unpack one (c,s) row at a time into a
+ * caller-owned scratch buffer of length M. The unpack itself is two
+ * shifts + mask per index, fully amortised by the gather work that
+ * follows. */
+static inline size_t pqv2_l2_packed_row_bytes(uint32_t M) {
+    return ((size_t)M + 3u) / 4u * 3u;
+}
+
+/* Unpack a single packed row (ceil(M/4)*3 bytes) to a uint8[M] buffer. */
+static inline void pqv2_l2_unpack_row(const uint8_t *src, uint8_t *dst, uint32_t M) {
+    uint32_t m = 0;
+    while (m + 4 <= M) {
+        uint8_t b0 = src[0], b1 = src[1], b2 = src[2];
+        dst[m + 0] = (uint8_t)(b0 & 0x3F);
+        dst[m + 1] = (uint8_t)(((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2));
+        dst[m + 2] = (uint8_t)(((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4));
+        dst[m + 3] = (uint8_t)((b2 >> 2) & 0x3F);
+        src += 3;
+        m += 4;
+    }
+    if (m < M) {
+        uint8_t b0 = src[0], b1 = src[1], b2 = src[2];
+        uint8_t tmp[4];
+        tmp[0] = (uint8_t)(b0 & 0x3F);
+        tmp[1] = (uint8_t)(((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2));
+        tmp[2] = (uint8_t)(((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4));
+        tmp[3] = (uint8_t)((b2 >> 2) & 0x3F);
+        for (uint32_t k = 0; m < M; m++, k++) dst[m] = tmp[k];
+    }
+}
+
+/* Resolve the L2 index row pointer for chunk c, subchunk s. If the
+ * tensor is bit-packed, unpack into `scratch[M]` and return scratch.
+ * Otherwise return the in-place row pointer (no copy). */
+static inline const uint8_t *pqv2_l2_row(const pqv2_t *t,
+                                           uint32_t c, uint32_t s,
+                                           uint8_t *scratch) {
+    uint32_t M = t->M, ns = t->n_subchunks;
+    if (t->l2_idx_bits == 6) {
+        size_t row_bytes = pqv2_l2_packed_row_bytes(M);
+        const uint8_t *packed = t->l2_indices
+            + ((size_t)c * ns + s) * row_bytes;
+        pqv2_l2_unpack_row(packed, scratch, M);
+        return scratch;
+    }
+    return &t->l2_indices[((size_t)c * ns + s) * M];
+}
+
+/* ── Stage 5g.2 — L1 index layout adapter ─────────────────────────────
+ *
+ * The CPU NEON kernel inner loops read L1 indices in chunk-major order
+ * (one contiguous M-byte run per (c, s) slot — what `vld1q_u8` wants).
+ * Pre-5g.2 encoders always wrote chunk-major on disk so `t->indices`
+ * already pointed at the NEON-friendly layout.
+ *
+ * Stage 5g.2 introduces an opt-in row-major on-disk layout so the Metal
+ * upload can zero-copy via newBufferWithBytesNoCopy. For CPU paths, we
+ * preserve NEON performance by gathering a one-shot chunk-major scratch
+ * row of size M bytes inside the (c, s) loop — same pattern as the K=256
+ * inner accumulator. Previous Stage 5g.2 revision materialised the entire
+ * [n_chunks][n_subchunks][M] transpose up-front (≈ 470 MB for Llama-3-8B)
+ * which made every matvec malloc/free that whole shadow. The per-(c, s)
+ * gather costs M bytes total and reuses the same buffer across all
+ * iterations.
+ *
+ * Caller pattern at each public matvec entry:
+ *   uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+ *       ? (uint8_t *)malloc((size_t)M) : NULL;
+ *   uint32_t l1_total = (t->N / t->G) * t->n_subchunks;
+ *   ...
+ *   for (c) for (s) {
+ *       const uint8_t *idx;
+ *       if (l1_row_scratch) {
+ *           uint32_t off = c * ns + s;
+ *           for (uint32_t mm = 0; mm < M; mm++)
+ *               l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+ *           idx = l1_row_scratch;
+ *       } else {
+ *           idx = &t->indices[((size_t)c * ns + s) * M];
+ *       }
+ *       // ... use idx[m] ...
+ *   }
+ *   free(l1_row_scratch); */
+
+/* Random-access single-index read for the scalar paths. */
+static inline uint8_t pqv2_l2_idx_at(const pqv2_t *t,
+                                       uint32_t c, uint32_t s, uint32_t m) {
+    uint32_t M = t->M, ns = t->n_subchunks;
+    if (t->l2_idx_bits == 6) {
+        size_t row_bytes = pqv2_l2_packed_row_bytes(M);
+        const uint8_t *row = t->l2_indices
+            + ((size_t)c * ns + s) * row_bytes;
+        uint32_t group = m >> 2u;
+        uint32_t lane  = m & 3u;
+        const uint8_t *p = row + (size_t)group * 3u;
+        uint8_t b0 = p[0], b1 = p[1], b2 = p[2];
+        switch (lane) {
+            case 0: return (uint8_t)(b0 & 0x3F);
+            case 1: return (uint8_t)(((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2));
+            case 2: return (uint8_t)(((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4));
+            default: return (uint8_t)((b2 >> 2) & 0x3F);
+        }
+    }
+    return t->l2_indices[((size_t)c * ns + s) * M + m];
+}
+
 /* ── loader ───────────────────────────────────────────────────────── */
 /* File format (little-endian):
  *   magic "PQV2" 4 bytes
@@ -125,14 +241,28 @@ static void *xmalloc(size_t n) {
 }
 
 int pqv2_load(const char *path, pqv2_t *out, void **owned_p) {
+    memset(out, 0, sizeof(*out));  /* zeros scale_precision / cb_pool_size etc. */
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
+    /* Use file size to disambiguate the legacy 8-u32 header from the
+     * extended 9-u32 header (Stage 5h.1, l2_idx_bits added at hdr[8]). */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long fsz_l = ftell(f);
+    if (fsz_l < 0) { fclose(f); return -1; }
+    size_t fsz = (size_t)fsz_l;
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
     char magic[4];
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "PQV2", 4) != 0) {
         fprintf(stderr, "bad magic\n"); fclose(f); return -1;
     }
-    uint32_t hdr[8];
-    if (fread(hdr, 4, 8, f) != 8) { fclose(f); return -1; }
+    /* Read 9 u32s up-front; if file is too small, we know the header is
+     * the legacy 8-u32 form (hdr[8] doesn't exist). */
+    uint32_t hdr[9] = {0};
+    int header_u32s = 9;
+    if (fsz < 4 + 36) header_u32s = 8;
+    if (fread(hdr, 4, (size_t)header_u32s, f) != (size_t)header_u32s) {
+        fclose(f); return -1;
+    }
     out->M = hdr[0]; out->N = hdr[1]; out->G = hdr[2]; out->K = hdr[3];
     out->n_subchunks = hdr[4]; out->half = hdr[5];
     out->l2_kind = hdr[6]; out->l2_K = hdr[7];
@@ -142,6 +272,39 @@ int pqv2_load(const char *path, pqv2_t *out, void **owned_p) {
     size_t cb_q_bytes = (size_t)out->n_subchunks * out->K * out->half;
     size_t cb_s_bytes = (size_t)out->n_subchunks * out->K * 2;
     size_t idx_bytes = (size_t)out->M * n_chunks * out->n_subchunks;
+    size_t l2_packed_bytes_per_row = ((size_t)out->M + 3u) / 4u * 3u;
+
+    /* Decide whether the candidate 9th u32 is really l2_idx_bits by
+     * checking the projected total file size against the actual size. */
+    int use_extended = 0;
+    uint32_t l2_idx_bits = 8;
+    if (header_u32s == 9) {
+        uint32_t b = hdr[8];
+        if ((b == 6 || b == 8) && out->l2_kind == 2) {
+            size_t l2q_bytes = (size_t)out->n_subchunks * out->l2_K * out->half;
+            size_t l2s_bytes = (size_t)out->n_subchunks * out->l2_K * 2;
+            size_t l2_idx_disk = (b == 6)
+                ? (size_t)n_chunks * out->n_subchunks * l2_packed_bytes_per_row
+                : idx_bytes;
+            size_t projected = 4 + 36 + row_bytes + cb_q_bytes + cb_s_bytes
+                               + idx_bytes + l2q_bytes + l2s_bytes + l2_idx_disk;
+            if (projected == fsz) {
+                use_extended = 1;
+                l2_idx_bits = b;
+            }
+        } else if (b == 8 && out->l2_kind == 0) {
+            size_t projected = 4 + 36 + row_bytes + cb_q_bytes + cb_s_bytes
+                               + idx_bytes;
+            if (projected == fsz) {
+                use_extended = 1;
+                l2_idx_bits = 8;
+            }
+        }
+    }
+    out->l2_idx_bits = l2_idx_bits;
+    /* Rewind so that the post-header read starts at the right place. */
+    if (fseek(f, use_extended ? (long)(4 + 36) : (long)(4 + 32), SEEK_SET)
+        != 0) { fclose(f); return -1; }
 
     owned_list_t *L = xmalloc(sizeof(*L));
     L->n = 0;
@@ -163,12 +326,15 @@ int pqv2_load(const char *path, pqv2_t *out, void **owned_p) {
     if (out->l2_kind == 2) {
         size_t l2q_bytes = (size_t)out->n_subchunks * out->l2_K * out->half;
         size_t l2s_bytes = (size_t)out->n_subchunks * out->l2_K * 2;
+        size_t l2_idx_disk = (out->l2_idx_bits == 6)
+            ? (size_t)n_chunks * out->n_subchunks * l2_packed_bytes_per_row
+            : idx_bytes;
         void *l2q = xmalloc(l2q_bytes); L->blocks[L->n++] = l2q;
         void *l2s = xmalloc(l2s_bytes); L->blocks[L->n++] = l2s;
-        void *l2i = xmalloc(idx_bytes); L->blocks[L->n++] = l2i;
+        void *l2i = xmalloc(l2_idx_disk); L->blocks[L->n++] = l2i;
         if (fread(l2q, 1, l2q_bytes, f) != l2q_bytes ||
             fread(l2s, 1, l2s_bytes, f) != l2s_bytes ||
-            fread(l2i, 1, idx_bytes, f) != idx_bytes) {
+            fread(l2i, 1, l2_idx_disk, f) != l2_idx_disk) {
             fprintf(stderr, "short read L2\n"); fclose(f); return -1;
         }
         out->l2_cb_q = l2q; out->l2_cb_scale = l2s; out->l2_indices = l2i;
@@ -219,14 +385,24 @@ void pqv2_matvec_scalar(const pqv2_t *t, const float *x, float *y) {
         float acc_l1 = 0.0f, acc_l2 = 0.0f;
         for (uint32_t c = 0; c < n_chunks; c++) {
             for (uint32_t s = 0; s < ns; s++) {
-                uint8_t k = t->indices[((size_t)c * ns + s) * M + m];
+                /* L1 index lookup: branch on on-disk layout. The hot path
+                 * here is the scalar reference kernel; perf-sensitive
+                 * paths gather a chunk-major row up front (see _lut,
+                 * _neon, _tbl_int8 etc). */
+                uint8_t k;
+                if (t->l1_idx_layout == 1) {
+                    uint32_t l1_total = n_chunks * ns;
+                    k = t->indices[(size_t)m * l1_total + (c * ns + s)];
+                } else {
+                    k = t->indices[((size_t)c * ns + s) * M + m];
+                }
                 const float *cw = &cb_fp32[(s * K + k) * half];
                 const float *xs = &x[c * G + s * half];
                 float d = 0.0f;
                 for (uint32_t h = 0; h < half; h++) d += cw[h] * xs[h];
                 acc_l1 += d;
                 if (t->l2_indices) {
-                    uint8_t k2 = t->l2_indices[((size_t)c * ns + s) * M + m];
+                    uint8_t k2 = pqv2_l2_idx_at(t, c, s, m);
                     const float *cw2 = &l2_cb[(s * t->l2_K + k2) * half];
                     float d2 = 0.0f;
                     for (uint32_t h = 0; h < half; h++) d2 += cw2[h] * xs[h];
@@ -249,6 +425,17 @@ void pqv2_matvec_scalar(const pqv2_t *t, const float *x, float *y) {
 void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
     uint32_t M = t->M, G = t->G, K = t->K, ns = t->n_subchunks, half = t->half;
     uint32_t n_chunks = t->N / G;
+
+    /* Stage 5g.2 — per-(c, s) gather of an M-byte chunk-major scratch row
+     * when on-disk layout is row-major. NULL when layout is already
+     * chunk-major (we read t->indices directly). */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)malloc((size_t)M) : NULL;
+    if (t->l1_idx_layout == 1 && !l1_row_scratch) {
+        memset(y, 0, (size_t)M * sizeof(float));
+        return;
+    }
+    uint32_t l1_total = n_chunks * ns;
 
     float *acc_l1 = calloc(M, sizeof(float));
     float *acc_l2 = (t->l2_kind == 2) ? calloc(M, sizeof(float)) : NULL;
@@ -277,6 +464,10 @@ void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
 
     float *lut = malloc((size_t)K * sizeof(float));
     float *l2_lut = (t->l2_kind == 2) ? malloc((size_t)t->l2_K * sizeof(float)) : NULL;
+    /* Scratch row for bit-packed L2 unpack (Stage 5h.1). One row at a
+     * time = M bytes total; reused across (c, s). */
+    uint8_t *l2_scratch = (t->l2_kind == 2 && t->l2_idx_bits == 6)
+        ? (uint8_t *)malloc((size_t)M) : NULL;
 
     for (uint32_t c = 0; c < n_chunks; c++) {
         for (uint32_t s = 0; s < ns; s++) {
@@ -290,7 +481,15 @@ void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
             }
             /* Gather rows — contiguous across M.
              * Layout assumed: indices[c, s, m] (transposed from python). */
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            const uint8_t *idx;
+            if (l1_row_scratch) {
+                uint32_t off = c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++)
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                idx = l1_row_scratch;
+            } else {
+                idx = &t->indices[((size_t)c * ns + s) * M];
+            }
             for (uint32_t m = 0; m < M; m++)
                 acc_l1[m] += lut[idx[m]];
 
@@ -301,7 +500,7 @@ void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
                     for (uint32_t h = 0; h < half; h++) d += cw[h] * xs[h];
                     l2_lut[k] = d;
                 }
-                const uint8_t *l2_idx = &t->l2_indices[((size_t)c * ns + s) * M];
+                const uint8_t *l2_idx = pqv2_l2_row(t, c, s, l2_scratch);
                 for (uint32_t m = 0; m < M; m++)
                     acc_l2[m] += l2_lut[l2_idx[m]];
             }
@@ -314,6 +513,8 @@ void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
     free(cb); if (l2_cb) free(l2_cb);
     free(lut); if (l2_lut) free(l2_lut);
     free(acc_l1); if (acc_l2) free(acc_l2);
+    if (l2_scratch) free(l2_scratch);
+    if (l1_row_scratch) free(l1_row_scratch);
 }
 
 /* ── NEON variant ─────────────────────────────────────────────────── */
@@ -323,6 +524,16 @@ void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
 void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
     uint32_t M = t->M, G = t->G, K = t->K, ns = t->n_subchunks, half = t->half;
     uint32_t n_chunks = t->N / G;
+
+    /* Stage 5g.2 — per-(c, s) gather of an M-byte chunk-major scratch row
+     * when on-disk layout is row-major. */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
+    if (t->l1_idx_layout == 1 && !l1_row_scratch) {
+        memset(y, 0, (size_t)M * sizeof(float));
+        return;
+    }
+    uint32_t l1_total = n_chunks * ns;
 
     float *acc_l1 = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
     memset(acc_l1, 0, M * sizeof(float));
@@ -354,6 +565,8 @@ void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
     float *l2_lut = NULL;
     if (t->l2_kind == 2)
         l2_lut = aligned_alloc(64, ((size_t)t->l2_K * sizeof(float) + 63) & ~63);
+    uint8_t *l2_scratch = (t->l2_kind == 2 && t->l2_idx_bits == 6)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
 
     for (uint32_t c = 0; c < n_chunks; c++) {
         for (uint32_t s = 0; s < ns; s++) {
@@ -364,7 +577,15 @@ void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
                 for (uint32_t h = 0; h < half; h++) d += cw[h] * xs[h];
                 lut[k] = d;
             }
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            const uint8_t *idx;
+            if (l1_row_scratch) {
+                uint32_t off = c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++)
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                idx = l1_row_scratch;
+            } else {
+                idx = &t->indices[((size_t)c * ns + s) * M];
+            }
             uint32_t m = 0;
             /* Process 16 rows at a time: gather 16 indices, look up, add. */
             for (; m + 16 <= M; m += 16) {
@@ -396,7 +617,7 @@ void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
                     for (uint32_t h = 0; h < half; h++) d += cw[h] * xs[h];
                     l2_lut[k] = d;
                 }
-                const uint8_t *l2_idx = &t->l2_indices[((size_t)c * ns + s) * M];
+                const uint8_t *l2_idx = pqv2_l2_row(t, c, s, l2_scratch);
                 for (uint32_t mm = 0; mm < M; mm++)
                     acc_l2[mm] += l2_lut[l2_idx[mm]];
             }
@@ -409,6 +630,8 @@ void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
     free(cb); if (l2_cb) free(l2_cb);
     free(lut); if (l2_lut) free(l2_lut);
     free(acc_l1); if (acc_l2) free(acc_l2);
+    if (l2_scratch) free(l2_scratch);
+    if (l1_row_scratch) free(l1_row_scratch);
 }
 /* ── INT8-TBL NEON kernel ────────────────────────────────────────── */
 /* Per (c, s):
@@ -448,6 +671,16 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
     uint32_t M = t->M, G = t->G, K = t->K, ns = t->n_subchunks, half = t->half;
     uint32_t n_chunks = t->N / G;
 
+    /* Stage 5g.2 — per-(c, s) gather of an M-byte chunk-major scratch row
+     * when on-disk layout is row-major. */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
+    if (t->l1_idx_layout == 1 && !l1_row_scratch) {
+        memset(y, 0, (size_t)M * sizeof(float));
+        return;
+    }
+    uint32_t l1_total = n_chunks * ns;
+
     float *acc_l1 = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
     memset(acc_l1, 0, M * sizeof(float));
     float *acc_l2 = NULL;
@@ -478,11 +711,22 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
     int8_t lut_q[64] __attribute__((aligned(16)));
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float lut_scale, l2_lut_scale;
+    uint8_t *l2_scratch = (t->l2_kind == 2 && t->l2_idx_bits == 6)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
 
     for (uint32_t c = 0; c < n_chunks; c++) {
         for (uint32_t s = 0; s < ns; s++) {
             const float *xs = &x[c * G + s * half];
             build_lut_int8(&cb[(size_t)s * K * half], xs, K, half, lut_q, &lut_scale);
+            const uint8_t *idx;
+            if (l1_row_scratch) {
+                uint32_t off = c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++)
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                idx = l1_row_scratch;
+            } else {
+                idx = &t->indices[((size_t)c * ns + s) * M];
+            }
 #if defined(__ARM_NEON)
             int8x16x4_t tbl;
             tbl.val[0] = vld1q_s8(&lut_q[0]);
@@ -490,7 +734,6 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
             tbl.val[2] = vld1q_s8(&lut_q[32]);
             tbl.val[3] = vld1q_s8(&lut_q[48]);
             float32x4_t scl = vdupq_n_f32(lut_scale);
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
             uint32_t m = 0;
             for (; m + 16 <= M; m += 16) {
                 uint8x16_t i16 = vld1q_u8(&idx[m]);
@@ -509,13 +752,13 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
             for (; m < M; m++)
                 acc_l1[m] += (float)lut_q[idx[m]] * lut_scale;
 #else
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
             for (uint32_t m = 0; m < M; m++)
                 acc_l1[m] += (float)lut_q[idx[m]] * lut_scale;
 #endif
             if (t->l2_kind == 2) {
                 build_lut_int8(&l2_cb[(size_t)s * t->l2_K * half], xs,
                                 t->l2_K, half, l2_lut_q, &l2_lut_scale);
+                const uint8_t *l2_idx = pqv2_l2_row(t, c, s, l2_scratch);
 #if defined(__ARM_NEON)
                 int8x16x4_t tbl2;
                 tbl2.val[0] = vld1q_s8(&l2_lut_q[0]);
@@ -523,7 +766,6 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
                 tbl2.val[2] = vld1q_s8(&l2_lut_q[32]);
                 tbl2.val[3] = vld1q_s8(&l2_lut_q[48]);
                 float32x4_t scl2 = vdupq_n_f32(l2_lut_scale);
-                const uint8_t *l2_idx = &t->l2_indices[((size_t)c * ns + s) * M];
                 uint32_t m = 0;
                 for (; m + 16 <= M; m += 16) {
                     uint8x16_t i16 = vld1q_u8(&l2_idx[m]);
@@ -542,7 +784,6 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
                 for (; m < M; m++)
                     acc_l2[m] += (float)l2_lut_q[l2_idx[m]] * l2_lut_scale;
 #else
-                const uint8_t *l2_idx = &t->l2_indices[((size_t)c * ns + s) * M];
                 for (uint32_t m = 0; m < M; m++)
                     acc_l2[m] += (float)l2_lut_q[l2_idx[m]] * l2_lut_scale;
 #endif
@@ -555,6 +796,8 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
     }
     free(cb); if (l2_cb) free(l2_cb);
     free(acc_l1); if (acc_l2) free(acc_l2);
+    if (l2_scratch) free(l2_scratch);
+    if (l1_row_scratch) free(l1_row_scratch);
 }
 
 /* ── INT8-TBL K=128 (2-bank) ──────────────────────────────────────
@@ -596,6 +839,16 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
     uint32_t n_chunks = t->N / G;
     if (K != 128) { pqv2_matvec_lut(t, x, y); return; }
 
+    /* Stage 5g.2 — per-(c, s) gather of an M-byte chunk-major scratch row
+     * when on-disk layout is row-major. */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
+    if (t->l1_idx_layout == 1 && !l1_row_scratch) {
+        memset(y, 0, (size_t)M * sizeof(float));
+        return;
+    }
+    uint32_t l1_total = n_chunks * ns;
+
     float *acc = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
     memset(acc, 0, M * sizeof(float));
     float *acc_l2 = NULL;
@@ -627,6 +880,8 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
     int8_t lut_hi[64] __attribute__((aligned(16)));
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float lut_scale, l2_lut_scale;
+    uint8_t *l2_scratch = (acc_l2 && t->l2_idx_bits == 6)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
 
     for (uint32_t c = 0; c < n_chunks; c++) {
         for (uint32_t s = 0; s < ns; s++) {
@@ -644,7 +899,15 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
             tbl_hi.val[2] = vld1q_s8(&lut_hi[32]);
             tbl_hi.val[3] = vld1q_s8(&lut_hi[48]);
             float32x4_t scl = vdupq_n_f32(lut_scale);
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            const uint8_t *idx;
+            if (l1_row_scratch) {
+                uint32_t off = c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++)
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                idx = l1_row_scratch;
+            } else {
+                idx = &t->indices[((size_t)c * ns + s) * M];
+            }
             uint32_t m = 0;
             const uint8x16_t mask63 = vdupq_n_u8(63);
             const uint8x16_t bank_bit = vdupq_n_u8(64);
@@ -682,7 +945,7 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
                 tbl2.val[2] = vld1q_s8(&l2_lut_q[32]);
                 tbl2.val[3] = vld1q_s8(&l2_lut_q[48]);
                 float32x4_t scl2 = vdupq_n_f32(l2_lut_scale);
-                const uint8_t *l2_idx = &t->l2_indices[((size_t)c * ns + s) * M];
+                const uint8_t *l2_idx = pqv2_l2_row(t, c, s, l2_scratch);
                 uint32_t mm = 0;
                 for (; mm + 16 <= M; mm += 16) {
                     uint8x16_t i16 = vld1q_u8(&l2_idx[mm]);
@@ -710,6 +973,8 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
     }
     free(cb); if (l2_cb) free(l2_cb);
     free(acc); if (acc_l2) free(acc_l2);
+    if (l2_scratch) free(l2_scratch);
+    if (l1_row_scratch) free(l1_row_scratch);
 }
 
 /* ── INT8-TBL K=256 (4-bank) ──────────────────────────────────────
@@ -804,6 +1069,19 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
     int8_t lut[4][64] __attribute__((aligned(16)));
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float lut_scale, l2_lut_scale;
+    /* Stage 5h.1 bit-packed L2 indices: unpack each (c,s) row into a
+     * stack-style scratch before the NEON vqtbl4q loop, so the loop body
+     * is unchanged. Only allocated when the tensor is actually packed. */
+    uint8_t *l2_scratch = (acc_l2 && t->l2_idx_bits == 6)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
+    /* Stage 5g.2 — when L1 on-disk layout is row-major, gather a
+     * chunk-major (size-M) scratch row per (c, s) iter so the NEON
+     * inner loop stays unchanged. Allocated once per call; size is
+     * tiny (≤ ~14 KB for Llama-7B-class M=14336). Heap (not stack) so
+     * very-large M doesn't blow worker stacks. */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
+    uint32_t l1_total = (uint32_t)(t->N / G) * ns;
 
     /* Profiling: cached single branch; zero overhead when disabled. */
     const int prof = pqv2_profile_enabled();
@@ -836,7 +1114,19 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
             LOAD_BANK(b2, lut[2]); LOAD_BANK(b3, lut[3]);
             #undef LOAD_BANK
             float32x4_t scl = vdupq_n_f32(lut_scale);
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            const uint8_t *idx;
+            if (l1_row_scratch) {
+                /* Gather row-major → contiguous chunk-major scratch.
+                 * Row-major on disk lays indices as [m * total + c*ns + s];
+                 * we want idx[m] for fixed (c, s). */
+                uint32_t off = (uint32_t)c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++) {
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                }
+                idx = l1_row_scratch;
+            } else {
+                idx = &t->indices[((size_t)c * ns + s) * M];
+            }
             const uint8x16_t mask63 = vdupq_n_u8(63);
             const uint8x16_t one_v = vdupq_n_u8(1);
             uint32_t m = 0;
@@ -920,7 +1210,7 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
                 tbl2.val[2] = vld1q_s8(&l2_lut_q[32]);
                 tbl2.val[3] = vld1q_s8(&l2_lut_q[48]);
                 float32x4_t scl2 = vdupq_n_f32(l2_lut_scale);
-                const uint8_t *l2_idx = &t->l2_indices[((size_t)c * ns + s) * M];
+                const uint8_t *l2_idx = pqv2_l2_row(t, c, s, l2_scratch);
                 uint32_t mm = 0;
                 for (; mm + 16 <= M; mm += 16) {
                     uint8x16_t i16 = vld1q_u8(&l2_idx[mm]);
@@ -971,6 +1261,8 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
         if (g_pqv2_n_calls % IB_PQV2_PROFILE_EVERY == 0)
             ib_pqv2_profile_dump();
     }
+    if (l2_scratch) free(l2_scratch);
+    if (l1_row_scratch) free(l1_row_scratch);
 }
 
 /* Public chunks accumulator (no skip, original API). */
@@ -1059,26 +1351,31 @@ void pqv2_matvec_tbl_int8_k256(const pqv2_t *t, const float *x, float *y) {
 #define IB_PQV2_BATCH_MAX 8
 
 /* Batched chunk-range accumulator (K=256). Pure accumulation into
- * caller-owned acc[B*M] over chunks [c_start, c_end). Per-position
- * summation order matches the single-position chunks variant exactly,
- * so spec verify agrees bit-for-bit with single-token decode (when
- * the threading uses the same chunk-to-slot partition).
+ * caller-owned acc[B*M] (and acc_l2[B*M] when L2 is present) over chunks
+ * [c_start, c_end). Per-position summation order matches the
+ * single-position chunks variant exactly, so spec verify agrees
+ * bit-for-bit with single-token decode (when the threading uses the
+ * same chunk-to-slot partition).
  *
  * Just calls the single-position chunks function B times; the batched
  * kernel I tried earlier (interleaved B-lane gathers) ran into NEON
  * register pressure for B=4 and lost the win we expected. Per-position
- * sequential calls are simpler and produce identical fp32 output. */
+ * sequential calls are simpler and produce identical fp32 output. The
+ * single-position function already handles L2 via the
+ * pqv2_acc_tbl_int8_k256_chunks_inner L2 path (NEON-accelerated), so
+ * propagating l2_cb / acc_l2_batch here is a straight pass-through. */
 void pqv2_acc_tbl_int8_k256_chunks_batch(
     const pqv2_t *t, const float *x_batch, int B,
-    const float *cb,
-    float *acc_batch,
+    const float *cb, const float *l2_cb,
+    float *acc_batch, float *acc_l2_batch,
     uint32_t c_start, uint32_t c_end)
 {
     if (t->K != 256) return;
     for (int b = 0; b < B; b++) {
         const float *xb = x_batch + (size_t)b * t->N;
-        float *ab = acc_batch + (size_t)b * t->M;
-        pqv2_acc_tbl_int8_k256_chunks(t, xb, cb, NULL, ab, NULL,
+        float *ab  = acc_batch    + (size_t)b * t->M;
+        float *ab2 = acc_l2_batch ? acc_l2_batch + (size_t)b * t->M : NULL;
+        pqv2_acc_tbl_int8_k256_chunks(t, xb, cb, l2_cb, ab, ab2,
                                         c_start, c_end);
     }
 }
@@ -1102,6 +1399,11 @@ void pqv2_matvec_tbl_int8_k256_skip(
     memset(acc, 0, M * sizeof(float));
     long n_skipped = 0;
     long n_total = (long)n_chunks * (long)ns;
+    /* Stage 5g.2 — per-(c,s) chunk-major scratch when on-disk layout
+     * is row-major. */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~(size_t)63) : NULL;
+    uint32_t l1_total = (uint32_t)n_chunks * ns;
 #if defined(__ARM_NEON)
     const uint8x16_t mask63 = vdupq_n_u8(63);
     const uint8x16_t one_v  = vdupq_n_u8(1);
@@ -1130,7 +1432,16 @@ void pqv2_matvec_tbl_int8_k256_skip(
             bank3.val[0] = vld1q_s8(&lut[3][0]);  bank3.val[1] = vld1q_s8(&lut[3][16]);
             bank3.val[2] = vld1q_s8(&lut[3][32]); bank3.val[3] = vld1q_s8(&lut[3][48]);
             float32x4_t scl = vdupq_n_f32(lut_scale);
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            const uint8_t *idx;
+            if (l1_row_scratch) {
+                uint32_t off = c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++) {
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                }
+                idx = l1_row_scratch;
+            } else {
+                idx = &t->indices[((size_t)c * ns + s) * M];
+            }
             for (uint32_t m = 0; m + 16 <= M; m += 16) {
                 uint8x16_t i16 = vld1q_u8(&idx[m]);
                 uint8x16_t i6  = vandq_u8(i16, mask63);
@@ -1163,6 +1474,7 @@ void pqv2_matvec_tbl_int8_k256_skip(
     pqv2_matvec_tbl_int8_k256(t, x, y);
 #endif
     free(acc);
+    if (l1_row_scratch) free(l1_row_scratch);
     if (out_skip_frac) *out_skip_frac = (double)n_skipped / (double)n_total;
 }
 
@@ -1197,6 +1509,10 @@ void pqv2_matvec_tbl_int8_skip(
     float *acc = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~(size_t)63);
     memset(acc, 0, M * sizeof(float));
     long n_skipped = 0, n_total = (long)n_chunks * (long)ns;
+    /* Stage 5g.2 — per-(c,s) chunk-major scratch when on-disk row-major. */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~(size_t)63) : NULL;
+    uint32_t l1_total = (uint32_t)n_chunks * ns;
 #if defined(__ARM_NEON)
     int8_t lut_q[64] __attribute__((aligned(16)));
     float lut_scale;
@@ -1216,7 +1532,16 @@ void pqv2_matvec_tbl_int8_skip(
             tbl.val[2] = vld1q_s8(&lut_q[32]);
             tbl.val[3] = vld1q_s8(&lut_q[48]);
             float32x4_t scl = vdupq_n_f32(lut_scale);
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            const uint8_t *idx;
+            if (l1_row_scratch) {
+                uint32_t off = c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++) {
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                }
+                idx = l1_row_scratch;
+            } else {
+                idx = &t->indices[((size_t)c * ns + s) * M];
+            }
             for (uint32_t m = 0; m + 16 <= M; m += 16) {
                 uint8x16_t i = vld1q_u8(&idx[m]);
                 int8x16_t g = vqtbl4q_s8(tbl, i);
@@ -1239,6 +1564,7 @@ void pqv2_matvec_tbl_int8_skip(
     pqv2_matvec_tbl_int8(t, x, y);
 #endif
     free(acc); if (cb_local) free(cb_local);
+    if (l1_row_scratch) free(l1_row_scratch);
     if (out_skip_frac) *out_skip_frac = (double)n_skipped / (double)n_total;
 }
 
@@ -1267,6 +1593,10 @@ void pqv2_matvec_tbl_int8_k256_fp16acc(
     /* fp16 acc: 2 bytes per element, half the traffic of fp32 acc. */
     __fp16 *acc = aligned_alloc(64, ((size_t)M * sizeof(__fp16) + 63) & ~(size_t)63);
     memset(acc, 0, M * sizeof(__fp16));
+    /* Stage 5g.2 — per-(c,s) chunk-major scratch when on-disk row-major. */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~(size_t)63) : NULL;
+    uint32_t l1_total = (uint32_t)n_chunks * ns;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     const uint8x16_t mask63 = vdupq_n_u8(63);
     const uint8x16_t one_v  = vdupq_n_u8(1);
@@ -1287,7 +1617,16 @@ void pqv2_matvec_tbl_int8_k256_fp16acc(
             bank2.val[2] = vld1q_s8(&lut[2][32]); bank2.val[3] = vld1q_s8(&lut[2][48]);
             bank3.val[0] = vld1q_s8(&lut[3][0]);  bank3.val[1] = vld1q_s8(&lut[3][16]);
             bank3.val[2] = vld1q_s8(&lut[3][32]); bank3.val[3] = vld1q_s8(&lut[3][48]);
-            const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M];
+            const uint8_t *idx;
+            if (l1_row_scratch) {
+                uint32_t off = c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++) {
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                }
+                idx = l1_row_scratch;
+            } else {
+                idx = &t->indices[((size_t)c * ns + s) * M];
+            }
             float32x4_t scl = vdupq_n_f32(lut_scale);
             for (uint32_t m = 0; m + 16 <= M; m += 16) {
                 uint8x16_t i16 = vld1q_u8(&idx[m]);
@@ -1333,6 +1672,7 @@ void pqv2_matvec_tbl_int8_k256_fp16acc(
     pqv2_matvec_tbl_int8_k256(t, x, y);
 #endif
     free(acc);
+    if (l1_row_scratch) free(l1_row_scratch);
 }
 
 /* DERISK: GEMM-style B=4 K=256 matvec. Outer loop = row tiles of 16;
@@ -1358,6 +1698,10 @@ void pqv2_matvec_tbl_int8_k256_gemm_b4(
     const float *cb = t->cb_fp32;
     float *acc = aligned_alloc(64, ((size_t)4 * M * sizeof(float) + 63) & ~(size_t)63);
     memset(acc, 0, (size_t)4 * M * sizeof(float));
+    /* Stage 5g.2 — per-(c,s) chunk-major scratch when on-disk row-major. */
+    uint8_t *l1_row_scratch = (t->l1_idx_layout == 1)
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~(size_t)63) : NULL;
+    uint32_t l1_total = (uint32_t)n_chunks * ns;
 #if defined(__ARM_NEON)
     const uint8x16_t mask63 = vdupq_n_u8(63);
     const uint8x16_t one_v  = vdupq_n_u8(1);
@@ -1376,7 +1720,16 @@ void pqv2_matvec_tbl_int8_k256_gemm_b4(
                 build_lut_int8_k256(&cb[(size_t)s * K * half], xs, half,
                                       lut[b], &lut_scale[b]);
             }
-            const uint8_t *idx_base = &t->indices[((size_t)c * ns + s) * M];
+            const uint8_t *idx_base;
+            if (l1_row_scratch) {
+                uint32_t off = c * ns + s;
+                for (uint32_t mm = 0; mm < M; mm++) {
+                    l1_row_scratch[mm] = t->indices[(size_t)mm * l1_total + off];
+                }
+                idx_base = l1_row_scratch;
+            } else {
+                idx_base = &t->indices[((size_t)c * ns + s) * M];
+            }
             for (uint32_t m = 0; m + 16 <= M; m += 16) {
                 /* Read indices ONCE for this 16-row tile. */
                 uint8x16_t i16 = vld1q_u8(&idx_base[m]);
@@ -1428,6 +1781,7 @@ void pqv2_matvec_tbl_int8_k256_gemm_b4(
     pqv2_matvec_tbl_int8_k256_batch(t, x_batch, 4, y_batch);
 #endif
     free(acc);
+    if (l1_row_scratch) free(l1_row_scratch);
 }
 
 /* Batched K=256 matvec — single-thread reference. Threading lives in
@@ -1488,16 +1842,19 @@ void pqv2_acc_tbl_int8_k256_chunks_skip(
 /* Non-ARM fallback for the batched chunk accumulator — the ARM variant
  * (inside the __ARM_NEON branch above) had no x86/scalar counterpart,
  * which broke the Linux-x86_64 and macOS-Intel links. Same B-loop over
- * the single-position chunks function as the ARM version. */
+ * the single-position chunks function as the ARM version, with L2
+ * pass-through to match. */
 void pqv2_acc_tbl_int8_k256_chunks_batch(
     const pqv2_t *t, const float *x_batch, int B,
-    const float *cb,
-    float *acc_batch,
+    const float *cb, const float *l2_cb,
+    float *acc_batch, float *acc_l2_batch,
     uint32_t c_start, uint32_t c_end) {
     if (t->K != 256) return;
     for (int b = 0; b < B; b++) {
-        pqv2_acc_tbl_int8_k256_chunks(t, x_batch + (size_t)b * t->N, cb, NULL,
-                                      acc_batch + (size_t)b * t->M, NULL,
+        float *ab  = acc_batch    + (size_t)b * t->M;
+        float *ab2 = acc_l2_batch ? acc_l2_batch + (size_t)b * t->M : NULL;
+        pqv2_acc_tbl_int8_k256_chunks(t, x_batch + (size_t)b * t->N,
+                                      cb, l2_cb, ab, ab2,
                                       c_start, c_end);
     }
 }

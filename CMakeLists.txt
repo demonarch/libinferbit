@@ -51,6 +51,7 @@ set(INFERBIT_SOURCES
     src/kernels/ternary.c
     src/forward.c
     src/forward_hiddens.c
+    src/dflash_orchestrator.c
     src/threading.c
     src/ibf_loader.c
     src/gguf.c
@@ -69,6 +70,9 @@ set(INFERBIT_SOURCES
     src/pqv2_kernel.c
     src/pqv2_format.c
     src/pqv2_model.c
+    src/pqv2_encode.c
+    src/mome.c
+    src/ibf_pack.c
 )
 
 # Determine target architecture
@@ -150,11 +154,73 @@ if(APPLE AND IB_ENABLE_METAL)
     add_compile_definitions(IB_HAS_METAL=1)
 endif()
 
+# ── zstd (optional — distribution-time .ibf.zst pack/unpack) ─────
+# Used only by src/ibf_pack.c. When zstd is found we compile that
+# translation unit with IB_HAS_ZSTD and link the resolved target;
+# when it isn't, the file still compiles, and inferbit_pack /
+# inferbit_unpack return -1 with a "zstd not available" error.
+#
+# Detection order:
+#   1. find_package(zstd CONFIG)  — Conan/vcpkg/recent Homebrew ship
+#      a zstdConfig.cmake providing zstd::libzstd_shared/_static.
+#   2. pkg_check_modules(IB_ZSTD libzstd) — Homebrew/apt/etc. always
+#      install a libzstd.pc.
+#   3. find_library + find_path manual fallback.
+set(IB_ZSTD_LIBS "")
+set(IB_ZSTD_INCLUDES "")
+set(IB_ZSTD_FOUND FALSE)
+
+find_package(zstd CONFIG QUIET)
+if(zstd_FOUND)
+    if(TARGET zstd::libzstd_shared)
+        set(IB_ZSTD_LIBS zstd::libzstd_shared)
+        set(IB_ZSTD_FOUND TRUE)
+    elseif(TARGET zstd::libzstd_static)
+        set(IB_ZSTD_LIBS zstd::libzstd_static)
+        set(IB_ZSTD_FOUND TRUE)
+    elseif(TARGET zstd::zstd)
+        set(IB_ZSTD_LIBS zstd::zstd)
+        set(IB_ZSTD_FOUND TRUE)
+    endif()
+endif()
+
+if(NOT IB_ZSTD_FOUND)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(IB_ZSTD QUIET libzstd)
+        if(IB_ZSTD_FOUND)
+            set(IB_ZSTD_LIBS ${IB_ZSTD_LIBRARIES})
+            set(IB_ZSTD_INCLUDES ${IB_ZSTD_INCLUDE_DIRS})
+        endif()
+    endif()
+endif()
+
+if(NOT IB_ZSTD_FOUND)
+    find_library(IB_ZSTD_LIB NAMES zstd libzstd)
+    find_path(IB_ZSTD_INC zstd.h)
+    if(IB_ZSTD_LIB AND IB_ZSTD_INC)
+        set(IB_ZSTD_LIBS ${IB_ZSTD_LIB})
+        set(IB_ZSTD_INCLUDES ${IB_ZSTD_INC})
+        set(IB_ZSTD_FOUND TRUE)
+    endif()
+endif()
+
+if(IB_ZSTD_FOUND)
+    message(STATUS "zstd: ENABLED (inferbit_pack/inferbit_unpack will compress)")
+    set_source_files_properties(src/ibf_pack.c PROPERTIES
+        COMPILE_DEFINITIONS "IB_HAS_ZSTD=1")
+else()
+    message(STATUS "zstd: not found — inferbit_pack/inferbit_unpack will return -1")
+endif()
+
 # Shared library
 add_library(inferbit SHARED ${INFERBIT_SOURCES})
 target_include_directories(inferbit PUBLIC include)
 target_include_directories(inferbit PRIVATE src)
-target_link_libraries(inferbit ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+if(IB_ZSTD_INCLUDES)
+    target_include_directories(inferbit PRIVATE ${IB_ZSTD_INCLUDES})
+endif()
+target_link_libraries(inferbit ${PLATFORM_LIBS} ${METAL_LINK_LIBS} ${IB_ZSTD_LIBS})
 if(IB_METAL_ENABLED)
     target_include_directories(inferbit PRIVATE ${METAL_INCLUDES})
     add_dependencies(inferbit metal_kernels_header)
@@ -190,7 +256,10 @@ endif()
 add_library(inferbit_static STATIC ${INFERBIT_SOURCES})
 target_include_directories(inferbit_static PUBLIC include)
 target_include_directories(inferbit_static PRIVATE src)
-target_link_libraries(inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS})
+if(IB_ZSTD_INCLUDES)
+    target_include_directories(inferbit_static PRIVATE ${IB_ZSTD_INCLUDES})
+endif()
+target_link_libraries(inferbit_static ${PLATFORM_LIBS} ${METAL_LINK_LIBS} ${IB_ZSTD_LIBS})
 if(IB_METAL_ENABLED)
     target_include_directories(inferbit_static PRIVATE ${METAL_INCLUDES})
     add_dependencies(inferbit_static metal_kernels_header)
@@ -224,7 +293,7 @@ if(NOT WIN32)
     foreach(b bench_pq_decode bench_pq_ffn bench_pq_model_mlp
               bench_pq_real_model bench_pq_pathd bench_pq_q8lut
               bench_pq_streaming bench_pq_dejavu bench_pq_bounded
-              test_pqv2_ibf test_pqv2_load bench_pqv2_gemm_b4
+              test_pqv2_ibf test_pqv2_load test_pqv2_roundtrip bench_pqv2_gemm_b4
               bench_pqv2_skip_k64 bench_pqv2_real_acts bench_pqv2_qkv_fusion
               bench_pqv2_to_int4)
         add_executable(${b} tests/${b}.c)
@@ -352,6 +421,7 @@ add_test(NAME ibf_loader COMMAND test_ibf_loader)
 add_test(NAME convert COMMAND test_convert)
 if(NOT WIN32)
     add_test(NAME forward COMMAND test_forward)
+    add_test(NAME pqv2_roundtrip COMMAND test_pqv2_roundtrip)
 endif()
 
 # Install

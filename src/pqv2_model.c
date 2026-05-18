@@ -25,6 +25,8 @@ extern inferbit_model* ibf_load(const char* path, const inferbit_config* config)
 /* Runtime-state helpers exposed from ibf_loader.c. */
 int ib_alloc_kv_caches(inferbit_model* model, int context_length, int dynamic);
 int ib_alloc_buffers(inferbit_model* model);
+/* Stage 3b: kv_format → kv_bits bridge, shared with ibf_loader.c. */
+void ib_apply_kv_format(inferbit_model* model, const inferbit_config* config);
 /* SIMD + thread pool — declared in inferbit_internal.h with the right
  * types (ib_simd_level, ib_thread_pool); already in scope. */
 
@@ -55,30 +57,81 @@ static void fill_llama_defaults(ib_ibf_header* h) {
  * LLaMA-family models by signature (q_proj M, hidden, n_layers).
  * TODO: replace with a config blob in the IBF v6 header. */
 static int detect_arch_from_tensors(const ib_pqv2_file* f, ib_ibf_header* h) {
-    /* Find L0.self_attn.q_proj to read q_proj_M and hidden. */
+    /* Find L0.self_attn.q_proj to read q_proj_M and hidden.
+     * Tensors may arrive as either IB_PQV2_KIND_PQV2 (FFN, o_proj, etc.)
+     * or IB_PQV2_KIND_RAW_FP16 (attention Q/K/V when the encoder kept
+     * them uncompressed). Accept both so this code stays orthogonal to
+     * the encoder's per-tensor format choices. */
     int q_proj_M = 0, hidden = 0, n_layers = 0;
     int v_proj_M = 0;
     int gate_proj_M = 0;
+    int gate_proj_expert_M = 0;   /* MoME: per-expert M (= total M / K) */
+    int gate_proj_expert_count = 0;
     for (int i = 0; i < f->n_tensors; i++) {
         const ib_pqv2_named_tensor* nt = &f->tensors[i];
-        if (nt->kind != IB_PQV2_KIND_PQV2) continue;
+        if (nt->kind != IB_PQV2_KIND_PQV2 &&
+            nt->kind != IB_PQV2_KIND_RAW_FP16) continue;
         int li;
         char parent[32], proj[32];
         if (sscanf(nt->name, "L%d.%31[^.].%31s", &li, parent, proj) != 3) continue;
         if (li + 1 > n_layers) n_layers = li + 1;
+        /* Read [M, N] from the appropriate field based on kind. */
+        int t_M = (nt->kind == IB_PQV2_KIND_PQV2)
+                  ? (int)nt->pq.M
+                  : (nt->ndim >= 1 ? nt->shape[0] : 0);
+        int t_N = (nt->kind == IB_PQV2_KIND_PQV2)
+                  ? (int)nt->pq.N
+                  : (nt->ndim >= 2 ? nt->shape[1] : 0);
         if (li == 0 && strcmp(parent, "self_attn") == 0) {
             if (strcmp(proj, "q_proj") == 0) {
-                q_proj_M = (int)nt->pq.M;
-                hidden   = (int)nt->pq.N;
+                q_proj_M = t_M;
+                hidden   = t_N;
             } else if (strcmp(proj, "v_proj") == 0) {
-                v_proj_M = (int)nt->pq.M;
+                v_proj_M = t_M;
             }
         } else if (li == 0 && strcmp(parent, "mlp") == 0 &&
                     strcmp(proj, "gate_proj") == 0) {
-            gate_proj_M = (int)nt->pq.M;
+            gate_proj_M = t_M;
+        }
+        /* MoME variant: when the encoder splits gate_proj into K expert
+         * sub-tensors, the legacy `L0.mlp.gate_proj` tensor doesn't
+         * exist. Reconstruct intermediate_size by multiplying per-
+         * expert M by the count of expertN tensors observed on layer
+         * 0. We rely on this scan running over every tensor; the count
+         * tracks how many `L0.mlp.gate_proj.expert{e}` we saw. */
+        {
+            int li2, eidx2;
+            char mproj2[32];
+            if (sscanf(nt->name, "L%d.mlp.%31[^.].expert%d",
+                        &li2, mproj2, &eidx2) == 3 &&
+                li2 == 0 && strcmp(mproj2, "gate_proj") == 0) {
+                if (gate_proj_expert_M == 0) gate_proj_expert_M = t_M;
+                gate_proj_expert_count++;
+                (void)t_N;
+            }
         }
     }
-    if (!q_proj_M || !hidden || !n_layers) return -1;
+    /* Promote MoME-split FFN to a flat intermediate_size for header
+     * detection. The hidden/num_heads code below doesn't depend on
+     * MoME being on, so we just synthesise gate_proj_M when only
+     * expert sub-tensors are present. */
+    if (gate_proj_M == 0 && gate_proj_expert_count > 0) {
+        gate_proj_M = gate_proj_expert_M * gate_proj_expert_count;
+    }
+    if (!q_proj_M || !hidden || !n_layers) {
+        fprintf(stderr,
+                "[N15] detect_arch: FAILED — q_proj_M=%d hidden=%d n_layers=%d "
+                "(L0.self_attn.q_proj not found or shape unreadable; "
+                "gate_proj_M=%d expert_M=%d expert_count=%d)\n",
+                q_proj_M, hidden, n_layers,
+                gate_proj_M, gate_proj_expert_M, gate_proj_expert_count);
+        return -1;
+    }
+    fprintf(stderr,
+            "[N15] detect_arch: OK — hidden=%d n_layers=%d q_proj_M=%d "
+            "v_proj_M=%d gate_proj_M=%d (expert_M=%d × count=%d)\n",
+            hidden, n_layers, q_proj_M, v_proj_M, gate_proj_M,
+            gate_proj_expert_M, gate_proj_expert_count);
 
     fill_llama_defaults(h);
     h->hidden_size       = hidden;
@@ -122,13 +175,24 @@ static int detect_arch_from_tensors(const ib_pqv2_file* f, ib_ibf_header* h) {
     return 0;
 }
 
-static void set_pq_meta(ib_tensor_meta* t, const pqv2_t* pq) {
+static void set_pq_meta(ib_tensor_meta* t, const ib_pqv2_named_tensor* nt) {
     memset(t, 0, sizeof(*t));
-    t->pq = pq;
-    t->shape[0] = (int)pq->M;
-    t->shape[1] = (int)pq->N;
+    t->pq = &nt->pq;
+    t->shape[0] = (int)nt->pq.M;
+    t->shape[1] = (int)nt->pq.N;
     t->ndim = 2;
     t->bits = -1;     /* sentinel — pq path takes over */
+    /* Stage 5c — propagate the on-disk residency hint to the loader's
+     * per-tensor meta so other subsystems (drive-mode setup, future
+     * mlock policy) can read it. */
+    t->residency_hint = nt->residency_hint;
+    /* Stage 5b — record the on-disk format choice. pq->l2_kind drives
+     * the runtime kernel dispatch already (0 = flat, 2 = pyramid); this
+     * field exists for diagnostics + tools that want to surface the
+     * mixed-format inventory without reaching into the pq descriptor. */
+    t->tensor_format = (nt->pq.l2_kind == 2)
+                         ? (int)INFERBIT_CONVERT_PQV2_PYRAMID
+                         : (int)INFERBIT_CONVERT_PQV2_FLAT;
 }
 
 /* For raw tensors: t->offset is relative to m->weight_data which is set
@@ -145,6 +209,12 @@ static void set_raw_meta(ib_tensor_meta* t,
     t->bits = 16;
     t->offset = (size_t)((const uint8_t*)data - (const uint8_t*)base);
     t->size = bytes;
+    /* Raw tensors carry no on-disk hint; default to AUTO. They're norms
+     * and the MoME router — small, hot-path tensors. The loader's
+     * heuristic in pqv2_load_internal can promote norms to RAM after the
+     * fact via the global IB_RESIDENCY_RAM_LAYERS override. */
+    t->residency_hint = (int)INFERBIT_RESIDENCY_AUTO;
+    t->tensor_format = (int)INFERBIT_CONVERT_INT4;  /* "raw fp16" sentinel */
 }
 
 static inferbit_model* pqv2_load_internal(const char* path,
@@ -163,6 +233,30 @@ static inferbit_model* pqv2_load_internal(const char* path,
         return NULL;
     }
     m->drive_fd_pretransposed = -1;  /* set by build_pretransposed_sidecar if drive mode */
+    /* Safety: always-precompute fp32 codebooks so cb_fp32 / l2_cb_fp32
+     * are NEVER NULL at matvec time, regardless of residency mode. NULL
+     * forces per-matvec re-decode (slower kernel branch — one source of
+     * pyramid RAM/drive PPL divergence). format.c is the usual source;
+     * this re-walk is the belt-and-braces guarantee. */
+    for (int i = 0; i < f->n_tensors; i++) {
+        ib_pqv2_named_tensor *nt = &f->tensors[i];
+        if (nt->kind != IB_PQV2_KIND_PQV2) continue;
+        pqv2_t *pq = &nt->pq;
+        size_t cb_n = (size_t)pq->n_subchunks * pq->K * pq->half;
+        if (!pq->cb_fp32 && pq->cb_q && pq->cb_scale && cb_n) {
+            float *cb = (float *)malloc(cb_n * sizeof(float));
+            if (cb) { for (size_t j = 0; j < cb_n; j++)
+                cb[j] = (float)pq->cb_q[j] * pqv2_h2f(pq->cb_scale[j / pq->half]);
+                pq->cb_fp32 = cb; }
+        }
+        if (pq->l2_kind == 2 && !pq->l2_cb_fp32 && pq->l2_cb_q && pq->l2_cb_scale) {
+            size_t l2_n = (size_t)pq->n_subchunks * pq->l2_K * pq->half;
+            float *cb = (float *)malloc(l2_n * sizeof(float));
+            if (cb) { for (size_t j = 0; j < l2_n; j++)
+                cb[j] = (float)pq->l2_cb_q[j] * pqv2_h2f(pq->l2_cb_scale[j / pq->half]);
+                pq->l2_cb_fp32 = cb; }
+        }
+    }
     if (detect_arch_from_tensors(f, &m->header) != 0) {
         fprintf(stderr, "pqv2_load: cannot detect architecture from %s\n", path);
         ib_pqv2_file_free(f);
@@ -172,6 +266,53 @@ static inferbit_model* pqv2_load_internal(const char* path,
     }
     m->layers = calloc((size_t)m->header.num_layers, sizeof(ib_layer_meta));
     if (!m->layers) goto fail;
+    /* Default every layer to mome_experts = 1 (= no MoME). The MoME
+     * scan below bumps this on layers that ship `.expert{e}` tensors. */
+    for (int li = 0; li < m->header.num_layers; li++) {
+        m->layers[li].mome_experts = 1;
+        m->layers[li].gate_proj_experts = NULL;
+        m->layers[li].up_proj_experts   = NULL;
+        m->layers[li].down_proj_experts = NULL;
+        memset(&m->layers[li].router, 0, sizeof(m->layers[li].router));
+    }
+
+    /* ── MoME detection pass (Stage 3a) ──────────────────────────────
+     *
+     * Scan tensor names twice: first to count per-layer max-expert-id
+     * (so we know how many slots to allocate); then the main loop
+     * populates the slots. Naming convention is documented in
+     * pqv2_format.h. A layer that has any `Lk.mlp.<proj>.expert{e}`
+     * tensor is treated as MoME; the highest e + 1 becomes
+     * mome_experts. Layers without expert tensors stay
+     * mome_experts == 1 and use the legacy gate/up/down slots. */
+    for (int i = 0; i < f->n_tensors; i++) {
+        const ib_pqv2_named_tensor* nt = &f->tensors[i];
+        int li, eidx;
+        char proj[32];
+        if (sscanf(nt->name, "L%d.mlp.%31[^.].expert%d",
+                    &li, proj, &eidx) == 3 &&
+            li >= 0 && li < m->header.num_layers && eidx >= 0) {
+            ib_layer_meta* L = &m->layers[li];
+            int want = eidx + 1;
+            if (want > L->mome_experts) L->mome_experts = want;
+        }
+    }
+    /* Allocate per-layer expert arrays once the count is known. */
+    for (int li = 0; li < m->header.num_layers; li++) {
+        ib_layer_meta* L = &m->layers[li];
+        if (L->mome_experts <= 1) continue;
+        size_t bytes = (size_t)L->mome_experts * sizeof(ib_tensor_meta);
+        L->gate_proj_experts = (ib_tensor_meta *)calloc(1, bytes);
+        L->up_proj_experts   = (ib_tensor_meta *)calloc(1, bytes);
+        L->down_proj_experts = (ib_tensor_meta *)calloc(1, bytes);
+        if (!L->gate_proj_experts || !L->up_proj_experts ||
+            !L->down_proj_experts) {
+            fprintf(stderr,
+                    "pqv2_load: oom allocating MoME expert slots for layer %d (K=%d)\n",
+                    li, L->mome_experts);
+            goto fail;
+        }
+    }
 
     /* m->weight_data points at the IBF v6 mmap. tensor_data() returns
      * weight_data + offset, so we encode raw-tensor file offsets
@@ -187,6 +328,33 @@ static inferbit_model* pqv2_load_internal(const char* path,
         const ib_pqv2_named_tensor* nt = &f->tensors[i];
         const char* n = nt->name;
         if (nt->kind == IB_PQV2_KIND_PQV2) {
+            /* MoME expert slot: L<L>.mlp.<proj>.expert<E>. Matched BEFORE
+             * the generic parent.proj parser so the expert suffix wins.
+             * Per-expert sub-tensor is a normal PQv2 tensor — we just
+             * route it into the right slot in the K-stacked expert
+             * array on the owning layer. */
+            {
+                int li, eidx;
+                char mproj[32];
+                if (sscanf(n, "L%d.mlp.%31[^.].expert%d",
+                            &li, mproj, &eidx) == 3 &&
+                    li >= 0 && li < m->header.num_layers && eidx >= 0) {
+                    ib_layer_meta* L = &m->layers[li];
+                    if (L->mome_experts > 1 && eidx < L->mome_experts) {
+                        ib_tensor_meta* slot = NULL;
+                        if (strcmp(mproj, "gate_proj") == 0)
+                            slot = &L->gate_proj_experts[eidx];
+                        else if (strcmp(mproj, "up_proj") == 0)
+                            slot = &L->up_proj_experts[eidx];
+                        else if (strcmp(mproj, "down_proj") == 0)
+                            slot = &L->down_proj_experts[eidx];
+                        if (slot) {
+                            set_pq_meta(slot, nt);
+                            continue;
+                        }
+                    }
+                }
+            }
             /* Layer projections: L<L>.<parent>.<proj> */
             int li;
             char parent[32], proj[32];
@@ -204,15 +372,71 @@ static inferbit_model* pqv2_load_internal(const char* path,
                     else if (strcmp(proj, "up_proj") == 0) slot = &L->up_proj;
                     else if (strcmp(proj, "down_proj") == 0) slot = &L->down_proj;
                 }
-                if (slot) set_pq_meta(slot, &nt->pq);
+                if (slot) set_pq_meta(slot, nt);
             } else if (strcmp(n, "token_embedding") == 0) {
-                set_pq_meta(&m->token_embedding, &nt->pq);
+                set_pq_meta(&m->token_embedding, nt);
             } else if (strcmp(n, "lm_head") == 0) {
-                set_pq_meta(&m->output_head, &nt->pq);
+                set_pq_meta(&m->output_head, nt);
             }
         } else {
             int li;
             char rest[64];
+            /* MoME router tensor: L<L>.mlp.router, raw fp16 [K, hidden].
+             * Matched first so the generic parent.proj parser below
+             * doesn't grab it.
+             *
+             * NOTE: scanf("L%d.mlp.router") returns 1 (number of converted
+             * specifiers) as long as %d converts — it does NOT report
+             * whether the trailing literal ".mlp.router" matched. So
+             * `L0.input_layernorm` and any other `L<N>.…` name would
+             * spuriously hit this branch, clobbering router with norm
+             * metadata. Verify the full suffix with strcmp instead. */
+            {
+                int li_r;
+                char tail[64];
+                if (sscanf(n, "L%d.%63s", &li_r, tail) == 2 &&
+                    li_r >= 0 && li_r < m->header.num_layers &&
+                    strcmp(tail, "mlp.router") == 0) {
+                    ib_layer_meta* L = &m->layers[li_r];
+                    if (L->mome_experts > 1) {
+                        int rows = nt->ndim >= 1 ? nt->shape[0] : 0;
+                        int cols = nt->ndim >= 2 ? nt->shape[1] : 1;
+                        set_raw_meta(&L->router, nt->raw_data, f->_buffer,
+                                      nt->raw_size, rows, cols);
+                        continue;
+                    }
+                }
+            }
+            /* First try parent.proj form (e.g. self_attn.q_proj) — needed
+             * when the encoder stores attention QKV (or other layer
+             * projections) as raw fp16 rather than PQv2. The IBF v6 PQv2
+             * format permits this for tensors whose PQv2 kernels aren't
+             * implemented (Q/K/V on the current Metal/CPU dispatch). */
+            {
+                char parent[32], proj[32];
+                if (sscanf(n, "L%d.%31[^.].%31s", &li, parent, proj) == 3 &&
+                    li >= 0 && li < m->header.num_layers) {
+                    ib_layer_meta* L = &m->layers[li];
+                    ib_tensor_meta* slot = NULL;
+                    int rows = nt->ndim >= 1 ? nt->shape[0] : 0;
+                    int cols = nt->ndim >= 2 ? nt->shape[1] : 1;
+                    if (strcmp(parent, "self_attn") == 0) {
+                        if (strcmp(proj, "q_proj") == 0) slot = &L->q_proj;
+                        else if (strcmp(proj, "k_proj") == 0) slot = &L->k_proj;
+                        else if (strcmp(proj, "v_proj") == 0) slot = &L->v_proj;
+                        else if (strcmp(proj, "o_proj") == 0) slot = &L->o_proj;
+                    } else if (strcmp(parent, "mlp") == 0) {
+                        if (strcmp(proj, "gate_proj") == 0) slot = &L->gate_proj;
+                        else if (strcmp(proj, "up_proj") == 0) slot = &L->up_proj;
+                        else if (strcmp(proj, "down_proj") == 0) slot = &L->down_proj;
+                    }
+                    if (slot) {
+                        set_raw_meta(slot, nt->raw_data, f->_buffer,
+                                      nt->raw_size, rows, cols);
+                        continue;
+                    }
+                }
+            }
             if (sscanf(n, "L%d.%63s", &li, rest) == 2 &&
                 li >= 0 && li < m->header.num_layers) {
                 ib_layer_meta* L = &m->layers[li];
@@ -237,6 +461,20 @@ static inferbit_model* pqv2_load_internal(const char* path,
         }
     }
 
+    /* Tied-embedding fallback. Models like Llama-3.2-1B/3B don't emit a
+     * separate lm_head tensor — config.json says tie_word_embeddings=true
+     * and the runtime is expected to reuse token_embedding for the output
+     * head. Without this, tensor_matmul(output_head) finds pq==NULL and
+     * bits==0 and silently no-ops, leaving logits uninitialized.
+     *
+     * Mirror whatever kind token_embedding ended up as: PQv2 → reuse the
+     * same pq descriptor; raw fp16 → reuse the raw bytes. */
+    if (!m->output_head.pq && m->output_head.bits == 0 &&
+        (m->token_embedding.pq || m->token_embedding.bits != 0)) {
+        m->output_head = m->token_embedding;
+        m->header.tie_word_embeddings = true;
+    }
+
     /* Runtime state init: same as legacy ibf_load post-load path. */
     int ctx_len = m->header.max_context_length;
     int kv_dynamic = 0;
@@ -255,6 +493,99 @@ static inferbit_model* pqv2_load_internal(const char* path,
         const char *rm = getenv("IB_RESIDENCY_MODE");
         m->residency_mode = (rm && (!strcmp(rm, "drive") || !strcmp(rm, "1"))) ? 1 : 0;
     }
+
+    /* Stage 5c — runtime promotion + diagnostic of per-tensor residency
+     * hints. IB_RESIDENCY_RAM_LAYERS=N promotes the first N layers'
+     * AUTO/DRIVE hints to RAM at load time (for the "always-hot first
+     * layers" decode pattern). IB_PQV2_TRACE=1 dumps each tensor's hint
+     * + on-disk format to stderr.
+     *
+     * v1 scope: this is diagnostic + state-propagation only; the
+     * mlock-on-RAM / madvise-on-DRIVE enforcement is wired by the
+     * existing drive_mode block below (which already handles the
+     * indices-streaming policy). Honoring per-tensor RAM-pinning under
+     * IB_RESIDENCY_MODE=drive is a follow-up.
+     *
+     * Iterates token_embedding + output_head + all layer projections,
+     * including MoME expert slots when present. */
+    int ram_layers_override = -1;
+    {
+        const char *e = getenv("IB_RESIDENCY_RAM_LAYERS");
+        if (e && e[0]) {
+            int v = atoi(e);
+            if (v >= 0 && v < 100000) ram_layers_override = v;
+        }
+    }
+    const int pq_trace =
+        (getenv("IB_PQV2_TRACE") != NULL &&
+         getenv("IB_PQV2_TRACE")[0] != '\0' &&
+         getenv("IB_PQV2_TRACE")[0] != '0');
+    {
+        ib_tensor_meta *globals[2] = { &m->token_embedding, &m->output_head };
+        const char *gnames[2] = { "token_embedding", "lm_head" };
+        for (int gi = 0; gi < 2; gi++) {
+            ib_tensor_meta *t = globals[gi];
+            if (!t->pq && t->bits == 0) continue;
+            /* Embedding / lm_head are always considered "early/hot":
+             * promote AUTO → RAM regardless of ram_layers_override.
+             * DRIVE-tagged tensors (explicit by the encoder) stay DRIVE. */
+            if (t->residency_hint == (int)INFERBIT_RESIDENCY_AUTO) {
+                t->residency_hint = (int)INFERBIT_RESIDENCY_RAM;
+            }
+            if (pq_trace) {
+                fprintf(stderr,
+                        "[pqv2] residency: %-20s fmt=%d hint=%d\n",
+                        gnames[gi], t->tensor_format, t->residency_hint);
+            }
+        }
+        for (int li = 0; li < m->header.num_layers; li++) {
+            ib_layer_meta *L = &m->layers[li];
+            int promote_to_ram =
+                (ram_layers_override >= 0 && li < ram_layers_override);
+            ib_tensor_meta *slots[7] = {
+                &L->q_proj, &L->k_proj, &L->v_proj, &L->o_proj,
+                &L->gate_proj, &L->up_proj, &L->down_proj,
+            };
+            const char *sn[7] = {
+                "q_proj","k_proj","v_proj","o_proj",
+                "gate_proj","up_proj","down_proj",
+            };
+            for (int si = 0; si < 7; si++) {
+                ib_tensor_meta *t = slots[si];
+                if (!t->pq && t->bits == 0) continue;
+                if (promote_to_ram &&
+                    t->residency_hint != (int)INFERBIT_RESIDENCY_DRIVE) {
+                    t->residency_hint = (int)INFERBIT_RESIDENCY_RAM;
+                }
+                if (pq_trace) {
+                    fprintf(stderr,
+                            "[pqv2] residency: L%d.%-10s fmt=%d hint=%d\n",
+                            li, sn[si], t->tensor_format, t->residency_hint);
+                }
+            }
+            /* MoME experts: same promotion rule by layer index. */
+            if (L->mome_experts > 1) {
+                ib_tensor_meta *exps[3] = {
+                    L->gate_proj_experts, L->up_proj_experts, L->down_proj_experts,
+                };
+                for (int xi = 0; xi < 3; xi++) {
+                    if (!exps[xi]) continue;
+                    for (int e = 0; e < L->mome_experts; e++) {
+                        ib_tensor_meta *t = &exps[xi][e];
+                        if (!t->pq && t->bits == 0) continue;
+                        if (promote_to_ram &&
+                            t->residency_hint != (int)INFERBIT_RESIDENCY_DRIVE) {
+                            t->residency_hint = (int)INFERBIT_RESIDENCY_RAM;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Stage 3b: resolve kv_format → kv_bits before KV alloc. PQ8
+     * currently falls back to INT8 (see ib_apply_kv_format). */
+    ib_apply_kv_format(m, config);
 
     if (ib_alloc_kv_caches(m, ctx_len, kv_dynamic) != 0) goto fail;
     if (ib_alloc_buffers(m) != 0) goto fail;
@@ -400,7 +731,20 @@ static inferbit_model* pqv2_load_internal(const char* path,
 
 fail:
     if (f) { ib_pqv2_file_free(f); free(f); }
-    free(m);
+    if (m) {
+        /* Free MoME expert arrays if the failure happened after they
+         * were allocated. The inferbit_free path does the same but we
+         * never reach that here. */
+        if (m->layers) {
+            for (int li = 0; li < m->header.num_layers; li++) {
+                free(m->layers[li].gate_proj_experts);
+                free(m->layers[li].up_proj_experts);
+                free(m->layers[li].down_proj_experts);
+            }
+        }
+        free(m->layers);
+        free(m);
+    }
     return NULL;
 }
 
@@ -511,12 +855,22 @@ static int build_pretransposed_sidecar(inferbit_model *m,
             got += (size_t)r;
         }
         const uint8_t *src = read_buf;
-        /* Transpose into staging: dst[m * total + c*ns + s] = src[(c*ns+s)*M + m]. */
-        for (uint32_t m_ = 0; m_ < M; m_++) {
-            uint8_t *row = staging + (size_t)m_ * total;
-            for (uint32_t c = 0; c < nc; c++) {
-                for (uint32_t s = 0; s < ns; s++) {
-                    row[c * ns + s] = src[((size_t)c * ns + s) * M + m_];
+        /* Transpose into staging: dst[m * total + c*ns + s].
+         * Source layout depends on the on-disk L1 index layout:
+         *   pq->l1_idx_layout == 0 (legacy chunk-major):
+         *      src[(c*ns+s)*M + m]
+         *   pq->l1_idx_layout == 1 (Stage 5g.2 row-major, Bug N16):
+         *      src[m*total + c*ns+s] — already in destination layout,
+         *      so a straight memcpy works. */
+        if (pq->l1_idx_layout == 1) {
+            memcpy(staging, src, idx_bytes);
+        } else {
+            for (uint32_t m_ = 0; m_ < M; m_++) {
+                uint8_t *row = staging + (size_t)m_ * total;
+                for (uint32_t c = 0; c < nc; c++) {
+                    for (uint32_t s = 0; s < ns; s++) {
+                        row[c * ns + s] = src[((size_t)c * ns + s) * M + m_];
+                    }
                 }
             }
         }

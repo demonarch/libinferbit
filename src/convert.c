@@ -8,6 +8,7 @@
 #include "inferbit_internal.h"
 #include "platform.h"
 #include "cJSON.h"
+#include "pqv2_encode.h"   /* pqv2_convert — dispatched when cfg.format != INT4 */
 
 #include <errno.h>
 #include <math.h>
@@ -431,7 +432,48 @@ inferbit_convert_config inferbit_default_convert_config(void) {
     c.threads         = 0;
     c.progress        = NULL;
     c.progress_ctx    = NULL;
+    c.format          = INFERBIT_CONVERT_INT4;
+    /* MoME defaults to 1 (= disabled). Wired into the PQv2 encoder
+     * path only; the INT4 path ignores it. See docs/v2/00_CORRECTION.md
+     * Stage 3a for the scaffolding semantics. */
+    c.mome_experts   = 1;
+    /* Stage 5b / 5c (docs/v2/00_CORRECTION.md) — per-class policy
+     * arrays. Zero-init everywhere means "use the global cfg->format
+     * and the encoder's residency heuristic" — bit-identical to
+     * pre-5b/5c behavior. Callers that want mixed-format or explicit
+     * residency override individual classes via
+     * inferbit_config_set_class_format / set_class_residency. */
+    for (int i = 0; i < INFERBIT_TENSOR_CLASS_COUNT; i++) {
+        c.per_class_format[i]    = INFERBIT_CONVERT_INT4;     /* = 0, "use global" */
+        c.per_class_residency[i] = INFERBIT_RESIDENCY_AUTO;   /* = 0, "use heuristic" */
+    }
+    /* Stage 5k / 5j (docs/v2/00_CORRECTION.md) — opt-in compression
+     * knobs. Defaults preserve the v0.4.1 / v0.4.2 file layout exactly:
+     *   scale_precision = 0  → row_scale + cb_scale stay fp16 on disk.
+     *   codebook_dedup  = 0  → no codebook pool emitted; loader/kernel
+     *                          paths exercise the legacy contiguous
+     *                          per-slot codebook layout. */
+    c.scale_precision = 0;
+    c.codebook_dedup  = 0;
     return c;
+}
+
+void inferbit_config_set_class_format(inferbit_convert_config *cfg,
+                                       inferbit_tensor_class cls,
+                                       inferbit_convert_format fmt)
+{
+    if (!cfg) return;
+    if ((int)cls < 0 || (int)cls >= INFERBIT_TENSOR_CLASS_COUNT) return;
+    cfg->per_class_format[cls] = fmt;
+}
+
+void inferbit_config_set_class_residency(inferbit_convert_config *cfg,
+                                          inferbit_tensor_class cls,
+                                          inferbit_residency hint)
+{
+    if (!cfg) return;
+    if ((int)cls < 0 || (int)cls >= INFERBIT_TENSOR_CLASS_COUNT) return;
+    cfg->per_class_residency[cls] = hint;
 }
 
 inferbit_format inferbit_detect_format(const char* path) {
@@ -483,6 +525,14 @@ int inferbit_convert(
         cfg = inferbit_default_convert_config();
     }
     if (!cfg.progress) cfg.progress = progress_noop;
+
+    /* Format dispatcher: route PQv2 / pyramid through the C encoder in
+     * src/pqv2_encode.c. INT4 falls through to the legacy path below
+     * (unchanged). See docs/v2/00_CORRECTION.md, Stage 1. */
+    if (cfg.format == INFERBIT_CONVERT_PQV2_FLAT ||
+        cfg.format == INFERBIT_CONVERT_PQV2_PYRAMID) {
+        return pqv2_convert(input_path, output_path, &cfg);
+    }
 
     /* Detect if input is a directory or single file */
     ib_struct_stat input_stat;

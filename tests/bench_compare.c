@@ -107,15 +107,25 @@ int main(int argc, char **argv) {
     }
     int use_gpu = (strcmp(backend, "gpu") == 0);
 
+    fprintf(stderr, "[N15] bench_compare: starting; path=%s backend=%s ctx_len=%d prompt=%d gen=%d\n",
+            argv[1], backend, ctx_len, prompt_tokens, gen_tokens);
     inferbit_config *cfg = inferbit_config_create();
     inferbit_config_set_context_length(cfg, ctx_len);
+    fprintf(stderr, "[N15] bench_compare: calling inferbit_load(%s)\n", argv[1]);
     inferbit_model *m = inferbit_load(argv[1], cfg);
-    if (!m) { fprintf(stderr, "load failed\n"); return 2; }
+    if (!m) {
+        fprintf(stderr, "[N15] bench_compare: BAIL — inferbit_load returned NULL for %s\n", argv[1]);
+        fprintf(stderr, "load failed\n");
+        return 2;
+    }
+    fprintf(stderr, "[N15] bench_compare: inferbit_load OK; hidden=%d vocab=%d num_layers=%d\n",
+            m->header.hidden_size, m->header.vocab_size, m->header.num_layers);
     int hidden = m->header.hidden_size;
     int vocab  = m->header.vocab_size;
 
     int total = prompt_tokens + gen_tokens;
     if (total > ctx_len) {
+        fprintf(stderr, "[N15] bench_compare: BAIL — prompt+gen=%d > ctx=%d\n", total, ctx_len);
         fprintf(stderr, "prompt+gen=%d > ctx=%d\n", total, ctx_len);
         return 1;
     }
@@ -127,10 +137,21 @@ int main(int argc, char **argv) {
     ib_metal_model_buffers *gbufs = NULL;
     float *embed_buf = malloc((size_t)hidden * sizeof(float));
     if (use_gpu) {
+        fprintf(stderr, "[N15] bench_compare: use_gpu=1, calling ib_metal_create()\n");
         ctx = ib_metal_create();
-        if (!ctx) { fprintf(stderr, "Metal not available\n"); return 3; }
+        if (!ctx) {
+            fprintf(stderr, "[N15] bench_compare: BAIL — ib_metal_create() returned NULL (no Metal device)\n");
+            fprintf(stderr, "Metal not available\n");
+            return 3;
+        }
+        fprintf(stderr, "[N15] bench_compare: ctx=%p, calling ib_metal_upload_model()\n", (void*)ctx);
         gbufs = ib_metal_upload_model(ctx, m);
-        if (!gbufs) { fprintf(stderr, "GPU upload failed\n"); return 4; }
+        if (!gbufs) {
+            fprintf(stderr, "[N15] bench_compare: BAIL — ib_metal_upload_model() returned NULL (model unsupported / OOM / arch)\n");
+            fprintf(stderr, "GPU upload failed\n");
+            return 4;
+        }
+        fprintf(stderr, "[N15] bench_compare: GPU upload OK; gbufs=%p\n", (void*)gbufs);
         /* Opt-in via env var: ib_metal_strip_cpu_mmap drops the mmap and
          * keeps only the embedding bytes. On macOS this momentarily holds
          * mmap+Metal+embed at once, so /usr/bin/time -l peak RSS goes UP

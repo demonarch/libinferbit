@@ -58,6 +58,11 @@ typedef struct {
 
     /* KV cache */
     int kv_bits;
+    /* KV-cache storage format (Stage 3b of docs/v2/00_CORRECTION.md).
+     * 0 = FP16 (default), 1 = INT8, 2 = PQ8. When non-zero, overrides
+     * `kv_bits` for storage-layout decisions. Populated from the
+     * inferbit_config at model load (see ibf_loader.c / pqv2_model.c). */
+    int kv_format;
 
     /* Data section */
     size_t weight_data_offset;
@@ -82,6 +87,30 @@ typedef struct {
      * Pointer is owned by the IBF v6 file backing (mmap or heap).
      * NULL for legacy v5 / INT4 / INT8 / FP16 tensors. */
     const pqv2_t* pq;
+    /* Stage 5d (docs/v2/00_CORRECTION.md): hybrid backend hint. Values
+     * match the public inferbit_backend enum exactly (0=AUTO, 1=CPU,
+     * 2=METAL). Stored as int to keep this header free of the public
+     * header inclusion ordering. Set at load time (or lazily at first
+     * forward) from IB_HYBRID_* env knobs. The CPU forward checks this
+     * before each FFN matmul and, when METAL, dispatches that single
+     * matmul through ib_metal_run_single_matmul. */
+    int preferred_backend;
+    /* Stage 5c (docs/v2/00_CORRECTION.md): residency hint parsed from
+     * the IBFv6 per-tensor blob header. Values match the public
+     * inferbit_residency enum (0=AUTO, 1=RAM, 2=DRIVE). Stored as int
+     * to keep header decoupling clean. Loader reads the on-disk hint
+     * (and may override via IB_RESIDENCY_RAM_LAYERS=N) into this field.
+     * v1: diagnostic only; the drive-mode mmap/mlock policy hookup is
+     * a follow-up. */
+    int residency_hint;
+    /* Stage 5b (docs/v2/00_CORRECTION.md): on-disk format for this
+     * tensor as resolved at encode time. Values match the public
+     * inferbit_convert_format enum (0=INT4, 1=PQV2_FLAT, 2=PQV2_PYRAMID).
+     * Populated at load time by inspecting pq->l2_kind (0 = flat,
+     * 2 = pyramid; INT4 only appears in legacy v5 / non-pqv2 paths).
+     * Diagnostic-grade for v1 — the kernel already dispatches on
+     * `pq->l2_kind` per tensor, so the runtime needs nothing else. */
+    int tensor_format;
 } ib_tensor_meta;
 
 /* ── Per-layer metadata ─────────────────────────────────────── */
@@ -100,6 +129,46 @@ typedef struct {
     /* Sparsity mask */
     size_t sparsity_mask_offset;
     size_t sparsity_mask_size;
+
+    /* ── Stage 3a — MoME (docs/v2/00_CORRECTION.md) ──────────────────
+     *
+     * Post-hoc Mix-of-Mini-Experts router metadata. v1 scaffolding:
+     * the FFN block is conceptually split into K mini-experts via a
+     * trivial row-range split of gate/up/down. Active when the
+     * loader saw `Lk.mlp.<proj>.expert{e}` tensors at load time AND
+     * the matching `Lk.mlp.router` raw-fp16 weight.
+     *
+     *   mome_experts        — K. 1 = no MoME (the default, identical
+     *                          to pre-MoME behaviour). >1 = MoME
+     *                          active; gate/up/down_proj are
+     *                          unused and the *_proj_experts arrays
+     *                          hold K stacked sub-tensors.
+     *   gate_proj_experts   — array of K ib_tensor_meta, NULL when
+     *                          mome_experts == 1. Owned by the
+     *                          owning model (free()d in model_free).
+     *   up_proj_experts     — same, for up_proj.
+     *   down_proj_experts   — same, for down_proj.
+     *   router              — [K, hidden] raw fp16 router weight
+     *                          (rows = experts, cols = hidden — same
+     *                          orientation as a regular FFN weight so
+     *                          the runtime fp16 matmul can consume it
+     *                          directly). The `pq` field is NULL;
+     *                          `offset/size/bits=16` point at the raw
+     *                          bytes inside the IBF v6 mmap. When
+     *                          mome_experts == 1 this is a zeroed
+     *                          struct.
+     *
+     * v1 correctness invariant: when router is the zero-init
+     * placeholder (no calibration done yet), the runtime falls back to
+     * "run every expert with uniform softmax(0) weight" which, on the
+     * trivial row-split layout, is mathematically identical to the
+     * un-split FFN matmul. So a MoME-enabled file always produces the
+     * same output as a non-MoME file until a real router is fitted. */
+    int mome_experts;
+    ib_tensor_meta *gate_proj_experts;
+    ib_tensor_meta *up_proj_experts;
+    ib_tensor_meta *down_proj_experts;
+    ib_tensor_meta router;
 } ib_layer_meta;
 
 /* ── KV cache ───────────────────────────────────────────────── */
@@ -234,6 +303,46 @@ struct inferbit_model {
      * CPU-bottleneck floor. CPU drive path continues to use drive_fd
      * (chunk-major). -1 = no sidecar (CPU-only drive or build failed). */
     int    drive_fd_pretransposed;
+
+    /* ── Stage 5d — hybrid CPU/GPU forward (docs/v2/00_CORRECTION.md) ──
+     *
+     * Lazily-allocated Metal-shared staging buffers for the per-matmul
+     * hybrid hook (forward.c::tensor_matmul_hybrid). When a CPU-routed
+     * forward hits an FFN matmul whose `preferred_backend == METAL`,
+     * the hook copies the fp32 input into hybrid_x_buf, runs one Metal
+     * matmul that writes into hybrid_y_buf, and copies the result back
+     * to the caller's CPU buffer. Buffers are sized to hold the largest
+     * FFN input (= hidden_size) and largest FFN output (= intermediate_
+     * size), so they can serve every gate/up/down dispatch.
+     *
+     * Allocated on first hybrid dispatch via ib_metal_alloc; both pointers
+     * are host-visible AND Metal-buffer-backed (unified memory). NULL
+     * when no hybrid call has happened yet; freed in inferbit_free
+     * alongside the metal_ctx. NOT created when metal_route_failed=1. */
+    void  *hybrid_x_buf;            /* Metal-shared fp32 input scratch */
+    void  *hybrid_y_buf;            /* Metal-shared fp32 output scratch */
+    size_t hybrid_x_buf_floats;     /* element capacity (NOT bytes) */
+    size_t hybrid_y_buf_floats;
+    int    hybrid_tags_applied;     /* 0 until preferred_backend has been seeded once */
+
+    /* ── Phase 4 — DFlash hybrid orchestrator (doc 36) ──────────────
+     *
+     * Attached via inferbit_dflash_attach. When dflash_cfg is non-NULL,
+     * ib_forward() routes single-token CPU decode through the orchestrator
+     * (see dflash_orchestrator.c). During every full forward, the
+     * post-residual hidden state at layer dflash_cfg->early_exit_layer is
+     * written into dflash_capture_buf (via the 3-line hook inside
+     * forward_single_ex), and its L2-norm into dflash_last_norm. The
+     * orchestrator uses last_norm + warmup to gate the next step.
+     *
+     * dflash_full_count / dflash_early_count are reset per generate()
+     * (by inferbit_dflash_attach) and incremented by the orchestrator. */
+    inferbit_dflash_config* dflash_cfg;
+    float* dflash_capture_buf;          /* [hidden_size] — last captured early-layer hidden */
+    float  dflash_last_norm;            /* L2-norm of dflash_capture_buf, or 0 before first capture */
+    int    dflash_decode_step;          /* number of decode steps observed since attach */
+    int    dflash_full_count;
+    int    dflash_early_count;
 };
 
 /* ── Config struct ──────────────────────────────────────────── */
@@ -250,6 +359,11 @@ struct inferbit_config {
      * long context for the (acceptable) cost of a sliding-window
      * attention horizon. */
     int  kv_window;
+    /* KV-cache storage format (Stage 3b of docs/v2/00_CORRECTION.md).
+     * Public-API value is inferbit_kv_format; stored as int to keep the
+     * struct layout decoupled from the public-enum width.
+     * 0 = FP16 (default), 1 = INT8, 2 = PQ8 (v1 falls back to INT8). */
+    int  kv_format;
 };
 
 /* ── SIMD dispatch ──────────────────────────────────────────── */
@@ -496,6 +610,64 @@ void ib_copy_norm_fp16(uint16_t* out, const void* src, const char* dtype, int si
 /* ── Forward pass ───────────────────────────────────────────── */
 
 int ib_forward(inferbit_model* model, const int32_t* tokens, int num_tokens, float* out_logits);
+
+/* Apply the final RMSNorm (in-place over `hidden`) followed by the LM-head
+ * matmul to produce logits. Factored out of forward_single_ex so the DFlash
+ * orchestrator (dflash_orchestrator.c) can reuse the same kernels on the
+ * early-exit projection path without duplicating tensor_data lookups and
+ * scale-buffer plumbing.
+ *
+ *   model    : the model owning output_norm + output_head.
+ *   hidden_io: [hidden_size] — RMSNorm is applied IN PLACE, so this buffer
+ *              is clobbered. Caller pre-fills with the source hidden state
+ *              (either the final post-stack residual on the full path, or
+ *              the captured early-layer residual on the DFlash early-exit
+ *              path).
+ *   logits_out: [vocab_size] output.
+ *   scale_buf : [max(hidden, intermediate, vocab)] scratch for matmul.
+ */
+void ib_apply_lm_head_finalize(const inferbit_model* model,
+                               float* hidden_io,
+                               float* logits_out,
+                               float* scale_buf);
+
+/* Single-token decode entrypoint. Non-static wrapper around forward_single_ex
+ * so the DFlash orchestrator can dispatch a full-forward decode step without
+ * going back through ib_forward()'s routing (which is what called the
+ * orchestrator in the first place — recursion would loop). */
+int ib_forward_single(inferbit_model* model, int token_id, int pos,
+                      float* out_logits);
+
+/* DFlash orchestrator entrypoint. Called from the top of ib_forward() when
+ * a DFlash config is attached. Sets *handled = 1 if the orchestrator
+ * produced logits (caller should return rc immediately); *handled = 0 if
+ * the request is not DFlash-applicable (multi-token prefill, Metal-routed,
+ * etc.) and the caller should fall through to the existing routing.
+ *
+ * Implemented in dflash_orchestrator.c. */
+int ib_dflash_try_route(inferbit_model* model,
+                        const int32_t* tokens,
+                        int num_tokens,
+                        float* out_logits,
+                        int* handled);
+
+/* CPU single-token matmul wrapper exposed for the MoME dispatcher.
+ *
+ * Behaviourally identical to the static `tensor_matmul` inside
+ * forward.c (PQv2 / W4A8 / INT8 / FP16 dispatch). Lives outside that
+ * static so src/mome.c can invoke per-expert matmuls without making
+ * tensor_matmul globally visible.
+ *
+ *   out       : [M] caller-allocated output buffer.
+ *   input     : [N] caller-allocated input vector.
+ *   M, N      : tensor's output rows and input cols.
+ *   scale_buf : [≥ max(M, N)] scratch used by INT4/INT8 paths.
+ *
+ * No threading guarantees beyond what tensor_matmul already does
+ * (PQv2 K=256 spawns the existing per-chunk pool internally). */
+void ib_tensor_matmul_cpu(const inferbit_model *m, const ib_tensor_meta *t,
+                          float *out, const float *input, int M, int N,
+                          float *scale_buf);
 
 /* Multi-position forward. Processes num_tokens tokens advancing the KV cache,
  * and writes per-position logits into out_logits[num_tokens * vocab_size].
