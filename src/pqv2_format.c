@@ -180,11 +180,12 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
           (size_t)(4 + (hdr_u32) * 4)                                           \
           /* row_scale: fp16[M] (legacy) OR fp8 E4M3[M] (Stage 5k H2 sp2) */   \
           + ((sp) >= 1 ? (size_t)out->M : (size_t)out->M * 2u)                 \
-          /* cb_q + cb_scale (rows = p1 if > 0 else n_sub) */                   \
+          /* cb_q + cb_scale (rows = p1 if > 0 else n_sub) — cb_scale  */     \
+          /* is ALWAYS fp16 (Goal I2 rollback). See note at decode site. */     \
           + ((size_t)((p1) > 0 ? (p1) : out->n_subchunks)                       \
                 * out->K * out->half                                            \
              + (size_t)((p1) > 0 ? (p1) : out->n_subchunks)                     \
-                * out->K * ((sp) >= 2 ? 1u : 2u))                               \
+                * out->K * 2u)                                                  \
           /* cb_pool_id[n_sub] only when p1 > 0 */                              \
           + ((p1) > 0 ? (size_t)out->n_subchunks : 0u)                          \
           /* L1 indices */                                                      \
@@ -194,7 +195,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
               ? ((size_t)((p2) > 0 ? (p2) : out->n_subchunks)                   \
                     * out->l2_K * out->half                                     \
                  + (size_t)((p2) > 0 ? (p2) : out->n_subchunks)                 \
-                    * out->l2_K * ((sp) >= 2 ? 1u : 2u)                         \
+                    * out->l2_K * 2u                                            \
                  + ((p2) > 0 ? (size_t)out->n_subchunks : 0u)                   \
                  + (((b) == 6 || (b) == 4)                                     \
                      ? (size_t)n_chunks * out->n_subchunks                      \
@@ -346,30 +347,29 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     }
     cursor += row_disk_bytes;
 
-    /* cb_q + cb_scale: rows = cb_pool_size if > 0 else n_subchunks. */
+    /* cb_q + cb_scale: rows = cb_pool_size if > 0 else n_subchunks.
+     *
+     * Goal I2: cb_scale is ALWAYS fp16 on disk, regardless of
+     * scale_precision. The Stage 5k sp=2 redesign briefly packed
+     * cb_scale as fp8 E4M3 (saving ns*K bytes/tensor), but probe_sp2
+     * showed cb_scale's distribution clusters around 1e-3..5e-3 with
+     * a ~300× range, putting ~30% of codewords in E4M3's subnormal
+     * band where the small ones flush to zero (RMSE_rel 38.8% vs 2.6%
+     * for row_scale). cb_scale was the actual driver of the sp=2 PPL
+     * regression (50.4 → 48.9 after row-scale fp8 fix). Old sp=2
+     * files written by the both-fp8 encoder are no longer readable —
+     * rerun the encoder. */
     uint32_t cb_rows = cb_pool_size > 0 ? cb_pool_size : out->n_subchunks;
     size_t cb_q_disk_bytes  = (size_t)cb_rows * out->K * out->half;
-    size_t cb_s_disk_bytes  = (scale_precision >= 2)
-                                ? (size_t)cb_rows * out->K
-                                : (size_t)cb_rows * out->K * 2u;
+    size_t cb_s_disk_bytes  = (size_t)cb_rows * out->K * 2u;
     if (cursor + cb_q_disk_bytes + cb_s_disk_bytes > size) PQV2_PARSE_FAIL();
     const int8_t  *cb_q_disk  = (const int8_t  *)(buf + cursor);
     cursor += cb_q_disk_bytes;
     const uint8_t *cb_s_disk  = (const uint8_t *)(buf + cursor);
     cursor += cb_s_disk_bytes;
 
-    /* Decode cb_scale (fp8 → fp16) if needed; same number of entries
-     * irrespective of pool, since the pool indexes the slot axis only. */
-    const uint16_t *cb_scale_decoded;
-    if (scale_precision >= 2) {
-        size_t n = (size_t)cb_rows * out->K;
-        uint16_t *cb_s = pqv2_decode_cb_scale_e4m3(cb_s_disk, n);
-        if (!cb_s) PQV2_PARSE_FAIL();
-        cb_scale_decoded = cb_s;
-        out_owned->cb_scale = cb_s;
-    } else {
-        cb_scale_decoded = (const uint16_t *)cb_s_disk;
-    }
+    /* cb_scale always fp16; point directly at the mmap'd file. */
+    const uint16_t *cb_scale_decoded = (const uint16_t *)cb_s_disk;
 
     /* Pool expansion (Stage 5j). When pool_size > 0, pool_id[n_subchunks]
      * follows the cb_scale block; expand pool → per-slot. v1 identity
@@ -409,9 +409,8 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     if (out->l2_kind == 2) {
         uint32_t l2_rows = l2_cb_pool_size > 0 ? l2_cb_pool_size : out->n_subchunks;
         size_t l2q_disk_bytes = (size_t)l2_rows * out->l2_K * out->half;
-        size_t l2s_disk_bytes = (scale_precision >= 2)
-                                  ? (size_t)l2_rows * out->l2_K
-                                  : (size_t)l2_rows * out->l2_K * 2u;
+        /* Goal I2: l2_cb_scale is always fp16, matching L1 cb_scale. */
+        size_t l2s_disk_bytes = (size_t)l2_rows * out->l2_K * 2u;
         size_t l2_idx_disk =
             (out->l2_idx_bits == 6 || out->l2_idx_bits == 4)
                 ? (size_t)n_chunks * out->n_subchunks
@@ -424,16 +423,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
         const uint8_t *l2_s_disk = (const uint8_t *)(buf + cursor);
         cursor += l2s_disk_bytes;
 
-        const uint16_t *l2_scale_decoded;
-        if (scale_precision >= 2) {
-            size_t n = (size_t)l2_rows * out->l2_K;
-            uint16_t *l2_s = pqv2_decode_cb_scale_e4m3(l2_s_disk, n);
-            if (!l2_s) PQV2_PARSE_FAIL();
-            l2_scale_decoded = l2_s;
-            out_owned->l2_cb_scale = l2_s;
-        } else {
-            l2_scale_decoded = (const uint16_t *)l2_s_disk;
-        }
+        const uint16_t *l2_scale_decoded = (const uint16_t *)l2_s_disk;
 
         if (l2_cb_pool_size > 0) {
             if (cursor + (size_t)out->n_subchunks > size) PQV2_PARSE_FAIL();

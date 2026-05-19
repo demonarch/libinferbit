@@ -2254,43 +2254,42 @@ static void mome_dispatch_ffn_batch(
      * IB_BATCH_MAX (32); stack allocation is fine. */
     float weights[IB_BATCH_MAX][IB_MOME_MAX_EXPERTS];
 
-    /* Decide weighting policy. */
+    /* Weighting policy for trivial row-split MoME (v1):
+     *   - Router (if non-zero) is used for SELECTION only — picks the
+     *     top_n experts per position.
+     *   - WEIGHTS are uniform K/n_active over the selected experts,
+     *     regardless of router magnitudes. This is the only weighting
+     *     that reconstructs the un-split FFN exactly when n_active=K
+     *     (and gives the correct K/n_active scaling for top_n<K).
+     *     Softmax weights would sum to 1 and scale FFN by 1/K, which
+     *     cascade-damages PPL through the model (R9 I4 regression).
+     */
+    const int top_n = mome_get_top_n(K);
     int calibrated = mome_router_is_nonzero(m, &layer->router);
-    if (calibrated) {
-        /* Batched router matmul: [B * K] = (router [K, hidden]) @ x [B * hidden].
-         * Reuse bb_hb as the router-output scratch — B*K << B*inter. */
-        float* router_out = hb;
+    float* router_out = NULL;
+    if (calibrated && top_n < K) {
+        /* Only run the router matmul if we actually need it for selection
+         * (top_n < K). Full-K activation makes the router a no-op. */
+        router_out = hb;
         tensor_matmul_batch(m, &layer->router, router_out, x_in_snap,
                             K, hidden, B,
                             scale_buf, q_scratch, sa_scratch);
-        const int top_n = mome_get_top_n(K);
-        for (int b = 0; b < B; b++) {
+    }
+    const float w_active = (float)K / (float)top_n;
+    for (int b = 0; b < B; b++) {
+        int active_b[IB_MOME_MAX_TOP_N];
+        if (top_n >= K) {
+            /* All experts: natural order keeps fp32 accumulation bit-
+             * identical to the zero-router path. */
+            for (int i = 0; i < K; i++) active_b[i] = i;
+        } else if (router_out) {
             float* logits_b = router_out + (size_t)b * K;
-            /* top-N selection over per-position logits. Inactive experts
-             * get weight 0; active experts get softmax over selected. */
-            int active[IB_MOME_MAX_TOP_N];
-            mome_top_n(logits_b, K, top_n, active);
-            float sel[IB_MOME_MAX_TOP_N];
-            for (int i = 0; i < top_n; i++) sel[i] = logits_b[active[i]];
-            /* softmax-inplace inlined (mome.c::mome_softmax_inplace is
-             * static; replicate the tiny loop here). */
-            float mx = sel[0];
-            for (int i = 1; i < top_n; i++) if (sel[i] > mx) mx = sel[i];
-            float s = 0.0f;
-            for (int i = 0; i < top_n; i++) { sel[i] = expf(sel[i] - mx); s += sel[i]; }
-            float inv = (s > 0.0f) ? (1.0f / s) : (1.0f / (float)top_n);
-            for (int e = 0; e < K; e++) weights[b][e] = 0.0f;
-            for (int i = 0; i < top_n; i++) weights[b][active[i]] = sel[i] * inv;
+            mome_top_n(logits_b, K, top_n, active_b);
+        } else {
+            for (int i = 0; i < top_n; i++) active_b[i] = i;
         }
-    } else {
-        /* Zero-router fallback: uniform weight per IB_MOME_TOP_N policy.
-         * mome_dispatch_ffn scales by K/n_active so n_active==K → 1.0
-         * (exact reconstruction). For the batched union path we always
-         * activate all K experts (n_active = K), giving weight = 1.0 —
-         * matches the single-position zero-router invariant. */
-        for (int b = 0; b < B; b++) {
-            for (int e = 0; e < K; e++) weights[b][e] = 1.0f;
-        }
+        for (int e = 0; e < K; e++) weights[b][e] = 0.0f;
+        for (int i = 0; i < top_n; i++) weights[b][active_b[i]] = w_active;
     }
 
     /* Zero the accumulator. */
@@ -2386,32 +2385,33 @@ static void mome_ffn_dispatch(inferbit_model *m, const ib_layer_meta *layer,
     if (B == 1) {
         const int K_ex   = layer->mome_experts;
         const int hidden = m->header.hidden_size;
-        if (mome_router_is_nonzero(m, &layer->router)) {
-            /* Calibrated router: per-position logits → top-N → softmax
-             * weighted dispatch. Mirror of the legacy forward_single_ex
-             * block. Logits buffer is stack-local (K_ex ≤
-             * IB_MOME_MAX_EXPERTS = 32). */
+        int top_n = mome_get_top_n(K_ex);
+        int active[IB_MOME_MAX_TOP_N];
+
+        if (top_n >= K_ex) {
+            /* All experts selected: natural ascending order keeps fp32
+             * accumulation bit-identical to the zero-router path. The
+             * router (if any) has no actual selection work to do. */
+            for (int i = 0; i < K_ex; i++) active[i] = i;
+        } else if (mome_router_is_nonzero(m, &layer->router)) {
+            /* Calibrated/heuristic router: use it for SELECTION ONLY
+             * (which top_n experts), not for weighting. The trivial
+             * row-split (v1) requires uniform K/n_active weights to
+             * reconstruct the un-split FFN — softmax weights that sum
+             * to 1 would scale FFN output by 1/K and cascade-damage
+             * PPL over the depth of the model. */
             float router_logits[IB_MOME_MAX_EXPERTS];
-            int   active[IB_MOME_MAX_TOP_N];
             ib_tensor_matmul_cpu(m, &layer->router, router_logits,
                                  xb_in_batch, K_ex, hidden, scale_buf);
-            int top_n = mome_get_top_n(K_ex);
             mome_top_n(router_logits, K_ex, top_n, active);
-            mome_dispatch_ffn(m, layer, xb_in_batch, hb_batch, hb2_batch,
-                              xb_out_batch,
-                              router_logits, active, top_n, scale_buf);
         } else {
-            /* Zero-router fallback: first top_n experts; mome_dispatch_ffn
-             * scales each weight by K/n_active so n_active==K reconstructs
-             * the un-split FFN exactly. */
-            int top_n = mome_get_top_n(K_ex);
-            int active[IB_MOME_MAX_TOP_N];
+            /* Zero router: pick the first top_n experts (no preference). */
             for (int i = 0; i < top_n; i++) active[i] = i;
-            mome_dispatch_ffn(m, layer, xb_in_batch, hb_batch, hb2_batch,
-                              xb_out_batch,
-                              /*router_logits=*/NULL, active,
-                              /*n_active=*/top_n, scale_buf);
         }
+        mome_dispatch_ffn(m, layer, xb_in_batch, hb_batch, hb2_batch,
+                          xb_out_batch,
+                          /*router_logits=*/NULL, active,
+                          /*n_active=*/top_n, scale_buf);
         return;
     }
 

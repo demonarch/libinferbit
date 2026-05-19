@@ -35,6 +35,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -493,15 +494,46 @@ static int mome_try_fused_gateup(inferbit_model *m,
      * same eligibility envelope as v1, so a v2 success replaces the v1
      * call entirely. On v2 returning -1 (invariant mismatch or non-NEON
      * build) we transparently fall back to v1; on v1 still returning -1
-     * we punt to the per-expert path. */
+     * we punt to the per-expert path.
+     *
+     * Goal I3: v2's slot-inner / m-outer reorder pays off only when M_per
+     * is large enough that the per-slot acc array stays cache-resident
+     * across the 2K-slot sweep AND the SIMD register pressure of holding
+     * 2K accumulator vectors per m-block is amortised. On TinyLlama
+     * (M_per=2816) the win turns negative; on Llama-3-8B (M_per=7168
+     * for K=2) it should be net positive. Threshold picked empirically —
+     * TinyLlama's M_per=2816 falls just below, Llama-3 at K=2 lands
+     * above. Override via IB_MOME_V2_M_MIN env. */
+    const int IB_MOME_V2_M_THRESHOLD = 4096;
+    static int m_thresh_cached = -1;
+    if (m_thresh_cached < 0) {
+        const char *thresh_env = getenv("IB_MOME_V2_M_MIN");
+        m_thresh_cached = thresh_env ? atoi(thresh_env)
+                                     : IB_MOME_V2_M_THRESHOLD;
+        if (m_thresh_cached < 0) m_thresh_cached = IB_MOME_V2_M_THRESHOLD;
+    }
+    static int profile_cached = -1;
+    if (profile_cached < 0) {
+        const char *pe = getenv("IB_MOME_PROFILE");
+        profile_cached = (pe && pe[0] && pe[0] != '0') ? 1 : 0;
+    }
+
     int rc = -1;
-    if (mome_fused_v2_enabled()) {
+    const char *kernel_used = "none";
+    if (rows_per_expert >= m_thresh_cached && mome_fused_v2_enabled()) {
         rc = pqv2_matvec_mome_gateup_k256_v2(
             gate_pq, up_pq, x_in, hb_all, hb2_all, n_active);
+        if (rc == 0) kernel_used = "v2";
     }
     if (rc != 0) {
         rc = pqv2_matvec_mome_gateup_k256(
             gate_pq, up_pq, x_in, hb_all, hb2_all, n_active);
+        if (rc == 0) kernel_used = "v1";
+    }
+    if (profile_cached) {
+        fprintf(stderr,
+                "[mome_profile] kernel=%s M_per=%d K=%d hidden=%d\n",
+                kernel_used, rows_per_expert, n_active, hidden);
     }
     if (rc != 0) {
         free(hb_all); free(hb2_all);

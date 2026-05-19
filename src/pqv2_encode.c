@@ -909,13 +909,33 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
                               size_t *out_size)
 {
     size_t n_chunks = (size_t)N / G;
-    /* Stage 5k row_scale layout (H2 sp2 redesign — Agent 3 round 1 fix).
-     *   sp = 0 : fp16[M]   (legacy, 2*M bytes)
-     *   sp = 2 : fp8[M]    (E4M3, M bytes — saves M bytes per tensor and
-     *                      recovers the ~10-decade dynamic range that
-     *                      the previous int8+row_max codec lost). */
+    /* Stage 5k scale layout (H2 sp2 redesign + I2 cb_scale rollback).
+     *   sp = 0 : row_scale fp16[M]      (legacy, 2*M bytes)
+     *            cb_scale  fp16[ns*K]   (legacy, 2*ns*K bytes)
+     *   sp = 2 : row_scale fp8[M]       (E4M3, M bytes — saves M bytes
+     *                                    per tensor; ~10-decade dynamic
+     *                                    range, 2-6% per-row rel error.
+     *                                    Probed safe on Llama-3 / TL
+     *                                    row_scale distributions.)
+     *            cb_scale  fp16[ns*K]   (legacy — Goal I2 fix). Previous
+     *                                    sp=2 packed cb_scale as fp8 E4M3
+     *                                    too, but cb_scale's distribution
+     *                                    clusters around 1e-3..5e-3 with
+     *                                    a 2-3 decade range; ~30% of
+     *                                    codewords fell into E4M3's
+     *                                    subnormal band where 5.9e-4
+     *                                    flushes to 0. Probe RMSE_rel
+     *                                    on TL gate_proj cb_scale was
+     *                                    38.8% (with zero-flushes) vs
+     *                                    2.6% for row_scale — confirming
+     *                                    cb_scale, not row_scale, drove
+     *                                    the sp2 PPL regression (PPL
+     *                                    50.4 → 48.9 after row-scale-only
+     *                                    fix; cb_scale fp16 expected to
+     *                                    restore PPL to ~6.3 flat
+     *                                    baseline). */
     int sp_fp8_rs   = (scale_precision >= 2);
-    int sp_fp8_cbs  = (scale_precision >= 2);
+    int sp_fp8_cbs  = 0;  /* Goal I2: cb_scale always fp16 — see note above. */
     size_t row_bytes;
     if (sp_fp8_rs) {
         row_bytes = (size_t)M;        /* fp8 E4M3[M] */
@@ -1382,32 +1402,87 @@ static int mome_emit_expert_blob(ib6_manifest *mf,
     return 0;
 }
 
-/* Push a zero-init [K, hidden] raw fp16 router weight.
+/* Push a [K, hidden] raw fp16 router weight.
  *
- * Note the orientation: rows = K (experts, = output dim), cols =
- * hidden (= input dim). This matches the standard tensor_matmul
- * contract `out[i] = sum_j w[i*N + j] * input[j]` so the runtime can
- * call ib_tensor_matmul_cpu(model, &router, logits, x, K, hidden, …)
- * with no transpose. The runtime detects "every element is fp16-zero"
- * and falls back to the all-experts uniform-weight path
- * (mathematically identical to the un-split FFN). Real router
- * weights come from a calibration follow-up; see mome.c TODO #2. */
+ * Orientation: rows = K (experts, = output dim), cols = hidden (= input
+ * dim). This matches the standard tensor_matmul contract
+ * `out[i] = sum_j w[i*N + j] * input[j]` so the runtime can call
+ * ib_tensor_matmul_cpu(model, &router, logits, x, K, hidden, …) with no
+ * transpose.
+ *
+ * Heuristic (I4, no-calibration): if a gate_proj source is supplied,
+ * we fill router[e, i] with the column-norm of expert e's contiguous
+ * row-slice of W_gate, i.e. ||W_gate[e*M_per .. (e+1)*M_per, i]||_2 .
+ * This makes `router_logits[e] = sum_i ||W_gate_e[:,i]|| * |x[i]|`
+ * (modulo signs) — experts whose row-slice has high column-norms
+ * aligned with the current activation's high-magnitude dims score
+ * higher under the softmax+top-N gating in forward_single_ex.
+ *
+ * If gate_src is NULL we fall back to the original zero-init router
+ * (runtime treats it as "no calibrated router" and uses uniform all-
+ * experts). Real calibrated weights still require an offline pass;
+ * see mome.c TODO #2. */
 static int push_zero_router(ib6_manifest *mf, const char *base_name,
-                             int hidden, int K)
+                             int hidden, int K,
+                             const void *gate_src, const char *gate_dtype,
+                             int gate_rows)
 {
     size_t count = (size_t)K * (size_t)hidden;
-    uint16_t *zeros = (uint16_t *)calloc(count, sizeof(uint16_t));
-    if (!zeros) { ib_set_error("oom: zero router"); return -1; }
-    /* Zero-init: v1 has no calibrated router; runtime falls back to
-     * all-experts when bytes are zero. Belt-and-braces memset in case
-     * the allocator path ever changes away from calloc. */
-    memset(zeros, 0, count * sizeof(uint16_t));
+    uint16_t *router = (uint16_t *)calloc(count, sizeof(uint16_t));
+    if (!router) { ib_set_error("oom: router"); return -1; }
+
+    int used_heuristic = 0;
+    /* I4 heuristic: column-norm of each expert's gate_proj row-slice.
+     * gate_proj is laid out [intermediate, hidden] row-major; expert e
+     * owns rows [e*M_per .. (e+1)*M_per) for all `hidden` columns.    */
+    if (gate_src && gate_dtype && gate_rows > 0 && K > 0 &&
+        (gate_rows % K) == 0) {
+        int M_per = gate_rows / K;
+        size_t total = (size_t)gate_rows * (size_t)hidden;
+        float *W = (float *)malloc(total * sizeof(float));
+        if (W && pqv2_read_matrix_fp32(W, gate_src, gate_dtype,
+                                        gate_rows, hidden) == 0) {
+            /* sumsq_e[i] = sum_{r in expert e rows} W[r, hidden + i]^2  */
+            double *sumsq = (double *)calloc((size_t)K * (size_t)hidden,
+                                              sizeof(double));
+            if (sumsq) {
+                for (int e = 0; e < K; e++) {
+                    int r0 = e * M_per;
+                    int r1 = r0 + M_per;
+                    for (int r = r0; r < r1; r++) {
+                        const float *row = W + (size_t)r * (size_t)hidden;
+                        double *acc = sumsq + (size_t)e * (size_t)hidden;
+                        for (int i = 0; i < hidden; i++) {
+                            float v = row[i];
+                            acc[i] += (double)v * (double)v;
+                        }
+                    }
+                }
+                /* Take sqrt and write as fp16 in [K, hidden] layout.   */
+                for (int e = 0; e < K; e++) {
+                    const double *acc = sumsq + (size_t)e * (size_t)hidden;
+                    uint16_t *dst = router + (size_t)e * (size_t)hidden;
+                    for (int i = 0; i < hidden; i++) {
+                        float n = (float)sqrt(acc[i]);
+                        dst[i] = enc_f2h(n);
+                    }
+                }
+                free(sumsq);
+                used_heuristic = 1;
+            }
+        }
+        free(W);
+    }
+    if (!used_heuristic) {
+        memset(router, 0, count * sizeof(uint16_t));
+    }
+
     char nm[128];
     snprintf(nm, sizeof(nm), "%s.router", base_name);
     int32_t shape[4] = { K, hidden, 1, 1 };
     if (ib6_push(mf, nm, IB_PQV2_KIND_RAW_FP16, 2, shape,
-                  zeros, count * sizeof(uint16_t)) != 0) {
-        free(zeros); ib_set_error("manifest oom (%s)", nm); return -1;
+                  router, count * sizeof(uint16_t)) != 0) {
+        free(router); ib_set_error("manifest oom (%s)", nm); return -1;
     }
     return 0;
 }
@@ -2334,17 +2409,29 @@ int pqv2_convert(const char *input_path,
          * keeps the layer functional but downgrades it to mome_experts=1
          * at load time — fine in v1, which is correctness-first. */
         const int K_experts = (cfg->mome_experts > 1) ? cfg->mome_experts : 1;
+        /* Capture gate_proj source for the I4 heuristic router below.   */
+        const void *gate_router_src = NULL;
+        const char *gate_router_dtype = NULL;
+        int         gate_router_rows  = 0;
         if (pq6_find_layer(ts, &names, l, names.gate_proj, &s, &t) == 0) {
             snprintf(nm, sizeof(nm), "L%d.mlp.gate_proj", l);
             int py_gate = PY(INFERBIT_TENSOR_CLASS_FFN_GATE);
             int rh_gate = RH(INFERBIT_TENSOR_CLASS_FFN_GATE);
             int rc_m = +1;   /* +1 = not MoME → fall through to flat */
             if (K_experts > 1) {
+                /* Stash before encode (mome_rows doesn't mutate src).   */
+                gate_router_src   = ib_ts_tensor_data(ts, s, t);
+                gate_router_dtype = ib_ts_tensor_dtype(ts, s, t);
+                gate_router_rows  = ib_ts_tensor_shape(ts, s, t, 0);
                 rc_m = read_and_push_pqv2_mome_rows(&mf, nm, ts, s, t,
                                                      G, K, half, py_gate,
                                                      rh_gate, sp, cd,
                                                      K_experts, seed);
                 if (rc_m == -1) goto fail;
+                if (rc_m == +1) {
+                    /* split rejected → don't pretend we have a router. */
+                    gate_router_src = NULL;
+                }
             }
             if (rc_m == +1) {
                 if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
@@ -2406,7 +2493,9 @@ int pqv2_convert(const char *input_path,
         if (K_experts > 1 && K_experts <= 32 && hidden > 0) {
             char base[64];
             snprintf(base, sizeof(base), "L%d.mlp", l);
-            if (push_zero_router(&mf, base, hidden, K_experts) != 0) goto fail;
+            if (push_zero_router(&mf, base, hidden, K_experts,
+                                  gate_router_src, gate_router_dtype,
+                                  gate_router_rows) != 0) goto fail;
         }
         if (pq6_find_layer(ts, &names, l, names.input_norm, &s, &t) == 0) {
             snprintf(nm, sizeof(nm), "L%d.input_layernorm", l);

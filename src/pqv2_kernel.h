@@ -31,14 +31,15 @@ typedef struct {
     uint32_t l2_idx_bits;
 
     /* Stage 5k — scale precision encoding. 0 = legacy (row_scale fp16,
-     * cb_scale fp16). 2 = row_scale fp8 E4M3 and cb_scale fp8 E4M3
-     * (H2 sp2 redesign — Agent 3 round 1 fix; was int8+row_max for
-     * row_scale, which collapsed multi-decade dynamic range and bloated
-     * PPL). Modes 1 and 3 are reserved per the doc but unimplemented
-     * in v1. The kernel ALWAYS reads `row_scale` and `cb_scale` as
-     * uint16 fp16 — when mode != 0, the loader decodes the on-disk fp8
-     * bytes into newly-allocated fp16 arrays at parse time, so the hot
-     * inner loops stay byte-identical. Cost absorbed in the load-time
+     * cb_scale fp16). 2 = row_scale fp8 E4M3, cb_scale fp16 (Goal I2;
+     * previously row+cb fp8 but the cb_scale distribution clusters in
+     * E4M3's subnormal band and 30% of codewords flushed to zero —
+     * see pqv2_encode.c and pqv2_format.c). Modes 1 and 3 are reserved
+     * per the doc but unimplemented in v1. The kernel ALWAYS reads
+     * `row_scale` and `cb_scale` as uint16 fp16 — when mode != 0, the
+     * loader decodes the on-disk fp8 bytes for row_scale only into
+     * newly-allocated fp16 arrays at parse time, so the hot inner
+     * loops stay byte-identical. Cost absorbed in the load-time
      * codebook prebuild. */
     uint32_t scale_precision;
 

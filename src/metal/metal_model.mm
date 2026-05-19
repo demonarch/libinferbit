@@ -618,7 +618,16 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
      * pq_idx at a shared scratch MTLBuffer that the forward path
      * refills per matmul. Keeps GPU weight RAM bounded regardless of
      * model size. token_embedding overrides via keep_indices_resident=1
-     * because embed_lookup needs random-access reads. */
+     * because embed_lookup needs random-access reads.
+     *
+     * Goal I1: when the tensor is a pyramid (l2_kind == 2), we must
+     * NOT early-return here — the L2 codebook + L2 indices upload at
+     * the bottom of this function is required for the dispatcher
+     * (rec_matmul_tb) to route to the l2residual kernel. Without it
+     * pq_K_l2 stays 0 and the flat decoder runs on pyramid data
+     * (Round 8 H3 symptom: PPL 6.26 instead of 5.886). Set the L1
+     * drive metadata, then fall through to the L2 upload block. */
+    int skip_l1_upload = 0;
     if (m && m->residency_mode == 1 && pq->indices_file_offset != 0
         && !keep_indices_resident) {
         out->pq_idx = NULL;
@@ -631,10 +640,15 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
         out->pq_drive_file_offset = (m->drive_fd_pretransposed >= 0)
             ? pq->indices_pretransposed_offset
             : pq->indices_file_offset;
-        return;
+        skip_l1_upload = 1;
+    } else {
+        out->pq_drive_file_offset = 0;
     }
-    out->pq_drive_file_offset = 0;
 
+    /* Goal I1: when skip_l1_upload is set (GPU drive mode), the L1
+     * MTLBuffer is shared scratch — bypass the per-tensor L1 upload
+     * but still fall through to the L2 pyramid upload below. */
+  if (!skip_l1_upload) {
     /* Stage 5g.2 — when the encoder wrote L1 indices in row-major
      * ([M][n_chunks][n_subchunks]) on disk, the layout already matches
      * exactly what the GPU SIMD kernel reads. Skip the transpose +
@@ -706,6 +720,7 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
         out->pq_idx = ib_metal_alloc(ctx, idx_bytes, idx_t);
         free(idx_t);
     }
+  } /* end if (!skip_l1_upload) — Goal I1 */
 
     /* PQv2 pyramid (Stage 5a, docs/v2/00_CORRECTION.md): when the
      * source tensor carries a second-level codebook (l2_kind == 2,

@@ -36,21 +36,28 @@
  *         scale_precision >= 1; ~10-decade dynamic range — replaces the
  *         original int8[M]+fp16 row_max codec that lost small rows),
  *       cb_q[rows*K*half] int8 — rows = cb_pool_size if > 0 else ns (Stage 5j),
- *       cb_scale[rows*K] fp16 (legacy) OR fp8 E4M3 (Stage 5k, scale_precision >= 2),
+ *       cb_scale[rows*K] fp16 — ALWAYS fp16 (Goal I2 rollback). The
+ *         Stage 5k sp=2 redesign briefly packed cb_scale as fp8 too,
+ *         but cb_scale's distribution clusters near E4M3's subnormal
+ *         floor (1e-3..5e-3) and 30% of codewords flushed to zero —
+ *         that, not row_scale, drove the sp=2 PPL regression. cb_scale
+ *         fp16 is correct under both sp=0 and sp=2.
  *       cb_pool_id[ns] u8 — ONLY present when cb_pool_size > 0 (Stage 5j),
  *       indices[M*nc*ns] u8 (transposed [nc, ns, M]),
  *       L2 (if l2_kind==2): l2_cb_q[l2_rows*l2_K*half],
- *         l2_cb_scale[l2_rows*l2_K] fp16/fp8,
+ *         l2_cb_scale[l2_rows*l2_K] fp16,
  *         l2_cb_pool_id[ns] u8 (only when l2_cb_pool_size > 0),
  *         l2_indices.
  *       Header sizes evolve in append-only fashion:
  *          8 u32 — legacy v0.4.0.
  *          9 u32 — Stage 5h.1: + l2_idx_bits.
  *         10 u32 — Stage 5c   : + residency_hint (0=AUTO, 1=RAM, 2=DRIVE).
- *         11 u32 — Stage 5k   : + scale_precision (0=fp16/fp16,
- *                                                  2=fp8 E4M3 / fp8 E4M3
- *                                                  — H2 sp2 redesign,
- *                                                  see pqv2_encode.c).
+ *         11 u32 — Stage 5k   : + scale_precision
+ *                                  (0 = row fp16 / cb fp16,
+ *                                   2 = row fp8  / cb fp16 — Goal I2;
+ *                                       previously row+cb fp8 but
+ *                                       cb_scale's subnormal-band loss
+ *                                       drove a PPL regression).
  *         13 u32 — Stage 5j   : + cb_pool_size + l2_cb_pool_size.
  *       Parser disambiguates by reconciling header size against the
  *       blob's total length (see parse_pqv2_blob in pqv2_format.c). Old
