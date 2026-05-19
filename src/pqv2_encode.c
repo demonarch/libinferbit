@@ -35,7 +35,7 @@ static inline float    enc_h2f(uint16_t h) { return ib_fp16_to_fp32(h); }
  * documented in metal_model.mm:441-466. */
 #define IB_PQV2_FP16_MIN_NORMAL  6.103515625e-5f
 
-/* ── Stage 5k: fp8 (E4M3) + int8 row_scale codecs ────────────────────
+/* ── Stage 5k: fp8 (E4M3) row_scale + cb_scale codecs ────────────────
  *
  * E4M3 layout (per the OCP "FP8 Formats for Deep Learning" spec, see
  * https://arxiv.org/abs/2209.05433):
@@ -47,9 +47,19 @@ static inline float    enc_h2f(uint16_t h) { return ib_fp16_to_fp32(h); }
  *   1 <= exp <= 14 : normal    value = sign * 2^(exp-7) * (1 + mant/8)
  *   exp == 15 + mant == 7 (binary 1111 111) : sentinel NaN (no Inf in E4M3)
  *
- * Max representable magnitude ≈ 448 (1.75 × 2^8). This easily covers
- * the dynamic range of PQv2 codebook scales, which are typically
- * `max(|cw|) / 127` for normalized weight rows — bounded near 1/127.
+ * Max representable magnitude ≈ 448 (1.75 × 2^8) — covers the full
+ * dynamic range of PQv2 row_scale (multi-decade, ~10 decades) and
+ * codebook scales.
+ *
+ * H2 sp2 redesign (Agent 3 round 1 fix): row_scale previously used a
+ * linear int8[M] + fp16 row_max codec, which collapsed the multi-decade
+ * row-scale range into a single linear quantum (~|row_max|/127 ≈ 3
+ * decades useful). Llama-3 / TinyLlama row_scales span 6-10 decades
+ * across rows of a single tensor, so the int8 path floored small rows
+ * to zero and produced PPL 34-50. Switching row_scale to fp8 E4M3
+ * (logarithmic, ~6-12% per-row relative error) restores ~10 decades
+ * of dynamic range; cb_scale already uses E4M3 since it has the same
+ * dynamic-range pathology.
  *
  * Decode is one read + a few shifts/multiplies; encode is one log2
  * + bias + clamp. Both stay inside a single SIMD register-equivalent —
@@ -132,16 +142,16 @@ static inline uint8_t enc_f32_to_e4m3(float f) {
     return (uint8_t)((sign << 7) | ((uint32_t)biased << 3) | (uint32_t)m);
 }
 
-/* Encode an fp16-valued row_scale array as int8[M] + a single fp16
- * row_max. Reads `src_fp16[M]`, fills `dst_int8[M]` and `*out_row_max`.
- *
- * Decode invariant: `recovered_fp16[m] ≈ (int8[m] / 127) * row_max`.
- * Quantization error is at most |row_max| / 254 per row scale, which
- * is negligible vs typical row_scale dynamic range (the row_scale
- * already varies by orders of magnitude across rows of a given
- * weight; pinning the per-tensor max anchors the cheap dim). */
-static void enc_pack_row_scale_int8(const uint16_t *src_fp16, int M,
-                                      int8_t *dst_int8, uint16_t *out_row_max)
+/* DEPRECATED (H2 sp2 redesign): the original Stage 5k row_scale codec
+ * packed fp16[M] into int8[M] + fp16 row_max, recovering each row scale
+ * as `(int8[m] / 127) * row_max`. That codec is fundamentally wrong for
+ * LLM row_scales, which span 6-10 decades within a single tensor —
+ * linear quantization with a per-tensor anchor floored the small-magnitude
+ * rows to zero and inflated PPL to 34-50. Kept here (compile-time-unused)
+ * so the codec history is recoverable; no caller uses it now. */
+static void __attribute__((unused))
+enc_pack_row_scale_int8(const uint16_t *src_fp16, int M,
+                          int8_t *dst_int8, uint16_t *out_row_max)
 {
     float ax = 0.0f;
     for (int m = 0; m < M; m++) {
@@ -149,7 +159,6 @@ static void enc_pack_row_scale_int8(const uint16_t *src_fp16, int M,
         float a = v < 0 ? -v : v;
         if (a > ax) ax = a;
     }
-    /* Clamp at fp16 min-normal so empty-row tensors don't underflow. */
     if (ax < IB_PQV2_FP16_MIN_NORMAL) ax = IB_PQV2_FP16_MIN_NORMAL;
     uint16_t max_h = enc_f2h(ax);
     float max_f = enc_h2f(max_h);
@@ -161,6 +170,23 @@ static void enc_pack_row_scale_int8(const uint16_t *src_fp16, int M,
         if (q > 127)  q = 127;
         if (q < -128) q = -128;
         dst_int8[m] = (int8_t)q;
+    }
+}
+
+/* Encode an fp16-valued row_scale array as fp8 E4M3 bytes — one byte
+ * per row scale. Same codec as cb_scale.
+ *
+ * Decode invariant: `recovered_fp16[m] ≈ pqv2_e4m3_to_f32(fp8[m])`.
+ * Per-row relative error is bounded by E4M3's mantissa step
+ * (~1/8 ≈ 6-12%), independent of the per-tensor dynamic range. Covers
+ * approximately 10 decades end-to-end (2^-9 subnormal floor to 448
+ * saturation), which is enough to encode every Llama-3 / TinyLlama
+ * row_scale we have measured without anchor loss. */
+static void enc_pack_row_scale_e4m3(const uint16_t *src_fp16, int M,
+                                      uint8_t *dst_e4m3)
+{
+    for (int m = 0; m < M; m++) {
+        dst_e4m3[m] = enc_f32_to_e4m3(enc_h2f(src_fp16[m]));
     }
 }
 
@@ -831,6 +857,42 @@ static void pqv2_pack_l2_row_6bit(const uint8_t *src_m, uint32_t M, uint8_t *dst
     }
 }
 
+/* Goal N36 — pack a row of M uint8 L2 indices (each in [0..15]) into
+ * ceil(M/2) bytes using 4-bit nibble packing:
+ *   byte0 = (i0 & 0x0F) | ((i1 & 0x0F) << 4)
+ * Mirror of the 6-bit packer above; two indices per byte, low nibble
+ * first. Used when l2_K <= 16 (the kernel's single-bank vqtbl1q_s8
+ * gather supports K up to 16). */
+static void pqv2_pack_l2_row_4bit(const uint8_t *src_m, uint32_t M, uint8_t *dst) {
+    uint32_t m = 0;
+    while (m + 2 <= M) {
+        uint8_t i0 = src_m[m + 0] & 0x0F;
+        uint8_t i1 = src_m[m + 1] & 0x0F;
+        dst[0] = (uint8_t)(i0 | (i1 << 4));
+        dst += 1;
+        m += 2;
+    }
+    if (m < M) {
+        uint8_t i0 = src_m[m + 0] & 0x0F;
+        dst[0] = (uint8_t)i0;  /* high nibble pads with zero */
+    }
+}
+
+/* Goal N36 — L2 codebook size override. Default 64 preserves v0.4.x
+ * behavior; set IB_L2_K=16 (or any 1..64 value, clamped) to shrink the
+ * L2 codebook (and thus the per-row packed-index byte count). The
+ * encoder uses 4-bit packing when the resolved value is ≤ 16, else
+ * falls back to 6-bit (≤64). */
+static int pqv2_resolve_l2_k(int pyramid) {
+    if (!pyramid) return 0;
+    const char *e = getenv("IB_L2_K");
+    if (e && e[0]) {
+        long v = strtol(e, NULL, 10);
+        if (v >= 1 && v <= 64) return (int)v;
+    }
+    return 64;
+}
+
 static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
                               int l2_kind, int l2_K,
                               const uint16_t *row_scale_fp16,
@@ -847,14 +909,16 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
                               size_t *out_size)
 {
     size_t n_chunks = (size_t)N / G;
-    /* Stage 5k row_scale layout.
-     *   sp = 0 : fp16[M]          (legacy)
-     *   sp = 2 : int8[M] + fp16 row_max (saves M bytes per tensor) */
-    int sp_int8_rs  = (scale_precision >= 2);
+    /* Stage 5k row_scale layout (H2 sp2 redesign — Agent 3 round 1 fix).
+     *   sp = 0 : fp16[M]   (legacy, 2*M bytes)
+     *   sp = 2 : fp8[M]    (E4M3, M bytes — saves M bytes per tensor and
+     *                      recovers the ~10-decade dynamic range that
+     *                      the previous int8+row_max codec lost). */
+    int sp_fp8_rs   = (scale_precision >= 2);
     int sp_fp8_cbs  = (scale_precision >= 2);
     size_t row_bytes;
-    if (sp_int8_rs) {
-        row_bytes = (size_t)M + 2u;   /* int8[M] + fp16 row_max */
+    if (sp_fp8_rs) {
+        row_bytes = (size_t)M;        /* fp8 E4M3[M] */
     } else {
         row_bytes = (size_t)M * 2;     /* legacy fp16[M] */
     }
@@ -872,10 +936,16 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
     size_t cb_pool_id_bytes = pool_on ? (size_t)n_sub : 0u;
     size_t idx_bytes    = (size_t)M * n_chunks * n_sub;
     /* Decide whether to bit-pack the L2 index stream. The kernel hot path
-     * is gated on l2_K ≤ 64 elsewhere; 6-bit-packing requires the same. */
-    int pack_l2 = (l2_kind == 2 && l2_K > 0 && l2_K <= 64);
-    uint32_t l2_idx_bits = pack_l2 ? 6u : 8u;
-    size_t l2_packed_bytes_per_row = ((size_t)M + 3u) / 4u * 3u;
+     * is gated on l2_K ≤ 64 elsewhere; 6-bit-packing requires the same.
+     * Goal N36: when l2_K ≤ 16, switch to 4-bit nibble packing (2 indices
+     * per byte) for a further 33% L2-index savings. */
+    int pack_l2_4bit = (l2_kind == 2 && l2_K > 0 && l2_K <= 16);
+    int pack_l2_6bit = (l2_kind == 2 && l2_K > 0 && l2_K <= 64 && !pack_l2_4bit);
+    int pack_l2 = pack_l2_4bit || pack_l2_6bit;
+    uint32_t l2_idx_bits = pack_l2_4bit ? 4u : (pack_l2_6bit ? 6u : 8u);
+    size_t l2_packed_bytes_per_row = pack_l2_4bit
+        ? (((size_t)M + 1u) / 2u)
+        : (((size_t)M + 3u) / 4u * 3u);
     size_t l2_idx_disk = pack_l2
         ? n_chunks * (size_t)n_sub * l2_packed_bytes_per_row
         : idx_bytes;
@@ -897,7 +967,7 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
      * (Stage 5c readers) still consume the file. Files only grow when
      * the user opts into 5k / 5j / 5g.2 knobs. */
     int need_pool   = (cb_pool_size_w != 0u) || (l2_cb_pool_size_w != 0u);
-    int need_sp     = (sp_int8_rs || sp_fp8_cbs);
+    int need_sp     = (sp_fp8_rs || sp_fp8_cbs);
     int need_layout = (l1_idx_layout != 0);
     int header_u32s;
     size_t header_bytes;
@@ -956,13 +1026,10 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
      * we drop those slots. */
     memcpy(buf + cur, hdr, (size_t)header_u32s * 4u); cur += (size_t)header_u32s * 4u;
 
-    /* row_scale: legacy fp16[M] OR int8[M] + fp16 row_max (Stage 5k). */
-    if (sp_int8_rs) {
-        int8_t *rs_int8 = (int8_t *)(buf + cur);
-        uint16_t row_max;
-        enc_pack_row_scale_int8(row_scale_fp16, M, rs_int8, &row_max);
-        memcpy(buf + cur + (size_t)M, &row_max, 2);
-        cur += (size_t)M + 2u;
+    /* row_scale: legacy fp16[M] OR fp8 E4M3[M] (Stage 5k, H2 sp2). */
+    if (sp_fp8_rs) {
+        enc_pack_row_scale_e4m3(row_scale_fp16, M, buf + cur);
+        cur += (size_t)M;
     } else {
         memcpy(buf + cur, row_scale_fp16, row_bytes); cur += row_bytes;
     }
@@ -1011,7 +1078,10 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
                         + (c * (size_t)n_sub + s) * (size_t)M;
                     uint8_t *dst_row = buf + cur
                         + (c * (size_t)n_sub + s) * l2_packed_bytes_per_row;
-                    pqv2_pack_l2_row_6bit(src_row, (uint32_t)M, dst_row);
+                    if (pack_l2_4bit)
+                        pqv2_pack_l2_row_4bit(src_row, (uint32_t)M, dst_row);
+                    else
+                        pqv2_pack_l2_row_6bit(src_row, (uint32_t)M, dst_row);
                 }
             }
             cur += l2_idx_disk;
@@ -1056,9 +1126,9 @@ static int push_pqv2_tensor(ib6_manifest *mf, const char *name,
      * path is hard-coded for l2_K ≤ 64. Larger l2_K would silently get
      * skipped by pqv2_threaded_matvec_k256 (forward.c) and the
      * single-thread variant (pqv2_kernel.c::pqv2_matvec_tbl_int8_k256
-     * line ~1010) — both guard on `l2_K <= 64`. We pick 64 (the max the
-     * kernel supports) for best residual quality. */
-    int l2_K = pyramid ? 64 : 0;
+     * line ~1010) — both guard on `l2_K <= 64`. Default 64; IB_L2_K=16
+     * (Goal N36) switches encoder + kernel to 4-bit packing. */
+    int l2_K = pqv2_resolve_l2_k(pyramid);
 
     size_t row_count    = (size_t)M;
     size_t cb_q_count   = (size_t)n_sub * K * half;
@@ -1426,7 +1496,7 @@ static int read_and_push_pqv2_mome_rows(ib6_manifest *mf,
     int M_per  = rows / K_experts;
     int n_chunks = N / G;
     int n_sub    = G / half;
-    int l2_K     = pyramid ? 64 : 0;
+    int l2_K     = pqv2_resolve_l2_k(pyramid);
 
     float *W = (float *)malloc((size_t)M_full * N * sizeof(float));
     if (!W) { ib_set_error("oom reading %s", base_name); return -1; }
@@ -1560,7 +1630,7 @@ static int read_and_push_pqv2_mome_cols(ib6_manifest *mf,
     int N_full   = cols;
     int n_chunks = N_full / G;
     int n_sub    = G / half;
-    int l2_K     = pyramid ? 64 : 0;
+    int l2_K     = pqv2_resolve_l2_k(pyramid);
     if ((n_chunks % K_experts) != 0) {
         /* Shared-codebook col-split requires the chunk count to divide
          * cleanly so each expert owns a contiguous CHUNK range (PQv2

@@ -128,6 +128,18 @@ typedef struct {
     float *scales_fp32;
     float *blk32_scales_fp32;
     float *norm_fp32;
+    /* ── Goal H4 — hot-cache instrumentation (scaffolding) ──────────
+     *
+     * Per-tensor access counter, incremented at every tensor_matmul
+     * entry. Used by the future adaptive hot-cache to decide which
+     * tensors to promote into the hot pool. Currently diagnostic only;
+     * enable the per-call increment + end-of-run top-10 summary by
+     * setting IB_TENSOR_HOTSET=1 (otherwise the counter stays zero
+     * and the matmul path skips the bump entirely).
+     *
+     * Lives next to the static scale caches because it's logically a
+     * cache-management hint, not part of the on-disk layout. */
+    uint64_t access_count;
 } ib_tensor_meta;
 
 /* ── Per-layer metadata ─────────────────────────────────────── */
@@ -398,6 +410,27 @@ struct inferbit_model {
     int    dflash_decode_step;          /* number of decode steps observed since attach */
     int    dflash_full_count;
     int    dflash_early_count;
+
+    /* ── Goal H4 — adaptive hot-cache (scaffolding only) ─────────────
+     *
+     * Small RAM-resident pool intended to hold frequently-touched
+     * tensors/codebooks during a generation. Today this is JUST the
+     * framework: the allocation, the lookup/promote API entry points,
+     * and the per-tensor access counters. The adaptive promotion
+     * policy that decides which tensors to copy in (and when to
+     * evict) is a follow-up patch — see ib_hot_lookup / ib_hot_promote
+     * below for the stub semantics.
+     *
+     *   hot_pool         : malloc'd region; default 32 MB, sized via
+     *                       IB_HOT_POOL_MB (set to 0 to disable). NULL
+     *                       when disabled or alloc failed (non-fatal).
+     *   hot_pool_bytes   : actual byte capacity of hot_pool.
+     *   hot_pool_entries : number of tensors currently held (always 0
+     *                       in the scaffolding — ib_hot_promote is a
+     *                       no-op until the adaptive logic lands). */
+    void  *hot_pool;
+    size_t hot_pool_bytes;
+    int    hot_pool_entries;
 };
 
 /* ── Config struct ──────────────────────────────────────────── */
@@ -740,6 +773,41 @@ void ib_tensor_matmul_cpu(const inferbit_model *m, const ib_tensor_meta *t,
  * expensive than ib_forward by one LM head per token. */
 int ib_forward_positions(inferbit_model* model, const int32_t* tokens,
                          int num_tokens, float* out_logits);
+
+/* ── Goal H4 — hot-cache framework (scaffolding only) ───────────
+ *
+ * The runtime layer that will (eventually) hold a small RAM pool of
+ * the hottest tensors during generation. v1 ships ONLY:
+ *   • a per-tensor access counter (ib_tensor_meta::access_count),
+ *     bumped at every tensor_matmul entry when IB_TENSOR_HOTSET=1.
+ *   • a model-owned hot_pool buffer (sized by IB_HOT_POOL_MB, default
+ *     32 MB; 0 disables).
+ *   • the two API stubs below, intentionally no-ops so callers can
+ *     wire them in now without changing observable behaviour.
+ *
+ * Env knobs:
+ *   IB_TENSOR_HOTSET=1  enable per-tensor access-count tracking +
+ *                       top-10 summary on inferbit_free.
+ *   IB_HOT_POOL_MB=N    hot-pool size in MB (default 32; 0 disables).
+ */
+
+/* Returns non-zero iff IB_TENSOR_HOTSET=1 was set when the process
+ * started. Cached on first call so the matmul hot path stays branch-
+ * predictor-friendly. */
+int ib_hotset_enabled(void);
+
+/* Try to find a hot copy of this tensor's bytes. Returns NULL if not
+ * in the hot pool. Callers fall through to the regular mmap/drive path. */
+const void *ib_hot_lookup(const inferbit_model *m, const ib_tensor_meta *t);
+
+/* Promote a tensor's bytes to the hot pool (memcpy from source).
+ * Returns 0 on success, non-zero if the pool is full or the tensor
+ * is too large. Caller is responsible for deciding when to promote. */
+int ib_hot_promote(inferbit_model *m, const ib_tensor_meta *t);
+
+/* Print a top-N most-accessed-tensors summary to stderr. No-op when
+ * IB_TENSOR_HOTSET is unset. Invoked by inferbit_free. */
+void ib_hotset_report(const inferbit_model *m);
 
 /* ── Threading ──────────────────────────────────────────────── */
 

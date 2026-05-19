@@ -27,6 +27,9 @@
 #include <errno.h>
 #include <sys/mman.h>
 
+/* pqv2_kernel.h is wrapped in extern "C" so pqv2_h2f / pqv2_f2h are
+ * C-linkage when included from this .mm — no forward decls needed. */
+
 /* Per-tensor GPU buffer set. EITHER (w, s, bits, blk32) — for INT4/INT8 —
  * OR (pq_rs, pq_cb, pq_idx, pq_M, pq_N, pq_G, pq_ns) — for PQv2 — is
  * populated. `is_pq` selects which path the dispatcher uses. */
@@ -230,14 +233,21 @@ static int model_is_supported(const inferbit_model *m, char *err, size_t err_sz)
               "PQv2 GPU path requires K=256 and half=2 on output_head");
         /* l2_kind == 0 (flat) and l2_kind == 2 (pyramid, K_L2 ≤ 64) both
          * supported on GPU after Stage 5a (docs/v2/00_CORRECTION.md).
-         * Pyramid + GPU drive streaming is not yet wired (would need a
-         * second shared-scratch ring for the L2 indices). */
+         *
+         * Goal H3 (partial): pyramid + GPU drive (IB_RESIDENCY_MODE=drive)
+         * is now permitted. L1 indices continue to stream through the
+         * shared scratch ring as in flat drive mode; the L2 codebook and
+         * L2 indices are uploaded fully resident at model upload time
+         * (preading from drive_fd at l2_indices_file_offset when the
+         * mmap-backed pq->l2_indices pointer is the empty drive scratch).
+         * L2 streaming would need a second shared-scratch ring — kept as
+         * a follow-up; for now we trade some Metal RAM (L2 indices are
+         * ~1/8th to 1/4 of L1 idx bytes depending on l2_idx_bits) for the
+         * much larger savings of L1 streaming. */
         if (m->output_head.pq->l2_kind != 0) {
             CHECK(m->output_head.pq->l2_kind == 2 && m->output_head.pq->l2_K > 0
                   && m->output_head.pq->l2_K <= 64,
                   "PQv2 L2 residual on output_head requires l2_kind=2 and 1 ≤ K_L2 ≤ 64");
-            CHECK(m->residency_mode != 1 || m->output_head.pq->indices_file_offset == 0,
-                  "PQv2 pyramid on GPU output_head not yet supported in drive (streaming) mode");
         }
     } else {
         CHECK(m->output_head.bits == 4 || m->output_head.bits == 8 || m->output_head.bits == 16,
@@ -255,8 +265,12 @@ static int model_is_supported(const inferbit_model *m, char *err, size_t err_sz)
                     CHECK(tt->pq->l2_kind == 2 && tt->pq->l2_K > 0 \
                           && tt->pq->l2_K <= 64, \
                           "PQv2 L2 residual requires l2_kind=2 and 1 ≤ K_L2 ≤ 64: " #name); \
-                    CHECK(m->residency_mode != 1 || tt->pq->indices_file_offset == 0, \
-                          "PQv2 pyramid on GPU not yet supported in drive (streaming) mode: " #name); \
+                    /* Goal H3: drive-mode pyramid is supported — see the \
+                     * matching block above for output_head. L1 streams; \
+                     * L2 codebook + L2 indices are uploaded resident in \
+                     * upload_pqv2_tensor_ex (preading from drive_fd at \
+                     * pq->l2_indices_file_offset when the mmap pointer is \
+                     * the empty drive scratch). */ \
                 } \
             } else { \
                 CHECK(tt->bits == 4 || tt->bits == 8, \
@@ -281,8 +295,7 @@ static int model_is_supported(const inferbit_model *m, char *err, size_t err_sz)
                     CHECK(tt->pq->l2_kind == 2 && tt->pq->l2_K > 0 \
                           && tt->pq->l2_K <= 64, \
                           "PQv2 L2 residual requires l2_kind=2 and 1 ≤ K_L2 ≤ 64: " #name); \
-                    CHECK(m->residency_mode != 1 || tt->pq->indices_file_offset == 0, \
-                          "PQv2 pyramid on GPU not yet supported in drive (streaming) mode: " #name); \
+                    /* Goal H3: drive-mode pyramid allowed — see TENSOR_OK. */ \
                 } \
             } else { \
                 CHECK(tt->bits == 4 || tt->bits == 8, \
@@ -560,17 +573,17 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
     if (!cb_fp16) { fprintf(stderr, "upload_pqv2_tensor: oom\n"); return; }
     for (uint32_t s = 0; s < pq->n_subchunks; s++) {
         for (uint32_t k = 0; k < pq->K; k++) {
-            /* cb_scale stored as raw uint16 fp16 — convert via union/memcpy. */
+            /* cb_scale stored as raw uint16 fp16. Previously decoded via
+             * a (exp + 0x70)<<23 shift that only handled fp16 NORMALS
+             * correctly — fp16 denormals (exp == 0, mant != 0) decoded
+             * 7-12× too large. L1 cb_scales stay normal in current
+             * encoders, so this didn't bite L1 in practice, but the same
+             * decode is shared with the L2 path below where denormal
+             * scales are routine. Use the canonical pqv2_h2f helper
+             * (matches pqv2_kernel.c::pqv2_h2f) so both paths handle
+             * denormals correctly. */
             uint16_t scl_bits = pq->cb_scale[s * pq->K + k];
-            uint32_t bits32 =
-                ((scl_bits & 0x8000u) << 16) |
-                ((((uint32_t)(scl_bits & 0x7C00u) >> 10) + 0x70u) << 23) |
-                ((uint32_t)(scl_bits & 0x03FFu) << 13);
-            /* zero / denorm / inf handling */
-            if ((scl_bits & 0x7FFFu) == 0) bits32 = (uint32_t)(scl_bits & 0x8000u) << 16;
-            else if ((scl_bits & 0x7C00u) == 0x7C00u) bits32 = ((uint32_t)(scl_bits & 0x8000u) << 16) | 0x7F800000u;
-            float scl;
-            memcpy(&scl, &bits32, 4);
+            float scl = pqv2_h2f(scl_bits);
             for (uint32_t h = 0; h < pq->half; h++) {
                 int8_t q = pq->cb_q[(s * pq->K + k) * pq->half + h];
                 float v = (float)q * scl;
@@ -703,19 +716,22 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
      *   - cb_l2: int8 + fp16 scales → pre-decoded fp16 [ns][K_L2][half]
      *   - idx_l2: on-disk [n_chunks][n_subchunks][M] u8, transposed
      *     to [M][n_chunks * n_subchunks] u8 for coalesced GPU reads.
+     *     (l2_idx_bits == 6: the on-disk packed [total][ceil(M/4)*3]
+     *     layout is uploaded as-is.)
      *
-     * Only enabled in non-drive mode for the initial 5a landing —
-     * pyramid + GPU drive streaming is a follow-up (would need a
-     * second shared-scratch ring + per-matmul L2 pread). */
+     * Goal H3 (partial drive support): pyramid + GPU drive is now
+     * permitted. L1 indices continue to stream through the shared
+     * scratch ring (handled above); the L2 codebook + L2 indices are
+     * uploaded fully resident here. In drive mode the source buffer
+     * pq->l2_indices is the (empty) drive scratch slot — we pread the
+     * real bytes from the IBF at pq->l2_indices_file_offset into a
+     * temporary host buffer first, then hand them to Metal. Full L2
+     * streaming (a second shared-scratch ring) is a follow-up; for now
+     * we keep L2 indices fully resident on Metal because they are
+     * ~1/4 to 1× the L1 idx bytes (depends on l2_idx_bits) — small
+     * compared to the L1 footprint we just kept off the GPU. */
     if (pq->l2_kind == 2 && pq->l2_K > 0 && pq->l2_K <= 64
-        && pq->l2_cb_q && pq->l2_cb_scale && pq->l2_indices
-        && out->pq_drive_file_offset != 0) {
-        fprintf(stderr, "ib_metal: upload_pqv2_tensor_ex: PQv2 pyramid (l2_kind=2, K_L2=%u) present but tensor is in GPU drive (streaming) mode — pyramid L2 streaming not supported in drive mode; L2 residual upload skipped (results will be wrong)\n",
-                (unsigned)pq->l2_K);
-    }
-    if (pq->l2_kind == 2 && pq->l2_K > 0 && pq->l2_K <= 64
-        && pq->l2_cb_q && pq->l2_cb_scale && pq->l2_indices
-        && out->pq_drive_file_offset == 0) {
+        && pq->l2_cb_q && pq->l2_cb_scale && pq->l2_indices) {
         size_t cb2_elts  = (size_t)pq->n_subchunks * pq->l2_K * pq->half;
         size_t cb2_bytes = cb2_elts * sizeof(uint16_t);
         uint16_t *cb2_fp16 = (uint16_t *)malloc(cb2_bytes);
@@ -726,17 +742,25 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
         if (cb2_fp16) {
             for (uint32_t s = 0; s < pq->n_subchunks; s++) {
                 for (uint32_t k = 0; k < pq->l2_K; k++) {
+                    /* Decode the per-codeword fp16 scale to fp32. The
+                     * Naive (exp+0x70)<<23 formula above is correct only
+                     * for fp16 NORMAL values (exp ∈ [1, 30]). L2 residual
+                     * scales are routinely DENORMAL (exp == 0, mant != 0,
+                     * value = mant/1024 * 2^-14), and the naive formula
+                     * decodes those as `(1 + mant/1024) * 2^-15`, which
+                     * is ~7-12× too large. That inflated scale made every
+                     * L2 codeword 7-12× larger than CPU, turning the L2
+                     * "small residual" into a destructive contribution
+                     * (matches pyramid Metal RAM PPL 9.47 vs CPU 5.91).
+                     * Use the same explicit decode that
+                     * pqv2_kernel.c::pqv2_h2f does. The L1 cb_scale path
+                     * isn't hit by this bug in practice because L1 scales
+                     * stay in the normal range, but feed it through the
+                     * same helper so future small-scale L1 codebooks
+                     * (e.g. Stage 5k INT8-row-scale variants) decode
+                     * correctly too. */
                     uint16_t scl_bits = pq->l2_cb_scale[s * pq->l2_K + k];
-                    uint32_t bits32 =
-                        ((scl_bits & 0x8000u) << 16) |
-                        ((((uint32_t)(scl_bits & 0x7C00u) >> 10) + 0x70u) << 23) |
-                        ((uint32_t)(scl_bits & 0x03FFu) << 13);
-                    if ((scl_bits & 0x7FFFu) == 0)
-                        bits32 = (uint32_t)(scl_bits & 0x8000u) << 16;
-                    else if ((scl_bits & 0x7C00u) == 0x7C00u)
-                        bits32 = ((uint32_t)(scl_bits & 0x8000u) << 16) | 0x7F800000u;
-                    float scl;
-                    memcpy(&scl, &bits32, 4);
+                    float scl = pqv2_h2f(scl_bits);
                     for (uint32_t h = 0; h < pq->half; h++) {
                         int8_t q = pq->l2_cb_q[(s * pq->l2_K + k) * pq->half + h];
                         float v = (float)q * scl;
@@ -759,32 +783,82 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
          *     for a (slot, m/4) group and extracts the m%4-th 6-bit lane.
          *     The 4-row sharing means consecutive rows in a warp hit the
          *     same 3-byte triple — coalesced enough for the residual
-         *     pass, which is bandwidth-secondary to L1 anyway. */
+         *     pass, which is bandwidth-secondary to L1 anyway.
+         *
+         * Goal H3 drive-mode sourcing: when the model is in drive mode,
+         * pq->l2_indices points at the (empty) shared L2 scratch — we
+         * cannot dereference it. pread the real L2 bytes from drive_fd
+         * at pq->l2_indices_file_offset into a temporary host buffer
+         * (size = the disk L2 byte count, which matches the upload
+         * byte count for both layouts) and use that as the source. */
         uint32_t l2_bits = (pq->l2_idx_bits == 6) ? 6u : 8u;
         out->pq_l2_idx_bits = (int)l2_bits;
         uint8_t *idx_l2_t = NULL;
         size_t idx_l2_bytes;
+        uint32_t nc_l2 = pq->N / pq->G;
+        size_t l2_disk_bytes;
         if (l2_bits == 6) {
-            uint32_t nc = pq->N / pq->G;
             size_t packed_row = ((size_t)pq->M + 3u) / 4u * 3u;
-            idx_l2_bytes = (size_t)nc * pq->n_subchunks * packed_row;
-            /* Upload directly from the on-disk packed buffer — same
-             * layout the GPU kernel expects. */
-            out->pq_idx_l2 =
-                ib_metal_alloc(ctx, idx_l2_bytes, pq->l2_indices);
+            idx_l2_bytes = (size_t)nc_l2 * pq->n_subchunks * packed_row;
+            l2_disk_bytes = idx_l2_bytes;  /* same packed layout on disk */
         } else {
-            idx_l2_bytes = idx_bytes;
+            idx_l2_bytes = idx_bytes;                                   /* [M][total] u8 */
+            l2_disk_bytes = (size_t)pq->M * nc_l2 * pq->n_subchunks;     /* [nc][ns][M] u8 */
+        }
+        /* In drive mode pq->l2_indices is the empty scratch slot; fetch
+         * the real bytes from disk into a temp buffer. Otherwise the
+         * mmap'd l2_indices pointer is live and we use it directly. */
+        uint8_t *l2_pread_buf = NULL;
+        const uint8_t *l2_src_bytes = (const uint8_t *)pq->l2_indices;
+        if (m && m->residency_mode == 1 && pq->l2_indices_file_offset != 0
+            && m->drive_fd >= 0) {
+            l2_pread_buf = (uint8_t *)malloc(l2_disk_bytes);
+            if (!l2_pread_buf) {
+                fprintf(stderr, "ib_metal: upload_pqv2_tensor_ex: OOM on drive-mode L2 indices pread staging (%zu bytes) — pyramid tensor will decode without residual\n",
+                        l2_disk_bytes);
+            } else {
+                size_t done = 0;
+                off_t off = (off_t)pq->l2_indices_file_offset;
+                int read_ok = 1;
+                while (done < l2_disk_bytes) {
+                    ssize_t r = pread(m->drive_fd, l2_pread_buf + done,
+                                       l2_disk_bytes - done, off + (off_t)done);
+                    if (r <= 0) {
+                        if (r == -1 && errno == EINTR) continue;
+                        fprintf(stderr, "ib_metal: upload_pqv2_tensor_ex: L2 indices pread failed in drive mode (off=%lld, want=%zu)\n",
+                                (long long)off, l2_disk_bytes - done);
+                        read_ok = 0;
+                        break;
+                    }
+                    done += (size_t)r;
+                }
+                if (!read_ok) {
+                    free(l2_pread_buf);
+                    l2_pread_buf = NULL;
+                } else {
+                    l2_src_bytes = l2_pread_buf;
+                }
+            }
+        }
+        if (!l2_src_bytes) {
+            /* No source available (drive-mode pread failed or non-drive
+             * l2_indices was NULL). Skip upload; pq_K_l2 stays 0 and the
+             * warning below fires. */
+        } else if (l2_bits == 6) {
+            /* Upload directly from the (mmap or pread'd) packed buffer —
+             * same layout the GPU kernel expects. */
+            out->pq_idx_l2 =
+                ib_metal_alloc(ctx, idx_l2_bytes, l2_src_bytes);
+        } else {
             idx_l2_t = (uint8_t *)malloc(idx_l2_bytes);
             if (idx_l2_t) {
-                uint32_t nc = pq->N / pq->G;
-                const uint8_t *l2_src = (const uint8_t *)pq->l2_indices;
                 for (uint32_t m_ = 0; m_ < pq->M; m_++) {
-                    for (uint32_t c = 0; c < nc; c++) {
+                    for (uint32_t c = 0; c < nc_l2; c++) {
                         for (uint32_t s = 0; s < pq->n_subchunks; s++) {
                             idx_l2_t[(size_t)m_ * total
                                      + c * pq->n_subchunks + s] =
-                                l2_src[((size_t)c * pq->n_subchunks + s)
-                                       * pq->M + m_];
+                                l2_src_bytes[((size_t)c * pq->n_subchunks + s)
+                                              * pq->M + m_];
                         }
                     }
                 }
@@ -792,6 +866,7 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
                 free(idx_l2_t);
             }
         }
+        if (l2_pread_buf) free(l2_pread_buf);
         /* Only flip pq_K_l2 ON when BOTH uploads succeeded — the
          * dispatcher (rec_matmul_tb) checks pq_K_l2 > 0 to route to the
          * L2residual kernel. If either upload failed we leave pq_K_l2 = 0

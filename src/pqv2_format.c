@@ -14,17 +14,32 @@
 
 static size_t align_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
-/* Per-row packed-index byte count: ceil(M/4)*3 with 4 indices in 3 bytes.
- * Matches the encoder's M-axis packing in pqv2_encode.c (Stage 5h.1). */
-static inline size_t pqv2_l2_packed_bytes_per_row(uint32_t M) {
+/* Per-row packed-index byte count.
+ *   bits == 6 (Stage 5h.1): ceil(M/4)*3 — 4 indices in 3 bytes.
+ *   bits == 4 (Goal N36)  : ceil(M/2)   — 2 indices per byte (l2_K ≤ 16).
+ * Matches the encoder's M-axis packing in pqv2_encode.c. */
+static inline size_t pqv2_l2_packed_bytes_per_row_b(uint32_t M, uint32_t bits) {
+    if (bits == 4u) return ((size_t)M + 1u) / 2u;
     return ((size_t)M + 3u) / 4u * 3u;
 }
+static inline size_t pqv2_l2_packed_bytes_per_row(uint32_t M) {
+    return pqv2_l2_packed_bytes_per_row_b(M, 6u);
+}
 
-/* ── Stage 5k: fp8 E4M3 decode + int8 row_scale expansion ──────────────
- * Inverse of pqv2_encode.c's enc_f32_to_e4m3 / enc_pack_row_scale_int8.
+/* ── Stage 5k: fp8 E4M3 decode for row_scale + cb_scale ────────────────
+ * Inverse of pqv2_encode.c's enc_f32_to_e4m3 / enc_pack_row_scale_e4m3.
  * Called once per tensor at load time, so cost is amortised over every
  * matmul that uses the tensor — the hot kernel sees only the resulting
- * fp16 arrays and stays byte-identical to the legacy layout. */
+ * fp16 arrays and stays byte-identical to the legacy layout.
+ *
+ * H2 sp2 redesign (Agent 3 round 1 fix): row_scale used to disk-pack as
+ * int8[M] + fp16 row_max (linear quantization with a per-tensor anchor).
+ * That codec floored the small-magnitude rows of LLM weight matrices to
+ * zero — Llama-3 / TinyLlama row_scales span 6-10 decades and a linear
+ * 127-step anchor can only resolve ~3. The codec is now fp8 E4M3[M]
+ * (logarithmic, ~10 decades dynamic range, 6-12% per-row relative error)
+ * — same codec as cb_scale. Old sp=2 IBF files written before this
+ * change are unreadable; rerun the encoder. */
 
 static inline float pqv2_e4m3_to_f32(uint8_t b) {
     uint32_t sign = (uint32_t)(b >> 7) & 0x1u;
@@ -72,17 +87,13 @@ typedef struct {
     void *l2_cb_q;
 } pqv2_blob_owned;
 
-/* Decode an int8 row_scale array (stored as M bytes + 2 bytes fp16
- * row_max) into a newly-allocated fp16[M] buffer. */
-static uint16_t *pqv2_decode_row_scale_int8(const int8_t *q, uint32_t M,
-                                              uint16_t row_max_h) {
+/* Decode an fp8 E4M3 row_scale array (stored as M bytes on disk) into
+ * a newly-allocated fp16[M] buffer. Mirrors pqv2_decode_cb_scale_e4m3. */
+static uint16_t *pqv2_decode_row_scale_e4m3(const uint8_t *src, uint32_t M) {
     uint16_t *out = (uint16_t *)malloc((size_t)M * sizeof(uint16_t));
     if (!out) return NULL;
-    float row_max = pqv2_h2f(row_max_h);
-    float k = row_max / 127.0f;
     for (uint32_t m = 0; m < M; m++) {
-        float v = (float)q[m] * k;
-        out[m] = pqv2_f32_to_fp16_bits(v);
+        out[m] = pqv2_f32_to_fp16_bits(pqv2_e4m3_to_f32(src[m]));
     }
     return out;
 }
@@ -138,7 +149,8 @@ static void *pqv2_expand_pool_cbs_fp16(const uint16_t *pool_s, const uint8_t *po
  *    8 u32 — original (M,N,G,K,n_sub,half,l2_kind,l2_K).
  *    9 u32 — Stage 5h.1: + l2_idx_bits (6=packed, 8=legacy).
  *   10 u32 — Stage 5c:   + residency_hint (0=AUTO, 1=RAM, 2=DRIVE).
- *   11 u32 — Stage 5k:   + scale_precision (0=fp16/fp16, 2=int8/fp8 E4M3).
+ *   11 u32 — Stage 5k:   + scale_precision (0=fp16/fp16, 2=fp8 E4M3 / fp8 E4M3
+ *                          — H2 sp2 redesign; was int8+row_max / fp8 E4M3).
  *   13 u32 — Stage 5j:   + cb_pool_size + l2_cb_pool_size.
  *   14 u32 — Stage 5g.2: + l1_idx_layout (0=chunk-major, 1=row-major).
  *
@@ -166,8 +178,8 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
         (                                                                       \
           /* header */                                                          \
           (size_t)(4 + (hdr_u32) * 4)                                           \
-          /* row_scale: fp16[M] OR int8[M]+fp16 row_max */                      \
-          + ((sp) >= 1 ? ((size_t)out->M + 2u) : (size_t)out->M * 2u)          \
+          /* row_scale: fp16[M] (legacy) OR fp8 E4M3[M] (Stage 5k H2 sp2) */   \
+          + ((sp) >= 1 ? (size_t)out->M : (size_t)out->M * 2u)                 \
           /* cb_q + cb_scale (rows = p1 if > 0 else n_sub) */                   \
           + ((size_t)((p1) > 0 ? (p1) : out->n_subchunks)                       \
                 * out->K * out->half                                            \
@@ -184,9 +196,9 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
                  + (size_t)((p2) > 0 ? (p2) : out->n_subchunks)                 \
                     * out->l2_K * ((sp) >= 2 ? 1u : 2u)                         \
                  + ((p2) > 0 ? (size_t)out->n_subchunks : 0u)                   \
-                 + (((b) == 6)                                                  \
+                 + (((b) == 6 || (b) == 4)                                     \
                      ? (size_t)n_chunks * out->n_subchunks                      \
-                           * pqv2_l2_packed_bytes_per_row(out->M)               \
+                           * pqv2_l2_packed_bytes_per_row_b(out->M, (b))        \
                      : idx_bytes))                                              \
               : 0u)                                                             \
         )
@@ -206,7 +218,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     if (!resolved && size >= 4 + 56) {
         uint32_t b = hdr[8], r = hdr[9], sp = hdr[10],
                  p1 = hdr[11], p2 = hdr[12], lay = hdr[13];
-        int bits_ok = (b == 6 || b == 8);
+        int bits_ok = (b == 4 || b == 6 || b == 8);
         int hint_ok = (r <= 2);
         int sp_ok   = (sp == 0 || sp == 2);
         int p1_ok   = (p1 == 0 || p1 == out->n_subchunks);
@@ -230,7 +242,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     if (!resolved && size >= 4 + 52) {
         uint32_t b = hdr[8], r = hdr[9], sp = hdr[10],
                  p1 = hdr[11], p2 = hdr[12];
-        int bits_ok = (b == 6 || b == 8);
+        int bits_ok = (b == 4 || b == 6 || b == 8);
         int hint_ok = (r <= 2);
         int sp_ok   = (sp == 0 || sp == 2);
         int p1_ok   = (p1 == 0 || p1 == out->n_subchunks);
@@ -251,7 +263,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     /* 11-u32 layout (Stage 5k, pre-5j). */
     if (!resolved && size >= 4 + 44) {
         uint32_t b = hdr[8], r = hdr[9], sp = hdr[10];
-        int bits_ok = (b == 6 || b == 8);
+        int bits_ok = (b == 4 || b == 6 || b == 8);
         int hint_ok = (r <= 2);
         int sp_ok   = (sp == 0 || sp == 2);
         if (bits_ok && hint_ok && sp_ok) {
@@ -268,7 +280,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     /* 10-u32 layout (Stage 5c). */
     if (!resolved && size >= 4 + 40) {
         uint32_t b = hdr[8], r = hdr[9];
-        int bits_ok = (b == 6 || b == 8);
+        int bits_ok = (b == 4 || b == 6 || b == 8);
         int hint_ok = (r <= 2);
         if (bits_ok && hint_ok) {
             size_t projected = PQV2_PROJ_SIZE_FULL(10, b, 0u, 0u, 0u);
@@ -283,7 +295,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     /* 9-u32 layout (Stage 5h.1). */
     if (!resolved && size >= 4 + 36) {
         uint32_t b = hdr[8];
-        if ((b == 6 || b == 8) &&
+        if ((b == 4 || b == 6 || b == 8) &&
             (out->l2_kind == 2 || (b == 8 && out->l2_kind == 0))) {
             size_t projected = PQV2_PROJ_SIZE_FULL(9, b, 0u, 0u, 0u);
             if (projected == size) {
@@ -318,16 +330,14 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
         return -1;                                                            \
     } while (0)
 
-    /* row_scale: fp16[M] OR int8[M]+fp16 row_max (Stage 5k). */
+    /* row_scale: fp16[M] (legacy) OR fp8 E4M3[M] (Stage 5k H2 sp2). */
     size_t row_disk_bytes = (scale_precision >= 1)
-                              ? ((size_t)out->M + 2u)
+                              ? (size_t)out->M
                               : (size_t)out->M * 2u;
     if (cursor + row_disk_bytes > size) PQV2_PARSE_FAIL();
     if (scale_precision >= 1) {
-        const int8_t  *rs_q = (const int8_t *)(buf + cursor);
-        uint16_t row_max;
-        memcpy(&row_max, buf + cursor + out->M, 2);
-        uint16_t *rs = pqv2_decode_row_scale_int8(rs_q, out->M, row_max);
+        const uint8_t *rs_e4m3 = (const uint8_t *)(buf + cursor);
+        uint16_t *rs = pqv2_decode_row_scale_e4m3(rs_e4m3, out->M);
         if (!rs) PQV2_PARSE_FAIL();
         out->row_scale = rs;
         out_owned->row_scale = rs;
@@ -403,9 +413,10 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
                                   ? (size_t)l2_rows * out->l2_K
                                   : (size_t)l2_rows * out->l2_K * 2u;
         size_t l2_idx_disk =
-            (out->l2_idx_bits == 6)
+            (out->l2_idx_bits == 6 || out->l2_idx_bits == 4)
                 ? (size_t)n_chunks * out->n_subchunks
-                      * pqv2_l2_packed_bytes_per_row(out->M)
+                      * pqv2_l2_packed_bytes_per_row_b(out->M,
+                                                         out->l2_idx_bits)
                 : idx_bytes;
         if (cursor + l2q_disk_bytes + l2s_disk_bytes > size) PQV2_PARSE_FAIL();
         const int8_t  *l2_q_disk = (const int8_t  *)(buf + cursor);

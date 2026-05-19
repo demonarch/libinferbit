@@ -31,6 +31,7 @@
 
 #include "mome.h"
 #include "inferbit_internal.h"
+#include "pqv2_kernel.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -388,6 +389,152 @@ static void *mome_expert_thread(void *raw) {
 }
 #endif /* MOME_HAS_PTHREAD */
 
+/* ── Goal N28: fused gate+up fast path (FLAT, shared codebook) ───────
+ *
+ * Runs the new pqv2_matvec_mome_gateup_k256 kernel ONCE for all K
+ * active experts (instead of K * 2 ib_tensor_matmul_cpu calls). The
+ * fused kernel re-uses the per-(c, s) INT8 LUT across every (expert,
+ * gate/up) output, saving the bulk of the LUT-build cost.
+ *
+ * Eligibility:
+ *   - every active expert's gate/up tensor is PQv2 (t->pq != NULL)
+ *   - K == 256 with cb_fp32 pre-decoded
+ *   - flat (l2_kind == 0 for both gate and up)
+ *   - all experts share the same cb_fp32 pointer (shared-codebook MoME
+ *     invariant — round-5 fix). We compare pointers rather than bytes
+ *     because the loader hands out exactly one decoded codebook buffer
+ *     per source codebook on the load path.
+ *   - shapes match (gate_e->shape[0] == rows_per_expert, etc.).
+ *
+ * On success: per-expert hb / hb2 buffers are written and the per-expert
+ * silu(hb) * hb2 + down + weighted-accumulate is performed sequentially.
+ * Returns 1 on success (caller returns immediately), 0 if ineligible.
+ *
+ * Env knob IB_MOME_FUSED_GATEUP=0 disables this path for A/B. */
+static int mome_fused_gateup_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("IB_MOME_FUSED_GATEUP");
+        cached = (e && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+/* Goal H1 — v2 fused MoME kernel A/B knob.
+ *
+ *   IB_MOME_FUSED_V2 unset / != "0"  → use the interleaved v2 kernel
+ *                                       (default; falls back to v1 if
+ *                                       the v2 kernel returns -1).
+ *   IB_MOME_FUSED_V2 == "0"           → skip v2, go straight to v1.
+ *
+ * v2 reuses the LUT in NEON registers across all K experts at each
+ * 32-row m-block, which keeps acc[m..m+32] cache-hot across slots and
+ * eliminates the 2K-slot acc memory sweep that v1 paid per (c, s). */
+static int mome_fused_v2_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("IB_MOME_FUSED_V2");
+        cached = (e && e[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static int mome_try_fused_gateup(inferbit_model *m,
+                                  const ib_layer_meta *layer,
+                                  const float *x_in,
+                                  const float *weights,
+                                  const int *active, int n_active,
+                                  int rows_per_expert, int hidden,
+                                  float *xb_out, float *scale_buf)
+{
+    if (!mome_fused_gateup_enabled()) return 0;
+    if (n_active <= 0 || n_active > IB_MOME_FUSED_MAX_K) return 0;
+
+    /* Resolve the K active experts' gate/up pqv2_t* and check eligibility. */
+    const pqv2_t *gate_pq[IB_MOME_FUSED_MAX_K];
+    const pqv2_t *up_pq  [IB_MOME_FUSED_MAX_K];
+    const ib_tensor_meta *down_t[IB_MOME_FUSED_MAX_K];
+    const pqv2_t *anchor = NULL;
+    for (int i = 0; i < n_active; i++) {
+        const int e = active ? active[i] : i;
+        if (e < 0 || e >= layer->mome_experts) return 0;
+        const ib_tensor_meta *gt = &layer->gate_proj_experts[e];
+        const ib_tensor_meta *ut = &layer->up_proj_experts[e];
+        const ib_tensor_meta *dt = &layer->down_proj_experts[e];
+        if (!gt->pq || !ut->pq) return 0;
+        if (gt->shape[0] != rows_per_expert ||
+            ut->shape[0] != rows_per_expert ||
+            dt->shape[1] != rows_per_expert) return 0;
+        const pqv2_t *g = gt->pq;
+        const pqv2_t *u = ut->pq;
+        if (g->K != 256 || u->K != 256) return 0;
+        if (g->l2_kind != 0 || u->l2_kind != 0) return 0;
+        if (!g->cb_fp32 || !u->cb_fp32) return 0;
+        if (i == 0) anchor = g;
+        if (g->cb_fp32 != anchor->cb_fp32) return 0;
+        if (u->cb_fp32 != anchor->cb_fp32) return 0;
+        gate_pq[i] = g;
+        up_pq[i]   = u;
+        down_t[i]  = dt;
+    }
+
+    /* Fused gate+up output slabs: 2 × n_active × rows_per_expert floats. */
+    const size_t per = (size_t)rows_per_expert;
+    float *hb_all  = (float *)aligned_alloc(64,
+        ((size_t)n_active * per * sizeof(float) + 63) & ~(size_t)63);
+    float *hb2_all = (float *)aligned_alloc(64,
+        ((size_t)n_active * per * sizeof(float) + 63) & ~(size_t)63);
+    if (!hb_all || !hb2_all) {
+        free(hb_all); free(hb2_all);
+        return 0;
+    }
+
+    /* Goal H1: prefer the v2 interleaved kernel when enabled. v2 has the
+     * same eligibility envelope as v1, so a v2 success replaces the v1
+     * call entirely. On v2 returning -1 (invariant mismatch or non-NEON
+     * build) we transparently fall back to v1; on v1 still returning -1
+     * we punt to the per-expert path. */
+    int rc = -1;
+    if (mome_fused_v2_enabled()) {
+        rc = pqv2_matvec_mome_gateup_k256_v2(
+            gate_pq, up_pq, x_in, hb_all, hb2_all, n_active);
+    }
+    if (rc != 0) {
+        rc = pqv2_matvec_mome_gateup_k256(
+            gate_pq, up_pq, x_in, hb_all, hb2_all, n_active);
+    }
+    if (rc != 0) {
+        free(hb_all); free(hb2_all);
+        return 0;
+    }
+
+    /* Per-expert silu(hb) * hb2 → hb, then down_proj, then weighted
+     * accumulate into xb_out. The down_proj still uses the full
+     * per-expert path (no shared codebook there in general). */
+    float *down_out = (float *)aligned_alloc(64,
+        ((size_t)hidden * sizeof(float) + 63) & ~(size_t)63);
+    if (!down_out) {
+        free(hb_all); free(hb2_all);
+        return 0;
+    }
+    for (int i = 0; i < n_active; i++) {
+        const float w_e = weights[i];
+        float *hb_e  = hb_all  + (size_t)i * per;
+        float *hb2_e = hb2_all + (size_t)i * per;
+        for (int r = 0; r < rows_per_expert; r++) {
+            hb_e[r] = mome_silu(hb_e[r]) * hb2_e[r];
+        }
+        ib_tensor_matmul_cpu(m, down_t[i], down_out, hb_e,
+                              hidden, rows_per_expert, scale_buf);
+        for (int h = 0; h < hidden; h++) {
+            xb_out[h] += w_e * down_out[h];
+        }
+    }
+    free(down_out);
+    free(hb_all); free(hb2_all);
+    return 1;
+}
+
 /* ── dispatch ────────────────────────────────────────────────────── */
 
 void mome_dispatch_ffn(inferbit_model *m,
@@ -439,6 +586,17 @@ void mome_dispatch_ffn(inferbit_model *m,
 
     /* Zero the output — we accumulate per-expert contributions. */
     memset(xb_out, 0, (size_t)hidden * sizeof(float));
+
+    /* ── Goal N28: try the fused gate+up fast path FIRST ──────────
+     * When all K experts share a codebook (post round-5 fix) and the
+     * tensors are FLAT K=256, the LUT-build cost can be amortised
+     * across all 2K gate+up outputs in one (c, s) sweep — saving the
+     * 4× LUT-build overhead the per-expert path currently pays. */
+    if (mome_try_fused_gateup(m, layer, x_in, weights, active, n_active,
+                                rows_per_expert, hidden, xb_out,
+                                scale_buf)) {
+        return;
+    }
 
     /* ── Decide path: parallel vs sequential ───────────────────────
      *

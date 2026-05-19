@@ -49,6 +49,13 @@ inferbit_model* inferbit_load(const char* path, const inferbit_config* config) {
 void inferbit_free(inferbit_model* model) {
     if (!model) return;
 
+    /* Goal H4 — emit the hot-tensor access summary BEFORE we tear the
+     * model down. The reporter dereferences the tensor metadata
+     * (access counts + sizes), so it has to run while `model->layers`
+     * and the embedded tensor blobs are still live. No-op unless
+     * IB_TENSOR_HOTSET=1 was set. */
+    ib_hotset_report(model);
+
 #ifdef IB_HAS_METAL
     /* Stage 5d hybrid staging buffers — must be freed BEFORE metal_ctx
      * (they were allocated via ib_metal_alloc against that ctx). */
@@ -259,6 +266,14 @@ void inferbit_free(inferbit_model* model) {
      * is safe whether or not inferbit_dflash_attach was ever called. */
     free(model->dflash_cfg);
     free(model->dflash_capture_buf);
+
+    /* Goal H4 — hot-cache scratch. Today this is always uninhabited
+     * (ib_hot_promote is a no-op), but we still own the malloc'd
+     * region. free(NULL) on disabled / OOM paths is safe. */
+    free(model->hot_pool);
+    model->hot_pool = NULL;
+    model->hot_pool_bytes = 0;
+    model->hot_pool_entries = 0;
 
     free(model);
 }

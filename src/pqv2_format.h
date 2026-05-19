@@ -32,8 +32,9 @@
  *                                    [l2_idx_bits], [residency_hint],
  *                                    [scale_precision],
  *                                    [cb_pool_size], [l2_cb_pool_size]),
- *       row_scale fp16[M] (legacy) OR int8[M] + fp16 row_max (Stage 5k,
- *         scale_precision >= 1),
+ *       row_scale fp16[M] (legacy) OR fp8 E4M3[M] (Stage 5k H2 sp2,
+ *         scale_precision >= 1; ~10-decade dynamic range — replaces the
+ *         original int8[M]+fp16 row_max codec that lost small rows),
  *       cb_q[rows*K*half] int8 — rows = cb_pool_size if > 0 else ns (Stage 5j),
  *       cb_scale[rows*K] fp16 (legacy) OR fp8 E4M3 (Stage 5k, scale_precision >= 2),
  *       cb_pool_id[ns] u8 — ONLY present when cb_pool_size > 0 (Stage 5j),
@@ -47,7 +48,9 @@
  *          9 u32 — Stage 5h.1: + l2_idx_bits.
  *         10 u32 — Stage 5c   : + residency_hint (0=AUTO, 1=RAM, 2=DRIVE).
  *         11 u32 — Stage 5k   : + scale_precision (0=fp16/fp16,
- *                                                  2=int8/fp8 E4M3).
+ *                                                  2=fp8 E4M3 / fp8 E4M3
+ *                                                  — H2 sp2 redesign,
+ *                                                  see pqv2_encode.c).
  *         13 u32 — Stage 5j   : + cb_pool_size + l2_cb_pool_size.
  *       Parser disambiguates by reconciling header size against the
  *       blob's total length (see parse_pqv2_blob in pqv2_format.c). Old

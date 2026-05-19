@@ -561,6 +561,37 @@ int ib_alloc_buffers(inferbit_model* model) {
         }
     }
 
+    /* ── Goal H4 — hot-tensor pool (scaffolding) ────────────────
+     *
+     * Allocate a small RAM-resident scratch region that the future
+     * adaptive promotion logic will use to keep the hottest tensors
+     * decode-resident. Today nothing populates this pool — see
+     * ib_hot_promote in forward.c, which is a deliberate no-op until
+     * the access-count instrumentation has produced enough data to
+     * drive promotion decisions.
+     *
+     * Sized via IB_HOT_POOL_MB (default 32 MB; 0 disables). OOM is
+     * non-fatal — model load still succeeds, ib_hot_lookup just keeps
+     * returning NULL. */
+    {
+        size_t hot_mb = 32;
+        const char *hp_env = getenv("IB_HOT_POOL_MB");
+        if (hp_env && hp_env[0]) {
+            long v = strtol(hp_env, NULL, 10);
+            if (v >= 0) hot_mb = (size_t)v;
+        }
+        if (hot_mb > 0) {
+            size_t bytes = hot_mb * (size_t)1024 * (size_t)1024;
+            model->hot_pool = malloc(bytes);
+            if (model->hot_pool) {
+                model->hot_pool_bytes = bytes;
+            } else {
+                model->hot_pool_bytes = 0;
+            }
+        }
+        model->hot_pool_entries = 0;
+    }
+
     return 0;
 }
 

@@ -30,6 +30,120 @@ static int w4a8_enabled(void) {
     return cached;
 }
 
+/* ── Goal H4 — hot-cache framework (scaffolding) ─────────────────────
+ *
+ * See inferbit_internal.h for the contract. v1 ships:
+ *   • ib_hotset_enabled  — cached IB_TENSOR_HOTSET env check.
+ *   • ib_hot_lookup      — always returns NULL (no entries promoted).
+ *   • ib_hot_promote     — no-op; reserved for the adaptive policy.
+ *   • ib_hotset_report   — top-10 most-accessed-tensors summary
+ *                          printed to stderr (called from inferbit_free).
+ *
+ * The counter increment lives in tensor_matmul() so every CPU matmul
+ * (PQv2, W4A8, INT8, FP16) contributes regardless of which dispatch
+ * branch is taken. The bump is gated on ib_hotset_enabled() so the
+ * default path pays exactly one cached branch. */
+int ib_hotset_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("IB_TENSOR_HOTSET");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+const void *ib_hot_lookup(const inferbit_model *m, const ib_tensor_meta *t) {
+    /* Stub: no promotion logic yet, so nothing is ever in the pool. */
+    (void)m; (void)t;
+    return NULL;
+}
+
+int ib_hot_promote(inferbit_model *m, const ib_tensor_meta *t) {
+    /* Stub: deliberately a no-op. When the adaptive policy lands this
+     * will memcpy the tensor's bytes into m->hot_pool and bookkeep an
+     * (offset → hot-pool slot) mapping. Returning non-zero signals
+     * "not promoted" to callers that want to fall back. */
+    (void)m; (void)t;
+    return 1;
+}
+
+/* Walk every ib_tensor_meta the model owns and visit it via `fn`.
+ * Centralised here so ib_hotset_report doesn't need to know the model
+ * layout, and so future per-tensor sweeps (e.g. promotion scoring) can
+ * share the same enumeration. */
+static void ib_for_each_tensor(const inferbit_model *m,
+                               void (*fn)(const ib_tensor_meta *, const char *, int, void *),
+                               void *udata) {
+    fn(&m->token_embedding, "token_embedding", -1, udata);
+    fn(&m->output_norm,     "output_norm",     -1, udata);
+    fn(&m->output_head,     "output_head",     -1, udata);
+    if (!m->layers) return;
+    for (int L = 0; L < m->header.num_layers; L++) {
+        const ib_layer_meta *lm = &m->layers[L];
+        fn(&lm->q_proj,         "q_proj",         L, udata);
+        fn(&lm->k_proj,         "k_proj",         L, udata);
+        fn(&lm->v_proj,         "v_proj",         L, udata);
+        fn(&lm->o_proj,         "o_proj",         L, udata);
+        fn(&lm->gate_proj,      "gate_proj",      L, udata);
+        fn(&lm->up_proj,        "up_proj",        L, udata);
+        fn(&lm->down_proj,      "down_proj",      L, udata);
+        fn(&lm->input_norm,     "input_norm",     L, udata);
+        fn(&lm->post_attn_norm, "post_attn_norm", L, udata);
+    }
+}
+
+typedef struct {
+    const ib_tensor_meta *t;
+    const char *name;
+    int layer;
+} ib_hot_entry;
+
+#define IB_HOT_REPORT_TOPN 10
+
+static void ib_hot_collect(const ib_tensor_meta *t, const char *name,
+                           int layer, void *udata) {
+    ib_hot_entry (*top)[IB_HOT_REPORT_TOPN] = udata;
+    /* Insertion-sort into top-N. O(N) per entry, fine for the few
+     * hundred tensors a transformer has. */
+    int slot = -1;
+    for (int i = 0; i < IB_HOT_REPORT_TOPN; i++) {
+        if (!(*top)[i].t || t->access_count > (*top)[i].t->access_count) {
+            slot = i; break;
+        }
+    }
+    if (slot < 0) return;
+    for (int i = IB_HOT_REPORT_TOPN - 1; i > slot; i--) (*top)[i] = (*top)[i-1];
+    (*top)[slot].t = t;
+    (*top)[slot].name = name;
+    (*top)[slot].layer = layer;
+}
+
+void ib_hotset_report(const inferbit_model *m) {
+    if (!m || !ib_hotset_enabled()) return;
+    ib_hot_entry top[IB_HOT_REPORT_TOPN];
+    for (int i = 0; i < IB_HOT_REPORT_TOPN; i++) {
+        top[i].t = NULL; top[i].name = NULL; top[i].layer = -1;
+    }
+    ib_for_each_tensor(m, ib_hot_collect, &top);
+    fprintf(stderr, "[ib-hotset] top-%d most-accessed tensors "
+                    "(hot_pool=%zu bytes, entries=%d):\n",
+            IB_HOT_REPORT_TOPN, m->hot_pool_bytes, m->hot_pool_entries);
+    for (int i = 0; i < IB_HOT_REPORT_TOPN; i++) {
+        if (!top[i].t || top[i].t->access_count == 0) break;
+        if (top[i].layer >= 0) {
+            fprintf(stderr, "  %2d. L%-2d %-16s  access=%llu  size=%zu\n",
+                    i + 1, top[i].layer, top[i].name,
+                    (unsigned long long)top[i].t->access_count,
+                    top[i].t->size);
+        } else {
+            fprintf(stderr, "  %2d.     %-16s  access=%llu  size=%zu\n",
+                    i + 1, top[i].name,
+                    (unsigned long long)top[i].t->access_count,
+                    top[i].t->size);
+        }
+    }
+}
+
 /* ── Stage 5d — hybrid CPU/GPU dispatch (docs/v2/00_CORRECTION.md) ──
  *
  * v1 ships a single env-var knob:
@@ -243,15 +357,25 @@ static int pthread_join(pthread_t t, void** retval) {
 #endif
 
 typedef struct ib_drive_pf_state {
-    pthread_t      thread;
+    /* N29 — two worker threads: thread_l1 pread's L1 indices, thread_l2
+     * pread's L2 indices. They run in parallel so the per-tensor I/O
+     * time is max(L1, L2) instead of L1 + L2. */
+    pthread_t      thread;        /* L1 worker (kept name for diff hygiene) */
+    pthread_t      thread_l2;     /* L2 worker */
     pthread_mutex_t mu;
-    pthread_cond_t  req_cv;    /* main → worker: a request is pending */
-    pthread_cond_t  done_cv;   /* worker → main: request complete */
-    /* Request state (protected by mu). */
+    pthread_cond_t  req_cv;       /* main → L1 worker */
+    pthread_cond_t  req_cv_l2;    /* main → L2 worker */
+    pthread_cond_t  done_cv;      /* worker → main: request complete */
+    /* Request state (protected by mu). The L1 and L2 workers share the
+     * same req_tensor / req_slot — main thread sets them before waking
+     * both and only re-issues once both have completed. */
     const ib_tensor_meta *req_tensor;   /* what to prefetch */
     int             req_slot;           /* which slot to fill (0 or 1) */
-    int             req_pending;        /* 1 when worker should service the request */
-    int             req_in_flight;      /* 1 between dequeue and completion */
+    int             req_pending_l1;     /* 1 when L1 worker should service */
+    int             req_pending_l2;     /* 1 when L2 worker should service */
+    int             req_in_flight_l1;   /* 1 between L1 dequeue and completion */
+    int             req_in_flight_l2;   /* 1 between L2 dequeue and completion */
+    int             req_ok_l1;          /* set by L1 worker on success */
     /* Result of the most recently completed request. */
     const ib_tensor_meta *done_tensor;
     int             done_slot;
@@ -296,18 +420,21 @@ static int drive_pread_full(int fd, void *buf, size_t bytes, off_t off) {
     return 1;
 }
 
+/* N29 — L1 worker. Pread's only the L1 indices for the current request.
+ * Runs in parallel with the L2 worker. Completion is signaled jointly:
+ * the second worker to finish broadcasts done_cv with the merged result. */
 static void *ib_drive_pf_worker(void *arg) {
     ib_drive_pf_state *st = (ib_drive_pf_state *)arg;
     pthread_mutex_lock(&st->mu);
     for (;;) {
-        while (!st->stop && !st->req_pending) {
+        while (!st->stop && !st->req_pending_l1) {
             pthread_cond_wait(&st->req_cv, &st->mu);
         }
         if (st->stop) break;
         const ib_tensor_meta *t = st->req_tensor;
         int slot = st->req_slot;
-        st->req_pending = 0;
-        st->req_in_flight = 1;
+        st->req_pending_l1 = 0;
+        st->req_in_flight_l1 = 1;
         pthread_mutex_unlock(&st->mu);
 
         int ok = 0;
@@ -318,37 +445,74 @@ static void *ib_drive_pf_worker(void *arg) {
             if (bytes > 0 && bytes <= st->scratch_size && off != 0) {
                 ok = drive_pread_full(st->fd, st->scratch[slot], bytes, off);
             }
-            /* Goal C3 — fill the matching L2 slot too. Failure to load
-             * L2 is non-fatal: the kernel falls back to the existing
-             * pq->l2_indices pointer (mmap or previous slot contents),
-             * but we still report L1 success so the L1 hot path stays
-             * fast. The OS readahead also helps batch the adjacent L2
-             * region (indices are stored contiguously in the file). */
-            if (ok && st->l2_scratch[slot] && pq->l2_kind == 2 &&
-                pq->l2_indices_file_offset != 0) {
-                size_t l2_bytes = drive_l2_indices_bytes(pq);
-                if (l2_bytes > 0 && l2_bytes <= st->l2_scratch_size) {
-                    (void)drive_pread_full(st->fd, st->l2_scratch[slot],
-                                           l2_bytes,
-                                           (off_t)pq->l2_indices_file_offset);
-                }
+        }
+
+        pthread_mutex_lock(&st->mu);
+        st->req_ok_l1 = ok;
+        st->req_in_flight_l1 = 0;
+        /* Publish result only when BOTH workers have finished. The last
+         * one to finish wins the publish; the other waits on its own cv
+         * for the next request. */
+        if (!st->req_in_flight_l2 && !st->req_pending_l2) {
+            st->done_tensor = ok ? t : NULL;
+            st->done_slot = ok ? slot : -1;
+            pthread_cond_broadcast(&st->done_cv);
+        }
+    }
+    pthread_mutex_unlock(&st->mu);
+    return NULL;
+}
+
+/* N29 — L2 worker. Pread's only the L2 indices (or no-ops when the
+ * tensor has no L2). Runs in parallel with the L1 worker. The L2 read
+ * is best-effort: failure does not invalidate the request, matching the
+ * pre-N29 semantics (kernel falls back to the existing pq->l2_indices
+ * pointer). */
+static void *ib_drive_pf_worker_l2(void *arg) {
+    ib_drive_pf_state *st = (ib_drive_pf_state *)arg;
+    pthread_mutex_lock(&st->mu);
+    for (;;) {
+        while (!st->stop && !st->req_pending_l2) {
+            pthread_cond_wait(&st->req_cv_l2, &st->mu);
+        }
+        if (st->stop) break;
+        const ib_tensor_meta *t = st->req_tensor;
+        int slot = st->req_slot;
+        st->req_pending_l2 = 0;
+        st->req_in_flight_l2 = 1;
+        pthread_mutex_unlock(&st->mu);
+
+        if (t && t->pq && slot >= 0 && slot < 2 &&
+            st->l2_scratch[slot] && t->pq->l2_kind == 2 &&
+            t->pq->l2_indices_file_offset != 0) {
+            const pqv2_t *pq = t->pq;
+            size_t l2_bytes = drive_l2_indices_bytes(pq);
+            if (l2_bytes > 0 && l2_bytes <= st->l2_scratch_size) {
+                (void)drive_pread_full(st->fd, st->l2_scratch[slot],
+                                       l2_bytes,
+                                       (off_t)pq->l2_indices_file_offset);
             }
         }
 
         pthread_mutex_lock(&st->mu);
-        st->req_in_flight = 0;
-        st->done_tensor = ok ? t : NULL;
-        st->done_slot = ok ? slot : -1;
-        pthread_cond_broadcast(&st->done_cv);
+        st->req_in_flight_l2 = 0;
+        if (!st->req_in_flight_l1 && !st->req_pending_l1) {
+            /* L1 worker already finished — publish the result it left in
+             * req_ok_l1. */
+            st->done_tensor = st->req_ok_l1 ? t : NULL;
+            st->done_slot = st->req_ok_l1 ? slot : -1;
+            pthread_cond_broadcast(&st->done_cv);
+        }
     }
     pthread_mutex_unlock(&st->mu);
     return NULL;
 }
 
 /* Wait for any in-flight prefetch to finish (called under mu) and clear
- * the result. */
+ * the result. N29 — must wait until BOTH workers are idle. */
 static void pf_wait_idle_locked(ib_drive_pf_state *st) {
-    while (st->req_pending || st->req_in_flight) {
+    while (st->req_pending_l1 || st->req_in_flight_l1 ||
+           st->req_pending_l2 || st->req_in_flight_l2) {
         pthread_cond_wait(&st->done_cv, &st->mu);
     }
 }
@@ -379,7 +543,12 @@ static ib_drive_pf_state *drive_pf_get(const inferbit_model *m) {
     if (pthread_cond_init(&st->req_cv, NULL) != 0) {
         pthread_mutex_destroy(&st->mu); free(st); return NULL;
     }
+    if (pthread_cond_init(&st->req_cv_l2, NULL) != 0) {
+        pthread_cond_destroy(&st->req_cv);
+        pthread_mutex_destroy(&st->mu); free(st); return NULL;
+    }
     if (pthread_cond_init(&st->done_cv, NULL) != 0) {
+        pthread_cond_destroy(&st->req_cv_l2);
         pthread_cond_destroy(&st->req_cv);
         pthread_mutex_destroy(&st->mu); free(st); return NULL;
     }
@@ -394,6 +563,21 @@ static ib_drive_pf_state *drive_pf_get(const inferbit_model *m) {
     st->done_slot = -1;
     if (pthread_create(&st->thread, NULL, ib_drive_pf_worker, st) != 0) {
         pthread_cond_destroy(&st->done_cv);
+        pthread_cond_destroy(&st->req_cv_l2);
+        pthread_cond_destroy(&st->req_cv);
+        pthread_mutex_destroy(&st->mu);
+        free(st);
+        return NULL;
+    }
+    if (pthread_create(&st->thread_l2, NULL, ib_drive_pf_worker_l2, st) != 0) {
+        /* Tear down the L1 worker we just created so we don't leak it. */
+        pthread_mutex_lock(&st->mu);
+        st->stop = 1;
+        pthread_cond_broadcast(&st->req_cv);
+        pthread_mutex_unlock(&st->mu);
+        pthread_join(st->thread, NULL);
+        pthread_cond_destroy(&st->done_cv);
+        pthread_cond_destroy(&st->req_cv_l2);
         pthread_cond_destroy(&st->req_cv);
         pthread_mutex_destroy(&st->mu);
         free(st);
@@ -411,8 +595,11 @@ static ib_drive_pf_state *drive_pf_get(const inferbit_model *m) {
         pthread_mutex_lock(&st->mu);
         st->req_tensor = mm->drive_pq_order[0];
         st->req_slot = 0;
-        st->req_pending = 1;
+        st->req_ok_l1 = 0;
+        st->req_pending_l1 = 1;
+        st->req_pending_l2 = 1;
         pthread_cond_signal(&st->req_cv);
+        pthread_cond_signal(&st->req_cv_l2);
         pthread_mutex_unlock(&st->mu);
     }
     return st;
@@ -429,9 +616,12 @@ void ib_drive_prefetch_shutdown(inferbit_model *m) {
     pf_wait_idle_locked(st);
     st->stop = 1;
     pthread_cond_broadcast(&st->req_cv);
+    pthread_cond_broadcast(&st->req_cv_l2);
     pthread_mutex_unlock(&st->mu);
     pthread_join(st->thread, NULL);
+    pthread_join(st->thread_l2, NULL);
     pthread_cond_destroy(&st->done_cv);
+    pthread_cond_destroy(&st->req_cv_l2);
     pthread_cond_destroy(&st->req_cv);
     pthread_mutex_destroy(&st->mu);
     free(st);
@@ -562,8 +752,11 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
         pthread_mutex_lock(&st->mu);
         st->req_tensor = t_next;
         st->req_slot = next_slot;
-        st->req_pending = 1;
+        st->req_ok_l1 = 0;
+        st->req_pending_l1 = 1;
+        st->req_pending_l2 = 1;
         pthread_cond_signal(&st->req_cv);
+        pthread_cond_signal(&st->req_cv_l2);
         pthread_mutex_unlock(&st->mu);
     }
 
@@ -1066,6 +1259,15 @@ static void tensor_matmul(
     float* out, const float* input, int M, int N,
     float* scale_buf
 ) {
+    /* Goal H4 — hot-cache instrumentation. Single-branch fast path:
+     * ib_hotset_enabled() is a cached int. When disabled this is one
+     * predictable branch with no memory write, so the cost when off is
+     * effectively zero. The cast strips const because access_count is
+     * book-keeping, not part of the on-disk tensor identity. */
+    if (ib_hotset_enabled()) {
+        ((ib_tensor_meta *)t)->access_count++;
+    }
+
     /* PQv2 dispatch — takes precedence when present. Per-chunk threading
      * for K=256; falls back to single-thread for other K or no pool. */
     if (t->pq) {
@@ -1730,6 +1932,16 @@ static void ib_attn_head_task(void* arg, int tid, int start, int end) {
  *   hidden_out[hidden_size]. Used by the batched verify path to stack B
  *   positions' hidden states before a single batched LM head matmul. When
  *   hidden_out is supplied the final RMSNorm runs regardless of compute_logits. */
+/* Forward decl: Goal N37 unified MoME FFN dispatch. Definition lives
+ * further down (after mome_dispatch_ffn_batch) but both forward_single_ex
+ * and forward_batch route their MoME branch through it. */
+static void mome_ffn_dispatch(inferbit_model *m, const ib_layer_meta *layer,
+                              float *xb_in_batch, float *hb_batch,
+                              float *hb2_batch, float *xb_out_batch,
+                              int B,
+                              float *scale_buf, int8_t *q_scratch,
+                              float *sa_scratch);
+
 static int forward_single_ex(inferbit_model* m, int token_id, int pos,
                              float* logits, int compute_logits,
                              float* hidden_out) {
@@ -1883,38 +2095,11 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
             if (!sp_mask && layer->mome_experts > 1 &&
                 layer->gate_proj_experts && layer->up_proj_experts &&
                 layer->down_proj_experts) {
-                const int K_ex = layer->mome_experts;
-                if (mome_router_is_nonzero(m, &layer->router)) {
-                    /* Calibrated router. Compute logits via the existing
-                     * fp16-matmul fast path: layer->router is a raw
-                     * fp16 [hidden, K] tensor in IBF v6, so tensor_matmul
-                     * handles it via the bits==16 branch.
-                     *
-                     * Logits buffer lives on the stack since K is small
-                     * (≤ IB_MOME_MAX_EXPERTS = 32). */
-                    float router_logits[IB_MOME_MAX_EXPERTS];
-                    int active[IB_MOME_MAX_TOP_N];
-                    ib_tensor_matmul_cpu(m, &layer->router, router_logits,
-                                          xb, K_ex, hidden, scale_buf);
-                    int top_n = mome_get_top_n(K_ex);
-                    mome_top_n(router_logits, K_ex, top_n, active);
-                    mome_dispatch_ffn(m, layer, xb, hb, hb2, xb,
-                                       router_logits, active, top_n,
-                                       scale_buf);
-                } else {
-                    /* Zero router → honor IB_MOME_TOP_N even without a router.
-                     * Pick the first top_n experts; mome_dispatch_ffn scales
-                     * each weight by K/n_active (mome.c:178-180) so top_n=K
-                     * reconstructs the full FFN exactly. */
-                    int top_n = mome_get_top_n(K_ex);
-                    int active[IB_MOME_MAX_TOP_N];
-                    for (int i = 0; i < top_n; i++) active[i] = i;
-                    mome_dispatch_ffn(m, layer, xb, hb, hb2, xb,
-                                       /*router_logits=*/NULL,
-                                       active,
-                                       /*n_active=*/top_n,
-                                       scale_buf);
-                }
+                /* Goal N37: single entry point shared with forward_batch.
+                 * For B==1, q_scratch / sa_scratch are unused — pass NULL. */
+                mome_ffn_dispatch(m, layer, xb, hb, hb2, xb, /*B=*/1,
+                                  scale_buf, /*q_scratch=*/NULL,
+                                  /*sa_scratch=*/NULL);
                 mome_handled = 1;
             }
 
@@ -2157,6 +2342,91 @@ static void mome_dispatch_ffn_batch(
     }
 }
 
+/* ── Unified MoME FFN dispatch (Goal N37) ────────────────────────
+ *
+ * Single entry point for the MoME branch shared by forward_single_ex
+ * (B==1, single-token decode) and forward_batch (B>1, prefill). Both
+ * call sites previously open-coded the same calibrated-vs-zero-router
+ * decision and then dispatched to either mome_dispatch_ffn (per-position)
+ * or mome_dispatch_ffn_batch (batched). That duplication had already
+ * started to drift between the two paths (round-6 wired batched dispatch
+ * to a new helper while the single-position branch kept its own copy).
+ *
+ * Contract:
+ *   - Caller has already verified `layer->mome_experts > 1` and that the
+ *     expert sub-tensor pointers are non-NULL. The helper re-checks and
+ *     returns silently on mismatch (matches the defensive style of the
+ *     two donor sites).
+ *   - For B == 1, q_scratch / sa_scratch may be NULL — the per-position
+ *     mome_dispatch_ffn does not consume them.
+ *   - For B  > 1, the caller must guarantee m->bb_xb2 is free at the
+ *     FFN stage of the layer (true in forward_batch; the model-lifetime
+ *     scratch is sized for IB_BATCH_MAX × hidden floats).
+ *   - xb_in_batch and xb_out_batch may alias (both donor call sites pass
+ *     `xb` for both). mome_dispatch_ffn snapshots on the stack for B==1,
+ *     and mome_dispatch_ffn_batch snapshots into m->bb_xb2 for B>1.
+ *
+ * Bit-identical to the prior open-coded paths: B==1 reproduces the
+ * router-logit matmul + top-N selection + mome_dispatch_ffn call from
+ * the old forward_single_ex block; B>1 just forwards into
+ * mome_dispatch_ffn_batch, which already owns the union-of-K routing
+ * documented in its header. */
+static void mome_ffn_dispatch(inferbit_model *m, const ib_layer_meta *layer,
+                              float *xb_in_batch, float *hb_batch,
+                              float *hb2_batch, float *xb_out_batch,
+                              int B,
+                              float *scale_buf, int8_t *q_scratch,
+                              float *sa_scratch)
+{
+    if (!m || !layer || B <= 0) return;
+    if (layer->mome_experts <= 1 ||
+        !layer->gate_proj_experts || !layer->up_proj_experts ||
+        !layer->down_proj_experts) return;
+
+    if (B == 1) {
+        const int K_ex   = layer->mome_experts;
+        const int hidden = m->header.hidden_size;
+        if (mome_router_is_nonzero(m, &layer->router)) {
+            /* Calibrated router: per-position logits → top-N → softmax
+             * weighted dispatch. Mirror of the legacy forward_single_ex
+             * block. Logits buffer is stack-local (K_ex ≤
+             * IB_MOME_MAX_EXPERTS = 32). */
+            float router_logits[IB_MOME_MAX_EXPERTS];
+            int   active[IB_MOME_MAX_TOP_N];
+            ib_tensor_matmul_cpu(m, &layer->router, router_logits,
+                                 xb_in_batch, K_ex, hidden, scale_buf);
+            int top_n = mome_get_top_n(K_ex);
+            mome_top_n(router_logits, K_ex, top_n, active);
+            mome_dispatch_ffn(m, layer, xb_in_batch, hb_batch, hb2_batch,
+                              xb_out_batch,
+                              router_logits, active, top_n, scale_buf);
+        } else {
+            /* Zero-router fallback: first top_n experts; mome_dispatch_ffn
+             * scales each weight by K/n_active so n_active==K reconstructs
+             * the un-split FFN exactly. */
+            int top_n = mome_get_top_n(K_ex);
+            int active[IB_MOME_MAX_TOP_N];
+            for (int i = 0; i < top_n; i++) active[i] = i;
+            mome_dispatch_ffn(m, layer, xb_in_batch, hb_batch, hb2_batch,
+                              xb_out_batch,
+                              /*router_logits=*/NULL, active,
+                              /*n_active=*/top_n, scale_buf);
+        }
+        return;
+    }
+
+    /* B > 1: delegate to the batched helper, which owns its own router
+     * decision (per-position softmax across all K when calibrated,
+     * uniform 1.0 across all K otherwise — see mome_dispatch_ffn_batch
+     * header). Snapshot scratch lives in m->bb_xb2, which is free at the
+     * FFN stage of forward_batch (last carried pre-O-proj data). */
+    mome_dispatch_ffn_batch(m, layer,
+                            xb_in_batch, hb_batch, hb2_batch,
+                            xb_out_batch, B,
+                            m->bb_xb2,
+                            scale_buf, q_scratch, sa_scratch);
+}
+
 /* ── Batched forward pass ───────────────────────────────────── */
 
 /* Process B tokens (at contiguous positions positions[0..B-1]) through the
@@ -2321,18 +2591,15 @@ static int forward_batch(inferbit_model* m, const int32_t* tokens,
         } else if (layer->mome_experts > 1 &&
                    layer->gate_proj_experts && layer->up_proj_experts &&
                    layer->down_proj_experts) {
-            /* Batched MoME dispatch — runs each expert's gate/up/down ONCE
-             * across all B positions via tensor_matmul_batch, then folds
-             * per-position SiLU and weighted accumulate in plain C.
-             *
-             * For B=64 / K=8 / 22 layers this drops the matmul count from
-             * 64 × 8 × 3 × 22 = 33 792 per prefill to 8 × 3 × 22 = 528,
-             * a ~64× reduction in dispatch overhead.
-             *
-             * xb2 is free at the FFN stage (last used pre-O-proj above)
-             * and serves as the aliasing-safe input snapshot. */
-            mome_dispatch_ffn_batch(m, layer, xb, hb, hb2, xb, B,
-                                    xb2, scale_buf, q_scratch, sa_scratch);
+            /* Goal N37: single entry point shared with forward_single_ex.
+             * For B>1 the helper delegates into mome_dispatch_ffn_batch,
+             * which uses m->bb_xb2 as its aliasing-safe input snapshot
+             * (free at this stage of the layer — last carried pre-O-proj
+             * data, see batched-helper header). The full optimisation
+             * notes — ~64× dispatch reduction for B=64/K=8/22 layers —
+             * still apply; we just hide the call-site choice. */
+            mome_ffn_dispatch(m, layer, xb, hb, hb2, xb, B,
+                              scale_buf, q_scratch, sa_scratch);
         } else {
             tensor_matmul_batch(m, &layer->gate_proj, hb, xb, inter, hidden, B,
                                 scale_buf, q_scratch, sa_scratch);

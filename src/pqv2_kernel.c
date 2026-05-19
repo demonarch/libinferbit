@@ -117,6 +117,12 @@ static inline size_t pqv2_l2_packed_row_bytes(uint32_t M) {
     return ((size_t)M + 3u) / 4u * 3u;
 }
 
+/* Goal N36 — per-row byte count for the 4-bit packing (2 indices per
+ * byte, low nibble first). l2_K must be ≤ 16. */
+static inline size_t pqv2_l2_packed_row_bytes_4bit(uint32_t M) {
+    return ((size_t)M + 1u) / 2u;
+}
+
 /* Unpack a single packed row (ceil(M/4)*3 bytes) to a uint8[M] buffer. */
 static inline void pqv2_l2_unpack_row(const uint8_t *src, uint8_t *dst, uint32_t M) {
     uint32_t m = 0;
@@ -140,6 +146,22 @@ static inline void pqv2_l2_unpack_row(const uint8_t *src, uint8_t *dst, uint32_t
     }
 }
 
+/* Goal N36 — unpack a 4-bit packed row (ceil(M/2) bytes) to uint8[M]. */
+static inline void pqv2_l2_unpack_4bit(const uint8_t *src, uint8_t *dst, uint32_t M) {
+    uint32_t m = 0;
+    while (m + 2 <= M) {
+        uint8_t b = src[0];
+        dst[m + 0] = (uint8_t)(b & 0x0F);
+        dst[m + 1] = (uint8_t)((b >> 4) & 0x0F);
+        src += 1;
+        m += 2;
+    }
+    if (m < M) {
+        uint8_t b = src[0];
+        dst[m] = (uint8_t)(b & 0x0F);
+    }
+}
+
 /* Resolve the L2 index row pointer for chunk c, subchunk s. If the
  * tensor is bit-packed, unpack into `scratch[M]` and return scratch.
  * Otherwise return the in-place row pointer (no copy). */
@@ -152,6 +174,13 @@ static inline const uint8_t *pqv2_l2_row(const pqv2_t *t,
         const uint8_t *packed = t->l2_indices
             + ((size_t)c * ns + s) * row_bytes;
         pqv2_l2_unpack_row(packed, scratch, M);
+        return scratch;
+    }
+    if (t->l2_idx_bits == 4) {
+        size_t row_bytes = pqv2_l2_packed_row_bytes_4bit(M);
+        const uint8_t *packed = t->l2_indices
+            + ((size_t)c * ns + s) * row_bytes;
+        pqv2_l2_unpack_4bit(packed, scratch, M);
         return scratch;
     }
     return &t->l2_indices[((size_t)c * ns + s) * M];
@@ -211,6 +240,13 @@ static inline uint8_t pqv2_l2_idx_at(const pqv2_t *t,
             case 2: return (uint8_t)(((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4));
             default: return (uint8_t)((b2 >> 2) & 0x3F);
         }
+    }
+    if (t->l2_idx_bits == 4) {
+        size_t row_bytes = pqv2_l2_packed_row_bytes_4bit(M);
+        const uint8_t *row = t->l2_indices
+            + ((size_t)c * ns + s) * row_bytes;
+        uint8_t b = row[m >> 1u];
+        return (uint8_t)((m & 1u) ? ((b >> 4) & 0x0F) : (b & 0x0F));
     }
     return t->l2_indices[((size_t)c * ns + s) * M + m];
 }
@@ -273,6 +309,7 @@ int pqv2_load(const char *path, pqv2_t *out, void **owned_p) {
     size_t cb_s_bytes = (size_t)out->n_subchunks * out->K * 2;
     size_t idx_bytes = (size_t)out->M * n_chunks * out->n_subchunks;
     size_t l2_packed_bytes_per_row = ((size_t)out->M + 3u) / 4u * 3u;
+    size_t l2_packed_bytes_per_row_4 = ((size_t)out->M + 1u) / 2u;
 
     /* Decide whether the candidate 9th u32 is really l2_idx_bits by
      * checking the projected total file size against the actual size. */
@@ -280,12 +317,14 @@ int pqv2_load(const char *path, pqv2_t *out, void **owned_p) {
     uint32_t l2_idx_bits = 8;
     if (header_u32s == 9) {
         uint32_t b = hdr[8];
-        if ((b == 6 || b == 8) && out->l2_kind == 2) {
+        if ((b == 4 || b == 6 || b == 8) && out->l2_kind == 2) {
             size_t l2q_bytes = (size_t)out->n_subchunks * out->l2_K * out->half;
             size_t l2s_bytes = (size_t)out->n_subchunks * out->l2_K * 2;
             size_t l2_idx_disk = (b == 6)
                 ? (size_t)n_chunks * out->n_subchunks * l2_packed_bytes_per_row
-                : idx_bytes;
+                : ((b == 4)
+                    ? (size_t)n_chunks * out->n_subchunks * l2_packed_bytes_per_row_4
+                    : idx_bytes);
             size_t projected = 4 + 36 + row_bytes + cb_q_bytes + cb_s_bytes
                                + idx_bytes + l2q_bytes + l2s_bytes + l2_idx_disk;
             if (projected == fsz) {
@@ -328,7 +367,9 @@ int pqv2_load(const char *path, pqv2_t *out, void **owned_p) {
         size_t l2s_bytes = (size_t)out->n_subchunks * out->l2_K * 2;
         size_t l2_idx_disk = (out->l2_idx_bits == 6)
             ? (size_t)n_chunks * out->n_subchunks * l2_packed_bytes_per_row
-            : idx_bytes;
+            : ((out->l2_idx_bits == 4)
+                ? (size_t)n_chunks * out->n_subchunks * l2_packed_bytes_per_row_4
+                : idx_bytes);
         void *l2q = xmalloc(l2q_bytes); L->blocks[L->n++] = l2q;
         void *l2s = xmalloc(l2s_bytes); L->blocks[L->n++] = l2s;
         void *l2i = xmalloc(l2_idx_disk); L->blocks[L->n++] = l2i;
@@ -466,7 +507,7 @@ void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
     float *l2_lut = (t->l2_kind == 2) ? malloc((size_t)t->l2_K * sizeof(float)) : NULL;
     /* Scratch row for bit-packed L2 unpack (Stage 5h.1). One row at a
      * time = M bytes total; reused across (c, s). */
-    uint8_t *l2_scratch = (t->l2_kind == 2 && t->l2_idx_bits == 6)
+    uint8_t *l2_scratch = (t->l2_kind == 2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
         ? (uint8_t *)malloc((size_t)M) : NULL;
 
     for (uint32_t c = 0; c < n_chunks; c++) {
@@ -565,7 +606,7 @@ void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
     float *l2_lut = NULL;
     if (t->l2_kind == 2)
         l2_lut = aligned_alloc(64, ((size_t)t->l2_K * sizeof(float) + 63) & ~63);
-    uint8_t *l2_scratch = (t->l2_kind == 2 && t->l2_idx_bits == 6)
+    uint8_t *l2_scratch = (t->l2_kind == 2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
         ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
 
     for (uint32_t c = 0; c < n_chunks; c++) {
@@ -711,7 +752,7 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
     int8_t lut_q[64] __attribute__((aligned(16)));
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float lut_scale, l2_lut_scale;
-    uint8_t *l2_scratch = (t->l2_kind == 2 && t->l2_idx_bits == 6)
+    uint8_t *l2_scratch = (t->l2_kind == 2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
         ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
 
     for (uint32_t c = 0; c < n_chunks; c++) {
@@ -880,7 +921,7 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
     int8_t lut_hi[64] __attribute__((aligned(16)));
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float lut_scale, l2_lut_scale;
-    uint8_t *l2_scratch = (acc_l2 && t->l2_idx_bits == 6)
+    uint8_t *l2_scratch = (acc_l2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
         ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
 
     for (uint32_t c = 0; c < n_chunks; c++) {
@@ -1072,7 +1113,7 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
     /* Stage 5h.1 bit-packed L2 indices: unpack each (c,s) row into a
      * stack-style scratch before the NEON vqtbl4q loop, so the loop body
      * is unchanged. Only allocated when the tensor is actually packed. */
-    uint8_t *l2_scratch = (acc_l2 && t->l2_idx_bits == 6)
+    uint8_t *l2_scratch = (acc_l2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
         ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
     /* Stage 5g.2 — when L1 on-disk layout is row-major, gather a
      * chunk-major (size-M) scratch row per (c, s) iter so the NEON
@@ -1797,6 +1838,537 @@ void pqv2_matvec_tbl_int8_k256_batch(
     }
 }
 
+/* ── Goal N28: fused MoME gate+up kernel (K=256, FLAT) ────────────────
+ *
+ * Builds the per-(c, s) INT8 LUT ONCE from the shared codebook, then
+ * gathers/accumulates against 2K expert outputs in the same pass. The
+ * dominant cost in the round-5 MoME path is repeated LUT construction
+ * (4 banks × 256 dot-products of length `half`, then a fp32→int8
+ * requantise of the 256 entries) — for K=2 experts × {gate, up} that
+ * cost is paid 4× when it only needs to be paid once.
+ *
+ * Per-expert acc arrays live in one big slab `acc[2K * M_per]` so the
+ * NEON gather loop body is byte-identical to the single-expert kernel
+ * — we just iterate `2K` times per (c, s) over different `idx` / `acc`
+ * pointer pairs and a fresh row-major scratch when `l1_idx_layout`
+ * demands it. After the (c, s) sweep, each expert's acc is multiplied
+ * by its own `row_scale` and written to hb_out[e] / hb2_out[e].
+ */
+int pqv2_matvec_mome_gateup_k256(
+    const pqv2_t * const *gate_experts,
+    const pqv2_t * const *up_experts,
+    const float *x,
+    float *hb_out,
+    float *hb2_out,
+    int K_experts)
+{
+    if (K_experts <= 0 || K_experts > IB_MOME_FUSED_MAX_K) return -1;
+    if (!gate_experts || !up_experts || !x || !hb_out || !hb2_out) return -1;
+    if (!gate_experts[0] || !up_experts[0]) return -1;
+    const pqv2_t *t0 = gate_experts[0];
+    /* Restrict to K=256 flat path with pre-decoded fp32 codebook. */
+    if (t0->K != 256 || !t0->cb_fp32 || t0->l2_kind != 0) return -1;
+
+    const uint32_t M_per = t0->M;
+    const uint32_t N     = t0->N;
+    const uint32_t G     = t0->G;
+    const uint32_t ns    = t0->n_subchunks;
+    const uint32_t half  = t0->half;
+    const uint32_t K_cb  = t0->K;
+    const uint32_t n_chunks = N / G;
+    const uint32_t l1_total = n_chunks * ns;
+
+    /* Invariant checks: every expert (gate+up) must match the prototype
+     * shape AND share the same fp32 codebook pointer. Caller is
+     * expected to have verified this — bail out if any expert differs
+     * so we don't silently produce garbage. */
+    const float *cb_fp32 = t0->cb_fp32;
+    for (int e = 0; e < K_experts; e++) {
+        const pqv2_t *g = gate_experts[e];
+        const pqv2_t *u = up_experts[e];
+        if (!g || !u) return -1;
+        if (g->K != 256 || u->K != 256) return -1;
+        if (g->M != M_per || u->M != M_per) return -1;
+        if (g->N != N || u->N != N) return -1;
+        if (g->G != G || u->G != G) return -1;
+        if (g->n_subchunks != ns || u->n_subchunks != ns) return -1;
+        if (g->half != half || u->half != half) return -1;
+        if (g->l2_kind != 0 || u->l2_kind != 0) return -1;
+        if (g->cb_fp32 != cb_fp32 || u->cb_fp32 != cb_fp32) return -1;
+    }
+
+    /* Per-tensor acc slabs — 2K of them, each M_per fp32 entries.
+     * Layout: acc_all[(2*e + 0) * M_per + m] = gate_e accumulator,
+     *         acc_all[(2*e + 1) * M_per + m] = up_e   accumulator. */
+    const size_t per_floats   = (size_t)M_per;
+    const size_t total_floats = (size_t)2 * K_experts * per_floats;
+    float *acc_all = (float *)aligned_alloc(64,
+        (total_floats * sizeof(float) + 63) & ~(size_t)63);
+    if (!acc_all) return -1;
+    memset(acc_all, 0, total_floats * sizeof(float));
+
+    /* Per-expert row-major → chunk-major scratch (one per gate+up
+     * tensor) when on-disk layout is row-major. Keep one scratch row
+     * per tensor so we can refill all 2K scratches per (c, s) and then
+     * sweep the gather loop 2K times. */
+    uint8_t *l1_scratch_slab = NULL;
+    uint8_t *l1_scratch_ptrs[2 * IB_MOME_FUSED_MAX_K];
+    int any_rowmajor = 0;
+    for (int e = 0; e < K_experts; e++) {
+        if (gate_experts[e]->l1_idx_layout == 1) any_rowmajor = 1;
+        if (up_experts[e]->l1_idx_layout == 1)   any_rowmajor = 1;
+    }
+    if (any_rowmajor) {
+        size_t one = ((size_t)M_per + 63) & ~(size_t)63;
+        l1_scratch_slab = (uint8_t *)aligned_alloc(64, one * 2 * K_experts);
+        if (!l1_scratch_slab) { free(acc_all); return -1; }
+        for (int i = 0; i < 2 * K_experts; i++) {
+            l1_scratch_ptrs[i] = l1_scratch_slab + (size_t)i * one;
+        }
+    }
+
+#if defined(__ARM_NEON)
+    int8_t lut[4][64] __attribute__((aligned(16)));
+    float  lut_scale;
+    const uint8x16_t mask63 = vdupq_n_u8(63);
+    const uint8x16_t one_v  = vdupq_n_u8(1);
+
+    for (uint32_t c = 0; c < n_chunks; c++) {
+        for (uint32_t s = 0; s < ns; s++) {
+            const float *xs = &x[c * G + s * half];
+            /* ── BUILD LUT ONCE (shared across all 2K outputs) ── */
+            build_lut_int8_k256(&cb_fp32[(size_t)s * K_cb * half], xs, half,
+                                  lut, &lut_scale);
+
+            int8x16x4_t b0, b1, b2, b3;
+            #define LOAD_BANK(B, ARR) \
+                B.val[0] = vld1q_s8(&ARR[0]);  B.val[1] = vld1q_s8(&ARR[16]); \
+                B.val[2] = vld1q_s8(&ARR[32]); B.val[3] = vld1q_s8(&ARR[48]);
+            LOAD_BANK(b0, lut[0]); LOAD_BANK(b1, lut[1]);
+            LOAD_BANK(b2, lut[2]); LOAD_BANK(b3, lut[3]);
+            #undef LOAD_BANK
+            float32x4_t scl = vdupq_n_f32(lut_scale);
+
+            /* ── Refill per-tensor row-major scratches for this (c, s).
+             * Only the tensors that are row-major need a scratch fill;
+             * chunk-major tensors read t->indices directly. */
+            for (int e = 0; e < K_experts; e++) {
+                const pqv2_t *g = gate_experts[e];
+                const pqv2_t *u = up_experts[e];
+                if (g->l1_idx_layout == 1) {
+                    uint32_t off = c * ns + s;
+                    uint8_t *dst = l1_scratch_ptrs[2 * e + 0];
+                    for (uint32_t mm = 0; mm < M_per; mm++)
+                        dst[mm] = g->indices[(size_t)mm * l1_total + off];
+                }
+                if (u->l1_idx_layout == 1) {
+                    uint32_t off = c * ns + s;
+                    uint8_t *dst = l1_scratch_ptrs[2 * e + 1];
+                    for (uint32_t mm = 0; mm < M_per; mm++)
+                        dst[mm] = u->indices[(size_t)mm * l1_total + off];
+                }
+            }
+
+            /* ── Gather + accumulate for each of the 2K outputs. ── */
+            for (int slot = 0; slot < 2 * K_experts; slot++) {
+                const pqv2_t *t = (slot & 1) ? up_experts[slot >> 1]
+                                              : gate_experts[slot >> 1];
+                const uint8_t *idx;
+                if (t->l1_idx_layout == 1) {
+                    idx = l1_scratch_ptrs[slot];
+                } else {
+                    idx = &t->indices[((size_t)c * ns + s) * M_per];
+                }
+                float *acc = acc_all + (size_t)slot * per_floats;
+
+                uint32_t m = 0;
+                /* 32-row blocks with prefetch (mirror of
+                 * pqv2_acc_tbl_int8_k256_chunks_inner). */
+                for (; m + 32 <= M_per; m += 32) {
+                    if (m + 256 < M_per) __builtin_prefetch(&idx[m + 256], 0, 0);
+                    uint8x16_t iA = vld1q_u8(&idx[m]);
+                    uint8x16_t iB = vld1q_u8(&idx[m + 16]);
+                    uint8x16_t i6A = vandq_u8(iA, mask63);
+                    uint8x16_t i6B = vandq_u8(iB, mask63);
+                    int8x16_t gA0 = vqtbl4q_s8(b0, i6A); int8x16_t gB0 = vqtbl4q_s8(b0, i6B);
+                    int8x16_t gA1 = vqtbl4q_s8(b1, i6A); int8x16_t gB1 = vqtbl4q_s8(b1, i6B);
+                    int8x16_t gA2 = vqtbl4q_s8(b2, i6A); int8x16_t gB2 = vqtbl4q_s8(b2, i6B);
+                    int8x16_t gA3 = vqtbl4q_s8(b3, i6A); int8x16_t gB3 = vqtbl4q_s8(b3, i6B);
+                    uint8x16_t selA_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(iA, 6), one_v), one_v);
+                    uint8x16_t selA_msb = vceqq_u8(vshrq_n_u8(iA, 7), one_v);
+                    uint8x16_t selB_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(iB, 6), one_v), one_v);
+                    uint8x16_t selB_msb = vceqq_u8(vshrq_n_u8(iB, 7), one_v);
+                    int8x16_t gA = vbslq_s8(selA_msb, vbslq_s8(selA_lsb, gA3, gA2),
+                                                       vbslq_s8(selA_lsb, gA1, gA0));
+                    int8x16_t gB = vbslq_s8(selB_msb, vbslq_s8(selB_lsb, gB3, gB2),
+                                                       vbslq_s8(selB_lsb, gB1, gB0));
+                    int16x8_t lA = vmovl_s8(vget_low_s8(gA)); int16x8_t hA = vmovl_s8(vget_high_s8(gA));
+                    int16x8_t lB = vmovl_s8(vget_low_s8(gB)); int16x8_t hB = vmovl_s8(vget_high_s8(gB));
+                    float32x4_t fA0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lA)));
+                    float32x4_t fA1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lA)));
+                    float32x4_t fA2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hA)));
+                    float32x4_t fA3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hA)));
+                    float32x4_t fB0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lB)));
+                    float32x4_t fB1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lB)));
+                    float32x4_t fB2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hB)));
+                    float32x4_t fB3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hB)));
+                    vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), fA0, scl));
+                    vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), fA1, scl));
+                    vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), fA2, scl));
+                    vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), fA3, scl));
+                    vst1q_f32(&acc[m+16], vfmaq_f32(vld1q_f32(&acc[m+16]), fB0, scl));
+                    vst1q_f32(&acc[m+20], vfmaq_f32(vld1q_f32(&acc[m+20]), fB1, scl));
+                    vst1q_f32(&acc[m+24], vfmaq_f32(vld1q_f32(&acc[m+24]), fB2, scl));
+                    vst1q_f32(&acc[m+28], vfmaq_f32(vld1q_f32(&acc[m+28]), fB3, scl));
+                }
+                for (; m + 16 <= M_per; m += 16) {
+                    uint8x16_t i16 = vld1q_u8(&idx[m]);
+                    uint8x16_t i6 = vandq_u8(i16, mask63);
+                    int8x16_t g0 = vqtbl4q_s8(b0, i6);
+                    int8x16_t g1 = vqtbl4q_s8(b1, i6);
+                    int8x16_t g2 = vqtbl4q_s8(b2, i6);
+                    int8x16_t g3 = vqtbl4q_s8(b3, i6);
+                    uint8x16_t sel_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(i16, 6), one_v), one_v);
+                    uint8x16_t sel_msb = vceqq_u8(vshrq_n_u8(i16, 7), one_v);
+                    int8x16_t g = vbslq_s8(sel_msb, vbslq_s8(sel_lsb, g3, g2),
+                                                     vbslq_s8(sel_lsb, g1, g0));
+                    int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+                    int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+                    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+                    float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)));
+                    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+                    float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)));
+                    vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), f0, scl));
+                    vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), f1, scl));
+                    vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
+                    vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
+                }
+                for (; m < M_per; m++) {
+                    uint8_t k = idx[m];
+                    int8_t v = lut[k >> 6][k & 63];
+                    acc[m] += (float)v * lut_scale;
+                }
+            }
+        }
+    }
+#else
+    /* Scalar fallback — same loop structure, no NEON. */
+    int8_t lut[4][64];
+    float  lut_scale;
+    for (uint32_t c = 0; c < n_chunks; c++) {
+        for (uint32_t s = 0; s < ns; s++) {
+            const float *xs = &x[c * G + s * half];
+            build_lut_int8_k256(&cb_fp32[(size_t)s * K_cb * half], xs, half,
+                                  lut, &lut_scale);
+            for (int slot = 0; slot < 2 * K_experts; slot++) {
+                const pqv2_t *t = (slot & 1) ? up_experts[slot >> 1]
+                                              : gate_experts[slot >> 1];
+                const uint8_t *idx = &t->indices[((size_t)c * ns + s) * M_per];
+                float *acc = acc_all + (size_t)slot * per_floats;
+                for (uint32_t m = 0; m < M_per; m++) {
+                    uint8_t k = idx[m];
+                    int8_t v = lut[k >> 6][k & 63];
+                    acc[m] += (float)v * lut_scale;
+                }
+            }
+        }
+    }
+#endif
+
+    /* ── Apply per-expert row_scale and emit hb / hb2 outputs. ── */
+    for (int e = 0; e < K_experts; e++) {
+        const float *gate_acc = acc_all + (size_t)(2 * e + 0) * per_floats;
+        const float *up_acc   = acc_all + (size_t)(2 * e + 1) * per_floats;
+        const uint16_t *rs_g  = gate_experts[e]->row_scale;
+        const uint16_t *rs_u  = up_experts[e]->row_scale;
+        float *go = hb_out  + (size_t)e * per_floats;
+        float *uo = hb2_out + (size_t)e * per_floats;
+        for (uint32_t m = 0; m < M_per; m++) {
+            go[m] = gate_acc[m] * pqv2_h2f(rs_g[m]);
+            uo[m] = up_acc[m]   * pqv2_h2f(rs_u[m]);
+        }
+    }
+
+    free(acc_all);
+    if (l1_scratch_slab) free(l1_scratch_slab);
+    return 0;
+}
+
+/* ── Goal H1: batched MoME kernel v2 (interleaved across K experts) ───
+ *
+ * Same outputs/contract as pqv2_matvec_mome_gateup_k256, but the
+ * inner (c, s) loop is restructured so each 32-row m-block processes
+ * ALL 2K slots before advancing to m+32. The 32-row block of acc
+ * for each slot stays in NEON registers across the slot dimension,
+ * so per-(c, s) acc memory traffic is amortised across slots:
+ *
+ *   v1: per (c, s) per slot: read M_per acc + write M_per acc
+ *       (M_per traffic × 2K slots = 2 * 2K * M_per * 4 bytes)
+ *   v2: per (c, s) per m-block: read 32 acc per slot, write 32 acc
+ *       per slot, but the 32-row LUT banks stay resident across slots
+ *       (LUT-resident win is the same; the m-block acc still touches
+ *       memory once per slot, but the indices fetch and the gather
+ *       dominate, and the acc cache lines are guaranteed L1-hot).
+ *
+ * The real v2 lever is index locality + LUT-register residency at the
+ * m-block granularity. NEON has 32 SIMD registers; we burn 16 on the
+ * 4 LUT banks (b0..b3, 4 q-regs each) and keep 16 free for index
+ * loads, gather scratch, and acc fma chains.
+ */
+int pqv2_matvec_mome_gateup_k256_v2(
+    const pqv2_t * const *gate_experts,
+    const pqv2_t * const *up_experts,
+    const float *x,
+    float *hb_out,
+    float *hb2_out,
+    int K_experts)
+{
+    if (K_experts <= 0 || K_experts > IB_MOME_FUSED_MAX_K) return -1;
+    if (!gate_experts || !up_experts || !x || !hb_out || !hb2_out) return -1;
+    if (!gate_experts[0] || !up_experts[0]) return -1;
+    const pqv2_t *t0 = gate_experts[0];
+    if (t0->K != 256 || !t0->cb_fp32 || t0->l2_kind != 0) return -1;
+
+    const uint32_t M_per = t0->M;
+    const uint32_t N     = t0->N;
+    const uint32_t G     = t0->G;
+    const uint32_t ns    = t0->n_subchunks;
+    const uint32_t half  = t0->half;
+    const uint32_t K_cb  = t0->K;
+    const uint32_t n_chunks = N / G;
+    const uint32_t l1_total = n_chunks * ns;
+
+    /* Invariant re-check (same as v1). */
+    const float *cb_fp32 = t0->cb_fp32;
+    for (int e = 0; e < K_experts; e++) {
+        const pqv2_t *g = gate_experts[e];
+        const pqv2_t *u = up_experts[e];
+        if (!g || !u) return -1;
+        if (g->K != 256 || u->K != 256) return -1;
+        if (g->M != M_per || u->M != M_per) return -1;
+        if (g->N != N || u->N != N) return -1;
+        if (g->G != G || u->G != G) return -1;
+        if (g->n_subchunks != ns || u->n_subchunks != ns) return -1;
+        if (g->half != half || u->half != half) return -1;
+        if (g->l2_kind != 0 || u->l2_kind != 0) return -1;
+        if (g->cb_fp32 != cb_fp32 || u->cb_fp32 != cb_fp32) return -1;
+    }
+
+    const int n_slots = 2 * K_experts;
+    /* Per-slot acc slab — same layout as v1: (2*e+0) gate, (2*e+1) up. */
+    const size_t per_floats   = (size_t)M_per;
+    const size_t total_floats = (size_t)n_slots * per_floats;
+    float *acc_all = (float *)aligned_alloc(64,
+        (total_floats * sizeof(float) + 63) & ~(size_t)63);
+    if (!acc_all) return -1;
+    memset(acc_all, 0, total_floats * sizeof(float));
+
+    /* Row-major scratch slab — one row per slot (refilled per (c, s)). */
+    uint8_t *l1_scratch_slab = NULL;
+    uint8_t *l1_scratch_ptrs[2 * IB_MOME_FUSED_MAX_K];
+    int any_rowmajor = 0;
+    for (int e = 0; e < K_experts; e++) {
+        if (gate_experts[e]->l1_idx_layout == 1) any_rowmajor = 1;
+        if (up_experts[e]->l1_idx_layout == 1)   any_rowmajor = 1;
+    }
+    if (any_rowmajor) {
+        size_t one = ((size_t)M_per + 63) & ~(size_t)63;
+        l1_scratch_slab = (uint8_t *)aligned_alloc(64, one * (size_t)n_slots);
+        if (!l1_scratch_slab) { free(acc_all); return -1; }
+        for (int i = 0; i < n_slots; i++) {
+            l1_scratch_ptrs[i] = l1_scratch_slab + (size_t)i * one;
+        }
+    }
+
+    /* Cached per-slot idx-base pointers (recomputed per (c, s) loop). */
+    const uint8_t *slot_idx[2 * IB_MOME_FUSED_MAX_K];
+    float *slot_acc[2 * IB_MOME_FUSED_MAX_K];
+    const pqv2_t *slot_t[2 * IB_MOME_FUSED_MAX_K];
+    for (int slot = 0; slot < n_slots; slot++) {
+        slot_t[slot]   = (slot & 1) ? up_experts[slot >> 1]
+                                     : gate_experts[slot >> 1];
+        slot_acc[slot] = acc_all + (size_t)slot * per_floats;
+    }
+
+#if defined(__ARM_NEON)
+    int8_t lut[4][64] __attribute__((aligned(16)));
+    float  lut_scale;
+    const uint8x16_t mask63 = vdupq_n_u8(63);
+    const uint8x16_t one_v  = vdupq_n_u8(1);
+
+    for (uint32_t c = 0; c < n_chunks; c++) {
+        for (uint32_t s = 0; s < ns; s++) {
+            const float *xs = &x[c * G + s * half];
+            /* Build the shared LUT ONCE for this (c, s). */
+            build_lut_int8_k256(&cb_fp32[(size_t)s * K_cb * half], xs, half,
+                                  lut, &lut_scale);
+
+            /* Pre-load LUT banks into NEON regs (16 q-regs). */
+            int8x16x4_t b0, b1, b2, b3;
+            #define LOAD_BANK(B, ARR) \
+                B.val[0] = vld1q_s8(&ARR[0]);  B.val[1] = vld1q_s8(&ARR[16]); \
+                B.val[2] = vld1q_s8(&ARR[32]); B.val[3] = vld1q_s8(&ARR[48]);
+            LOAD_BANK(b0, lut[0]); LOAD_BANK(b1, lut[1]);
+            LOAD_BANK(b2, lut[2]); LOAD_BANK(b3, lut[3]);
+            #undef LOAD_BANK
+            float32x4_t scl = vdupq_n_f32(lut_scale);
+
+            /* Refill row-major scratches (if any) and cache idx base ptrs. */
+            uint32_t cs_off = c * ns + s;
+            for (int slot = 0; slot < n_slots; slot++) {
+                const pqv2_t *t = slot_t[slot];
+                if (t->l1_idx_layout == 1) {
+                    uint8_t *dst = l1_scratch_ptrs[slot];
+                    const uint8_t *src = t->indices;
+                    for (uint32_t mm = 0; mm < M_per; mm++)
+                        dst[mm] = src[(size_t)mm * l1_total + cs_off];
+                    slot_idx[slot] = dst;
+                } else {
+                    slot_idx[slot] = &t->indices[((size_t)cs_off) * M_per];
+                }
+            }
+
+            /* Outer loop: 32-row m-block. Inner loop: slot.
+             *
+             * For each m-block, we touch acc[m..m+32] for each slot. The
+             * critical reuse is the LUT in NEON registers (b0..b3). The
+             * per-slot acc cache line is guaranteed L1-hot across slots
+             * because the block is only 128 bytes per slot — even at
+             * K=32, total per-block acc is 32*32*4 = 4KB, fits in L1d. */
+            uint32_t m = 0;
+            for (; m + 32 <= M_per; m += 32) {
+                /* Prefetch next-block indices for slot 0 + slot 1. */
+                if (m + 256 < M_per) {
+                    __builtin_prefetch(&slot_idx[0][m + 256], 0, 0);
+                    if (n_slots > 1)
+                        __builtin_prefetch(&slot_idx[1][m + 256], 0, 0);
+                }
+                for (int slot = 0; slot < n_slots; slot++) {
+                    const uint8_t *idx = slot_idx[slot];
+                    float *acc = slot_acc[slot];
+
+                    uint8x16_t iA = vld1q_u8(&idx[m]);
+                    uint8x16_t iB = vld1q_u8(&idx[m + 16]);
+                    uint8x16_t i6A = vandq_u8(iA, mask63);
+                    uint8x16_t i6B = vandq_u8(iB, mask63);
+                    int8x16_t gA0 = vqtbl4q_s8(b0, i6A); int8x16_t gB0 = vqtbl4q_s8(b0, i6B);
+                    int8x16_t gA1 = vqtbl4q_s8(b1, i6A); int8x16_t gB1 = vqtbl4q_s8(b1, i6B);
+                    int8x16_t gA2 = vqtbl4q_s8(b2, i6A); int8x16_t gB2 = vqtbl4q_s8(b2, i6B);
+                    int8x16_t gA3 = vqtbl4q_s8(b3, i6A); int8x16_t gB3 = vqtbl4q_s8(b3, i6B);
+                    uint8x16_t selA_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(iA, 6), one_v), one_v);
+                    uint8x16_t selA_msb = vceqq_u8(vshrq_n_u8(iA, 7), one_v);
+                    uint8x16_t selB_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(iB, 6), one_v), one_v);
+                    uint8x16_t selB_msb = vceqq_u8(vshrq_n_u8(iB, 7), one_v);
+                    int8x16_t gA = vbslq_s8(selA_msb, vbslq_s8(selA_lsb, gA3, gA2),
+                                                       vbslq_s8(selA_lsb, gA1, gA0));
+                    int8x16_t gB = vbslq_s8(selB_msb, vbslq_s8(selB_lsb, gB3, gB2),
+                                                       vbslq_s8(selB_lsb, gB1, gB0));
+                    int16x8_t lA = vmovl_s8(vget_low_s8(gA)); int16x8_t hA = vmovl_s8(vget_high_s8(gA));
+                    int16x8_t lB = vmovl_s8(vget_low_s8(gB)); int16x8_t hB = vmovl_s8(vget_high_s8(gB));
+                    float32x4_t fA0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lA)));
+                    float32x4_t fA1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lA)));
+                    float32x4_t fA2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hA)));
+                    float32x4_t fA3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hA)));
+                    float32x4_t fB0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lB)));
+                    float32x4_t fB1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lB)));
+                    float32x4_t fB2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hB)));
+                    float32x4_t fB3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hB)));
+                    vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), fA0, scl));
+                    vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), fA1, scl));
+                    vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), fA2, scl));
+                    vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), fA3, scl));
+                    vst1q_f32(&acc[m+16], vfmaq_f32(vld1q_f32(&acc[m+16]), fB0, scl));
+                    vst1q_f32(&acc[m+20], vfmaq_f32(vld1q_f32(&acc[m+20]), fB1, scl));
+                    vst1q_f32(&acc[m+24], vfmaq_f32(vld1q_f32(&acc[m+24]), fB2, scl));
+                    vst1q_f32(&acc[m+28], vfmaq_f32(vld1q_f32(&acc[m+28]), fB3, scl));
+                }
+            }
+            /* 16-row tail block (also slot-inner). */
+            for (; m + 16 <= M_per; m += 16) {
+                for (int slot = 0; slot < n_slots; slot++) {
+                    const uint8_t *idx = slot_idx[slot];
+                    float *acc = slot_acc[slot];
+                    uint8x16_t i16 = vld1q_u8(&idx[m]);
+                    uint8x16_t i6 = vandq_u8(i16, mask63);
+                    int8x16_t g0 = vqtbl4q_s8(b0, i6);
+                    int8x16_t g1 = vqtbl4q_s8(b1, i6);
+                    int8x16_t g2 = vqtbl4q_s8(b2, i6);
+                    int8x16_t g3 = vqtbl4q_s8(b3, i6);
+                    uint8x16_t sel_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(i16, 6), one_v), one_v);
+                    uint8x16_t sel_msb = vceqq_u8(vshrq_n_u8(i16, 7), one_v);
+                    int8x16_t g = vbslq_s8(sel_msb, vbslq_s8(sel_lsb, g3, g2),
+                                                     vbslq_s8(sel_lsb, g1, g0));
+                    int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+                    int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+                    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+                    float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)));
+                    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+                    float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)));
+                    vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), f0, scl));
+                    vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), f1, scl));
+                    vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
+                    vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
+                }
+            }
+            /* Scalar row tail (also slot-inner). */
+            for (; m < M_per; m++) {
+                for (int slot = 0; slot < n_slots; slot++) {
+                    const uint8_t *idx = slot_idx[slot];
+                    float *acc = slot_acc[slot];
+                    uint8_t k = idx[m];
+                    int8_t v = lut[k >> 6][k & 63];
+                    acc[m] += (float)v * lut_scale;
+                }
+            }
+        }
+    }
+#else
+    /* Scalar fallback — same loop ordering (slot-inner per m-block).
+     * Reference path; not perf-critical. */
+    int8_t lut[4][64];
+    float  lut_scale;
+    for (uint32_t c = 0; c < n_chunks; c++) {
+        for (uint32_t s = 0; s < ns; s++) {
+            const float *xs = &x[c * G + s * half];
+            build_lut_int8_k256(&cb_fp32[(size_t)s * K_cb * half], xs, half,
+                                  lut, &lut_scale);
+            uint32_t cs_off = c * ns + s;
+            for (int slot = 0; slot < n_slots; slot++) {
+                const pqv2_t *t = slot_t[slot];
+                slot_idx[slot] = &t->indices[((size_t)cs_off) * M_per];
+            }
+            for (uint32_t m = 0; m < M_per; m++) {
+                for (int slot = 0; slot < n_slots; slot++) {
+                    const uint8_t *idx = slot_idx[slot];
+                    float *acc = slot_acc[slot];
+                    uint8_t k = idx[m];
+                    int8_t v = lut[k >> 6][k & 63];
+                    acc[m] += (float)v * lut_scale;
+                }
+            }
+        }
+    }
+#endif
+
+    /* Apply per-expert row_scale and emit hb / hb2. */
+    for (int e = 0; e < K_experts; e++) {
+        const float *gate_acc = acc_all + (size_t)(2 * e + 0) * per_floats;
+        const float *up_acc   = acc_all + (size_t)(2 * e + 1) * per_floats;
+        const uint16_t *rs_g  = gate_experts[e]->row_scale;
+        const uint16_t *rs_u  = up_experts[e]->row_scale;
+        float *go = hb_out  + (size_t)e * per_floats;
+        float *uo = hb2_out + (size_t)e * per_floats;
+        for (uint32_t m = 0; m < M_per; m++) {
+            go[m] = gate_acc[m] * pqv2_h2f(rs_g[m]);
+            uo[m] = up_acc[m]   * pqv2_h2f(rs_u[m]);
+        }
+    }
+
+    free(acc_all);
+    if (l1_scratch_slab) free(l1_scratch_slab);
+    return 0;
+}
+
 #else
 void pqv2_matvec_tbl_int8_k256_skip(
     const pqv2_t *t, const float *x, float *y, float st, double *of)
@@ -1869,5 +2441,30 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
 }
 void pqv2_matvec_tbl_int8_k256(const pqv2_t *t, const float *x, float *y) {
     pqv2_matvec_lut(t, x, y);
+}
+int pqv2_matvec_mome_gateup_k256(
+    const pqv2_t * const *gate_experts,
+    const pqv2_t * const *up_experts,
+    const float *x,
+    float *hb_out,
+    float *hb2_out,
+    int K_experts)
+{
+    (void)gate_experts; (void)up_experts; (void)x;
+    (void)hb_out; (void)hb2_out; (void)K_experts;
+    /* Non-ARM build has no fused kernel; caller falls back. */
+    return -1;
+}
+int pqv2_matvec_mome_gateup_k256_v2(
+    const pqv2_t * const *gate_experts,
+    const pqv2_t * const *up_experts,
+    const float *x,
+    float *hb_out,
+    float *hb2_out,
+    int K_experts)
+{
+    (void)gate_experts; (void)up_experts; (void)x;
+    (void)hb_out; (void)hb2_out; (void)K_experts;
+    return -1;
 }
 #endif

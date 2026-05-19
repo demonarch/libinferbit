@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* PQ-v2 standalone kernel + on-disk format for the pq-v2-bench branch.
  *
  * Layout matches scripts/poc/pqv2_encode.py PQv2Tensor (no AWQ for bench):
@@ -27,13 +31,15 @@ typedef struct {
     uint32_t l2_idx_bits;
 
     /* Stage 5k — scale precision encoding. 0 = legacy (row_scale fp16,
-     * cb_scale fp16). 2 = row_scale int8 + per-tensor fp16 row_max, and
-     * cb_scale fp8 (E4M3). Modes 1 and 3 are reserved per the doc but
-     * unimplemented in v1. The kernel ALWAYS reads `row_scale` and
-     * `cb_scale` as uint16 fp16 — when mode != 0, the loader decodes
-     * the on-disk int8/fp8 bytes into newly-allocated fp16 arrays at
-     * parse time, so the hot inner loops stay byte-identical. Cost
-     * absorbed in the load-time codebook prebuild. */
+     * cb_scale fp16). 2 = row_scale fp8 E4M3 and cb_scale fp8 E4M3
+     * (H2 sp2 redesign — Agent 3 round 1 fix; was int8+row_max for
+     * row_scale, which collapsed multi-decade dynamic range and bloated
+     * PPL). Modes 1 and 3 are reserved per the doc but unimplemented
+     * in v1. The kernel ALWAYS reads `row_scale` and `cb_scale` as
+     * uint16 fp16 — when mode != 0, the loader decodes the on-disk fp8
+     * bytes into newly-allocated fp16 arrays at parse time, so the hot
+     * inner loops stay byte-identical. Cost absorbed in the load-time
+     * codebook prebuild. */
     uint32_t scale_precision;
 
     /* Stage 5j — codebook pool. When > 0 in the on-disk header, the file
@@ -229,5 +235,69 @@ uint16_t pqv2_f2h(float f);
  * calls. This getter prints the accumulated totals on demand (e.g. at
  * process exit). No-op when profiling was never enabled. */
 void ib_pqv2_profile_dump(void);
+
+/* Goal N28 — fused MoME gate+up kernel (K=256, FLAT only). */
+#ifndef IB_MOME_FUSED_MAX_K
+#define IB_MOME_FUSED_MAX_K 32
+#endif
+
+/*
+ *
+ * Computes K experts' gate AND up matvecs in a single (chunk, sub-chunk)
+ * sweep, sharing the per-(c, s) LUT build across all 2K outputs. The
+ * caller MUST verify (before the call) that:
+ *   - every gate_experts[e]->cb_fp32 == gate_experts[0]->cb_fp32, and
+ *   - up_experts[e]->cb_fp32 also matches gate_experts[0]->cb_fp32.
+ * This is the shared-codebook MoME invariant (round-5 fix); the kernel
+ * builds the LUT once from gate_experts[0]->cb_fp32 and reuses it for
+ * every (e, gate/up) gather. Each expert keeps its own row_scale and
+ * indices arrays.
+ *
+ * Restrictions: K=256, l2_kind==0 (flat — no pyramid), same (M, N, G,
+ * n_subchunks, half) across all 2K tensors, K_experts ≤ 32, all
+ * cb_fp32 non-NULL.
+ *
+ * Outputs:
+ *   hb_out[e * M_per + m]  = gate matvec result for expert e, row m
+ *   hb2_out[e * M_per + m] = up   matvec result for expert e, row m
+ * where M_per = gate_experts[0]->M.
+ *
+ * Returns 0 on success, -1 if invariants don't hold (caller should fall
+ * back to the per-expert path). */
+int pqv2_matvec_mome_gateup_k256(
+    const pqv2_t * const *gate_experts,
+    const pqv2_t * const *up_experts,
+    const float *x,
+    float *hb_out,
+    float *hb2_out,
+    int K_experts);
+
+/* Goal H1 — batched MoME gate+up kernel v2 (K=256, FLAT only).
+ *
+ * Same contract as pqv2_matvec_mome_gateup_k256, but with the (c, s)
+ * inner loop restructured so the K experts are interleaved INSIDE each
+ * 32-row m-block. The v1 kernel processes the m-axis once per slot
+ * (slot = expert × {gate, up}), refilling acc[m..m+32] from memory
+ * 2K times per (c, s). v2 holds acc[m..m+32] in registers across all
+ * 2K slots, paying one acc[m] load and one acc[m] store per m-block
+ * per (c, s) — independent of K_experts.
+ *
+ * Eligibility (same as v1): K=256, l2_kind==0, shared cb_fp32 across
+ * all gate/up tensors. Caller must verify before calling; the kernel
+ * re-checks and returns -1 on mismatch. Env knob IB_MOME_FUSED_V2=0
+ * disables this path so the caller falls back to v1.
+ *
+ * Returns 0 on success, -1 if invariants don't hold. */
+int pqv2_matvec_mome_gateup_k256_v2(
+    const pqv2_t * const *gate_experts,
+    const pqv2_t * const *up_experts,
+    const float *x,
+    float *hb_out,
+    float *hb2_out,
+    int K_experts);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
