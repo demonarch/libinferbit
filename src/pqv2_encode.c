@@ -917,11 +917,14 @@ static void pqv2_pack_l2_row_4bit(const uint8_t *src_m, uint32_t M, uint8_t *dst
     }
 }
 
-/* Goal N36 — L2 codebook size override. Default 64 preserves v0.4.x
- * behavior; set IB_L2_K=16 (or any 1..64 value, clamped) to shrink the
- * L2 codebook (and thus the per-row packed-index byte count). The
- * encoder uses 4-bit packing when the resolved value is ≤ 16, else
- * falls back to 6-bit (≤64). */
+/* L2 codebook size. DEFAULT 16 (4-bit packed L2) as of 2026-05-20: the
+ * 16-entry L2 codebook Pareto-dominates the old 64-entry default once the
+ * k-means empty-cluster reseed + L2 restarts landed — it is smaller
+ * (712 vs 803 MB on TinyLlama), faster on CPU (44.7 vs 31 t/s), correct on
+ * Metal + drive (4-bit unpack added), and LOWER PPL (6.497 vs 6.520). So
+ * `--format pyramid` now means 4-bit L2. Set IB_L2_K=64 (or any 1..64) to
+ * opt back into the legacy 6-bit L2. The encoder uses 4-bit packing when
+ * the resolved value is ≤ 16, else 6-bit (≤ 64). */
 static int pqv2_resolve_l2_k(int pyramid) {
     if (!pyramid) return 0;
     const char *e = getenv("IB_L2_K");
@@ -929,7 +932,7 @@ static int pqv2_resolve_l2_k(int pyramid) {
         long v = strtol(e, NULL, 10);
         if (v >= 1 && v <= 64) return (int)v;
     }
-    return 64;
+    return 16;
 }
 
 static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
