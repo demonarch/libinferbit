@@ -30,6 +30,129 @@ static int w4a8_enabled(void) {
     return cached;
 }
 
+/* ── FFN activation-sparsity QUALITY PROBE (env-gated, off by default) ──
+ *
+ * Hypothesis: per token most FFN intermediate neurons have silu(gate)≈0, so
+ * we can zero them with negligible quality loss. This probe measures the
+ * PPL-vs-density curve to bound an eventual sparse kernel's speedup; it does
+ * NOT skip compute (multiply-by-zero == skip for QUALITY purposes).
+ *
+ *   IB_FFN_DENSITY        float in (0,1]; keep top density·inter neurons by
+ *                         magnitude. Unset / >=1 / <=0 => probe disabled.
+ *   IB_FFN_SPARSITY_MODE  0 (default): threshold |hb| = |silu(gate)·up|
+ *                         1: threshold |silu(gate)| (the "predict from gate"
+ *                            variant — lets a real kernel skip up+down).
+ */
+static float ffn_density(void) {
+    static float cached = -2.0f;
+    if (cached < -1.0f) {
+        const char* e = getenv("IB_FFN_DENSITY");
+        float d = (e && e[0]) ? (float)atof(e) : 1.0f;
+        if (!(d > 0.0f) || d >= 1.0f) d = 1.0f; /* off */
+        cached = d;
+    }
+    return cached;
+}
+static int ffn_sparsity_mode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("IB_FFN_SPARSITY_MODE");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* In-place quickselect on a scratch copy of |vals[0..n)| to find the
+ * threshold τ = the (n-k)-th smallest magnitude, where k = #neurons to
+ * keep. Returns τ such that keeping |x|>=τ retains ~k entries. */
+static float ffn_select_threshold(const float* vals, int n, int keep,
+                                  float* scratch) {
+    if (keep <= 0) return 1e30f;       /* zero everything */
+    if (keep >= n) return -1.0f;       /* keep everything */
+    for (int i = 0; i < n; i++) {
+        float v = vals[i];
+        scratch[i] = v < 0.0f ? -v : v;
+    }
+    /* We want the (n-keep)-th smallest => rank index target = n-keep. */
+    int target = n - keep;
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        float pivot = scratch[(lo + hi) >> 1];
+        int i = lo, j = hi;
+        while (i <= j) {
+            while (scratch[i] < pivot) i++;
+            while (scratch[j] > pivot) j--;
+            if (i <= j) {
+                float t = scratch[i]; scratch[i] = scratch[j]; scratch[j] = t;
+                i++; j--;
+            }
+        }
+        if (target <= j)      hi = j;
+        else if (target >= i) lo = i;
+        else break;
+    }
+    return scratch[target];
+}
+
+/* Apply the density probe to the post-silu_mul activation hb[inter].
+ * gate_pre points at the pre-silu_mul gate output (= hb before silu_mul was
+ * called over it) for mode-1 gating; in mode 0 it is ignored. scratch must
+ * hold >= inter floats. */
+static void ffn_apply_density(float* hb, const float* gate_pre, int inter,
+                              float* scratch) {
+    float density = ffn_density();
+    if (density >= 1.0f) return;
+    int keep = (int)(density * (float)inter + 0.5f);
+    if (keep >= inter) return;
+
+    if (ffn_sparsity_mode() == 1 && gate_pre) {
+        /* Mode 1: rank by |silu(gate)|. Reuse scratch to hold silu(gate). */
+        for (int i = 0; i < inter; i++) {
+            float g = gate_pre[i];
+            scratch[i] = g / (1.0f + expf(-g));   /* silu(gate) */
+        }
+        /* select_threshold copies |scratch| into a second region — but we
+         * only have one scratch buffer, so compute τ over scratch directly
+         * via a magnitude copy at the tail half is unsafe. Instead inline:
+         * temporarily abs scratch in place, quickselect, then re-derive
+         * keep-mask by comparing |silu(gate)| to τ. */
+        /* abs in place */
+        for (int i = 0; i < inter; i++) {
+            if (scratch[i] < 0.0f) scratch[i] = -scratch[i];
+        }
+        int target = inter - keep;
+        int lo = 0, hi = inter - 1;
+        while (lo < hi) {
+            float pivot = scratch[(lo + hi) >> 1];
+            int i = lo, j = hi;
+            while (i <= j) {
+                while (scratch[i] < pivot) i++;
+                while (scratch[j] > pivot) j--;
+                if (i <= j) {
+                    float t = scratch[i]; scratch[i] = scratch[j]; scratch[j] = t;
+                    i++; j--;
+                }
+            }
+            if (target <= j)      hi = j;
+            else if (target >= i) lo = i;
+            else break;
+        }
+        float tau = scratch[target];
+        for (int i = 0; i < inter; i++) {
+            float g = gate_pre[i];
+            float s = g / (1.0f + expf(-g));
+            if ((s < 0.0f ? -s : s) < tau) hb[i] = 0.0f;
+        }
+    } else {
+        /* Mode 0: rank by |hb| = |silu(gate)*up|. */
+        float tau = ffn_select_threshold(hb, inter, keep, scratch);
+        for (int i = 0; i < inter; i++) {
+            float v = hb[i];
+            if ((v < 0.0f ? -v : v) < tau) hb[i] = 0.0f;
+        }
+    }
+}
+
 /* ── Goal H4 — hot-cache framework (scaffolding) ─────────────────────
  *
  * See inferbit_internal.h for the contract. v1 ships:
@@ -2111,7 +2234,26 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
                     tensor_matmul_hybrid(m, l, &layer->gate_proj, hb, xb, inter, hidden, scale_buf);
                     tensor_matmul_hybrid(m, l, &layer->up_proj,   hb2, xb, inter, hidden, scale_buf);
                 }
-                ib_kern.silu_mul(hb, hb, hb2, inter);
+                /* FFN activation-sparsity QUALITY PROBE (env-gated, off by
+                 * default). When IB_FFN_DENSITY<1: snapshot gate (mode 1
+                 * needs pre-silu gate, since silu_mul overwrites hb), run
+                 * silu_mul, then zero the bottom-(1-density) neurons. */
+                if (ffn_density() < 1.0f) {
+                    float* gate_snap = NULL;
+                    float* dscratch  = (float*)malloc((size_t)inter * sizeof(float));
+                    if (ffn_sparsity_mode() == 1) {
+                        gate_snap = (float*)malloc((size_t)inter * sizeof(float));
+                        if (gate_snap) memcpy(gate_snap, hb, (size_t)inter * sizeof(float));
+                    }
+                    ib_kern.silu_mul(hb, hb, hb2, inter);
+                    if (dscratch) {
+                        ffn_apply_density(hb, gate_snap, inter, dscratch);
+                    }
+                    free(dscratch);
+                    free(gate_snap);
+                } else {
+                    ib_kern.silu_mul(hb, hb, hb2, inter);
+                }
                 /* down_proj reads from hb which already has zeros for masked rows —
                  * the multiply by zero propagates naturally, no sparse path needed */
                 tensor_matmul_hybrid(m, l, &layer->down_proj, xb, hb, hidden, inter, scale_buf);
@@ -2370,6 +2512,15 @@ static void mome_dispatch_ffn_batch(
  * the old forward_single_ex block; B>1 just forwards into
  * mome_dispatch_ffn_batch, which already owns the union-of-K routing
  * documented in its header. */
+/* Gate-energy MoME router probe toggle (IB_MOME_GATE_ENERGY=1). */
+static int mome_gate_energy_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("IB_MOME_GATE_ENERGY");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
 static void mome_ffn_dispatch(inferbit_model *m, const ib_layer_meta *layer,
                               float *xb_in_batch, float *hb_batch,
                               float *hb2_batch, float *xb_out_batch,
@@ -2387,6 +2538,47 @@ static void mome_ffn_dispatch(inferbit_model *m, const ib_layer_meta *layer,
         const int hidden = m->header.hidden_size;
         int top_n = mome_get_top_n(K_ex);
         int active[IB_MOME_MAX_TOP_N];
+
+        /* ── Gate-energy router (QUALITY PROBE, IB_MOME_GATE_ENERGY) ──
+         * Training-free runtime router for MoME. Computes gate(x) for ALL
+         * experts, then energy_e = Σ_{i∈e} |silu(gate_e[i])| and selects
+         * the top_n highest-energy experts. Dispatch then runs only those
+         * with uniform K/n_active weighting (selection-only semantics,
+         * router_logits=NULL — same as the zero-router path). For the
+         * probe we recompute gate inside mome_dispatch_ffn too (measure
+         * quality first; skipping the redundant gate matmul for unselected
+         * experts is the later speed optimisation). */
+        if (top_n < K_ex && mome_gate_energy_enabled() &&
+            layer->gate_proj_experts) {
+            const int inter = m->header.intermediate_size;
+            const int rows_per_expert = inter / K_ex;
+            if (rows_per_expert > 0 && rows_per_expert <= inter) {
+                float energy[IB_MOME_MAX_EXPERTS];
+                int ok = 1;
+                for (int e = 0; e < K_ex; e++) {
+                    const ib_tensor_meta *gate_e = &layer->gate_proj_experts[e];
+                    if (gate_e->shape[0] != rows_per_expert) { ok = 0; break; }
+                    /* hb_batch ([inter]) reused as per-expert gate scratch. */
+                    ib_tensor_matmul_cpu(m, gate_e, hb_batch, xb_in_batch,
+                                         rows_per_expert, hidden, scale_buf);
+                    float acc = 0.0f;
+                    for (int r = 0; r < rows_per_expert; r++) {
+                        float g = hb_batch[r];
+                        float s = g / (1.0f + expf(-g));   /* silu(gate) */
+                        acc += (s < 0.0f) ? -s : s;
+                    }
+                    energy[e] = acc;
+                }
+                if (ok) {
+                    mome_top_n(energy, K_ex, top_n, active);
+                    mome_dispatch_ffn(m, layer, xb_in_batch, hb_batch,
+                                      hb2_batch, xb_out_batch,
+                                      /*router_logits=*/NULL, active,
+                                      /*n_active=*/top_n, scale_buf);
+                    return;
+                }
+            }
+        }
 
         if (top_n >= K_ex) {
             /* All experts selected: natural ascending order keeps fp32

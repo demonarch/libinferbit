@@ -1535,12 +1535,262 @@ static void permute_qk_rows_fp32_inplace(float *W, int rows, int cols,
     free(tmp);
 }
 
+/* ── MoME cosine row-clustering (QUALITY PROBE, env-gated) ────────────
+ *
+ * Hypothesis (training-free "real MoME"): grouping FFN neurons whose
+ * gate_proj row vectors point in similar input directions (high cosine
+ * similarity) into the same expert makes each expert respond to a
+ * coherent slice of input space. A runtime gate-energy router can then
+ * skip low-energy experts (top_n < K) with far less quality loss than
+ * the contiguous row-split, where each "expert" is just an arbitrary
+ * slice of one big sum and carries no standalone meaning.
+ *
+ * This module computes a row permutation from the gate matrix:
+ *   1. L2-normalise each of `inter` gate rows ([inter, hidden]).
+ *   2. Cosine k-means (= Euclidean k-means on the normalised rows; the
+ *      two are monotonically equivalent for unit vectors) with K_experts
+ *      clusters.
+ *   3. Build a permutation that groups rows by cluster, balanced to
+ *      exactly M_per = inter / K_experts rows per expert (k-means gives
+ *      uneven clusters; we assign the largest clusters first and overflow
+ *      the remainder into the next expert slot so every expert is full).
+ *
+ * The SAME permutation is applied to gate (rows), up (rows) and down
+ * (cols, since down's columns correspond to gate's rows). Because all
+ * three are permuted consistently, the full-FFN sum is invariant — no
+ * runtime change is needed for correctness; only WHICH rows land in each
+ * expert changes. Gated behind IB_MOME_COSINE_CLUSTER=1 (default off).
+ *
+ * The permutation is computed once when the GATE projection is encoded
+ * and stashed in a process-static keyed by row count, then reused by the
+ * UP and DOWN encoders for the same layer (they run immediately after
+ * gate in convert order). */
+static int mome_cosine_cluster_enabled(void) {
+    const char *e = getenv("IB_MOME_COSINE_CLUSTER");
+    return (e && e[0] && e[0] != '0') ? 1 : 0;
+}
+
+/* Process-static permutation handoff: gate writes, up/down read. Sized
+ * for the largest FFN seen; reallocated on growth. Single-threaded
+ * conversion, so no locking needed. */
+static int  *g_mome_perm      = NULL;   /* length g_mome_perm_n */
+static int   g_mome_perm_n    = 0;
+static int   g_mome_perm_K    = 0;
+
+/* Compute a balanced cosine-cluster row permutation for W_gate
+ * [inter, hidden]. perm_out[new_row] = old_row (i.e. apply by gathering
+ * src row perm_out[i] into dst row i). Returns 0 on success, -1 on
+ * allocation failure (caller falls back to identity / contiguous). */
+static int mome_compute_cosine_perm(const float *W_gate, int inter,
+                                     int hidden, int K_experts, uint32_t seed,
+                                     int *perm_out)
+{
+    if (inter <= 0 || hidden <= 0 || K_experts <= 1) return -1;
+    if ((inter % K_experts) != 0) return -1;
+    const int M_per = inter / K_experts;
+
+    /* L2-normalise rows into a scratch copy (cosine k-means = Euclidean
+     * k-means on unit vectors). */
+    float *Wn = (float *)malloc((size_t)inter * hidden * sizeof(float));
+    if (!Wn) return -1;
+    for (int r = 0; r < inter; r++) {
+        const float *src = W_gate + (size_t)r * hidden;
+        float *dst = Wn + (size_t)r * hidden;
+        double ss = 0.0;
+        for (int i = 0; i < hidden; i++) ss += (double)src[i] * (double)src[i];
+        float inv = (ss > 1e-20) ? (float)(1.0 / sqrt(ss)) : 0.0f;
+        for (int i = 0; i < hidden; i++) dst[i] = src[i] * inv;
+    }
+
+    float   *centers = (float *)malloc((size_t)K_experts * hidden * sizeof(float));
+    int32_t *labels  = (int32_t *)malloc((size_t)inter * sizeof(int32_t));
+    if (!centers || !labels) { free(Wn); free(centers); free(labels); return -1; }
+
+    /* Self-contained high-D cosine (spherical) k-means. The shared
+     * ib_kmeans_fit is hardcoded for tiny D (PQ uses D=2; it bails when
+     * D>64), so it cannot cluster D=hidden gate rows — we run a minimal
+     * Lloyd's loop here. Cosine similarity = dot product on the already
+     * L2-normalised rows, so "nearest center" = "largest dot", and the
+     * centroid update is mean-then-renormalise (spherical k-means). */
+    {
+        /* Init: pick K well-separated seed rows (farthest-point / k-means++
+         * style on cosine distance). Seed 0 = deterministic first row. */
+        uint32_t rng = seed ? seed : 1234u;
+        rng = rng * 1664525u + 1013904223u;
+        int seed0 = (int)(rng % (uint32_t)inter);
+        memcpy(centers, Wn + (size_t)seed0 * hidden,
+               (size_t)hidden * sizeof(float));
+        float *mindist = (float *)malloc((size_t)inter * sizeof(float));
+        if (!mindist) { free(Wn); free(centers); free(labels); return -1; }
+        for (int r = 0; r < inter; r++) {
+            const float *x = Wn + (size_t)r * hidden;
+            float dot = 0.0f;
+            for (int i = 0; i < hidden; i++) dot += x[i] * centers[i];
+            mindist[r] = 1.0f - dot;     /* cosine distance */
+        }
+        for (int kk = 1; kk < K_experts; kk++) {
+            /* Farthest-point: pick the row with the largest min-cos-dist. */
+            int best = 0; float bestd = -1.0f;
+            for (int r = 0; r < inter; r++)
+                if (mindist[r] > bestd) { bestd = mindist[r]; best = r; }
+            memcpy(centers + (size_t)kk * hidden, Wn + (size_t)best * hidden,
+                   (size_t)hidden * sizeof(float));
+            const float *c = centers + (size_t)kk * hidden;
+            for (int r = 0; r < inter; r++) {
+                const float *x = Wn + (size_t)r * hidden;
+                float dot = 0.0f;
+                for (int i = 0; i < hidden; i++) dot += x[i] * c[i];
+                float d = 1.0f - dot;
+                if (d < mindist[r]) mindist[r] = d;
+            }
+        }
+        free(mindist);
+
+        /* Lloyd iterations. */
+        double *csum = (double *)malloc((size_t)K_experts * hidden * sizeof(double));
+        if (!csum) { free(Wn); free(centers); free(labels); return -1; }
+        for (int it = 0; it < 25; it++) {
+            int changed = 0;
+            for (int r = 0; r < inter; r++) {
+                const float *x = Wn + (size_t)r * hidden;
+                int bestk = 0; float bestdot = -2.0f;
+                for (int k = 0; k < K_experts; k++) {
+                    const float *c = centers + (size_t)k * hidden;
+                    float dot = 0.0f;
+                    for (int i = 0; i < hidden; i++) dot += x[i] * c[i];
+                    if (dot > bestdot) { bestdot = dot; bestk = k; }
+                }
+                if (labels[r] != bestk) { changed = 1; }
+                labels[r] = bestk;
+            }
+            /* Recompute centers = renormalised mean of assigned rows. */
+            memset(csum, 0, (size_t)K_experts * hidden * sizeof(double));
+            int *cnt = (int *)calloc((size_t)K_experts, sizeof(int));
+            if (!cnt) { free(csum); free(Wn); free(centers); free(labels); return -1; }
+            for (int r = 0; r < inter; r++) {
+                int k = labels[r];
+                const float *x = Wn + (size_t)r * hidden;
+                double *acc = csum + (size_t)k * hidden;
+                for (int i = 0; i < hidden; i++) acc[i] += x[i];
+                cnt[k]++;
+            }
+            for (int k = 0; k < K_experts; k++) {
+                float *c = centers + (size_t)k * hidden;
+                if (cnt[k] == 0) continue;   /* keep prior center if empty */
+                const double *acc = csum + (size_t)k * hidden;
+                double ss = 0.0;
+                for (int i = 0; i < hidden; i++) ss += acc[i] * acc[i];
+                float inv = (ss > 1e-20) ? (float)(1.0 / sqrt(ss)) : 0.0f;
+                for (int i = 0; i < hidden; i++) c[i] = (float)(acc[i] * inv);
+            }
+            free(cnt);
+            if (!changed && it > 0) break;
+        }
+        free(csum);
+    }
+    free(Wn);
+    free(centers);
+
+    /* Count cluster sizes. */
+    int *csize = (int *)calloc((size_t)K_experts, sizeof(int));
+    if (!csize) { free(labels); return -1; }
+    for (int r = 0; r < inter; r++) {
+        int c = labels[r];
+        if (c < 0 || c >= K_experts) c = 0;
+        csize[c]++;
+    }
+    if (getenv("IB_MOME_CLUSTER_DEBUG")) {
+        fprintf(stderr, "[mome_cosine] cluster sizes:");
+        for (int c = 0; c < K_experts; c++) fprintf(stderr, " %d", csize[c]);
+        fprintf(stderr, "\n");
+    }
+
+    /* Order clusters largest-first so the biggest coherent groups claim
+     * whole expert slots before smaller clusters fill the remainder. */
+    int *corder = (int *)malloc((size_t)K_experts * sizeof(int));
+    if (!corder) { free(labels); free(csize); return -1; }
+    for (int c = 0; c < K_experts; c++) corder[c] = c;
+    for (int a = 0; a < K_experts; a++) {
+        int best = a;
+        for (int b = a + 1; b < K_experts; b++)
+            if (csize[corder[b]] > csize[corder[best]]) best = b;
+        int t = corder[a]; corder[a] = corder[best]; corder[best] = t;
+    }
+
+    /* Emit rows cluster-by-cluster (largest first) into a flat order, then
+     * chop into K equal M_per blocks. Because k-means clusters are uneven,
+     * a block boundary may split a cluster — that's the intended overflow:
+     * boundary rows of an over-full cluster spill into the next expert. */
+    int pos = 0;
+    for (int oc = 0; oc < K_experts; oc++) {
+        int c = corder[oc];
+        for (int r = 0; r < inter && pos < inter; r++) {
+            if (labels[r] == c) perm_out[pos++] = r;
+        }
+    }
+    /* Safety: append any rows with out-of-range labels (shouldn't happen). */
+    if (pos < inter) {
+        char *seen = (char *)calloc((size_t)inter, 1);
+        if (seen) {
+            for (int i = 0; i < pos; i++) seen[perm_out[i]] = 1;
+            for (int r = 0; r < inter && pos < inter; r++)
+                if (!seen[r]) perm_out[pos++] = r;
+            free(seen);
+        }
+    }
+
+    (void)M_per;
+    free(labels); free(csize); free(corder);
+    return (pos == inter) ? 0 : -1;
+}
+
+/* Permute rows of W [rows, cols] in place using perm[new]=old. */
+static int mome_apply_row_perm(float *W, int rows, int cols, const int *perm)
+{
+    float *tmp = (float *)malloc((size_t)rows * cols * sizeof(float));
+    if (!tmp) return -1;
+    for (int i = 0; i < rows; i++)
+        memcpy(tmp + (size_t)i * cols, W + (size_t)perm[i] * cols,
+               (size_t)cols * sizeof(float));
+    memcpy(W, tmp, (size_t)rows * cols * sizeof(float));
+    free(tmp);
+    return 0;
+}
+
+/* Permute cols of W [rows, cols] in place using perm[new]=old. */
+static int mome_apply_col_perm(float *W, int rows, int cols, const int *perm)
+{
+    float *tmp = (float *)malloc((size_t)cols * sizeof(float));
+    if (!tmp) return -1;
+    for (int r = 0; r < rows; r++) {
+        float *row = W + (size_t)r * cols;
+        for (int j = 0; j < cols; j++) tmp[j] = row[perm[j]];
+        memcpy(row, tmp, (size_t)cols * sizeof(float));
+    }
+    free(tmp);
+    return 0;
+}
+
+/* Classify a MoME projection from its tensor name. Returns 0=gate,
+ * 1=up, 2=down, -1=unknown. */
+static int mome_proj_kind(const char *name) {
+    if (!name) return -1;
+    if (strstr(name, "gate_proj")) return 0;
+    if (strstr(name, "up_proj"))   return 1;
+    if (strstr(name, "down_proj")) return 2;
+    return -1;
+}
+
 /* MoME row-split FFN pusher (gate_proj / up_proj).
  *
  * Reads `name_in_source` (FFN gate/up matrix [intermediate, hidden]) as
  * fp32 once, slices it into K equal contiguous row-blocks, encodes each
  * as its own PQv2 tensor named `<base_name>.expert{e}`. Caller chooses
  * pyramid/flat exactly as for the non-MoME path.
+ *
+ * When IB_MOME_COSINE_CLUSTER=1 the rows are first reordered by a
+ * cosine-cluster permutation (computed from the gate matrix, reused for
+ * up/down) so each expert groups input-similar neurons.
  *
  * Returns 0 on success, -1 on error (ib_set_error filled), +1 if the
  * tensor cannot be MoME-split (e.g. M not divisible by K) — caller
@@ -1579,6 +1829,55 @@ static int read_and_push_pqv2_mome_rows(ib6_manifest *mf,
         free(W);
         ib_set_error("%s: unsupported dtype %s", base_name, dtype);
         return -1;
+    }
+
+    /* ── Cosine row-clustering (QUALITY PROBE, IB_MOME_COSINE_CLUSTER) ──
+     * gate: compute the permutation from W (the gate matrix) and stash it.
+     * up:   reuse the stashed permutation (same row count as gate).
+     * Both apply it by gathering rows so the per-expert blocks group
+     * input-similar neurons instead of arbitrary contiguous slices. */
+    if (mome_cosine_cluster_enabled()) {
+        int kind = mome_proj_kind(base_name);
+        if (getenv("IB_MOME_CLUSTER_DEBUG"))
+            fprintf(stderr, "[mome_cosine] %s kind=%d M=%d N=%d K=%d\n",
+                    base_name, kind, M_full, N, K_experts);
+        if (kind == 0) {
+            /* gate → (re)compute and stash. */
+            if (g_mome_perm_n < M_full || !g_mome_perm) {
+                free(g_mome_perm);
+                g_mome_perm = (int *)malloc((size_t)M_full * sizeof(int));
+                g_mome_perm_n = g_mome_perm ? M_full : 0;
+            }
+            if (g_mome_perm &&
+                mome_compute_cosine_perm(W, M_full, N, K_experts,
+                                          seed, g_mome_perm) == 0) {
+                g_mome_perm_K = K_experts;
+                if (getenv("IB_MOME_CLUSTER_DEBUG")) {
+                    int moved = 0;
+                    for (int i = 0; i < M_full; i++)
+                        if (g_mome_perm[i] != i) moved++;
+                    fprintf(stderr, "[mome_cosine] gate perm built: %d/%d rows moved\n",
+                            moved, M_full);
+                }
+                if (mome_apply_row_perm(W, M_full, N, g_mome_perm) != 0) {
+                    free(W); ib_set_error("mome cosine: row perm oom");
+                    return -1;
+                }
+            } else {
+                /* clustering failed → leave W contiguous, invalidate stash
+                 * so up/down also stay contiguous (consistent fallback). */
+                g_mome_perm_K = 0;
+            }
+        } else if (kind == 1) {
+            /* up → reuse gate's permutation when valid for this row count. */
+            if (g_mome_perm && g_mome_perm_n >= M_full &&
+                g_mome_perm_K == K_experts) {
+                if (mome_apply_row_perm(W, M_full, N, g_mome_perm) != 0) {
+                    free(W); ib_set_error("mome cosine: up perm oom");
+                    return -1;
+                }
+            }
+        }
     }
 
     /* One full-tensor encode → shared codebook + full row_scale + full
@@ -1722,6 +2021,18 @@ static int read_and_push_pqv2_mome_cols(ib6_manifest *mf,
         free(W);
         ib_set_error("%s: unsupported dtype %s", base_name, dtype);
         return -1;
+    }
+
+    /* ── Cosine clustering (down): permute COLUMNS by gate's row perm.
+     * down_proj is [hidden, inter]; its columns index the same FFN
+     * neurons that gate/up rows do, so the identical permutation keeps
+     * the FFN math consistent (gate row i ↔ up row i ↔ down col i). */
+    if (mome_cosine_cluster_enabled() && g_mome_perm &&
+        g_mome_perm_n >= N_full && g_mome_perm_K == K_experts) {
+        if (mome_apply_col_perm(W, M_full, N_full, g_mome_perm) != 0) {
+            free(W); ib_set_error("mome cosine: down col perm oom");
+            return -1;
+        }
     }
 
     /* Encode full down_proj [hidden, inter] once. */
