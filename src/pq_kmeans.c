@@ -251,6 +251,7 @@ static double lloyd_one_init(const float* X, int N, int D, int K,
         for (int l = 0; l < lanes; l++) inertia += inertias[l];
 
         float shift = 0.0f;
+        int reseeded = 0;
         for (int k = 0; k < K; k++) {
             int total_count = 0;
             float cs[64];  /* D <= 64 in practice (we use 2) */
@@ -275,15 +276,26 @@ static double lloyd_one_init(const float* X, int N, int D, int K,
                     shift += dv * dv;
                     ck[d] = new_v;
                 }
+            } else {
+                /* Empty cluster — wasted codebook capacity. Reseed it to a
+                 * random fitting point so the K cells stay fully utilised.
+                 * Matters most at small K (the pyramid L2 codebook is ≤16,
+                 * where a single dead centroid is ~6% of capacity); rare at
+                 * K=256 thanks to k-means++ init, so L1 is effectively
+                 * unaffected. Force one more Lloyd pass (reseeded=1) so the
+                 * convergence test below can't exit on a stale `shift` that
+                 * predates the move. */
+                int rp = pq_rng_below(rng, N);
+                const float* xr = X + (size_t)rp * D;
+                for (int d = 0; d < D; d++) ck[d] = xr[d];
+                reseeded = 1;
             }
-            /* If a cluster went empty, leave its center at its previous
-             * position. sklearn re-seeds empty clusters; we accept the
-             * occasional duplicate centroid since k-means++ init makes
-             * empties rare in practice. */
         }
 
-        /* Convergence check. */
-        if (shift < tol) break;
+        /* Convergence check. A reseed perturbs the centroids without
+         * contributing to `shift`, so never converge on a reseed iter. */
+        if (!reseeded && shift < tol) break;
+        if (reseeded) { prev_inertia = inertia; continue; }
         if (it > 0 && fabs(prev_inertia - inertia) < (double)tol * (prev_inertia + 1e-12)) break;
         prev_inertia = inertia;
     }

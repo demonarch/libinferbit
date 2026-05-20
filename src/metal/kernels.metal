@@ -4798,6 +4798,21 @@ inline uint pqv2_l2_unpack_6bit(device const uchar *row_base,
     }
 }
 
+/* Goal N36 — 4-bit packed L2 index unpack (l2_K ≤ 16). The on-disk /
+ * uploaded layout is slot-major [total][ceil(M/2)]: 2 indices per byte,
+ * low nibble = even row, high nibble = odd row. The packed row for slot
+ * `slot` is stride_packed_bytes = ceil(M/2). For row m read byte m/2 and
+ * extract the (m & 1)-th nibble. Mirrors pqv2_kernel.c::pqv2_l2_unpack_4bit
+ * / pqv2_l2_idx_at. The 16-entry codebook needs no bank select. */
+inline uint pqv2_l2_unpack_4bit(device const uchar *row_base,
+                                  uint stride_packed_bytes,
+                                  uint slot, uint m)
+{
+    device const uchar *row = row_base + (size_t)slot * stride_packed_bytes;
+    uint b = (uint)row[m >> 1u];
+    return (m & 1u) ? ((b >> 4u) & 0x0Fu) : (b & 0x0Fu);
+}
+
 kernel void matmul_pqv2_k256_half2_l2residual(
     device const half  *row_scale  [[buffer(0)]],   /* [M] */
     device const half  *cb_l1      [[buffer(1)]],   /* [ns][K_L1=256][2] fp16 */
@@ -4830,10 +4845,14 @@ kernel void matmul_pqv2_k256_half2_l2residual(
      * as idx_l1); for the 6-bit-packed layout, the upload keeps the
      * on-disk [total][ceil(M/4)*3] layout (slot-major) so each slot's
      * 3-byte group is contiguous and shared by 4 rows. */
-    bool l2_packed = (l2_idx_bits == 6u);
+    bool l2_packed6 = (l2_idx_bits == 6u);
+    bool l2_packed4 = (l2_idx_bits == 4u);
     device const uchar *idx_l2_row = l2_idx_bits == 8u
         ? (idx_l2 + (size_t)my_m * total) : idx_l2;
-    uint l2_packed_stride = (M + 3u) / 4u * 3u;
+    /* 6-bit: 4-in-3 bytes ⇒ ceil(M/4)*3 per slot.
+     * 4-bit: 2-in-1 byte  ⇒ ceil(M/2)   per slot. */
+    uint l2_packed_stride = l2_packed4 ? ((M + 1u) / 2u)
+                                       : ((M + 3u) / 4u * 3u);
 
     float acc_l1 = 0.0f;
     float acc_l2 = 0.0f;
@@ -4868,9 +4887,12 @@ kernel void matmul_pqv2_k256_half2_l2residual(
         /* L2 path (K_L2 ≤ 64, runtime-variable). Codebook stride is
          * K_L2 entries per subchunk; each entry is half2 (HALF=2 fp16). */
         uint k0_l2, k1_l2;
-        if (l2_packed) {
+        if (l2_packed6) {
             k0_l2 = pqv2_l2_unpack_6bit(idx_l2_row, l2_packed_stride, i,  my_m);
             k1_l2 = pqv2_l2_unpack_6bit(idx_l2_row, l2_packed_stride, i2, my_m);
+        } else if (l2_packed4) {
+            k0_l2 = pqv2_l2_unpack_4bit(idx_l2_row, l2_packed_stride, i,  my_m);
+            k1_l2 = pqv2_l2_unpack_4bit(idx_l2_row, l2_packed_stride, i2, my_m);
         } else {
             k0_l2 = (uint)idx_l2_row[i];
             k1_l2 = (uint)idx_l2_row[i2];

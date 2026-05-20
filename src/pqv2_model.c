@@ -719,18 +719,14 @@ static inferbit_model* pqv2_load_internal(const char* path,
             const pqv2_t *pq = tslots[i]->pq;
             size_t b = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
             if (b > max_idx_bytes) max_idx_bytes = b;
-            /* Goal C3 — compute L2 indices size for pyramid tensors. */
+            /* Goal C3 — compute L2 indices size for pyramid tensors.
+             * Goal N36 fix: branch on l2_idx_bits (4/6/8) via the shared
+             * kernel helper. The 4-bit packing is ceil(M/2) per row, not the
+             * 8-bit M-per-row size that this previously fell through to —
+             * the wrong (larger) size sized the scratch generously but the
+             * matching pread over-read, causing the l2k16 drive slowdown. */
             if (pq->l2_kind == 2 && pq->l2_indices) {
-                uint32_t n_chunks = pq->N / pq->G;
-                size_t l2b;
-                if (pq->l2_idx_bits == 6) {
-                    /* ceil(M/4)*3 bytes per (chunk, subchunk) row. */
-                    size_t per_row = ((size_t)pq->M + 3u) / 4u * 3u;
-                    l2b = (size_t)n_chunks * pq->n_subchunks * per_row;
-                } else {
-                    /* 8-bit: same shape as L1. */
-                    l2b = (size_t)pq->M * n_chunks * pq->n_subchunks;
-                }
+                size_t l2b = pqv2_l2_total_index_bytes(pq);
                 if (l2b > max_l2_idx_bytes) max_l2_idx_bytes = l2b;
             }
         }

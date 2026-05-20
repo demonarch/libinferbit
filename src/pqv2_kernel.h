@@ -116,6 +116,27 @@ typedef struct {
     size_t l2_indices_file_offset;
 } pqv2_t;
 
+/* Per-(chunk,subchunk) L2 index row byte count, branched on bit-width.
+ *   bits == 4 (Goal N36)  : ceil(M/2)   — 2 indices per byte (l2_K <= 16).
+ *   bits == 6 (Stage 5h.1): ceil(M/4)*3 — 4 indices in 3 bytes (l2_K <= 64).
+ *   bits == 8 (legacy)    : M           — one byte per index.
+ * Single source of truth for the on-disk L2 index packing; mirrors the
+ * encoder M-axis packing and the loader's l2_idx_disk computation. */
+static inline size_t pqv2_l2_row_bytes(uint32_t M, uint32_t l2_idx_bits) {
+    if (l2_idx_bits == 4u) return ((size_t)M + 1u) / 2u;
+    if (l2_idx_bits == 6u) return ((size_t)M + 3u) / 4u * 3u;
+    return (size_t)M; /* 8-bit legacy */
+}
+
+/* Total L2 index byte size for a pyramid tensor (0 if no L2). Used by the
+ * drive-mode scratch allocation and per-matmul pread to size the stream. */
+static inline size_t pqv2_l2_total_index_bytes(const pqv2_t *pq) {
+    if (!pq || pq->l2_kind != 2) return 0;
+    uint32_t n_chunks = pq->N / pq->G;
+    return (size_t)n_chunks * pq->n_subchunks
+         * pqv2_l2_row_bytes(pq->M, pq->l2_idx_bits);
+}
+
 /* Load .pqv2 file into freshly-malloc'd buffers. Returns 0 on success.
  * Caller frees t->row_scale, t->cb_q, t->cb_scale, t->indices, and the
  * three l2_* fields when non-NULL. */

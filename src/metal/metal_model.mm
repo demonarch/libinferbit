@@ -827,7 +827,8 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
          * pq_idx_l2 NULL — the model finalizer allocates the shared L2
          * scratch ring and drive_prepare_pq preads into it. The L2
          * CODEBOOK above stays resident (few KB/tensor). */
-        uint32_t l2_bits = (pq->l2_idx_bits == 6) ? 6u : 8u;
+        uint32_t l2_bits = (pq->l2_idx_bits == 6) ? 6u
+                         : (pq->l2_idx_bits == 4) ? 4u : 8u;
         out->pq_l2_idx_bits = (int)l2_bits;
         uint8_t *idx_l2_t = NULL;
         size_t idx_l2_bytes;
@@ -835,6 +836,15 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
         size_t l2_disk_bytes;
         if (l2_bits == 6) {
             size_t packed_row = ((size_t)pq->M + 3u) / 4u * 3u;
+            idx_l2_bytes = (size_t)nc_l2 * pq->n_subchunks * packed_row;
+            l2_disk_bytes = idx_l2_bytes;  /* same packed layout on disk */
+        } else if (l2_bits == 4) {
+            /* Goal N36 — 4-bit packed (2 indices per byte, low nibble
+             * first; l2_K ≤ 16). Per (chunk,subchunk) slot row is
+             * ceil(M/2) bytes. Mirror pqv2_l2_packed_row_bytes_4bit.
+             * Upload the on-disk slot-major [nc][ns][ceil(M/2)] layout
+             * as-is; the kernel unpacks the m%2-th nibble per lane. */
+            size_t packed_row = ((size_t)pq->M + 1u) / 2u;
             idx_l2_bytes = (size_t)nc_l2 * pq->n_subchunks * packed_row;
             l2_disk_bytes = idx_l2_bytes;  /* same packed layout on disk */
         } else {
@@ -858,9 +868,10 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
         if (!l2_src_bytes) {
             /* No source available. Skip upload; pq_K_l2 stays 0 and the
              * warning below fires. */
-        } else if (l2_bits == 6) {
+        } else if (l2_bits == 6 || l2_bits == 4) {
             /* Upload directly from the mmap'd packed buffer — same layout
-             * the GPU kernel expects. */
+             * the GPU kernel expects (6-bit: 4-in-3 bytes; 4-bit: 2-in-1
+             * byte). The kernel unpacks per lane. */
             out->pq_idx_l2 =
                 ib_metal_alloc(ctx, idx_l2_bytes, l2_src_bytes);
         } else {
@@ -1515,8 +1526,9 @@ static int drive_load_pq_l2_idx_to_slot(ib_metal_model_buffers *b,
     }
     off_t off = (off_t)tb->pq_l2_drive_file_offset;
 
-    if (tb->pq_l2_idx_bits == 6) {
-        /* Packed layout: on-disk == kernel-native; pread to scratch. */
+    if (tb->pq_l2_idx_bits == 6 || tb->pq_l2_idx_bits == 4) {
+        /* Packed layout (6-bit 4-in-3, or 4-bit 2-in-1): on-disk ==
+         * kernel-native; pread to scratch unchanged. */
         uint8_t *dst = (uint8_t *)b->gpu_drive_l2_idx_scratch[slot];
         size_t done = 0;
         while (done < disk_bytes) {

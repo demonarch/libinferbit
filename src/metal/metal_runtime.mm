@@ -3280,8 +3280,8 @@ extern "C" int ib_metal_rec_matmul_pqv2_k256_half2_l2residual(
         || M <= 0 || N <= 0 || G <= 0 || n_subchunks <= 0
         || K_L2 <= 0 || K_L2 > 64) return -1;
     if ((N % G) != 0) return -1;
-    /* Only legacy 8-bit and packed 6-bit L2 layouts are supported. */
-    if (l2_idx_bits != 6 && l2_idx_bits != 8) return -1;
+    /* Legacy 8-bit, packed 6-bit, and packed 4-bit (Goal N36) L2 layouts. */
+    if (l2_idx_bits != 4 && l2_idx_bits != 6 && l2_idx_bits != 8) return -1;
 
     id<MTLComputePipelineState> ps =
         get_pipeline(rec->ctx, "matmul_pqv2_k256_half2_l2residual");

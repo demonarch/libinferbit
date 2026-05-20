@@ -514,16 +514,13 @@ typedef struct ib_drive_pf_state {
     int             stop;
 } ib_drive_pf_state;
 
-/* Goal C3 — total L2 indices bytes for tensor t (or 0 if no L2). */
+/* Goal C3 — total L2 indices bytes for tensor t (or 0 if no L2).
+ * Branches on pq->l2_idx_bits (4/6/8) via the shared kernel helper so the
+ * pread streams exactly the on-disk packed size. Goal N36 fix: the 4-bit
+ * packing (ceil(M/2)) was previously falling through to the 8-bit size,
+ * over-reading ~2x per matmul under F_NOCACHE. */
 static inline size_t drive_l2_indices_bytes(const pqv2_t *pq) {
-    if (!pq || pq->l2_kind != 2) return 0;
-    uint32_t n_chunks = pq->N / pq->G;
-    if (pq->l2_idx_bits == 6) {
-        size_t per_row = ((size_t)pq->M + 3u) / 4u * 3u;
-        return (size_t)n_chunks * pq->n_subchunks * per_row;
-    }
-    /* 8-bit legacy: same shape as L1. */
-    return (size_t)pq->M * n_chunks * pq->n_subchunks;
+    return pqv2_l2_total_index_bytes(pq);
 }
 
 /* Goal C3 — pread `bytes` from `fd` at `off` into `buf`. Returns 1 on

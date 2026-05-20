@@ -282,6 +282,13 @@ typedef struct {
     float   **centers_t;                /* per-thread, [n_threads] of [K][half] */
     int32_t **labels_t;                 /* per-thread, [n_threads] of [n_points] */
     int      *errors_t;                 /* per-thread error flags */
+    int       is_l2;                    /* 1 ⇒ this is the pyramid L2 residual
+                                           fit (apply_row_scale==0): use the
+                                           L2-tuned k-means schedule (more
+                                           iters + restarts) since K is tiny
+                                           (≤16) and a better local minimum on
+                                           the residual recovers PPL with no
+                                           on-disk format change. */
 } pqv2_slot_ctx;
 
 static void pqv2_encode_slot_worker(void *arg, int thread_id,
@@ -323,9 +330,36 @@ static void pqv2_encode_slot_worker(void *arg, int thread_id,
                 if (v > 0) max_iter = v;
             }
         }
+        int n_init = 1;
+        if (c->is_l2) {
+            /* Pyramid L2 residual fit. K ≤ 16 here, so a *better* codebook
+             * is cheap: several k-means++ restarts (best by inertia wins)
+             * tighten the partition the 16 codewords impose on the residual.
+             * The decisive lever is the empty-cluster reseed in pq_kmeans.c
+             * (a dead centroid is ~6% of a 16-entry codebook); restarts then
+             * pick the luckiest reseeded run. Measured on TinyLlama wikitext
+             * (warmup 64 / score 256 / ctx 1024): baseline l2k16 PPL 6.604;
+             * n_init=8 → 6.576; n_init=16 + reseed → 6.497 — beating the full
+             * l2_K=64 pyramid (6.520) at the SAME 712 MB file. More Lloyd
+             * iters alone gave nothing (k-means already converges < 10 iters),
+             * so max_iter just needs convergence headroom. This changes only
+             * WHICH 16 codewords are picked — the on-disk layout
+             * (l2_idx_bits=4, header) is untouched, so the existing decoder
+             * reads the file verbatim. Tunable via env for ablation. */
+            max_iter = 25;
+            n_init   = 16;
+            {
+                const char *e = getenv("IB_L2_KMEANS_ITERS");
+                if (e && *e) { int v = atoi(e); if (v > 0) max_iter = v; }
+            }
+            {
+                const char *e = getenv("IB_L2_KMEANS_NINIT");
+                if (e && *e) { int v = atoi(e); if (v > 0) n_init = v; }
+            }
+        }
         kcfg.max_iter = max_iter;
         kcfg.tol = 1e-4f;
-        kcfg.n_init = 1;
+        kcfg.n_init = n_init;
         /* subsample — fit the codebook on a random subset; final
          * assignment below runs on the FULL n_points via ib_kmeans_assign,
          * so quality is preserved. 50k is plenty for K=256 in 2D
@@ -585,6 +619,11 @@ static int pqv2_encode_flat_impl(const float *W_in, int M, int N,
     ctx.centers_t = centers_t;
     ctx.labels_t  = labels_t;
     ctx.errors_t  = errors_t;
+    /* The pyramid L2 residual pass is the only caller that disables the
+     * per-row scale (the decoder adds acc_l2 with no row factor). Use that
+     * as the L2 signal so we can apply the heavier k-means schedule to the
+     * 16-entry residual codebook only — L1 (K=256) stays fast/unchanged. */
+    ctx.is_l2 = (apply_row_scale == 0) ? 1 : 0;
 
     /* Run the slot loop in parallel. chunk_size = 1 → round-robin so the
      * larger slots get spread across workers rather than piling up on
