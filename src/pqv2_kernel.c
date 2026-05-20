@@ -480,26 +480,40 @@ void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
 
     float *acc_l1 = calloc(M, sizeof(float));
     float *acc_l2 = (t->l2_kind == 2) ? calloc(M, sizeof(float)) : NULL;
-    /* Pre-decoded codebooks fp32 (K * half) per sub-chunk */
-    float *cb = malloc((size_t)ns * K * half * sizeof(float));
-    for (uint32_t s = 0; s < ns; s++) {
-        for (uint32_t k = 0; k < K; k++) {
-            float sc = pqv2_h2f(t->cb_scale[s * K + k]);
-            const int8_t *q = &t->cb_q[(s * K + k) * half];
-            for (uint32_t h = 0; h < half; h++)
-                cb[(s * K + k) * half + h] = (float)q[h] * sc;
-        }
-    }
-    float *l2_cb = NULL;
-    if (t->l2_kind == 2) {
-        l2_cb = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+    /* Pre-decoded codebooks fp32: reuse the load-time t->cb_fp32 /
+     * t->l2_cb_fp32 when present, else decode locally (fallback). */
+    const float *cb;
+    float *cb_local = NULL;
+    if (t->cb_fp32) {
+        cb = t->cb_fp32;
+    } else {
+        cb_local = malloc((size_t)ns * K * half * sizeof(float));
         for (uint32_t s = 0; s < ns; s++) {
-            for (uint32_t k = 0; k < t->l2_K; k++) {
-                float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
-                const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+            for (uint32_t k = 0; k < K; k++) {
+                float sc = pqv2_h2f(t->cb_scale[s * K + k]);
+                const int8_t *q = &t->cb_q[(s * K + k) * half];
                 for (uint32_t h = 0; h < half; h++)
-                    l2_cb[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                    cb_local[(s * K + k) * half + h] = (float)q[h] * sc;
             }
+        }
+        cb = cb_local;
+    }
+    const float *l2_cb = NULL;
+    float *l2_cb_local = NULL;
+    if (t->l2_kind == 2) {
+        if (t->l2_cb_fp32) {
+            l2_cb = t->l2_cb_fp32;
+        } else {
+            l2_cb_local = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+            for (uint32_t s = 0; s < ns; s++) {
+                for (uint32_t k = 0; k < t->l2_K; k++) {
+                    float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
+                    const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+                    for (uint32_t h = 0; h < half; h++)
+                        l2_cb_local[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                }
+            }
+            l2_cb = l2_cb_local;
         }
     }
 
@@ -551,7 +565,8 @@ void pqv2_matvec_lut(const pqv2_t *t, const float *x, float *y) {
         float rs = pqv2_h2f(t->row_scale[m]);
         y[m] = acc_l1[m] * rs + (acc_l2 ? acc_l2[m] : 0.0f);
     }
-    free(cb); if (l2_cb) free(l2_cb);
+    if (cb_local) free(cb_local);
+    if (l2_cb_local) free(l2_cb_local);
     free(lut); if (l2_lut) free(l2_lut);
     free(acc_l1); if (acc_l2) free(acc_l2);
     if (l2_scratch) free(l2_scratch);
@@ -583,24 +598,38 @@ void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
         acc_l2 = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
         memset(acc_l2, 0, M * sizeof(float));
     }
-    float *cb = malloc((size_t)ns * K * half * sizeof(float));
-    for (uint32_t s = 0; s < ns; s++)
-        for (uint32_t k = 0; k < K; k++) {
-            float sc = pqv2_h2f(t->cb_scale[s * K + k]);
-            const int8_t *q = &t->cb_q[(s * K + k) * half];
-            for (uint32_t h = 0; h < half; h++)
-                cb[(s * K + k) * half + h] = (float)q[h] * sc;
-        }
-    float *l2_cb = NULL;
-    if (t->l2_kind == 2) {
-        l2_cb = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+    /* Perf: reuse the load-time pre-decoded fp32 codebooks. */
+    const float *cb;
+    float *cb_local = NULL;
+    if (t->cb_fp32) {
+        cb = t->cb_fp32;
+    } else {
+        cb_local = malloc((size_t)ns * K * half * sizeof(float));
         for (uint32_t s = 0; s < ns; s++)
-            for (uint32_t k = 0; k < t->l2_K; k++) {
-                float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
-                const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+            for (uint32_t k = 0; k < K; k++) {
+                float sc = pqv2_h2f(t->cb_scale[s * K + k]);
+                const int8_t *q = &t->cb_q[(s * K + k) * half];
                 for (uint32_t h = 0; h < half; h++)
-                    l2_cb[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                    cb_local[(s * K + k) * half + h] = (float)q[h] * sc;
             }
+        cb = cb_local;
+    }
+    const float *l2_cb = NULL;
+    float *l2_cb_local = NULL;
+    if (t->l2_kind == 2) {
+        if (t->l2_cb_fp32) {
+            l2_cb = t->l2_cb_fp32;
+        } else {
+            l2_cb_local = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+            for (uint32_t s = 0; s < ns; s++)
+                for (uint32_t k = 0; k < t->l2_K; k++) {
+                    float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
+                    const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+                    for (uint32_t h = 0; h < half; h++)
+                        l2_cb_local[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                }
+            l2_cb = l2_cb_local;
+        }
     }
     float *lut = aligned_alloc(64, ((size_t)K * sizeof(float) + 63) & ~63);
     float *l2_lut = NULL;
@@ -668,7 +697,8 @@ void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
         float rs = pqv2_h2f(t->row_scale[m]);
         y[m] = acc_l1[m] * rs + (acc_l2 ? acc_l2[m] : 0.0f);
     }
-    free(cb); if (l2_cb) free(l2_cb);
+    if (cb_local) free(cb_local);
+    if (l2_cb_local) free(l2_cb_local);
     free(lut); if (l2_lut) free(l2_lut);
     free(acc_l1); if (acc_l2) free(acc_l2);
     if (l2_scratch) free(l2_scratch);
@@ -729,24 +759,41 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
         acc_l2 = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
         memset(acc_l2, 0, M * sizeof(float));
     }
-    float *cb = malloc((size_t)ns * K * half * sizeof(float));
-    for (uint32_t s = 0; s < ns; s++)
-        for (uint32_t k = 0; k < K; k++) {
-            float sc = pqv2_h2f(t->cb_scale[s * K + k]);
-            const int8_t *q = &t->cb_q[(s * K + k) * half];
-            for (uint32_t h = 0; h < half; h++)
-                cb[(s * K + k) * half + h] = (float)q[h] * sc;
-        }
-    float *l2_cb = NULL;
-    if (t->l2_kind == 2) {
-        l2_cb = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+    /* Perf: codebook fp32 is a STATIC tensor property, pre-decoded at load
+     * into t->cb_fp32 / t->l2_cb_fp32. Reuse it and skip the per-call
+     * malloc + fp16->fp32 decode (ns*K*half + ns*l2_K*half conversions per
+     * matvec). Local decode kept only as a fallback when the cache is NULL. */
+    const float *cb;
+    float *cb_local = NULL;
+    if (t->cb_fp32) {
+        cb = t->cb_fp32;
+    } else {
+        cb_local = malloc((size_t)ns * K * half * sizeof(float));
         for (uint32_t s = 0; s < ns; s++)
-            for (uint32_t k = 0; k < t->l2_K; k++) {
-                float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
-                const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+            for (uint32_t k = 0; k < K; k++) {
+                float sc = pqv2_h2f(t->cb_scale[s * K + k]);
+                const int8_t *q = &t->cb_q[(s * K + k) * half];
                 for (uint32_t h = 0; h < half; h++)
-                    l2_cb[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                    cb_local[(s * K + k) * half + h] = (float)q[h] * sc;
             }
+        cb = cb_local;
+    }
+    const float *l2_cb = NULL;
+    float *l2_cb_local = NULL;
+    if (t->l2_kind == 2) {
+        if (t->l2_cb_fp32) {
+            l2_cb = t->l2_cb_fp32;
+        } else {
+            l2_cb_local = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+            for (uint32_t s = 0; s < ns; s++)
+                for (uint32_t k = 0; k < t->l2_K; k++) {
+                    float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
+                    const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+                    for (uint32_t h = 0; h < half; h++)
+                        l2_cb_local[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                }
+            l2_cb = l2_cb_local;
+        }
     }
 
     int8_t lut_q[64] __attribute__((aligned(16)));
@@ -835,7 +882,8 @@ void pqv2_matvec_tbl_int8(const pqv2_t *t, const float *x, float *y) {
         float rs = pqv2_h2f(t->row_scale[m]);
         y[m] = acc_l1[m] * rs + (acc_l2 ? acc_l2[m] : 0.0f);
     }
-    free(cb); if (l2_cb) free(l2_cb);
+    if (cb_local) free(cb_local);
+    if (l2_cb_local) free(l2_cb_local);
     free(acc_l1); if (acc_l2) free(acc_l2);
     if (l2_scratch) free(l2_scratch);
     if (l1_row_scratch) free(l1_row_scratch);
@@ -897,25 +945,40 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
         acc_l2 = aligned_alloc(64, ((size_t)M * sizeof(float) + 63) & ~63);
         memset(acc_l2, 0, M * sizeof(float));
     }
-    float *cb = malloc((size_t)ns * K * half * sizeof(float));
-    for (uint32_t s = 0; s < ns; s++)
-        for (uint32_t k = 0; k < K; k++) {
-            float sc = pqv2_h2f(t->cb_scale[s * K + k]);
-            const int8_t *q = &t->cb_q[(s * K + k) * half];
-            for (uint32_t h = 0; h < half; h++)
-                cb[(s * K + k) * half + h] = (float)q[h] * sc;
-        }
-    /* L2 codebooks (PQ, K_L2 ≤ 64) */
-    float *l2_cb = NULL;
-    if (acc_l2) {
-        l2_cb = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+    /* Perf: reuse the load-time pre-decoded fp32 codebooks (t->cb_fp32 /
+     * t->l2_cb_fp32); fall back to a per-call decode only if they're NULL. */
+    const float *cb;
+    float *cb_local = NULL;
+    if (t->cb_fp32) {
+        cb = t->cb_fp32;
+    } else {
+        cb_local = malloc((size_t)ns * K * half * sizeof(float));
         for (uint32_t s = 0; s < ns; s++)
-            for (uint32_t k = 0; k < t->l2_K; k++) {
-                float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
-                const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+            for (uint32_t k = 0; k < K; k++) {
+                float sc = pqv2_h2f(t->cb_scale[s * K + k]);
+                const int8_t *q = &t->cb_q[(s * K + k) * half];
                 for (uint32_t h = 0; h < half; h++)
-                    l2_cb[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                    cb_local[(s * K + k) * half + h] = (float)q[h] * sc;
             }
+        cb = cb_local;
+    }
+    /* L2 codebooks (PQ, K_L2 ≤ 64) */
+    const float *l2_cb = NULL;
+    float *l2_cb_local = NULL;
+    if (acc_l2) {
+        if (t->l2_cb_fp32) {
+            l2_cb = t->l2_cb_fp32;
+        } else {
+            l2_cb_local = malloc((size_t)ns * t->l2_K * half * sizeof(float));
+            for (uint32_t s = 0; s < ns; s++)
+                for (uint32_t k = 0; k < t->l2_K; k++) {
+                    float sc = pqv2_h2f(t->l2_cb_scale[s * t->l2_K + k]);
+                    const int8_t *q = &t->l2_cb_q[(s * t->l2_K + k) * half];
+                    for (uint32_t h = 0; h < half; h++)
+                        l2_cb_local[(s * t->l2_K + k) * half + h] = (float)q[h] * sc;
+                }
+            l2_cb = l2_cb_local;
+        }
     }
     int8_t lut_lo[64] __attribute__((aligned(16)));
     int8_t lut_hi[64] __attribute__((aligned(16)));
@@ -1012,7 +1075,8 @@ void pqv2_matvec_tbl_int8_k128(const pqv2_t *t, const float *x, float *y) {
         float rs = pqv2_h2f(t->row_scale[m]);
         y[m] = acc[m] * rs + (acc_l2 ? acc_l2[m] : 0.0f);
     }
-    free(cb); if (l2_cb) free(l2_cb);
+    if (cb_local) free(cb_local);
+    if (l2_cb_local) free(l2_cb_local);
     free(acc); if (acc_l2) free(acc_l2);
     if (l2_scratch) free(l2_scratch);
     if (l1_row_scratch) free(l1_row_scratch);

@@ -55,9 +55,14 @@ static void cpu_embed_lookup(const inferbit_model *m, int token, float *out) {
         const int8_t *cb_q = (const int8_t *)pq->cb_q;
         const uint16_t *cb_s = (const uint16_t *)pq->cb_scale;
         float rs = pq->row_scale ? ib_fp16_to_fp32(((const uint16_t *)pq->row_scale)[token]) : 1.0f;
+        /* Row-major (pq->l1_idx_layout == 1) support — see bench_ppl_run.c
+         * cpu_embed_lookup for the rationale (mirrors forward.c). */
+        uint32_t total = nc * pq->n_subchunks;
         for (uint32_t c = 0; c < nc; c++) {
             for (uint32_t s = 0; s < pq->n_subchunks; s++) {
-                uint8_t k = idx_base[((size_t)c * pq->n_subchunks + s) * pq->M + token];
+                uint8_t k = (pq->l1_idx_layout == 1)
+                    ? idx_base[(size_t)token * total + c * pq->n_subchunks + s]
+                    : idx_base[((size_t)c * pq->n_subchunks + s) * pq->M + token];
                 float scl = ib_fp16_to_fp32(cb_s[s * K + k]) * rs;
                 for (uint32_t h = 0; h < HALF; h++) {
                     out[c * pq->G + s * HALF + h] =
@@ -147,18 +152,32 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[N15] bench_compare: ctx=%p, calling ib_metal_upload_model()\n", (void*)ctx);
         gbufs = ib_metal_upload_model(ctx, m);
         if (!gbufs) {
-            fprintf(stderr, "[N15] bench_compare: BAIL — ib_metal_upload_model() returned NULL (model unsupported / OOM / arch)\n");
-            fprintf(stderr, "GPU upload failed\n");
-            return 4;
+            fprintf(stderr, "[N15] bench_compare: ib_metal_upload_model() returned NULL (model unsupported / OOM / arch)\n");
+            /* Metal refused this model (e.g. MoME — no Metal kernel). Rather
+             * than dying with no output, cleanly fall back to the CPU path so
+             * --backend gpu still produces correct (CPU-quality) numbers. */
+            fprintf(stderr, "Metal unsupported for this model (MoME); "
+                            "falling back to CPU\n");
+            ib_metal_destroy(ctx);
+            ctx = NULL;
+            use_gpu = 0;
+            /* Force the libinferbit router onto CPU too: ib_forward() would
+             * otherwise re-attempt (and re-fail) the Metal upload. */
+#if defined(_WIN32)
+            _putenv_s("IB_BACKEND", "cpu");
+#else
+            setenv("IB_BACKEND", "cpu", 1);
+#endif
+        } else {
+            fprintf(stderr, "[N15] bench_compare: GPU upload OK; gbufs=%p\n", (void*)gbufs);
         }
-        fprintf(stderr, "[N15] bench_compare: GPU upload OK; gbufs=%p\n", (void*)gbufs);
         /* Opt-in via env var: ib_metal_strip_cpu_mmap drops the mmap and
          * keeps only the embedding bytes. On macOS this momentarily holds
          * mmap+Metal+embed at once, so /usr/bin/time -l peak RSS goes UP
          * by ~embedding_size, but steady-state RSS during a long inference
          * run drops by ~file_size. Off by default to keep the bench's peak
          * metric clean; flip via IB_STRIP_MMAP=1. */
-        if (getenv("IB_STRIP_MMAP")) ib_metal_strip_cpu_mmap(m);
+        if (gbufs && getenv("IB_STRIP_MMAP")) ib_metal_strip_cpu_mmap(m);
     }
 
     /* Batched prefill is the realistic workload — empirically ~5× faster

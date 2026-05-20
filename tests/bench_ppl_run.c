@@ -77,9 +77,21 @@ static void cpu_embed_lookup(const inferbit_model *m, int token, float *out) {
         const int8_t  *cb_q  = (const int8_t  *)pq->cb_q;
         const uint16_t *cb_s = (const uint16_t *)pq->cb_scale;
         float rs = pq->row_scale ? ib_fp16_to_fp32(((const uint16_t *)pq->row_scale)[token]) : 1.0f;
+        /* Bug N16 / row-major support: when L1 indices are stored
+         * row-major on disk ([M][n_chunks][n_subchunks], encoder opt-in
+         * IB_PQV2_L1_ROWMAJOR=1, pq->l1_idx_layout == 1) the per-token
+         * byte for (c, s) lives at token*total + c*ns + s, not the legacy
+         * chunk-major (c*ns + s)*M + token. Without this branch the GPU
+         * eval path (which uses this helper for the embedding) reads
+         * scrambled embeddings for every token and PPL explodes, while the
+         * pure-CPU ib_forward() path stays correct because forward.c's own
+         * embedding_lookup already handles the layout. */
+        uint32_t total = nc * pq->n_subchunks;
         for (uint32_t c = 0; c < nc; c++) {
             for (uint32_t s = 0; s < pq->n_subchunks; s++) {
-                uint8_t k = idx_base[((size_t)c * pq->n_subchunks + s) * pq->M + token];
+                uint8_t k = (pq->l1_idx_layout == 1)
+                    ? idx_base[(size_t)token * total + c * pq->n_subchunks + s]
+                    : idx_base[((size_t)c * pq->n_subchunks + s) * pq->M + token];
                 float scl = ib_fp16_to_fp32(cb_s[s * K + k]) * rs;
                 for (uint32_t h = 0; h < HALF; h++) {
                     out[c * pq->G + s * HALF + h] =
@@ -184,8 +196,25 @@ int main(int argc, char **argv) {
         ctx = ib_metal_create();
         if (!ctx) { fprintf(stderr, "metal init failed\n"); return 5; }
         gbufs = ib_metal_upload_model(ctx, m);
-        if (!gbufs) { fprintf(stderr, "metal upload failed\n"); return 6; }
-        if (getenv("IB_STRIP_MMAP")) ib_metal_strip_cpu_mmap(m);
+        if (!gbufs) {
+            /* Metal refused this model (e.g. MoME — no Metal kernel). Rather
+             * than dying with no output, cleanly fall back to the CPU path so
+             * --backend gpu still produces correct (CPU-quality) numbers. */
+            fprintf(stderr, "Metal unsupported for this model (MoME); "
+                            "falling back to CPU\n");
+            ib_metal_destroy(ctx);
+            ctx = NULL;
+            use_gpu = 0;
+            /* Force the libinferbit router onto CPU too: ib_forward() would
+             * otherwise re-attempt (and re-fail) the Metal upload. */
+#if defined(_WIN32)
+            _putenv_s("IB_BACKEND", "cpu");
+#else
+            setenv("IB_BACKEND", "cpu", 1);
+#endif
+        } else if (getenv("IB_STRIP_MMAP")) {
+            ib_metal_strip_cpu_mmap(m);
+        }
     }
 
     float *logits = malloc((size_t)vocab * sizeof(float));

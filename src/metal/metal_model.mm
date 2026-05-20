@@ -79,6 +79,15 @@ struct tensor_bufs {
      * path preads from this file offset (within the IBF) into the
      * scratch right before this tensor's matmul dispatch. */
     size_t pq_drive_file_offset;   /* 0 = not streamed (RAM mode) */
+    /* PEAK-RAM fix: pyramid L2 indices streamed from disk in GPU drive
+     * mode (mirrors pq_drive_file_offset for L1). When set, pq_idx_l2 is
+     * NULL at upload time (no resident MTLBuffer) and the forward path
+     * preads the L2 indices into the shared gpu_drive_l2_idx_scratch ring
+     * right before each pyramid matmul. The L2 CODEBOOK (pq_cb_l2) stays
+     * resident (small). 0 = L2 indices resident (RAM mode). */
+    size_t pq_l2_drive_file_offset; /* 0 = L2 idx resident */
+    size_t pq_l2_drive_disk_bytes;  /* on-disk L2 idx byte count to pread */
+    size_t pq_l2_drive_scratch_bytes; /* scratch (kernel-native) byte count */
 };
 
 /* Per-layer GPU buffer set. */
@@ -167,6 +176,17 @@ struct ib_metal_model_buffers {
     int     gpu_drive_sr_size;           /* slots per sub-ring (n_slots / n_subrings) */
     int     gpu_drive_cur_sr;            /* current sub-ring (0..n_subrings-1) */
     void   *gpu_drive_pending_cb;        /* CB of the OTHER sub-ring (in flight) */
+
+    /* PEAK-RAM fix: parallel L2-index scratch ring for pyramid drive
+     * mode. Same slot count / sub-ring discipline as the L1 ring (each
+     * pyramid matmul consumes slot i of BOTH rings in lockstep), so no
+     * extra synchronization is needed — drive_prepare_pq loads L1 then
+     * L2 into the same slot index. Sized for the largest tensor's
+     * kernel-native L2 indices. 0 slots = no pyramid tensors streamed. */
+    void   *gpu_drive_l2_idx_scratch[4]; /* L2 idx MTLBuffer slots */
+    void   *gpu_drive_l2_idx_staging[4]; /* CPU pread → transpose buffers */
+    size_t  gpu_drive_l2_idx_scratch_size; /* size of EACH L2 slot */
+    int     gpu_drive_l2_idx_n_slots;    /* 0 = no L2 streaming */
 
     /* State buffers (reused across layers). */
     void *x;
@@ -800,12 +820,13 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
          *     same 3-byte triple — coalesced enough for the residual
          *     pass, which is bandwidth-secondary to L1 anyway.
          *
-         * Goal H3 drive-mode sourcing: when the model is in drive mode,
-         * pq->l2_indices points at the (empty) shared L2 scratch — we
-         * cannot dereference it. pread the real L2 bytes from drive_fd
-         * at pq->l2_indices_file_offset into a temporary host buffer
-         * (size = the disk L2 byte count, which matches the upload
-         * byte count for both layouts) and use that as the source. */
+         * PEAK-RAM fix: when the model is in GPU drive mode, do NOT make
+         * the L2 indices resident. Like L1, they are the big resident
+         * chunk; stream them per matmul through gpu_drive_l2_idx_scratch.
+         * Here we just record the file offset + byte counts and leave
+         * pq_idx_l2 NULL — the model finalizer allocates the shared L2
+         * scratch ring and drive_prepare_pq preads into it. The L2
+         * CODEBOOK above stays resident (few KB/tensor). */
         uint32_t l2_bits = (pq->l2_idx_bits == 6) ? 6u : 8u;
         out->pq_l2_idx_bits = (int)l2_bits;
         uint8_t *idx_l2_t = NULL;
@@ -820,48 +841,26 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
             idx_l2_bytes = idx_bytes;                                   /* [M][total] u8 */
             l2_disk_bytes = (size_t)pq->M * nc_l2 * pq->n_subchunks;     /* [nc][ns][M] u8 */
         }
-        /* In drive mode pq->l2_indices is the empty scratch slot; fetch
-         * the real bytes from disk into a temp buffer. Otherwise the
-         * mmap'd l2_indices pointer is live and we use it directly. */
-        uint8_t *l2_pread_buf = NULL;
+        int l2_drive = (m && m->residency_mode == 1
+                        && pq->l2_indices_file_offset != 0
+                        && m->drive_fd >= 0);
+        if (l2_drive) {
+            /* Stream the L2 indices: record the redirect; pq_idx_l2 stays
+             * NULL (filled per-matmul). Codebook already resident above. */
+            out->pq_l2_drive_file_offset   = pq->l2_indices_file_offset;
+            out->pq_l2_drive_disk_bytes     = l2_disk_bytes;
+            out->pq_l2_drive_scratch_bytes  = idx_l2_bytes;
+            out->pq_idx_l2 = NULL;
+        } else {
+        /* RAM mode: the mmap'd l2_indices pointer is live; upload it
+         * resident (transposing for the 8-bit layout). */
         const uint8_t *l2_src_bytes = (const uint8_t *)pq->l2_indices;
-        if (m && m->residency_mode == 1 && pq->l2_indices_file_offset != 0
-            && m->drive_fd >= 0) {
-            l2_pread_buf = (uint8_t *)malloc(l2_disk_bytes);
-            if (!l2_pread_buf) {
-                fprintf(stderr, "ib_metal: upload_pqv2_tensor_ex: OOM on drive-mode L2 indices pread staging (%zu bytes) — pyramid tensor will decode without residual\n",
-                        l2_disk_bytes);
-            } else {
-                size_t done = 0;
-                off_t off = (off_t)pq->l2_indices_file_offset;
-                int read_ok = 1;
-                while (done < l2_disk_bytes) {
-                    ssize_t r = pread(m->drive_fd, l2_pread_buf + done,
-                                       l2_disk_bytes - done, off + (off_t)done);
-                    if (r <= 0) {
-                        if (r == -1 && errno == EINTR) continue;
-                        fprintf(stderr, "ib_metal: upload_pqv2_tensor_ex: L2 indices pread failed in drive mode (off=%lld, want=%zu)\n",
-                                (long long)off, l2_disk_bytes - done);
-                        read_ok = 0;
-                        break;
-                    }
-                    done += (size_t)r;
-                }
-                if (!read_ok) {
-                    free(l2_pread_buf);
-                    l2_pread_buf = NULL;
-                } else {
-                    l2_src_bytes = l2_pread_buf;
-                }
-            }
-        }
         if (!l2_src_bytes) {
-            /* No source available (drive-mode pread failed or non-drive
-             * l2_indices was NULL). Skip upload; pq_K_l2 stays 0 and the
+            /* No source available. Skip upload; pq_K_l2 stays 0 and the
              * warning below fires. */
         } else if (l2_bits == 6) {
-            /* Upload directly from the (mmap or pread'd) packed buffer —
-             * same layout the GPU kernel expects. */
+            /* Upload directly from the mmap'd packed buffer — same layout
+             * the GPU kernel expects. */
             out->pq_idx_l2 =
                 ib_metal_alloc(ctx, idx_l2_bytes, l2_src_bytes);
         } else {
@@ -881,7 +880,7 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
                 free(idx_l2_t);
             }
         }
-        if (l2_pread_buf) free(l2_pread_buf);
+        } /* end RAM-mode L2 upload */
         /* Only flip pq_K_l2 ON when BOTH uploads succeeded — the
          * dispatcher (rec_matmul_tb) checks pq_K_l2 > 0 to route to the
          * L2residual kernel. If either upload failed we leave pq_K_l2 = 0
@@ -889,7 +888,11 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
          * pyramid data, but model_is_supported has already gated this
          * tensor through, so failing closed here would crash the model).
          * Emit a warning so the failure is at least visible. */
-        if (out->pq_cb_l2 && out->pq_idx_l2) {
+        /* In drive mode pq_idx_l2 is intentionally NULL (streamed); the
+         * presence of pq_l2_drive_file_offset means the L2 ring will fill
+         * it per-matmul. Treat that as success too. */
+        int l2_ready = out->pq_idx_l2 || out->pq_l2_drive_file_offset != 0;
+        if (out->pq_cb_l2 && l2_ready) {
             out->pq_K_l2 = (int)pq->l2_K;
         } else {
             fprintf(stderr,
@@ -1148,6 +1151,47 @@ ib_metal_upload_model(ib_metal_ctx *ctx, const void *model_handle)
                 fprintf(stderr, "ib_metal: GPU drive mode ON. %d slots (%d sub-rings × %d), %zu B/slot, %d tensors streamed\n",
                         n_slots, b->gpu_drive_n_subrings, b->gpu_drive_sr_size, scratch_sz, n_repointed);
                 #undef REPOINT
+
+                /* PEAK-RAM fix: parallel L2-index scratch ring for pyramid
+                 * tensors. Allocate ONLY if any tensor streams its L2
+                 * indices (pq_l2_drive_file_offset != 0). Uses the SAME
+                 * n_slots so the L2 ring advances in lockstep with the L1
+                 * ring (drive_prepare_pq fills slot i of both). Sized to
+                 * the largest tensor's kernel-native L2 idx bytes. */
+                size_t max_l2 = 0;
+                #define CONSIDER_L2(tb) do { \
+                    if ((tb).is_pq && (tb).pq_l2_drive_file_offset != 0) { \
+                        size_t s2 = (tb).pq_l2_drive_scratch_bytes; \
+                        if (s2 > max_l2) max_l2 = s2; \
+                    } \
+                } while (0)
+                for (int L = 0; L < b->num_layers; L++) {
+                    struct layer_bufs *lb = &b->layers[L];
+                    CONSIDER_L2(lb->q); CONSIDER_L2(lb->k); CONSIDER_L2(lb->v); CONSIDER_L2(lb->o);
+                    CONSIDER_L2(lb->gate); CONSIDER_L2(lb->up); CONSIDER_L2(lb->down);
+                }
+                CONSIDER_L2(b->output_head);
+                #undef CONSIDER_L2
+                if (max_l2 > 0) {
+                    size_t l2_scratch_sz = (max_l2 + 16383u) & ~((size_t)16383u);
+                    int l2_ok = 1;
+                    for (int i = 0; i < n_slots; i++) {
+                        b->gpu_drive_l2_idx_scratch[i] = ib_metal_alloc(ctx, l2_scratch_sz, NULL);
+                        b->gpu_drive_l2_idx_staging[i] = malloc(l2_scratch_sz);
+                        if (!b->gpu_drive_l2_idx_scratch[i] || !b->gpu_drive_l2_idx_staging[i]) {
+                            l2_ok = 0;
+                        }
+                    }
+                    b->gpu_drive_l2_idx_scratch_size = l2_scratch_sz;
+                    b->gpu_drive_l2_idx_n_slots = l2_ok ? n_slots : 0;
+                    if (!l2_ok) {
+                        fprintf(stderr, "ib_metal: GPU drive L2 scratch alloc failed (%zu B × %d)\n",
+                                l2_scratch_sz, n_slots);
+                    } else {
+                        fprintf(stderr, "ib_metal: GPU drive L2-index streaming ON. %zu B/slot × %d slots\n",
+                                l2_scratch_sz, n_slots);
+                    }
+                }
             }
         }
         #undef CONSIDER
@@ -1316,6 +1360,9 @@ ib_metal_release_model(ib_metal_ctx *ctx, ib_metal_model_buffers *b)
     for (int i = 0; i < 4; i++) {
         FR(b->gpu_drive_idx_scratch[i]);
         if (b->gpu_drive_idx_staging[i]) free(b->gpu_drive_idx_staging[i]);
+        /* PEAK-RAM fix: parallel L2-index ring (pyramid drive mode). */
+        FR(b->gpu_drive_l2_idx_scratch[i]);
+        if (b->gpu_drive_l2_idx_staging[i]) free(b->gpu_drive_l2_idx_staging[i]);
     }
     FR(b->x); FR(b->xb); FR(b->xb2);
     FR(b->q); FR(b->k); FR(b->v); FR(b->attn_out);
@@ -1440,6 +1487,81 @@ static int drive_load_pq_idx_to_slot(ib_metal_model_buffers *b,
     return 0;
 }
 
+/* PEAK-RAM fix: pyramid L2-index analog of drive_load_pq_idx_to_slot.
+ * preads this tensor's L2 indices from the IBF at
+ * pq_l2_drive_file_offset into the L2 ring's slot, transposing
+ * [nc][ns][M] → [M][total] for the 8-bit layout (matching the resident
+ * upload), or preading the packed 6-bit layout directly. Returns 0 on
+ * success, -1 on error. Slot index is the SAME as the L1 slot so the two
+ * rings stay in lockstep. */
+static int drive_load_pq_l2_idx_to_slot(ib_metal_model_buffers *b,
+                                         const struct tensor_bufs *tb,
+                                         int slot)
+{
+    if (!tb || !tb->is_pq || tb->pq_l2_drive_file_offset == 0) return 0;
+    if (!b || !b->model) return -1;
+    if (slot < 0 || slot >= b->gpu_drive_l2_idx_n_slots) return -1;
+    if (!b->gpu_drive_l2_idx_scratch[slot] || !b->gpu_drive_l2_idx_staging[slot]) return -1;
+    const inferbit_model *m = (const inferbit_model *)b->model;
+    int fd = m->drive_fd;
+    if (fd < 0) return -1;
+
+    size_t disk_bytes    = tb->pq_l2_drive_disk_bytes;
+    size_t scratch_bytes = tb->pq_l2_drive_scratch_bytes;
+    if (scratch_bytes > b->gpu_drive_l2_idx_scratch_size) {
+        fprintf(stderr, "drive_load_pq_l2_idx_to_slot: %zu B > slot %zu B\n",
+                scratch_bytes, b->gpu_drive_l2_idx_scratch_size);
+        return -1;
+    }
+    off_t off = (off_t)tb->pq_l2_drive_file_offset;
+
+    if (tb->pq_l2_idx_bits == 6) {
+        /* Packed layout: on-disk == kernel-native; pread to scratch. */
+        uint8_t *dst = (uint8_t *)b->gpu_drive_l2_idx_scratch[slot];
+        size_t done = 0;
+        while (done < disk_bytes) {
+            ssize_t r = pread(fd, dst + done, disk_bytes - done, off + (off_t)done);
+            if (r <= 0) {
+                if (r == -1 && errno == EINTR) continue;
+                fprintf(stderr, "drive_load_pq_l2_idx_to_slot[6bit]: pread failed (off=%lld, want=%zu)\n",
+                        (long long)off, disk_bytes - done);
+                return -1;
+            }
+            done += (size_t)r;
+        }
+        return 0;
+    }
+
+    /* 8-bit layout: pread [nc][ns][M] into staging, transpose to scratch
+     * [M][total]. total = nc*ns. */
+    uint32_t M     = (uint32_t)tb->pq_M;
+    uint32_t nc    = (uint32_t)(tb->pq_N / tb->pq_G);
+    uint32_t ns    = (uint32_t)tb->pq_ns;
+    uint32_t total = nc * ns;
+    uint8_t *staging = (uint8_t *)b->gpu_drive_l2_idx_staging[slot];
+    size_t done = 0;
+    while (done < disk_bytes) {
+        ssize_t r = pread(fd, staging + done, disk_bytes - done, off + (off_t)done);
+        if (r <= 0) {
+            if (r == -1 && errno == EINTR) continue;
+            fprintf(stderr, "drive_load_pq_l2_idx_to_slot[8bit]: pread failed (off=%lld, want=%zu)\n",
+                    (long long)off, disk_bytes - done);
+            return -1;
+        }
+        done += (size_t)r;
+    }
+    uint8_t *dst = (uint8_t *)b->gpu_drive_l2_idx_scratch[slot];
+    for (uint32_t m_ = 0; m_ < M; m_++) {
+        uint8_t *row = dst + (size_t)m_ * total;
+        for (uint32_t c = 0; c < nc; c++) {
+            for (uint32_t s = 0; s < ns; s++) {
+                row[c * ns + s] = staging[((size_t)c * ns + s) * M + m_];
+            }
+        }
+    }
+    return 0;
+}
+
 /* GPU drive mode 2-slot ring wrapper. Returns the MTLBuffer pointer
  * the matmul should read pq_idx from — either the ring slot we just
  * loaded into (drive-streamed) or tb->pq_idx unchanged (RAM-mode).
@@ -1455,8 +1577,10 @@ static int drive_load_pq_idx_to_slot(ib_metal_model_buffers *b,
  *     once per matmul. */
 static void *drive_prepare_pq(ib_metal_recorder *r,
                                 ib_metal_model_buffers *b,
-                                const struct tensor_bufs *tb)
+                                const struct tensor_bufs *tb,
+                                void **out_l2_idx)
 {
+    if (out_l2_idx) *out_l2_idx = tb ? tb->pq_idx_l2 : NULL;
     if (!tb || !tb->is_pq || tb->pq_drive_file_offset == 0) {
         return tb ? tb->pq_idx : NULL;
     }
@@ -1496,6 +1620,14 @@ static void *drive_prepare_pq(ib_metal_recorder *r,
     }
     int slot = b->gpu_drive_cur_sr * sr_sz + b->gpu_drive_idx_in_flight;
     if (drive_load_pq_idx_to_slot(b, tb, slot) != 0) return NULL;
+    /* PEAK-RAM fix: pyramid tensors also stream L2 indices into the
+     * parallel L2 ring's SAME slot, in lockstep with L1. The ring
+     * discipline (commit/checkpoint above) covers both buffers since the
+     * GPU reads L1 and L2 of the same matmul together. */
+    if (tb->pq_l2_drive_file_offset != 0) {
+        if (drive_load_pq_l2_idx_to_slot(b, tb, slot) != 0) return NULL;
+        if (out_l2_idx) *out_l2_idx = b->gpu_drive_l2_idx_scratch[slot];
+    }
     b->gpu_drive_idx_in_flight++;
     return b->gpu_drive_idx_scratch[slot];
 }
@@ -1538,15 +1670,18 @@ static int rec_matmul_tb(ib_metal_recorder *r,
                           int M, int N)
 {
     if (tb->is_pq) {
-        void *idx = drive_prepare_pq(r, b, tb);
+        void *idx_l2 = NULL;
+        void *idx = drive_prepare_pq(r, b, tb, &idx_l2);
         if (!idx) return -1;
         /* Pyramid (l2_kind=2) path: route to the dedicated kernel that
          * does L1+L2 in one dispatch. Skips the optional simdmat-decode
-         * branch entirely (that one only knows about flat PQv2). */
-        if (tb->pq_K_l2 > 0 && tb->pq_cb_l2 && tb->pq_idx_l2) {
+         * branch entirely (that one only knows about flat PQv2).
+         * idx_l2 is either the resident pq_idx_l2 (RAM mode) or the
+         * just-filled L2 ring slot (drive mode). */
+        if (tb->pq_K_l2 > 0 && tb->pq_cb_l2 && idx_l2) {
             return ib_metal_rec_matmul_pqv2_k256_half2_l2residual(r,
                 tb->pq_rs, tb->pq_cb, idx,
-                tb->pq_cb_l2, tb->pq_idx_l2,
+                tb->pq_cb_l2, idx_l2,
                 x_fp32, out,
                 tb->pq_M, tb->pq_N, tb->pq_G, tb->pq_ns, tb->pq_K_l2,
                 tb->pq_l2_idx_bits ? tb->pq_l2_idx_bits : 8);
@@ -1970,7 +2105,8 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
         if (rc == 0) return 0;
     }
     if (tb && tb->is_pq) {
-        void *idx = drive_prepare_pq(r, b, tb);
+        void *idx_l2 = NULL;
+        void *idx = drive_prepare_pq(r, b, tb, &idx_l2);
         if (!idx) return -1;
         /* Pyramid (l2_kind=2) batched path: the simdmat-tiled fast
          * batched kernels don't know about the L2 residual, so loop
@@ -1978,14 +2114,16 @@ static int rec_matmul_batched_tb(ib_metal_recorder *r,
          * correct (matches CPU and per-token Metal); performance work
          * is a follow-up (a true batched L2 kernel would amortize
          * indices reads across B positions, mirroring the flat batched
-         * design). */
-        if (tb->pq_K_l2 > 0 && tb->pq_cb_l2 && tb->pq_idx_l2) {
+         * design). idx_l2 is resident (RAM) or the L2 ring slot (drive);
+         * the slot stays valid across the B-loop because the ring only
+         * advances on the next drive_prepare_pq call. */
+        if (tb->pq_K_l2 > 0 && tb->pq_cb_l2 && idx_l2) {
             for (int bb = 0; bb < B; bb++) {
                 const void *xp = (const float *)x_fp32 + (size_t)bb * N;
                 void       *op = (float *)out          + (size_t)bb * M;
                 int rc = ib_metal_rec_matmul_pqv2_k256_half2_l2residual(r,
                     tb->pq_rs, tb->pq_cb, idx,
-                    tb->pq_cb_l2, tb->pq_idx_l2,
+                    tb->pq_cb_l2, idx_l2,
                     xp, op,
                     tb->pq_M, tb->pq_N, tb->pq_G, tb->pq_ns, tb->pq_K_l2,
                     tb->pq_l2_idx_bits ? tb->pq_l2_idx_bits : 8);

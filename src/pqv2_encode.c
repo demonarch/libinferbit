@@ -1559,15 +1559,20 @@ static void permute_qk_rows_fp32_inplace(float *W, int rows, int cols,
  * (cols, since down's columns correspond to gate's rows). Because all
  * three are permuted consistently, the full-FFN sum is invariant — no
  * runtime change is needed for correctness; only WHICH rows land in each
- * expert changes. Gated behind IB_MOME_COSINE_CLUSTER=1 (default off).
+ * expert changes. Default ON; opt out with IB_MOME_COSINE_CLUSTER=0.
  *
  * The permutation is computed once when the GATE projection is encoded
  * and stashed in a process-static keyed by row count, then reused by the
  * UP and DOWN encoders for the same layer (they run immediately after
  * gate in convert order). */
 static int mome_cosine_cluster_enabled(void) {
+    /* Default ON: cosine row-clustering is a free quality win (TinyLlama
+     * K=2 PPL 6.65 vs contiguous 6.90, identical size, +0.6% convert
+     * time). Opt out with IB_MOME_COSINE_CLUSTER=0 for the legacy
+     * contiguous row-split. */
     const char *e = getenv("IB_MOME_COSINE_CLUSTER");
-    return (e && e[0] && e[0] != '0') ? 1 : 0;
+    if (e && e[0]) return (e[0] != '0') ? 1 : 0;
+    return 1;
 }
 
 /* Process-static permutation handoff: gate writes, up/down read. Sized
