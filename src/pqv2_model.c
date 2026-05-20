@@ -993,22 +993,13 @@ static int build_pretransposed_sidecar(inferbit_model *m,
             got += (size_t)r;
         }
         const uint8_t *src = read_buf;
-        /* Transpose into staging: dst[m * total + c*ns + s].
-         * Source layout depends on the on-disk L1 index layout:
-         *   pq->l1_idx_layout == 0 (legacy chunk-major):
-         *      src[(c*ns+s)*M + m]
-         *   pq->l1_idx_layout == 1 (Stage 5g.2 row-major, Bug N16):
-         *      src[m*total + c*ns+s] — already in destination layout,
-         *      so a straight memcpy works. */
-        if (pq->l1_idx_layout == 1) {
-            memcpy(staging, src, idx_bytes);
-        } else {
-            for (uint32_t m_ = 0; m_ < M; m_++) {
-                uint8_t *row = staging + (size_t)m_ * total;
-                for (uint32_t c = 0; c < nc; c++) {
-                    for (uint32_t s = 0; s < ns; s++) {
-                        row[c * ns + s] = src[((size_t)c * ns + s) * M + m_];
-                    }
+        /* Transpose into staging: dst[m * total + c*ns + s]. The on-disk
+         * L1 indices are always chunk-major (src[(c*ns+s)*M + m]). */
+        for (uint32_t m_ = 0; m_ < M; m_++) {
+            uint8_t *row = staging + (size_t)m_ * total;
+            for (uint32_t c = 0; c < nc; c++) {
+                for (uint32_t s = 0; s < ns; s++) {
+                    row[c * ns + s] = src[((size_t)c * ns + s) * M + m_];
                 }
             }
         }

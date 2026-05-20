@@ -26,87 +26,17 @@ static inline size_t pqv2_l2_packed_bytes_per_row(uint32_t M) {
     return pqv2_l2_packed_bytes_per_row_b(M, 6u);
 }
 
-/* ── Stage 5k: fp8 E4M3 decode for row_scale + cb_scale ────────────────
- * Inverse of pqv2_encode.c's enc_f32_to_e4m3 / enc_pack_row_scale_e4m3.
- * Called once per tensor at load time, so cost is amortised over every
- * matmul that uses the tensor — the hot kernel sees only the resulting
- * fp16 arrays and stays byte-identical to the legacy layout.
- *
- * H2 sp2 redesign (Agent 3 round 1 fix): row_scale used to disk-pack as
- * int8[M] + fp16 row_max (linear quantization with a per-tensor anchor).
- * That codec floored the small-magnitude rows of LLM weight matrices to
- * zero — Llama-3 / TinyLlama row_scales span 6-10 decades and a linear
- * 127-step anchor can only resolve ~3. The codec is now fp8 E4M3[M]
- * (logarithmic, ~10 decades dynamic range, 6-12% per-row relative error)
- * — same codec as cb_scale. Old sp=2 IBF files written before this
- * change are unreadable; rerun the encoder. */
-
-static inline float pqv2_e4m3_to_f32(uint8_t b) {
-    uint32_t sign = (uint32_t)(b >> 7) & 0x1u;
-    uint32_t exp  = (uint32_t)(b >> 3) & 0xFu;
-    uint32_t mant = (uint32_t)b & 0x7u;
-    if (exp == 0xFu && mant == 0x7u) {
-        uint32_t nan_bits = (sign << 31) | 0x7FC00000u;
-        float f; memcpy(&f, &nan_bits, 4); return f;
-    }
-    float val;
-    if (exp == 0u) {
-        val = (float)mant * (1.0f / 8.0f) * (1.0f / 64.0f);
-    } else {
-        int e = (int)exp - 7;
-        float mantissa = 1.0f + (float)mant * (1.0f / 8.0f);
-        val = ldexpf(mantissa, e);
-    }
-    return sign ? -val : val;
-}
-
-/* fp32 → fp16 (round to nearest even, no NaN/Inf re-tagging). Used to
- * normalize Stage 5k decoded scales into the fp16 buffer the kernel
- * already consumes. */
-static inline uint16_t pqv2_f32_to_fp16_bits(float f) {
-    uint32_t x;
-    memcpy(&x, &f, 4);
-    uint32_t sign = (x >> 16) & 0x8000u;
-    int      exp  = (int)((x >> 23) & 0xFFu) - 127 + 15;
-    uint32_t mant = x & 0x7FFFFFu;
-    if (exp <= 0)  return (uint16_t)sign;
-    if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
-    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
-}
-
 /* Owned-pointer bag filled by parse_pqv2_blob when the on-disk layout
- * forces the loader to materialise fp16/int8 scratch (Stages 5k + 5j).
+ * forces the loader to materialise int8 scratch (Stage 5j pool expand).
  * Caller (= ib_pqv2_file_load) copies these into the named-tensor entry
  * so ib_pqv2_file_free can release them. Any field left NULL means the
  * corresponding pqv2_t pointer is into the mmap'd file (zero-copy). */
 typedef struct {
-    void *row_scale;     /* fp16[M], allocated when scale_precision >= 1 */
-    void *cb_scale;      /* fp16[rows*K], allocated when scale_precision >= 2 */
+    void *cb_scale;      /* fp16[rows*K], allocated when pool expanded */
     void *l2_cb_scale;
     void *cb_q;          /* int8[ns*K*half], allocated when pool expanded */
     void *l2_cb_q;
 } pqv2_blob_owned;
-
-/* Decode an fp8 E4M3 row_scale array (stored as M bytes on disk) into
- * a newly-allocated fp16[M] buffer. Mirrors pqv2_decode_cb_scale_e4m3. */
-static uint16_t *pqv2_decode_row_scale_e4m3(const uint8_t *src, uint32_t M) {
-    uint16_t *out = (uint16_t *)malloc((size_t)M * sizeof(uint16_t));
-    if (!out) return NULL;
-    for (uint32_t m = 0; m < M; m++) {
-        out[m] = pqv2_f32_to_fp16_bits(pqv2_e4m3_to_f32(src[m]));
-    }
-    return out;
-}
-
-/* Decode an fp8 E4M3 cb_scale block into fp16. */
-static uint16_t *pqv2_decode_cb_scale_e4m3(const uint8_t *src, size_t n) {
-    uint16_t *out = (uint16_t *)malloc(n * sizeof(uint16_t));
-    if (!out) return NULL;
-    for (size_t i = 0; i < n; i++) {
-        out[i] = pqv2_f32_to_fp16_bits(pqv2_e4m3_to_f32(src[i]));
-    }
-    return out;
-}
 
 /* Stage 5j — expand a pooled codebook back into a per-slot [n_sub*K**]
  * buffer. v1 ships pool_size == n_subchunks with identity pool_id, so
@@ -145,14 +75,16 @@ static void *pqv2_expand_pool_cbs_fp16(const uint16_t *pool_s, const uint8_t *po
  * into 'buf' directly (zero-copy, legacy) or point at heap allocations
  * recorded in `*out_owned` so the file freer can release them.
  *
- * Header history (append-only):
+ * Header history (append-only). The sp2 (11-u32 scale_precision) and the
+ * rowmajor (14-u32 l1_idx_layout) variants were retired in the format
+ * consolidation — they can no longer be created, so their parse branches
+ * were deleted. The recognized layouts are now:
  *    8 u32 — original (M,N,G,K,n_sub,half,l2_kind,l2_K).
  *    9 u32 — Stage 5h.1: + l2_idx_bits (6=packed, 8=legacy).
  *   10 u32 — Stage 5c:   + residency_hint (0=AUTO, 1=RAM, 2=DRIVE).
- *   11 u32 — Stage 5k:   + scale_precision (0=fp16/fp16, 2=fp8 E4M3 / fp8 E4M3
- *                          — H2 sp2 redesign; was int8+row_max / fp8 E4M3).
- *   13 u32 — Stage 5j:   + cb_pool_size + l2_cb_pool_size.
- *   14 u32 — Stage 5g.2: + l1_idx_layout (0=chunk-major, 1=row-major).
+ *   13 u32 — Stage 5j:   + scale_precision (always 0) + cb_pool_size
+ *                          + l2_cb_pool_size. (hdr[10] retained as a
+ *                          reserved 0 slot for layout/size compatibility.)
  *
  * Disambiguates without a version field by reconciling header size +
  * data layout against the blob's total length: pick the largest header
@@ -173,13 +105,14 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     size_t idx_bytes = (size_t)out->M * n_chunks * out->n_subchunks;
 
     /* Helper: project total blob bytes given the candidate header layout
-     * (in u32s), l2_idx_bits, scale_precision, and pool sizes. */
-    #define PQV2_PROJ_SIZE_FULL(hdr_u32, b, sp, p1, p2)                        \
+     * (in u32s), l2_idx_bits, and pool sizes. row_scale + cb_scale are
+     * always plain fp16 on disk (the sp2 fp8 variant was retired). */
+    #define PQV2_PROJ_SIZE_FULL(hdr_u32, b, p1, p2)                            \
         (                                                                       \
           /* header */                                                          \
           (size_t)(4 + (hdr_u32) * 4)                                           \
-          /* row_scale: fp16[M] (legacy) OR fp8 E4M3[M] (Stage 5k H2 sp2) */   \
-          + ((sp) >= 1 ? (size_t)out->M : (size_t)out->M * 2u)                 \
+          /* row_scale: fp16[M] */                                              \
+          + (size_t)out->M * 2u                                                 \
           /* cb_q + cb_scale (rows = p1 if > 0 else n_sub) — cb_scale  */     \
           /* is ALWAYS fp16 (Goal I2 rollback). See note at decode site. */     \
           + ((size_t)((p1) > 0 ? (p1) : out->n_subchunks)                       \
@@ -209,71 +142,28 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     uint32_t maybe_bits = 8;
     size_t header_bytes = 4 + 32;
     int hint = 0;
-    uint32_t scale_precision = 0;
     uint32_t cb_pool_size = 0;
     uint32_t l2_cb_pool_size = 0;
-    uint32_t l1_idx_layout = 0;
     int resolved = 0;
 
-    /* 14-u32 layout (Stage 5g.2 — adds l1_idx_layout). */
-    if (!resolved && size >= 4 + 56) {
-        uint32_t b = hdr[8], r = hdr[9], sp = hdr[10],
-                 p1 = hdr[11], p2 = hdr[12], lay = hdr[13];
-        int bits_ok = (b == 4 || b == 6 || b == 8);
-        int hint_ok = (r <= 2);
-        int sp_ok   = (sp == 0 || sp == 2);
-        int p1_ok   = (p1 == 0 || p1 == out->n_subchunks);
-        int p2_ok   = (p2 == 0 || p2 == out->n_subchunks);
-        int lay_ok  = (lay == 0 || lay == 1);
-        if (bits_ok && hint_ok && sp_ok && p1_ok && p2_ok && lay_ok) {
-            size_t projected = PQV2_PROJ_SIZE_FULL(14, b, sp, p1, p2);
-            if (projected == size) {
-                maybe_bits = b;
-                header_bytes = 4 + 56;
-                hint = (int)r;
-                scale_precision = sp;
-                cb_pool_size = p1;
-                l2_cb_pool_size = p2;
-                l1_idx_layout = lay;
-                resolved = 1;
-            }
-        }
-    }
-    /* 13-u32 layout (Stage 5j). */
+    /* 13-u32 layout (Stage 5j dedup). hdr[10] is a reserved 0 slot
+     * (formerly scale_precision; sp2 retired). */
     if (!resolved && size >= 4 + 52) {
         uint32_t b = hdr[8], r = hdr[9], sp = hdr[10],
                  p1 = hdr[11], p2 = hdr[12];
         int bits_ok = (b == 4 || b == 6 || b == 8);
         int hint_ok = (r <= 2);
-        int sp_ok   = (sp == 0 || sp == 2);
+        int sp_ok   = (sp == 0);
         int p1_ok   = (p1 == 0 || p1 == out->n_subchunks);
         int p2_ok   = (p2 == 0 || p2 == out->n_subchunks);
         if (bits_ok && hint_ok && sp_ok && p1_ok && p2_ok) {
-            size_t projected = PQV2_PROJ_SIZE_FULL(13, b, sp, p1, p2);
+            size_t projected = PQV2_PROJ_SIZE_FULL(13, b, p1, p2);
             if (projected == size) {
                 maybe_bits = b;
                 header_bytes = 4 + 52;
                 hint = (int)r;
-                scale_precision = sp;
                 cb_pool_size = p1;
                 l2_cb_pool_size = p2;
-                resolved = 1;
-            }
-        }
-    }
-    /* 11-u32 layout (Stage 5k, pre-5j). */
-    if (!resolved && size >= 4 + 44) {
-        uint32_t b = hdr[8], r = hdr[9], sp = hdr[10];
-        int bits_ok = (b == 4 || b == 6 || b == 8);
-        int hint_ok = (r <= 2);
-        int sp_ok   = (sp == 0 || sp == 2);
-        if (bits_ok && hint_ok && sp_ok) {
-            size_t projected = PQV2_PROJ_SIZE_FULL(11, b, sp, 0u, 0u);
-            if (projected == size) {
-                maybe_bits = b;
-                header_bytes = 4 + 44;
-                hint = (int)r;
-                scale_precision = sp;
                 resolved = 1;
             }
         }
@@ -284,7 +174,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
         int bits_ok = (b == 4 || b == 6 || b == 8);
         int hint_ok = (r <= 2);
         if (bits_ok && hint_ok) {
-            size_t projected = PQV2_PROJ_SIZE_FULL(10, b, 0u, 0u, 0u);
+            size_t projected = PQV2_PROJ_SIZE_FULL(10, b, 0u, 0u);
             if (projected == size) {
                 maybe_bits = b;
                 header_bytes = 4 + 40;
@@ -298,7 +188,7 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
         uint32_t b = hdr[8];
         if ((b == 4 || b == 6 || b == 8) &&
             (out->l2_kind == 2 || (b == 8 && out->l2_kind == 0))) {
-            size_t projected = PQV2_PROJ_SIZE_FULL(9, b, 0u, 0u, 0u);
+            size_t projected = PQV2_PROJ_SIZE_FULL(9, b, 0u, 0u);
             if (projected == size) {
                 maybe_bits = b;
                 header_bytes = 4 + 36;
@@ -311,10 +201,8 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
     #undef PQV2_PROJ_SIZE_FULL
 
     out->l2_idx_bits = maybe_bits;
-    out->scale_precision = scale_precision;
     out->cb_pool_size = cb_pool_size;
     out->l2_cb_pool_size = l2_cb_pool_size;
-    out->l1_idx_layout = l1_idx_layout;
     if (out_residency_hint) *out_residency_hint = hint;
     size_t cursor = header_bytes;
 
@@ -322,7 +210,6 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
      * scratch — caller only ever sees `out_owned` populated when the
      * parse succeeds. */
     #define PQV2_PARSE_FAIL() do {                                            \
-        if (out_owned->row_scale)     free(out_owned->row_scale);             \
         if (out_owned->cb_scale)      free(out_owned->cb_scale);              \
         if (out_owned->l2_cb_scale)   free(out_owned->l2_cb_scale);           \
         if (out_owned->cb_q)          free(out_owned->cb_q);                  \
@@ -331,34 +218,14 @@ static int parse_pqv2_blob(const uint8_t *buf, size_t size, pqv2_t *out,
         return -1;                                                            \
     } while (0)
 
-    /* row_scale: fp16[M] (legacy) OR fp8 E4M3[M] (Stage 5k H2 sp2). */
-    size_t row_disk_bytes = (scale_precision >= 1)
-                              ? (size_t)out->M
-                              : (size_t)out->M * 2u;
+    /* row_scale: always plain fp16[M], zero-copy into the mmap'd file. */
+    size_t row_disk_bytes = (size_t)out->M * 2u;
     if (cursor + row_disk_bytes > size) PQV2_PARSE_FAIL();
-    if (scale_precision >= 1) {
-        const uint8_t *rs_e4m3 = (const uint8_t *)(buf + cursor);
-        uint16_t *rs = pqv2_decode_row_scale_e4m3(rs_e4m3, out->M);
-        if (!rs) PQV2_PARSE_FAIL();
-        out->row_scale = rs;
-        out_owned->row_scale = rs;
-    } else {
-        out->row_scale = (const uint16_t *)(buf + cursor);
-    }
+    out->row_scale = (const uint16_t *)(buf + cursor);
     cursor += row_disk_bytes;
 
     /* cb_q + cb_scale: rows = cb_pool_size if > 0 else n_subchunks.
-     *
-     * Goal I2: cb_scale is ALWAYS fp16 on disk, regardless of
-     * scale_precision. The Stage 5k sp=2 redesign briefly packed
-     * cb_scale as fp8 E4M3 (saving ns*K bytes/tensor), but probe_sp2
-     * showed cb_scale's distribution clusters around 1e-3..5e-3 with
-     * a ~300× range, putting ~30% of codewords in E4M3's subnormal
-     * band where the small ones flush to zero (RMSE_rel 38.8% vs 2.6%
-     * for row_scale). cb_scale was the actual driver of the sp=2 PPL
-     * regression (50.4 → 48.9 after row-scale fp8 fix). Old sp=2
-     * files written by the both-fp8 encoder are no longer readable —
-     * rerun the encoder. */
+     * cb_scale is always plain fp16 on disk. */
     uint32_t cb_rows = cb_pool_size > 0 ? cb_pool_size : out->n_subchunks;
     size_t cb_q_disk_bytes  = (size_t)cb_rows * out->K * out->half;
     size_t cb_s_disk_bytes  = (size_t)cb_rows * out->K * 2u;
@@ -556,10 +423,9 @@ int ib_pqv2_file_load(const char *path, ib_pqv2_file *out) {
             if (parse_pqv2_blob(p + blob_off, (size_t)blob_size,
                                  &t->pq, &hint, &owned) != 0) goto fail;
             t->residency_hint = hint;
-            /* Stage 5k / 5j — record loader-allocated buffers for cleanup.
+            /* Stage 5j — record loader-allocated buffers for cleanup.
              * NULL fields mean the corresponding pq pointer is into the
-             * mmap'd file (zero-copy / legacy). */
-            t->owned_row_scale     = owned.row_scale;
+             * mmap'd file (zero-copy). */
             t->owned_cb_scale      = owned.cb_scale;
             t->owned_l2_cb_scale   = owned.l2_cb_scale;
             t->owned_cb_q          = owned.cb_q;
@@ -595,8 +461,7 @@ void ib_pqv2_file_free(ib_pqv2_file *f) {
             if (t->kind == IB_PQV2_KIND_PQV2) {
                 if (t->pq.cb_fp32)    free((void*)t->pq.cb_fp32);
                 if (t->pq.l2_cb_fp32) free((void*)t->pq.l2_cb_fp32);
-                /* Stage 5k / 5j scratch (NULL when zero-copy from mmap). */
-                if (t->owned_row_scale)   free(t->owned_row_scale);
+                /* Stage 5j scratch (NULL when zero-copy from mmap). */
                 if (t->owned_cb_scale)    free(t->owned_cb_scale);
                 if (t->owned_l2_cb_scale) free(t->owned_l2_cb_scale);
                 if (t->owned_cb_q)        free(t->owned_cb_q);

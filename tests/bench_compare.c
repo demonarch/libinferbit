@@ -55,14 +55,10 @@ static void cpu_embed_lookup(const inferbit_model *m, int token, float *out) {
         const int8_t *cb_q = (const int8_t *)pq->cb_q;
         const uint16_t *cb_s = (const uint16_t *)pq->cb_scale;
         float rs = pq->row_scale ? ib_fp16_to_fp32(((const uint16_t *)pq->row_scale)[token]) : 1.0f;
-        /* Row-major (pq->l1_idx_layout == 1) support — see bench_ppl_run.c
-         * cpu_embed_lookup for the rationale (mirrors forward.c). */
-        uint32_t total = nc * pq->n_subchunks;
+        /* L1 indices are always chunk-major on disk: idx[(c*ns+s)*M + token]. */
         for (uint32_t c = 0; c < nc; c++) {
             for (uint32_t s = 0; s < pq->n_subchunks; s++) {
-                uint8_t k = (pq->l1_idx_layout == 1)
-                    ? idx_base[(size_t)token * total + c * pq->n_subchunks + s]
-                    : idx_base[((size_t)c * pq->n_subchunks + s) * pq->M + token];
+                uint8_t k = idx_base[((size_t)c * pq->n_subchunks + s) * pq->M + token];
                 float scl = ib_fp16_to_fp32(cb_s[s * K + k]) * rs;
                 for (uint32_t h = 0; h < HALF; h++) {
                     out[c * pq->G + s * HALF + h] =

@@ -30,19 +30,6 @@ typedef struct {
      * before the packing field existed. */
     uint32_t l2_idx_bits;
 
-    /* Stage 5k — scale precision encoding. 0 = legacy (row_scale fp16,
-     * cb_scale fp16). 2 = row_scale fp8 E4M3, cb_scale fp16 (Goal I2;
-     * previously row+cb fp8 but the cb_scale distribution clusters in
-     * E4M3's subnormal band and 30% of codewords flushed to zero —
-     * see pqv2_encode.c and pqv2_format.c). Modes 1 and 3 are reserved
-     * per the doc but unimplemented in v1. The kernel ALWAYS reads
-     * `row_scale` and `cb_scale` as uint16 fp16 — when mode != 0, the
-     * loader decodes the on-disk fp8 bytes for row_scale only into
-     * newly-allocated fp16 arrays at parse time, so the hot inner
-     * loops stay byte-identical. Cost absorbed in the load-time
-     * codebook prebuild. */
-    uint32_t scale_precision;
-
     /* Stage 5j — codebook pool. When > 0 in the on-disk header, the file
      * holds `cb_pool_size` codebooks and a per-slot `pool_id[n_subchunks]`
      * mapping. The v1 loader EXPANDS the pool back into a per-slot
@@ -57,32 +44,16 @@ typedef struct {
     uint32_t cb_pool_size;            /* L1 pool size on disk; 0 = no pool */
     uint32_t l2_cb_pool_size;         /* L2 pool size on disk; 0 = no pool */
 
-    /* Stage 5g.2 — L1 index on-disk layout selector.
-     *   0 = chunk-major [n_chunks][n_subchunks][M] (legacy, NEON-friendly).
-     *   1 = row-major   [M][n_chunks][n_subchunks] (Metal zero-copy
-     *       friendly — the GPU SIMD kernel already reads row-major, so
-     *       the upload-time transpose becomes a no-op and the staging
-     *       malloc can be skipped via newBufferWithBytesNoCopy).
-     * Selected at encode time via IB_PQV2_L1_ROWMAJOR=1 (opt-in for v1).
-     * Defaults to 0 for files written before this field existed —
-     * disambiguated by the same blob-size heuristic that handles every
-     * other append-only header field. */
-    uint32_t l1_idx_layout;           /* 0 = chunk-major, 1 = row-major */
-
-    /* fp16 stored as raw uint16. After Stage 5k decode (mode != 0), this
-     * points at a loader-allocated buffer rather than the mmap'd file. */
+    /* fp16 stored as raw uint16, zero-copy into the mmap'd file. */
     const uint16_t *row_scale;        /* [M] */
 
     /* L1 codebooks. Sized by `cb_pool_size > 0 ? cb_pool_size : n_subchunks`. */
     const int8_t  *cb_q;              /* [rows * K * half] */
     const uint16_t *cb_scale;         /* [rows * K] fp16 */
-    /* L1 indices. Logical extent is always M*(N/G)*n_subchunks bytes.
-     * Layout selected by `l1_idx_layout`:
-     *   0 → on-disk [n_chunks][n_subchunks][M], i.e. legacy chunk-major
-     *       (NEON kernel reads `indices[(c*ns + s)*M + m]`).
-     *   1 → on-disk [M][n_chunks][n_subchunks], i.e. row-major
-     *       (Metal upload becomes zero-copy; NEON kernel reads
-     *       `indices[m*total + c*ns + s]`, less optimal cache pattern). */
+    /* L1 indices. Logical extent is always M*(N/G)*n_subchunks bytes,
+     * always chunk-major on disk: [n_chunks][n_subchunks][M]
+     * (kernel reads `indices[(c*ns + s)*M + m]`). The row-major disk
+     * variant was retired in the format consolidation. */
     const uint8_t *indices;
 
     /* L2-PQ codebooks (NULL if no L2). Sized analogously by

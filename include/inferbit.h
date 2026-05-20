@@ -371,14 +371,10 @@ typedef struct {
      * class. Index by `inferbit_tensor_class`. */
     inferbit_residency per_class_residency[INFERBIT_TENSOR_CLASS_COUNT];
 
-    /* Stage 5k — lower-precision scales (docs/v2/00_CORRECTION.md).
-     *   0 = legacy: row_scale fp16, codebook_scale fp16 (default).
-     *   2 = row_scale int8 + per-tensor fp16 row_max; codebook_scale
-     *       fp8 (E4M3). Free at kernel time — decoded into fp16 by the
-     *       loader so the hot inner loops are byte-identical to legacy.
-     * Modes 1 and 3 are reserved per the doc but not implemented in v1
-     * (incremental gains, not worth a separate header field). Zero-init
-     * stays bit-identical to v0.4.1. */
+    /* deprecated, ignored — the sp2 (fp8 scale) on-disk variant was
+     * retired in the format consolidation; row_scale + codebook_scale
+     * are always fp16 on disk. Kept for ABI parity with the Python
+     * ctypes mirror; the value has no effect. */
     int scale_precision;
 
     /* Stage 5j — codebook + scale dedup (docs/v2/00_CORRECTION.md).

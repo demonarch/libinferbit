@@ -447,13 +447,13 @@ inferbit_convert_config inferbit_default_convert_config(void) {
         c.per_class_format[i]    = INFERBIT_CONVERT_INT4;     /* = 0, "use global" */
         c.per_class_residency[i] = INFERBIT_RESIDENCY_AUTO;   /* = 0, "use heuristic" */
     }
-    /* Stage 5k / 5j (docs/v2/00_CORRECTION.md) — opt-in compression
-     * knobs. Defaults preserve the v0.4.1 / v0.4.2 file layout exactly:
-     *   scale_precision = 0  → row_scale + cb_scale stay fp16 on disk.
-     *   codebook_dedup  = 0  → no codebook pool emitted; loader/kernel
-     *                          paths exercise the legacy contiguous
-     *                          per-slot codebook layout. */
-    c.scale_precision = 0;
+    /* scale_precision is deprecated and ignored (the sp2 fp8 variant was
+     * retired in the format consolidation); row_scale + cb_scale are
+     * always fp16 on disk. The field is kept for ABI parity with the
+     * Python ctypes mirror. codebook_dedup = 0 → no codebook pool
+     * emitted; loader/kernel paths use the contiguous per-slot codebook
+     * layout. */
+    c.scale_precision = 0;  /* deprecated, ignored */
     c.codebook_dedup  = 0;
     return c;
 }

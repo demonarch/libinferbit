@@ -998,39 +998,15 @@ void ib_embedding_lookup(const inferbit_model* m, int token_id, float* out) {
 embed_mmap_path:
         {
             const uint8_t* idx_base = (const uint8_t*)pq->indices;
-            /* Bug N16 — when the L1 indices on disk are row-major
-             * ([M][n_chunks][n_subchunks], opt-in via IB_PQV2_L1_ROWMAJOR=1),
-             * the per-token byte for (c, s) lives at
-             *   token_id * total + c * n_sub + s
-             * rather than the legacy chunk-major
-             *   (c * n_sub + s) * M + token_id
-             * Without this branch, embedding lookup reads garbage for every
-             * token, poisoning the rest of the forward and blowing PPL up
-             * (168450 on TinyLlama). Same logical byte is fetched in both
-             * layouts; the indices are byte-equivalent (see encoder
-             * pqv2_encode.c::pqv2_encode_slot_worker scatter). */
-            if (pq->l1_idx_layout == 1) {
-                size_t row_base = (size_t)token_id * (size_t)total;
-                for (uint32_t c = 0; c < nc; c++) {
-                    for (uint32_t s = 0; s < ns; s++) {
-                        uint8_t k = idx_base[row_base + c * ns + s];
-                        float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
-                        for (uint32_t h = 0; h < HALF; h++) {
-                            int8_t q = cb_q[(s * K + k) * HALF + h];
-                            out[c * G + s * HALF + h] = (float)q * scl;
-                        }
-                    }
-                }
-            } else {
-                /* Legacy chunk-major: idx[(c*ns+s)*M + token_id] */
-                for (uint32_t c = 0; c < nc; c++) {
-                    for (uint32_t s = 0; s < ns; s++) {
-                        uint8_t k = idx_base[((size_t)c * ns + s) * pq->M + token_id];
-                        float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
-                        for (uint32_t h = 0; h < HALF; h++) {
-                            int8_t q = cb_q[(s * K + k) * HALF + h];
-                            out[c * G + s * HALF + h] = (float)q * scl;
-                        }
+            /* L1 indices are always chunk-major on disk:
+             *   idx[(c*ns+s)*M + token_id] */
+            for (uint32_t c = 0; c < nc; c++) {
+                for (uint32_t s = 0; s < ns; s++) {
+                    uint8_t k = idx_base[((size_t)c * ns + s) * pq->M + token_id];
+                    float scl = fp16_to_fp32(cb_s[s * K + k]) * rs;
+                    for (uint32_t h = 0; h < HALF; h++) {
+                        int8_t q = cb_q[(s * K + k) * HALF + h];
+                        out[c * G + s * HALF + h] = (float)q * scl;
                     }
                 }
             }

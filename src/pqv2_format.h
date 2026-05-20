@@ -30,35 +30,24 @@
  *     If kind == 0 (PQV2): the "PQV2" single-tensor blob from pqv2_kernel.c:
  *       magic "PQV2", header u32×N (M,N,G,K,n_sub,half,l2_kind,l2_K,
  *                                    [l2_idx_bits], [residency_hint],
- *                                    [scale_precision],
+ *                                    [reserved=0],
  *                                    [cb_pool_size], [l2_cb_pool_size]),
- *       row_scale fp16[M] (legacy) OR fp8 E4M3[M] (Stage 5k H2 sp2,
- *         scale_precision >= 1; ~10-decade dynamic range — replaces the
- *         original int8[M]+fp16 row_max codec that lost small rows),
+ *       row_scale fp16[M],
  *       cb_q[rows*K*half] int8 — rows = cb_pool_size if > 0 else ns (Stage 5j),
- *       cb_scale[rows*K] fp16 — ALWAYS fp16 (Goal I2 rollback). The
- *         Stage 5k sp=2 redesign briefly packed cb_scale as fp8 too,
- *         but cb_scale's distribution clusters near E4M3's subnormal
- *         floor (1e-3..5e-3) and 30% of codewords flushed to zero —
- *         that, not row_scale, drove the sp=2 PPL regression. cb_scale
- *         fp16 is correct under both sp=0 and sp=2.
+ *       cb_scale[rows*K] fp16,
  *       cb_pool_id[ns] u8 — ONLY present when cb_pool_size > 0 (Stage 5j),
- *       indices[M*nc*ns] u8 (transposed [nc, ns, M]),
+ *       indices[M*nc*ns] u8 (chunk-major [nc, ns, M]),
  *       L2 (if l2_kind==2): l2_cb_q[l2_rows*l2_K*half],
  *         l2_cb_scale[l2_rows*l2_K] fp16,
  *         l2_cb_pool_id[ns] u8 (only when l2_cb_pool_size > 0),
  *         l2_indices.
- *       Header sizes evolve in append-only fashion:
+ *       Header sizes evolve in append-only fashion (the sp2 11-u32 and
+ *       rowmajor 14-u32 variants were retired — no longer creatable):
  *          8 u32 — legacy v0.4.0.
  *          9 u32 — Stage 5h.1: + l2_idx_bits.
  *         10 u32 — Stage 5c   : + residency_hint (0=AUTO, 1=RAM, 2=DRIVE).
- *         11 u32 — Stage 5k   : + scale_precision
- *                                  (0 = row fp16 / cb fp16,
- *                                   2 = row fp8  / cb fp16 — Goal I2;
- *                                       previously row+cb fp8 but
- *                                       cb_scale's subnormal-band loss
- *                                       drove a PPL regression).
- *         13 u32 — Stage 5j   : + cb_pool_size + l2_cb_pool_size.
+ *         13 u32 — Stage 5j   : + reserved(=0) + cb_pool_size
+ *                                  + l2_cb_pool_size.
  *       Parser disambiguates by reconciling header size against the
  *       blob's total length (see parse_pqv2_blob in pqv2_format.c). Old
  *       files default new fields to 0 — bit-identical legacy behavior.
@@ -131,15 +120,14 @@ typedef struct {
      * predates this field — disambiguated by the same blob-size
      * heuristic that handles the Stage 5h.1 l2_idx_bits field. */
     int residency_hint;
-    /* Stage 5k / 5j — when the on-disk blob uses lower-precision scales
-     * (scale_precision != 0) or a codebook pool (cb_pool_size > 0), the
-     * loader allocates fp16/int8 buffers that the kernel can consume
-     * unchanged (decoded from int8/fp8 / expanded from the pool). These
+    /* Stage 5j — when the on-disk blob uses a codebook pool
+     * (cb_pool_size > 0), the loader allocates int8/fp16 buffers that the
+     * kernel can consume unchanged (expanded from the pool). These
      * pointers track ownership so ib_pqv2_file_free can release them;
-     * NULL means the corresponding `pq.row_scale` / `pq.cb_scale` /
-     * `pq.cb_q` etc. point directly at the mmap'd file (legacy). */
-    void *owned_row_scale;     /* fp16[M] when scale_precision >= 1 */
-    void *owned_cb_scale;      /* fp16[rows*K] when scale_precision >= 2 */
+     * NULL means the corresponding `pq.cb_scale` / `pq.cb_q` etc. point
+     * directly at the mmap'd file (zero-copy). row_scale + cb_scale are
+     * always plain fp16 on disk now (the fp8 sp2 variant was retired). */
+    void *owned_cb_scale;      /* fp16[rows*K] when pool expanded */
     void *owned_l2_cb_scale;
     void *owned_cb_q;          /* int8[ns*K*half] when pool expanded */
     void *owned_l2_cb_q;

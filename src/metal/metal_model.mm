@@ -68,12 +68,6 @@ struct tensor_bufs {
      * M axis, kept in the on-disk slot-major layout
      * [total][ceil(M/4)*3] so 4 rows share a 3-byte triple. */
     int   pq_l2_idx_bits;
-    /* Stage 5g.2 — on-disk L1 index layout.
-     *   0 = chunk-major [n_chunks][n_subchunks][M] (legacy).
-     *   1 = row-major   [M][n_chunks][n_subchunks] (kernel-native; the
-     *       drive-mode pread can land directly in the MTLBuffer scratch
-     *       with no transpose, mirroring the doc-35 sidecar fast path). */
-    int   pq_l1_idx_layout;
     /* Path D GPU drive mode: when set, pq_idx points at the SHARED
      * gpu_drive_idx_scratch (not a per-tensor MTLBuffer). The forward
      * path preads from this file offset (within the IBF) into the
@@ -571,7 +565,6 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
     out->pq_N  = (int)pq->N;
     out->pq_G  = (int)pq->G;
     out->pq_ns = (int)pq->n_subchunks;
-    out->pq_l1_idx_layout = (int)pq->l1_idx_layout;
 
     /* row_scale is already fp16 (stored as uint16_t). Source is the
      * mmap'd PQv2 blob (parsed in pqv2_format.c::parse_pqv2_blob). Try
@@ -619,17 +612,11 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
         return;
     }
 
-    /* Indices on disk are either [n_chunks][n_subchunks][M] u8 (legacy
-     * chunk-major; `pq->l1_idx_layout == 0`) or [M][n_chunks][n_subchunks]
-     * (row-major, opt-in `IB_PQV2_L1_ROWMAJOR=1` at encode time;
-     * `pq->l1_idx_layout == 1`).
-     *
-     * The GPU SIMD kernel reads `indices[m * total + i]` (row-major)
-     * where total = n_chunks * n_subchunks, so for `layout == 1` the
-     * mmap'd file region already matches the kernel layout and we
-     * zero-copy via newBufferWithBytesNoCopy. For `layout == 0` we
-     * transpose at upload time into a malloc'd staging buffer and
-     * Metal allocates a fresh MTLBuffer (legacy 2× file-size path). */
+    /* Indices on disk are always [n_chunks][n_subchunks][M] u8
+     * (chunk-major). The GPU SIMD kernel reads `indices[m * total + i]`
+     * (row-major) where total = n_chunks * n_subchunks, so we transpose
+     * at upload time into a malloc'd staging buffer and Metal allocates
+     * a fresh MTLBuffer. */
     uint32_t total = (uint32_t)((pq->N / pq->G) * pq->n_subchunks);
     size_t idx_bytes = (size_t)pq->M * total;
 
@@ -669,33 +656,9 @@ static void upload_pqv2_tensor_ex(ib_metal_ctx *ctx, const inferbit_model *m,
      * MTLBuffer is shared scratch — bypass the per-tensor L1 upload
      * but still fall through to the L2 pyramid upload below. */
   if (!skip_l1_upload) {
-    /* Stage 5g.2 — when the encoder wrote L1 indices in row-major
-     * ([M][n_chunks][n_subchunks]) on disk, the layout already matches
-     * exactly what the GPU SIMD kernel reads. Skip the transpose +
-     * malloc + Metal copy and zero-copy the mmap'd region directly
-     * into a MTLBuffer via newBufferWithBytesNoCopy. This is the whole
-     * point of IB_PQV2_L1_ROWMAJOR=1 — drops peak Metal RAM from
-     * ~2× file size to ~1× file size for PQv2-encoded weights.
-     *
-     * Only applies when we're not in GPU drive mode (handled above)
-     * and not in CPU drive mode (the drive_fd path below). In CPU
-     * drive mode pq->indices points at a shared scratch buffer, not
-     * the mmap'd disk region, so we can't zero-copy from it. */
-    int can_zero_copy_rm = (pq->l1_idx_layout == 1) && pq->indices
-        && !(m && m->residency_mode == 1 && pq->indices_file_offset != 0
-              && m->drive_fd >= 0);
-    if (can_zero_copy_rm) {
-        out->pq_idx = ib_metal_alloc_mmap(ctx, idx_bytes,
-                                            (const void *)pq->indices);
-        if (out->pq_idx) {
-            /* Successful zero-copy or copy-fallback inside the helper.
-             * Either way no transpose was needed. */
-            /* Continue into the L2 path below. */
-        } else {
-            fprintf(stderr, "upload_pqv2_tensor: alloc_mmap returned NULL for L1 row-major indices\n");
-            return;
-        }
-    } else {
+    /* L1 indices are always chunk-major on disk; transpose at upload
+     * time into the GPU's row-major [M][total] layout. */
+    {
         uint8_t *idx_t = (uint8_t *)malloc(idx_bytes);
         if (!idx_t) { fprintf(stderr, "upload_pqv2_tensor: oom on indices\n"); return; }
         /* In CPU drive mode (doc 32), pq->indices has been redirected to a
@@ -1434,26 +1397,16 @@ static int drive_load_pq_idx_to_slot(ib_metal_model_buffers *b,
      * MTLBuffer scratch with zero transpose work on the critical path.
      * Lifts the drive-mode CPU floor from ~2.3 tok/s.
      *
-     * Stage 5g.2: the in-file region itself is kernel-native when
-     * `pq_l1_idx_layout == 1` (encoder opt-in IB_PQV2_L1_ROWMAJOR=1).
-     * In that case we can skip both the sidecar and the legacy
-     * transpose — pread directly from the main IBF into the MTLBuffer
-     * scratch.
-     *
      * Falls back to the legacy in-file [c][s][m] path (with per-matmul
-     * transpose) only when neither the sidecar nor the on-disk
-     * row-major layout is available. */
+     * transpose) when the sidecar is not available. */
     int use_sidecar = (m->drive_fd_pretransposed >= 0);
-    int in_file_rowmajor = (tb->pq_l1_idx_layout == 1);
-    int direct_pread = use_sidecar || in_file_rowmajor;
     int fd = use_sidecar ? m->drive_fd_pretransposed : m->drive_fd;
     if (fd < 0) return -1;
     off_t off = (off_t)tb->pq_drive_file_offset;
 
-    if (direct_pread) {
-        /* Direct-to-scratch pread; no transpose. Source is either the
-         * sidecar (pre-transposed copy) or the main IBF with on-disk
-         * row-major layout (Stage 5g.2). */
+    if (use_sidecar) {
+        /* Direct-to-scratch pread from the pre-transposed sidecar copy;
+         * no transpose needed. */
         uint8_t *dst = (uint8_t *)b->gpu_drive_idx_scratch[slot];
         size_t done = 0;
         while (done < idx_bytes) {
@@ -1461,8 +1414,7 @@ static int drive_load_pq_idx_to_slot(ib_metal_model_buffers *b,
                               off + (off_t)done);
             if (r <= 0) {
                 if (r == -1 && errno == EINTR) continue;
-                fprintf(stderr, "drive_load_pq_idx_to_slot[%s]: pread failed (off=%lld, want=%zu)\n",
-                        use_sidecar ? "sidecar" : "in-file-rowmajor",
+                fprintf(stderr, "drive_load_pq_idx_to_slot[sidecar]: pread failed (off=%lld, want=%zu)\n",
                         (long long)off, idx_bytes - done);
                 return -1;
             }

@@ -35,170 +35,6 @@ static inline float    enc_h2f(uint16_t h) { return ib_fp16_to_fp32(h); }
  * documented in metal_model.mm:441-466. */
 #define IB_PQV2_FP16_MIN_NORMAL  6.103515625e-5f
 
-/* ── Stage 5k: fp8 (E4M3) row_scale + cb_scale codecs ────────────────
- *
- * E4M3 layout (per the OCP "FP8 Formats for Deep Learning" spec, see
- * https://arxiv.org/abs/2209.05433):
- *   sign : 1 bit
- *   exp  : 4 bits (bias = 7)
- *   mant : 3 bits
- *
- *   exp == 0       : subnormal value = sign * 2^-6 * (mant/8)
- *   1 <= exp <= 14 : normal    value = sign * 2^(exp-7) * (1 + mant/8)
- *   exp == 15 + mant == 7 (binary 1111 111) : sentinel NaN (no Inf in E4M3)
- *
- * Max representable magnitude ≈ 448 (1.75 × 2^8) — covers the full
- * dynamic range of PQv2 row_scale (multi-decade, ~10 decades) and
- * codebook scales.
- *
- * H2 sp2 redesign (Agent 3 round 1 fix): row_scale previously used a
- * linear int8[M] + fp16 row_max codec, which collapsed the multi-decade
- * row-scale range into a single linear quantum (~|row_max|/127 ≈ 3
- * decades useful). Llama-3 / TinyLlama row_scales span 6-10 decades
- * across rows of a single tensor, so the int8 path floored small rows
- * to zero and produced PPL 34-50. Switching row_scale to fp8 E4M3
- * (logarithmic, ~6-12% per-row relative error) restores ~10 decades
- * of dynamic range; cb_scale already uses E4M3 since it has the same
- * dynamic-range pathology.
- *
- * Decode is one read + a few shifts/multiplies; encode is one log2
- * + bias + clamp. Both stay inside a single SIMD register-equivalent —
- * matches the "inline-cost transform" rule from docs/v2 §5h "file-size
- * rule". The encoder is called once per codeword at conversion time
- * (cold path); the decoder is called once per codeword at load time
- * (cold path) — the hot inner kernel never sees fp8 because the loader
- * expands E4M3 back into fp16 before any matmul runs. */
-
-/* Encoder-side decode is the unit-test / round-trip counterpart to
- * enc_f32_to_e4m3 — kept here for completeness so future agents can
- * verify the codec without re-deriving the bit layout. The production
- * loader uses pqv2_e4m3_to_f32 in pqv2_format.c. */
-static inline float __attribute__((unused)) enc_e4m3_to_f32(uint8_t b) {
-    uint32_t sign = (uint32_t)(b >> 7) & 0x1u;
-    uint32_t exp  = (uint32_t)(b >> 3) & 0xFu;
-    uint32_t mant = (uint32_t)b & 0x7u;
-    /* Sentinel NaN. */
-    if (exp == 0xFu && mant == 0x7u) {
-        uint32_t nan_bits = (sign << 31) | 0x7FC00000u;
-        float f; memcpy(&f, &nan_bits, 4); return f;
-    }
-    float val;
-    if (exp == 0u) {
-        /* Subnormal: 2^-6 * (mant / 8). */
-        val = (float)mant * (1.0f / 8.0f) * (1.0f / 64.0f);
-    } else {
-        /* Normal: 2^(exp-7) * (1 + mant/8). */
-        int e = (int)exp - 7;
-        float mantissa = 1.0f + (float)mant * (1.0f / 8.0f);
-        val = ldexpf(mantissa, e);
-    }
-    return sign ? -val : val;
-}
-
-static inline uint8_t enc_f32_to_e4m3(float f) {
-    if (f != f) return 0xFFu;          /* NaN → S=1 sentinel */
-    uint32_t sign = (f < 0.0f) ? 1u : 0u;
-    float a = sign ? -f : f;
-    /* Round to the nearest representable E4M3 magnitude. Max normal
-     * magnitude = 2^8 * (1 + 7/8) = 448; clamp at the saturation
-     * level (= 0x7E = +max if positive, 0xFE = -max if negative). */
-    const float E4M3_MAX = 448.0f;
-    if (a >= E4M3_MAX) {
-        return (uint8_t)((sign << 7) | 0x7Eu);
-    }
-    /* Compute target exponent (unbiased). Below 2^-6 we hit subnormal. */
-    if (a < (1.0f / 64.0f)) {
-        /* Subnormal region: value = (mant / 8) * 2^-6. */
-        float scaled = a * 64.0f * 8.0f;  /* a / (2^-6 / 8) */
-        int m = (int)lrintf(scaled);
-        if (m <= 0) return (uint8_t)(sign << 7);
-        if (m > 7) m = 7;
-        return (uint8_t)((sign << 7) | (uint32_t)m);
-    }
-    int e;
-    float mantissa = frexpf(a, &e);     /* a = mantissa * 2^e, 0.5 ≤ mantissa < 1 */
-    /* frexpf returns mantissa ∈ [0.5, 1); E4M3 uses 1.xxx so shift. */
-    mantissa *= 2.0f; e -= 1;            /* now mantissa ∈ [1.0, 2.0) and e is unbiased */
-    int biased = e + 7;
-    if (biased <= 0) {
-        /* Falls into subnormal range when scaled. */
-        float scaled = a * 64.0f * 8.0f;
-        int m = (int)lrintf(scaled);
-        if (m <= 0) return (uint8_t)(sign << 7);
-        if (m > 7) m = 7;
-        return (uint8_t)((sign << 7) | (uint32_t)m);
-    }
-    if (biased > 14) biased = 14;        /* will clamp mant below */
-    /* mantissa ∈ [1, 2); store the fractional part as 3-bit field
-     * rounded to nearest. */
-    int m = (int)lrintf((mantissa - 1.0f) * 8.0f);
-    if (m == 8) { m = 0; biased += 1; }
-    if (biased > 15) biased = 15;        /* belt-and-suspenders */
-    /* Reject the (15, 7) NaN sentinel — bump down to the max-finite
-     * encoding 0x7E if rounding pushed us up to the reserved slot. */
-    if (biased == 15 && m == 7) {
-        biased = 14; m = 7;
-    }
-    return (uint8_t)((sign << 7) | ((uint32_t)biased << 3) | (uint32_t)m);
-}
-
-/* DEPRECATED (H2 sp2 redesign): the original Stage 5k row_scale codec
- * packed fp16[M] into int8[M] + fp16 row_max, recovering each row scale
- * as `(int8[m] / 127) * row_max`. That codec is fundamentally wrong for
- * LLM row_scales, which span 6-10 decades within a single tensor —
- * linear quantization with a per-tensor anchor floored the small-magnitude
- * rows to zero and inflated PPL to 34-50. Kept here (compile-time-unused)
- * so the codec history is recoverable; no caller uses it now. */
-static void __attribute__((unused))
-enc_pack_row_scale_int8(const uint16_t *src_fp16, int M,
-                          int8_t *dst_int8, uint16_t *out_row_max)
-{
-    float ax = 0.0f;
-    for (int m = 0; m < M; m++) {
-        float v = enc_h2f(src_fp16[m]);
-        float a = v < 0 ? -v : v;
-        if (a > ax) ax = a;
-    }
-    if (ax < IB_PQV2_FP16_MIN_NORMAL) ax = IB_PQV2_FP16_MIN_NORMAL;
-    uint16_t max_h = enc_f2h(ax);
-    float max_f = enc_h2f(max_h);
-    *out_row_max = max_h;
-    float inv = 127.0f / max_f;
-    for (int m = 0; m < M; m++) {
-        float v = enc_h2f(src_fp16[m]);
-        int q = (int)lrintf(v * inv);
-        if (q > 127)  q = 127;
-        if (q < -128) q = -128;
-        dst_int8[m] = (int8_t)q;
-    }
-}
-
-/* Encode an fp16-valued row_scale array as fp8 E4M3 bytes — one byte
- * per row scale. Same codec as cb_scale.
- *
- * Decode invariant: `recovered_fp16[m] ≈ pqv2_e4m3_to_f32(fp8[m])`.
- * Per-row relative error is bounded by E4M3's mantissa step
- * (~1/8 ≈ 6-12%), independent of the per-tensor dynamic range. Covers
- * approximately 10 decades end-to-end (2^-9 subnormal floor to 448
- * saturation), which is enough to encode every Llama-3 / TinyLlama
- * row_scale we have measured without anchor loss. */
-static void enc_pack_row_scale_e4m3(const uint16_t *src_fp16, int M,
-                                      uint8_t *dst_e4m3)
-{
-    for (int m = 0; m < M; m++) {
-        dst_e4m3[m] = enc_f32_to_e4m3(enc_h2f(src_fp16[m]));
-    }
-}
-
-/* Encode an fp16-valued codebook-scale array as fp8 E4M3 bytes. */
-static void enc_pack_cb_scale_e4m3(const uint16_t *src_fp16, size_t n,
-                                     uint8_t *dst_e4m3)
-{
-    for (size_t i = 0; i < n; i++) {
-        dst_e4m3[i] = enc_f32_to_e4m3(enc_h2f(src_fp16[i]));
-    }
-}
-
 /* ── source-row → fp32 (mirror quantize.c::read_row_fp32 inline) ──── */
 
 static float pqv2_fp16_to_f32_local(uint16_t h) {
@@ -260,21 +96,13 @@ typedef struct {
     const float *Wn;                    /* row-normalized W */
     int8_t   *cb_int8_out;              /* [n_sub][K][half] */
     uint16_t *cb_scale_fp16_out;        /* [n_sub][K] */
-    /* On-disk u8 index output buffer. Logical extent is M*n_chunks*n_sub
-     * bytes regardless of layout; what changes is the scatter pattern in
-     * the slot worker, gated by `idx_layout_rowmajor`:
-     *   0 → write at [(ch * n_sub + s) * M + m]   (chunk-major; legacy
-     *                                              NEON-friendly).
-     *   1 → write at [(m * n_chunks + ch) * n_sub + s] (row-major; the
-     *                                              Metal upload becomes
-     *                                              zero-copy because the
-     *                                              GPU kernel already
-     *                                              reads in this layout).
+    /* On-disk u8 index output buffer, always chunk-major: the slot worker
+     * scatters at [(ch * n_sub + s) * M + m] (NEON-friendly). The
+     * row-major disk layout was retired in the format consolidation.
      * NULL = no on-disk u8 emission for this call (the pyramid L1 pass
      * uses indices_rowmajor_out below for the residual reconstruction
      * and re-encodes via push_pqv2_tensor with its own buffer). */
     uint8_t  *indices_chunkmajor_out;
-    int       idx_layout_rowmajor;      /* 0 = chunk-major (legacy), 1 = row-major */
     int32_t  *indices_rowmajor_out;     /* [M][n_chunks][n_sub] int32 — caller may
                                            request this to drive a pyramid L1 recon
                                            independent of the u8 disk layout */
@@ -410,25 +238,17 @@ static void pqv2_encode_slot_worker(void *arg, int thread_id,
             return;
         }
 
-        /* Scatter labels into the caller's output buffers.
-         *
-         * Stage 5g.2: the u8 disk index scatter is gated on
-         * idx_layout_rowmajor. The chunk-major branch is bit-identical
-         * to legacy; the row-major branch swaps the linearization so
-         * the GPU upload can zero-copy mmap the file region directly
-         * into a MTLBuffer (the GPU SIMD kernel already reads in
-         * row-major). int32 rowmajor output (used by the pyramid L1
-         * recon pass) is independent of layout — always written in
-         * row-major because the consumer is the per-row residual
-         * inner loop. */
-        const int rm = c->idx_layout_rowmajor;
+        /* Scatter labels into the caller's output buffers. The L1 disk
+         * index is always chunk-major [n_chunks][n_subchunks][M] (the
+         * row-major disk variant was retired in the format consolidation).
+         * `indices_rowmajor_out` is unrelated to that — it's the int32
+         * row-major label buffer the pyramid L1-recon pass consumes to
+         * compute the residual, always written row-major. */
         for (int m = 0; m < M; m++) {
             for (int ch = 0; ch < n_chunks; ch++) {
                 int32_t lbl = labels[(size_t)m * n_chunks + ch];
                 if (c->indices_chunkmajor_out) {
-                    size_t off = rm
-                        ? ((size_t)m * n_chunks + ch) * n_sub + s
-                        : ((size_t)ch * n_sub + s) * M + m;
+                    size_t off = ((size_t)ch * n_sub + s) * M + m;
                     c->indices_chunkmajor_out[off] = (uint8_t)lbl;
                 }
                 if (c->indices_rowmajor_out) {
@@ -469,7 +289,6 @@ static int pqv2_encode_flat_impl(const float *W_in, int M, int N,
                                   uint16_t *cb_scale_fp16_out,
                                   uint16_t *row_scale_fp16_out,
                                   uint8_t  *indices_chunkmajor_out,
-                                  int       idx_layout_rowmajor,
                                   int32_t  *indices_rowmajor_out,
                                   uint32_t  seed)
 {
@@ -613,7 +432,6 @@ static int pqv2_encode_flat_impl(const float *W_in, int M, int N,
     ctx.cb_int8_out = cb_int8_out;
     ctx.cb_scale_fp16_out = cb_scale_fp16_out;
     ctx.indices_chunkmajor_out = indices_chunkmajor_out;
-    ctx.idx_layout_rowmajor    = idx_layout_rowmajor;
     ctx.indices_rowmajor_out   = indices_rowmajor_out;
     ctx.Xs_t = Xs_t;
     ctx.centers_t = centers_t;
@@ -663,13 +481,10 @@ int pqv2_encode_flat(const float *W, int M, int N,
                      uint8_t  *indices_out,
                      uint32_t  seed)
 {
-    /* Public legacy wrapper: chunk-major layout (idx_layout_rowmajor=0).
-     * The row-major opt-in flows through the internal push_pqv2_tensor
-     * path which calls pqv2_encode_flat_impl directly. */
+    /* Public wrapper: L1 indices are always chunk-major on disk. */
     return pqv2_encode_flat_impl(W, M, N, G, K, half, /*apply_row_scale=*/1,
                                   cb_int8_out, cb_scale_fp16_out,
                                   row_scale_fp16_out, indices_out,
-                                  /*idx_layout_rowmajor=*/0,
                                   NULL, seed);
 }
 
@@ -714,7 +529,6 @@ int pqv2_encode_pyramid(const float *W, int M, int N,
     int rc = pqv2_encode_flat_impl(W, M, N, G, K_L1, half, /*apply_row_scale=*/1,
                                     cb_int8_l1_out, cb_scale_fp16_l1_out,
                                     row_scale_fp16_out, indices_l1_out,
-                                    /*idx_layout_rowmajor=*/0,
                                     idx_rm, seed);
     if (rc != 0) { free(idx_rm); return rc; }
 
@@ -777,7 +591,6 @@ int pqv2_encode_pyramid(const float *W, int M, int N,
     rc = pqv2_encode_flat_impl(R, M, N, G, K_L2, half, /*apply_row_scale=*/0,
                                 cb_int8_l2_out, cb_scale_fp16_l2_out,
                                 row_scale_l2_throwaway, indices_l2_out,
-                                /*idx_layout_rowmajor=*/0,
                                 NULL, seed ^ 0xa5a5a5a5u);
     free(row_scale_l2_throwaway);
     free(R);
@@ -945,56 +758,22 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
                               const uint16_t *l2_cb_scale_fp16,/* nullable */
                               const uint8_t  *l2_indices_chunkmajor, /* nullable */
                               int residency_hint,             /* Stage 5c */
-                              int scale_precision,            /* Stage 5k */
                               int codebook_dedup,             /* Stage 5j */
-                              int l1_idx_layout,              /* Stage 5g.2 */
                               size_t *out_size)
 {
     size_t n_chunks = (size_t)N / G;
-    /* Stage 5k scale layout (H2 sp2 redesign + I2 cb_scale rollback).
-     *   sp = 0 : row_scale fp16[M]      (legacy, 2*M bytes)
-     *            cb_scale  fp16[ns*K]   (legacy, 2*ns*K bytes)
-     *   sp = 2 : row_scale fp8[M]       (E4M3, M bytes — saves M bytes
-     *                                    per tensor; ~10-decade dynamic
-     *                                    range, 2-6% per-row rel error.
-     *                                    Probed safe on Llama-3 / TL
-     *                                    row_scale distributions.)
-     *            cb_scale  fp16[ns*K]   (legacy — Goal I2 fix). Previous
-     *                                    sp=2 packed cb_scale as fp8 E4M3
-     *                                    too, but cb_scale's distribution
-     *                                    clusters around 1e-3..5e-3 with
-     *                                    a 2-3 decade range; ~30% of
-     *                                    codewords fell into E4M3's
-     *                                    subnormal band where 5.9e-4
-     *                                    flushes to 0. Probe RMSE_rel
-     *                                    on TL gate_proj cb_scale was
-     *                                    38.8% (with zero-flushes) vs
-     *                                    2.6% for row_scale — confirming
-     *                                    cb_scale, not row_scale, drove
-     *                                    the sp2 PPL regression (PPL
-     *                                    50.4 → 48.9 after row-scale-only
-     *                                    fix; cb_scale fp16 expected to
-     *                                    restore PPL to ~6.3 flat
-     *                                    baseline). */
-    int sp_fp8_rs   = (scale_precision >= 2);
-    int sp_fp8_cbs  = 0;  /* Goal I2: cb_scale always fp16 — see note above. */
-    size_t row_bytes;
-    if (sp_fp8_rs) {
-        row_bytes = (size_t)M;        /* fp8 E4M3[M] */
-    } else {
-        row_bytes = (size_t)M * 2;     /* legacy fp16[M] */
-    }
+    /* row_scale + cb_scale are always plain fp16 on disk (the sp2 fp8
+     * variant was retired in the format consolidation). */
+    size_t row_bytes = (size_t)M * 2;     /* fp16[M] */
     /* Stage 5j codebook pool. v1 scaffolding: pool_size = n_subchunks,
      * identity pool_id mapping. Same codebook bytes as legacy + an
      * n_subchunks-byte pool_id array. */
     int pool_on = (codebook_dedup != 0);
     uint32_t cb_pool_size_w  = pool_on ? (uint32_t)n_sub : 0u;
     uint32_t l2_cb_pool_size_w = (pool_on && l2_kind == 2) ? (uint32_t)n_sub : 0u;
-    size_t cb_pool_rows = pool_on ? (size_t)n_sub : (size_t)n_sub;  /* same in v1 */
+    size_t cb_pool_rows = (size_t)n_sub;  /* pool_size == n_sub in v1 */
     size_t cb_q_bytes   = cb_pool_rows * (size_t)K * (size_t)half;
-    size_t cb_s_bytes_fp16 = cb_pool_rows * (size_t)K * 2u;
-    size_t cb_s_bytes   = sp_fp8_cbs ? cb_pool_rows * (size_t)K
-                                       : cb_s_bytes_fp16;
+    size_t cb_s_bytes   = cb_pool_rows * (size_t)K * 2u;
     size_t cb_pool_id_bytes = pool_on ? (size_t)n_sub : 0u;
     size_t idx_bytes    = (size_t)M * n_chunks * n_sub;
     /* Decide whether to bit-pack the L2 index stream. The kernel hot path
@@ -1015,47 +794,33 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
      *   hdr[0..7]  M, N, G, K, n_sub, half, l2_kind, l2_K (legacy 8 u32)
      *   hdr[8]     l2_idx_bits          (Stage 5h.1)
      *   hdr[9]     residency_hint       (Stage 5c)
-     *   hdr[10]    scale_precision      (Stage 5k)
+     *   hdr[10]    reserved (= 0)       (formerly scale_precision; sp2 retired)
      *   hdr[11]    cb_pool_size         (Stage 5j; 0 = no pool)
      *   hdr[12]    l2_cb_pool_size      (Stage 5j; 0 = no pool)
-     *   hdr[13]    l1_idx_layout        (Stage 5g.2; 0 = chunk-major,
-     *                                                 1 = row-major
-     *                                                     for Metal
-     *                                                     zero-copy)
      *
      * Picked-shortest-header policy: emit the SMALLEST header that
-     * losslessly carries the active fields. Default config (sp == 0,
-     * cd == 0, layout == 0) emits the 10-u32 header so old loaders
-     * (Stage 5c readers) still consume the file. Files only grow when
-     * the user opts into 5k / 5j / 5g.2 knobs. */
+     * losslessly carries the active fields. Default config (cd == 0)
+     * emits the 10-u32 header so old loaders (Stage 5c readers) still
+     * consume the file. Files only grow when the user opts into the
+     * Stage 5j dedup pool. */
     int need_pool   = (cb_pool_size_w != 0u) || (l2_cb_pool_size_w != 0u);
-    int need_sp     = (sp_fp8_rs || sp_fp8_cbs);
-    int need_layout = (l1_idx_layout != 0);
     int header_u32s;
     size_t header_bytes;
-    if (need_layout) {
-        header_u32s = 14;
-        header_bytes = 4 + 56;
-    } else if (need_pool) {
+    if (need_pool) {
         header_u32s = 13;
         header_bytes = 4 + 52;
-    } else if (need_sp) {
-        header_u32s = 11;
-        header_bytes = 4 + 44;
     } else {
         header_u32s = 10;
         header_bytes = 4 + 40;
     }
     size_t total = header_bytes + row_bytes + cb_q_bytes + cb_s_bytes
                     + cb_pool_id_bytes + idx_bytes;
-    size_t l2q_bytes = 0, l2s_bytes = 0, l2s_bytes_disk = 0;
+    size_t l2q_bytes = 0, l2s_bytes = 0;
     size_t l2_cb_pool_id_bytes = 0;
     if (l2_kind == 2) {
-        size_t l2_rows = pool_on ? (size_t)n_sub : (size_t)n_sub;  /* same in v1 */
+        size_t l2_rows = (size_t)n_sub;  /* pool_size == n_sub in v1 */
         l2q_bytes = l2_rows * (size_t)l2_K * (size_t)half;
-        l2s_bytes_disk = sp_fp8_cbs ? (l2_rows * (size_t)l2_K)
-                                       : (l2_rows * (size_t)l2_K * 2u);
-        l2s_bytes = l2s_bytes_disk;
+        l2s_bytes = l2_rows * (size_t)l2_K * 2u;  /* always fp16 */
         l2_cb_pool_id_bytes = pool_on ? (size_t)n_sub : 0u;
         total += l2q_bytes + l2s_bytes + l2_cb_pool_id_bytes + l2_idx_disk;
     }
@@ -1065,47 +830,28 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
     memcpy(buf + cur, "PQV2", 4); cur += 4;
     uint32_t rhint = (uint32_t)residency_hint;
     if (rhint > 2) rhint = 0;  /* clamp unknown values to AUTO */
-    uint32_t sp = (uint32_t)scale_precision;
-    /* Only modes 0 and 2 are implemented in v1; clamp anything else
-     * down to 0 so a future writer that sets mode 1/3 won't trip the
-     * loader. The loader also rejects unknown values. */
-    if (sp != 0u && sp != 2u) sp = 0u;
-    uint32_t layout_w = (l1_idx_layout == 1) ? 1u : 0u;
-    uint32_t hdr[14] = {
+    uint32_t hdr[13] = {
         (uint32_t)M, (uint32_t)N, (uint32_t)G, (uint32_t)K,
         (uint32_t)n_sub, (uint32_t)half,
         (uint32_t)l2_kind, (uint32_t)l2_K,
         l2_idx_bits,
         rhint,
-        sp,
+        0u,                /* reserved (formerly scale_precision) */
         cb_pool_size_w,
         l2_cb_pool_size_w,
-        layout_w,
     };
     /* Write only the active prefix of the header. Older loaders that
-     * don't know the Stage 5k / 5j / 5g.2 fields still consume default-
-     * off files (sp == 0 && cb_pool_size == 0 && layout == 0) because
-     * we drop those slots. */
+     * don't know the Stage 5j fields still consume default-off files
+     * (cb_pool_size == 0) because we drop those slots. */
     memcpy(buf + cur, hdr, (size_t)header_u32s * 4u); cur += (size_t)header_u32s * 4u;
 
-    /* row_scale: legacy fp16[M] OR fp8 E4M3[M] (Stage 5k, H2 sp2). */
-    if (sp_fp8_rs) {
-        enc_pack_row_scale_e4m3(row_scale_fp16, M, buf + cur);
-        cur += (size_t)M;
-    } else {
-        memcpy(buf + cur, row_scale_fp16, row_bytes); cur += row_bytes;
-    }
+    /* row_scale: plain fp16[M]. */
+    memcpy(buf + cur, row_scale_fp16, row_bytes); cur += row_bytes;
     /* Codebook: in v1 the pool layout writes the SAME bytes as legacy
      * (pool_size == n_subchunks; identity pool_id mapping appended
-     * after cb_scale). */
+     * after cb_scale). cb_scale is always plain fp16. */
     memcpy(buf + cur, cb_q, cb_q_bytes); cur += cb_q_bytes;
-    if (sp_fp8_cbs) {
-        size_t cb_n = cb_pool_rows * (size_t)K;
-        enc_pack_cb_scale_e4m3(cb_scale_fp16, cb_n, buf + cur);
-        cur += cb_n;
-    } else {
-        memcpy(buf + cur, cb_scale_fp16, cb_s_bytes); cur += cb_s_bytes;
-    }
+    memcpy(buf + cur, cb_scale_fp16, cb_s_bytes); cur += cb_s_bytes;
     /* Stage 5j pool_id[n_sub] — only present when cb_pool_size > 0.
      * v1 identity mapping: pool_id[s] = s, so cb[s] = pool[s] = cb[s]
      * (round-trips to legacy semantics). */
@@ -1118,13 +864,8 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
     memcpy(buf + cur, indices_chunkmajor, idx_bytes); cur += idx_bytes;
     if (l2_kind == 2) {
         memcpy(buf + cur, l2_cb_q, l2q_bytes); cur += l2q_bytes;
-        if (sp_fp8_cbs) {
-            size_t l2_cb_n = (size_t)n_sub * (size_t)l2_K;  /* pool_size == n_sub in v1 */
-            enc_pack_cb_scale_e4m3(l2_cb_scale_fp16, l2_cb_n, buf + cur);
-            cur += l2_cb_n;
-        } else {
-            memcpy(buf + cur, l2_cb_scale_fp16, l2s_bytes); cur += l2s_bytes;
-        }
+        /* l2_cb_scale is always plain fp16. */
+        memcpy(buf + cur, l2_cb_scale_fp16, l2s_bytes); cur += l2s_bytes;
         if (l2_cb_pool_id_bytes) {
             for (size_t s = 0; s < (size_t)n_sub; s++) {
                 buf[cur + s] = (uint8_t)s;
@@ -1165,19 +906,14 @@ static void *build_pqv2_blob(int M, int N, int G, int K, int n_sub, int half,
  * heuristic + per-class overrides resolve this in pqv2_convert before
  * each call.
  *
- * `idx_layout_rowmajor`: Stage 5g.2 — when 1, write L1 indices in
- *   [M][n_chunks][n_subchunks] on disk and stamp l1_idx_layout=1 in the
- *   blob header so the Metal upload skips its [nc,ns,M]→[M,total]
- *   transpose and zero-copies the index region into a MTLBuffer. Default
- *   0 stays bit-identical to v0.4.x — chunk-major on disk, transposed at
- *   upload time. Caller resolves this via IB_PQV2_L1_ROWMAJOR=1 once
- *   per pqv2_convert and passes it down to every push_pqv2_tensor. */
+ * L1 indices are always written chunk-major [n_chunks][n_subchunks][M]
+ * on disk (the row-major opt-in was retired in the format
+ * consolidation). */
 static int push_pqv2_tensor(ib6_manifest *mf, const char *name,
                              const float *W, int M, int N,
                              int G, int K, int half,
                              int pyramid, int residency_hint,
-                             int scale_precision, int codebook_dedup,
-                             int idx_layout_rowmajor,
+                             int codebook_dedup,
                              uint32_t seed)
 {
     int n_chunks = N / G;
@@ -1222,94 +958,13 @@ static int push_pqv2_tensor(ib6_manifest *mf, const char *name,
 
     int rc;
     if (pyramid) {
-        /* Pyramid path: L1 disk layout flows through the public
-         * pyramid encoder (which writes chunk-major) when the legacy
-         * default is in effect. Row-major requires bypassing the
-         * public wrapper and calling pqv2_encode_flat_impl with the
-         * layout flag (the pyramid L2 pass is always chunk-major on
-         * disk — its kernel reads use slot-major packed layout that's
-         * already zero-copy via the 5h.1 packed format). */
-        if (idx_layout_rowmajor) {
-            int32_t *idx_rm = (int32_t *)malloc((size_t)M * n_chunks * n_sub * sizeof(int32_t));
-            if (!idx_rm) {
-                free(cb_q); free(cb_s); free(row_s); free(idx_l1);
-                free(cb_q_l2); free(cb_s_l2); free(idx_l2);
-                ib_set_error("push_pqv2_tensor: oom (idx_rm pyramid)");
-                return -1;
-            }
-            /* L1: row-major u8 on disk + int32 row-major for L2 recon. */
-            rc = pqv2_encode_flat_impl(W, M, N, G, K, half, /*apply_row_scale=*/1,
-                                        cb_q, cb_s, row_s, idx_l1,
-                                        /*idx_layout_rowmajor=*/1,
-                                        idx_rm, seed);
-            if (rc == 0) {
-                /* Reconstruct residual and L2-encode just like
-                 * pqv2_encode_pyramid does, but using idx_rm for the
-                 * L1 labels (already populated above). */
-                float *R = (float *)malloc((size_t)M * N * sizeof(float));
-                float *cb_fp32 = R ? (float *)malloc((size_t)n_sub * K * half * sizeof(float)) : NULL;
-                if (!R || !cb_fp32) {
-                    free(R); free(cb_fp32); free(idx_rm);
-                    free(cb_q); free(cb_s); free(row_s); free(idx_l1);
-                    free(cb_q_l2); free(cb_s_l2); free(idx_l2);
-                    ib_set_error("push_pqv2_tensor: oom (pyramid R/cb_fp32)");
-                    return -1;
-                }
-                for (int s = 0; s < n_sub; s++) {
-                    for (int k = 0; k < K; k++) {
-                        float scl = enc_h2f(cb_s[(size_t)s * K + k]);
-                        const int8_t *q = cb_q + ((size_t)s * K + k) * half;
-                        float *o = cb_fp32 + ((size_t)s * K + k) * half;
-                        for (int h = 0; h < half; h++) o[h] = (float)q[h] * scl;
-                    }
-                }
-                for (int m = 0; m < M; m++) {
-                    float rs = enc_h2f(row_s[m]);
-                    const float *src = W + (size_t)m * N;
-                    float *dst = R + (size_t)m * N;
-                    for (int c = 0; c < n_chunks; c++) {
-                        for (int s = 0; s < n_sub; s++) {
-                            int32_t lbl = idx_rm[((size_t)m * n_chunks + c) * n_sub + s];
-                            const float *cw = cb_fp32 + ((size_t)s * K + (size_t)lbl) * half;
-                            float *out_slice = dst + (size_t)c * G + s * half;
-                            const float *in_slice = src + (size_t)c * G + s * half;
-                            for (int h = 0; h < half; h++) {
-                                out_slice[h] = in_slice[h] - cw[h] * rs;
-                            }
-                        }
-                    }
-                }
-                free(cb_fp32);
-                free(idx_rm);
-                /* L2: residual encode, chunk-major on disk (the packed
-                 * 6-bit L2 reader keeps slot-major, doesn't care about
-                 * L1 layout). */
-                uint16_t *rs_l2_throw = (uint16_t *)malloc((size_t)M * sizeof(uint16_t));
-                if (!rs_l2_throw) {
-                    free(R);
-                    free(cb_q); free(cb_s); free(row_s); free(idx_l1);
-                    free(cb_q_l2); free(cb_s_l2); free(idx_l2);
-                    ib_set_error("push_pqv2_tensor: oom (rs_l2)");
-                    return -1;
-                }
-                rc = pqv2_encode_flat_impl(R, M, N, G, l2_K, half, /*apply_row_scale=*/0,
-                                            cb_q_l2, cb_s_l2, rs_l2_throw, idx_l2,
-                                            /*idx_layout_rowmajor=*/0,
-                                            NULL, seed ^ 0xa5a5a5a5u);
-                free(rs_l2_throw);
-                free(R);
-            } else {
-                free(idx_rm);
-            }
-        } else {
-            rc = pqv2_encode_pyramid(W, M, N, G, 0, l2_K, half,
-                                      cb_q, cb_s, cb_q_l2, cb_s_l2,
-                                      row_s, idx_l1, idx_l2, seed);
-        }
+        /* Pyramid path: L1 + additive L2, both chunk-major on disk. */
+        rc = pqv2_encode_pyramid(W, M, N, G, 0, l2_K, half,
+                                  cb_q, cb_s, cb_q_l2, cb_s_l2,
+                                  row_s, idx_l1, idx_l2, seed);
     } else {
         rc = pqv2_encode_flat_impl(W, M, N, G, K, half, /*apply_row_scale=*/1,
                                     cb_q, cb_s, row_s, idx_l1,
-                                    idx_layout_rowmajor,
                                     NULL, seed);
     }
     if (rc != 0) {
@@ -1323,9 +978,7 @@ static int push_pqv2_tensor(ib6_manifest *mf, const char *name,
                                   l2_kind, l2_K,
                                   row_s, cb_q, cb_s, idx_l1,
                                   cb_q_l2, cb_s_l2, idx_l2,
-                                  residency_hint,
-                                  scale_precision, codebook_dedup,
-                                  idx_layout_rowmajor,
+                                  residency_hint, codebook_dedup,
                                   &blob_size);
     free(cb_q); free(cb_s); free(row_s); free(idx_l1);
     free(cb_q_l2); free(cb_s_l2); free(idx_l2);
@@ -1422,7 +1075,6 @@ static int mome_emit_expert_blob(ib6_manifest *mf,
                                   const uint16_t *l2_cb_s_shared,
                                   const uint8_t  *idx_l2_slice,
                                   int residency_hint,
-                                  int scale_precision,
                                   int codebook_dedup)
 {
     size_t blob_size = 0;
@@ -1431,8 +1083,7 @@ static int mome_emit_expert_blob(ib6_manifest *mf,
                                   row_scale_slice, cb_q_shared, cb_s_shared,
                                   idx_l1_slice,
                                   l2_cb_q_shared, l2_cb_s_shared, idx_l2_slice,
-                                  residency_hint, scale_precision, codebook_dedup,
-                                  /*l1_idx_layout=*/0,
+                                  residency_hint, codebook_dedup,
                                   &blob_size);
     if (!blob) { ib_set_error("mome_emit_expert_blob: oom (build_pqv2_blob)"); return -1; }
     char nm[128];
@@ -1848,7 +1499,7 @@ static int read_and_push_pqv2_mome_rows(ib6_manifest *mf,
                                           int shard, int t,
                                           int G, int K_cb, int half,
                                           int pyramid, int residency_hint,
-                                          int scale_precision, int codebook_dedup,
+                                          int codebook_dedup,
                                           int K_experts,
                                           uint32_t seed)
 {
@@ -1959,7 +1610,6 @@ static int read_and_push_pqv2_mome_rows(ib6_manifest *mf,
         rc = pqv2_encode_flat_impl(W, M_full, N, G, K_cb, half,
                                     /*apply_row_scale=*/1,
                                     cb_q, cb_s, row_s, idx_l1,
-                                    /*idx_layout_rowmajor=*/0,
                                     NULL, seed);
     }
     free(W);
@@ -2010,7 +1660,7 @@ static int read_and_push_pqv2_mome_rows(ib6_manifest *mf,
                                     pyramid, l2_K,
                                     rs_e, cb_q, cb_s, idx_e,
                                     cb_q_l2, cb_s_l2, idxL2_e,
-                                    residency_hint, scale_precision,
+                                    residency_hint,
                                     codebook_dedup) != 0) {
             rc_final = -1; break;
         }
@@ -2034,7 +1684,7 @@ static int read_and_push_pqv2_mome_cols(ib6_manifest *mf,
                                           int shard, int t,
                                           int G, int K_cb, int half,
                                           int pyramid, int residency_hint,
-                                          int scale_precision, int codebook_dedup,
+                                          int codebook_dedup,
                                           int K_experts,
                                           uint32_t seed)
 {
@@ -2111,7 +1761,6 @@ static int read_and_push_pqv2_mome_cols(ib6_manifest *mf,
         rc = pqv2_encode_flat_impl(W, M_full, N_full, G, K_cb, half,
                                     /*apply_row_scale=*/1,
                                     cb_q, cb_s, row_s, idx_l1,
-                                    /*idx_layout_rowmajor=*/0,
                                     NULL, seed);
     }
     free(W);
@@ -2142,7 +1791,7 @@ static int read_and_push_pqv2_mome_cols(ib6_manifest *mf,
                                     pyramid, l2_K,
                                     row_s, cb_q, cb_s, idx_l1_src,
                                     cb_q_l2, cb_s_l2, idx_l2_src,
-                                    residency_hint, scale_precision,
+                                    residency_hint,
                                     codebook_dedup) != 0) {
             rc_final = -1; break;
         }
@@ -2160,8 +1809,7 @@ static int read_and_push_pqv2(ib6_manifest *mf, const char *name,
                                const ib_tensor_source *ts, int shard, int t,
                                int G, int K, int half, int pyramid,
                                int residency_hint,
-                               int scale_precision, int codebook_dedup,
-                               int idx_layout_rowmajor,
+                               int codebook_dedup,
                                int qk_n_heads, int head_dim, uint32_t seed)
 {
     const void *raw = ib_ts_tensor_data(ts, shard, t);
@@ -2187,8 +1835,7 @@ static int read_and_push_pqv2(ib6_manifest *mf, const char *name,
     }
     int rc = push_pqv2_tensor(mf, name, W, rows, cols, G, K, half,
                                pyramid, residency_hint,
-                               scale_precision, codebook_dedup,
-                               idx_layout_rowmajor, seed);
+                               codebook_dedup, seed);
     free(W);
     return rc;
 }
@@ -2546,17 +2193,14 @@ int pqv2_convert(const char *input_path,
 
     /* Format consolidation (2026-05-20): the supported on-disk formats are
      * exactly `flat` and `pyramid`, with `--mome K` as an orthogonal option.
-     * The scale_precision=2 (sp2) and L1-row-major (rowmajor) variants are
+     * The scale_precision=2 (sp2) and L1-row-major (rowmajor) variants were
      * REMOVED — both were Pareto-dominated (sp2: same size, worse PPL;
      * rowmajor: same size+quality as chunk-major, its only purpose was a
-     * Metal zero-copy that proved a wash and was repeatedly buggy). We force
-     * them off here so no file can ever be created with them; the now-dead
-     * decode branches are scheduled for physical deletion. cfg->scale_precision
+     * Metal zero-copy that proved a wash and was repeatedly buggy). All of
+     * their encode/decode code has been physically deleted; cfg->scale_precision
      * is ignored. IB_L2_K (4-bit L2) is intentionally retained — it's an
      * active line of work, not a dead variant. */
-    int sp = 0;
     int cd = cfg->codebook_dedup ? 1 : 0;
-    int idx_layout_rowmajor = 0;
 
     void (*progress)(float, const char *, void *) = cfg->progress;
     void *prog_ctx = cfg->progress_ctx;
@@ -2670,8 +2314,7 @@ int pqv2_convert(const char *input_path,
             if (G > 0 && (hidden % G) == 0) {
                 rc = read_and_push_pqv2(&mf, "token_embedding", ts, s, t,
                                          G, K, half, /*pyramid=*/0, rh,
-                                         sp, cd,
-                                         idx_layout_rowmajor,
+                                         cd,
                                          /*qk_n_heads=*/0, /*head_dim=*/0,
                                          seed);
             } else {
@@ -2718,8 +2361,7 @@ int pqv2_convert(const char *input_path,
             if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
                                     PY(INFERBIT_TENSOR_CLASS_ATTN_Q),
                                     RH(INFERBIT_TENSOR_CLASS_ATTN_Q),
-                                    sp, cd,
-                                    idx_layout_rowmajor,
+                                    cd,
                                     num_heads, head_dim, seed) != 0)
                 goto fail;
         }
@@ -2728,8 +2370,7 @@ int pqv2_convert(const char *input_path,
             if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
                                     PY(INFERBIT_TENSOR_CLASS_ATTN_K),
                                     RH(INFERBIT_TENSOR_CLASS_ATTN_K),
-                                    sp, cd,
-                                    idx_layout_rowmajor,
+                                    cd,
                                     num_kv_heads, head_dim, seed) != 0)
                 goto fail;
         }
@@ -2738,8 +2379,7 @@ int pqv2_convert(const char *input_path,
             if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
                                     PY(INFERBIT_TENSOR_CLASS_ATTN_V),
                                     RH(INFERBIT_TENSOR_CLASS_ATTN_V),
-                                    sp, cd,
-                                    idx_layout_rowmajor,
+                                    cd,
                                     0, 0, seed) != 0) goto fail;
         }
         if (pq6_find_layer(ts, &names, l, names.o_proj, &s, &t) == 0) {
@@ -2747,8 +2387,7 @@ int pqv2_convert(const char *input_path,
             if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
                                     PY(INFERBIT_TENSOR_CLASS_ATTN_O),
                                     RH(INFERBIT_TENSOR_CLASS_ATTN_O),
-                                    sp, cd,
-                                    idx_layout_rowmajor,
+                                    cd,
                                     0, 0, seed) != 0) goto fail;
         }
         /* FFN tensors. MoME scaffolding (Stage 3a): when cfg->mome_experts
@@ -2776,7 +2415,7 @@ int pqv2_convert(const char *input_path,
                 gate_router_rows  = ib_ts_tensor_shape(ts, s, t, 0);
                 rc_m = read_and_push_pqv2_mome_rows(&mf, nm, ts, s, t,
                                                      G, K, half, py_gate,
-                                                     rh_gate, sp, cd,
+                                                     rh_gate, cd,
                                                      K_experts, seed);
                 if (rc_m == -1) goto fail;
                 if (rc_m == +1) {
@@ -2786,8 +2425,7 @@ int pqv2_convert(const char *input_path,
             }
             if (rc_m == +1) {
                 if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
-                                        py_gate, rh_gate, sp, cd,
-                                        idx_layout_rowmajor,
+                                        py_gate, rh_gate, cd,
                                         0, 0, seed) != 0) goto fail;
             }
         }
@@ -2799,14 +2437,13 @@ int pqv2_convert(const char *input_path,
             if (K_experts > 1) {
                 rc_m = read_and_push_pqv2_mome_rows(&mf, nm, ts, s, t,
                                                      G, K, half, py_up,
-                                                     rh_up, sp, cd,
+                                                     rh_up, cd,
                                                      K_experts, seed);
                 if (rc_m == -1) goto fail;
             }
             if (rc_m == +1) {
                 if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
-                                        py_up, rh_up, sp, cd,
-                                        idx_layout_rowmajor,
+                                        py_up, rh_up, cd,
                                         0, 0, seed) != 0) goto fail;
             }
         }
@@ -2818,14 +2455,13 @@ int pqv2_convert(const char *input_path,
             if (K_experts > 1) {
                 rc_m = read_and_push_pqv2_mome_cols(&mf, nm, ts, s, t,
                                                      G, K, half, py_dn,
-                                                     rh_dn, sp, cd,
+                                                     rh_dn, cd,
                                                      K_experts, seed);
                 if (rc_m == -1) goto fail;
             }
             if (rc_m == +1) {
                 if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
-                                        py_dn, rh_dn, sp, cd,
-                                        idx_layout_rowmajor,
+                                        py_dn, rh_dn, cd,
                                         0, 0, seed) != 0) goto fail;
             }
         }
@@ -2899,8 +2535,7 @@ int pqv2_convert(const char *input_path,
             if (G > 0 && (hidden % G) == 0) {
                 rc = read_and_push_pqv2(&mf, "lm_head", ts, head_shard, head_t,
                                          G, K, half, /*pyramid=*/0, rh_head,
-                                         sp, cd,
-                                         idx_layout_rowmajor,
+                                         cd,
                                          /*qk_n_heads=*/0, /*head_dim=*/0,
                                          seed);
             } else {
