@@ -2502,26 +2502,19 @@ int pqv2_convert(const char *input_path,
         }
     }
 
-    /* Stage 5k/5j knobs — uniform across all per-tensor pushes for v1.
-     * Per-class precision/dedup overrides are a future extension; v1
-     * applies the config-level setting to every PQv2 emit. */
-    int sp = cfg->scale_precision;
-    if (sp != 0 && sp != 2) sp = 0;          /* clamp to implemented modes */
+    /* Format consolidation (2026-05-20): the supported on-disk formats are
+     * exactly `flat` and `pyramid`, with `--mome K` as an orthogonal option.
+     * The scale_precision=2 (sp2) and L1-row-major (rowmajor) variants are
+     * REMOVED — both were Pareto-dominated (sp2: same size, worse PPL;
+     * rowmajor: same size+quality as chunk-major, its only purpose was a
+     * Metal zero-copy that proved a wash and was repeatedly buggy). We force
+     * them off here so no file can ever be created with them; the now-dead
+     * decode branches are scheduled for physical deletion. cfg->scale_precision
+     * is ignored. IB_L2_K (4-bit L2) is intentionally retained — it's an
+     * active line of work, not a dead variant. */
+    int sp = 0;
     int cd = cfg->codebook_dedup ? 1 : 0;
-
-    /* Stage 5g.2 — L1 index on-disk layout. Opt-in via IB_PQV2_L1_ROWMAJOR=1
-     * for v1; default 0 keeps every byte identical to v0.4.2. When 1, the
-     * encoder writes L1 indices in [M][n_chunks][n_subchunks] so the Metal
-     * upload skips its transpose loop + index staging malloc and zero-copies
-     * the file region directly into a MTLBuffer. The CPU NEON kernel pays
-     * a cache cost on the row-major layout (gathers across rows for a
-     * fixed (c,s) slot become scatter-reads across chunks); ship as
-     * Metal-first v1, future encoder writes both layouts. */
     int idx_layout_rowmajor = 0;
-    {
-        const char *e = getenv("IB_PQV2_L1_ROWMAJOR");
-        if (e && e[0] && e[0] != '0') idx_layout_rowmajor = 1;
-    }
 
     void (*progress)(float, const char *, void *) = cfg->progress;
     void *prog_ctx = cfg->progress_ctx;
