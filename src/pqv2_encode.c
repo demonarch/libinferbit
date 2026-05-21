@@ -1259,13 +1259,19 @@ static void permute_qk_rows_fp32_inplace(float *W, int rows, int cols,
  * UP and DOWN encoders for the same layer (they run immediately after
  * gate in convert order). */
 static int mome_cosine_cluster_enabled(void) {
-    /* Default ON: cosine row-clustering is a free quality win (TinyLlama
-     * K=2 PPL 6.65 vs contiguous 6.90, identical size, +0.6% convert
-     * time). Opt out with IB_MOME_COSINE_CLUSTER=0 for the legacy
-     * contiguous row-split. */
+    /* Default OFF. Cosine row-clustering only ever benefited top_n<K
+     * ROUTING (it concentrates per-token co-activation energy), and
+     * training-free routing is dead (docs/v2/01_MOME_FINDINGS.md). MoME
+     * now runs all-K (exact reconstruction), which is partition-invariant
+     * — so clustering has zero quality upside and, with a residual perm
+     * inconsistency in this path, currently costs ~+1.9% PPL (TinyLlama
+     * K=4: contiguous 6.889 vs clustered 7.019). The one future that would
+     * revive it is PER-EXPERT codebooks (clustered rows -> tighter
+     * per-expert codebook -> beat flat quality); the path is kept, dormant,
+     * for that. Re-enable with IB_MOME_COSINE_CLUSTER=1. */
     const char *e = getenv("IB_MOME_COSINE_CLUSTER");
     if (e && e[0]) return (e[0] != '0') ? 1 : 0;
-    return 1;
+    return 0;
 }
 
 /* Process-static permutation handoff: gate writes, up/down read. Sized
