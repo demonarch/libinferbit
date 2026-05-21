@@ -80,7 +80,14 @@ extern void ib_tensor_matmul_cpu_isolated(const inferbit_model *m,
 
 int mome_get_top_n(int K) {
     if (K <= 0) return 0;
-    int n = (K < 2) ? K : 2;   /* default min(2, K) */
+    /* Default ALL experts (top_n = K) = exact un-split FFN reconstruction.
+     * MoME is a quality/size/RAM-pagination tool, NOT a routing/compute-skip
+     * tool: training-free top_n<K routing of a post-hoc row-split is proven
+     * dead (see docs/v2/01_MOME_FINDINGS.md) and catastrophically degrades
+     * PPL (e.g. K=4 top_n=2 prefill -> PPL 95+ vs 6.9 all-K on TinyLlama).
+     * The previous default of min(2,K) silently routed and corrupted output.
+     * Opt into routing experiments explicitly with IB_MOME_TOP_N. */
+    int n = K;
     const char *env = getenv("IB_MOME_TOP_N");
     if (env && *env) {
         int v = atoi(env);
