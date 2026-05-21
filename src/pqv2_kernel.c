@@ -162,6 +162,50 @@ static inline void pqv2_l2_unpack_4bit(const uint8_t *src, uint8_t *dst, uint32_
     }
 }
 
+/* Row-RANGE unpack variants for the threaded paged path: unpack only
+ * dst[m0:m1] from the FULL packed row `src`. The threaded paged compute
+ * passes 32-aligned [m0,m1) tiles, so m0 is a multiple of 4 (6-bit) / 2
+ * (4-bit) and the byte-group boundaries align with the whole-row unpack
+ * (bit-identical). Each thread writes a disjoint dst slice. */
+static inline void pqv2_l2_unpack_4bit_range(const uint8_t *src, uint8_t *dst,
+                                             uint32_t m0, uint32_t m1) {
+    uint32_t m = m0;
+    const uint8_t *p = src + (m0 >> 1);   /* m0 even -> exact byte start */
+    while (m + 2 <= m1) {
+        uint8_t b = *p++;
+        dst[m + 0] = (uint8_t)(b & 0x0F);
+        dst[m + 1] = (uint8_t)((b >> 4) & 0x0F);
+        m += 2;
+    }
+    if (m < m1) {           /* odd tail only if M is odd (rare) */
+        dst[m] = (uint8_t)(*p & 0x0F);
+    }
+}
+
+static inline void pqv2_l2_unpack_row_range(const uint8_t *src, uint8_t *dst,
+                                            uint32_t m0, uint32_t m1) {
+    uint32_t m = m0;
+    const uint8_t *p = src + (size_t)(m0 >> 2) * 3;   /* m0 % 4 == 0 */
+    while (m + 4 <= m1) {
+        uint8_t b0 = p[0], b1 = p[1], b2 = p[2];
+        dst[m + 0] = (uint8_t)(b0 & 0x3F);
+        dst[m + 1] = (uint8_t)(((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2));
+        dst[m + 2] = (uint8_t)(((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4));
+        dst[m + 3] = (uint8_t)((b2 >> 2) & 0x3F);
+        p += 3;
+        m += 4;
+    }
+    if (m < m1) {           /* tail only if M not a multiple of 4 */
+        uint8_t b0 = p[0], b1 = p[1], b2 = p[2];
+        uint8_t tmp[4];
+        tmp[0] = (uint8_t)(b0 & 0x3F);
+        tmp[1] = (uint8_t)(((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2));
+        tmp[2] = (uint8_t)(((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4));
+        tmp[3] = (uint8_t)((b2 >> 2) & 0x3F);
+        for (uint32_t k = 0; m < m1; m++, k++) dst[m] = tmp[k];
+    }
+}
+
 /* Resolve the L2 index row pointer for chunk c, subchunk s. If the
  * tensor is bit-packed, unpack into `scratch[M]` and return scratch.
  * Otherwise return the in-place row pointer (no copy). */
@@ -196,21 +240,22 @@ static inline const uint8_t *pqv2_l2_row(const pqv2_t *t,
  * byte-identical to pqv2_l2_row.) */
 static inline const uint8_t *pqv2_l2_row_local(const pqv2_t *t,
                                                 uint32_t local,
-                                                uint8_t *scratch) {
+                                                uint8_t *scratch,
+                                                uint32_t m0, uint32_t m1) {
     uint32_t M = t->M;
     if (t->l2_idx_bits == 6) {
         size_t row_bytes = pqv2_l2_packed_row_bytes(M);
         const uint8_t *packed = t->l2_indices + (size_t)local * row_bytes;
-        pqv2_l2_unpack_row(packed, scratch, M);
+        pqv2_l2_unpack_row_range(packed, scratch, m0, m1);   /* writes scratch[m0:m1] */
         return scratch;
     }
     if (t->l2_idx_bits == 4) {
         size_t row_bytes = pqv2_l2_packed_row_bytes_4bit(M);
         const uint8_t *packed = t->l2_indices + (size_t)local * row_bytes;
-        pqv2_l2_unpack_4bit(packed, scratch, M);
+        pqv2_l2_unpack_4bit_range(packed, scratch, m0, m1); /* writes scratch[m0:m1] */
         return scratch;
     }
-    return &t->l2_indices[(size_t)local * M];
+    return &t->l2_indices[(size_t)local * M];   /* 8-bit: in-place, absolute index */
 }
 
 /* L1 indices are always chunk-major on disk: [n_chunks][n_subchunks][M],
@@ -1297,9 +1342,10 @@ void pqv2_acc_tbl_int8_k256_chunks_skip(
  * slice; l2_cb is the fp32 L2 codebook. */
 static inline void pqv2_acc_csrange_l2_lane(
     const pqv2_t *t, const float *xs, const float *l2_cb,
-    uint32_t s, const uint8_t *l2_idx, float *acc_l2)
+    uint32_t s, const uint8_t *l2_idx, float *acc_l2,
+    uint32_t m0, uint32_t m1)
 {
-    uint32_t M = t->M, half = t->half;
+    uint32_t half = t->half;
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float l2_lut_scale;
     build_lut_int8(&l2_cb[(size_t)s * t->l2_K * half], xs,
@@ -1310,8 +1356,8 @@ static inline void pqv2_acc_csrange_l2_lane(
     tbl2.val[2] = vld1q_s8(&l2_lut_q[32]);
     tbl2.val[3] = vld1q_s8(&l2_lut_q[48]);
     float32x4_t scl2 = vdupq_n_f32(l2_lut_scale);
-    uint32_t mm = 0;
-    for (; mm + 16 <= M; mm += 16) {
+    uint32_t mm = m0;
+    for (; mm + 16 <= m1; mm += 16) {
         uint8x16_t i16 = vld1q_u8(&l2_idx[mm]);
         int8x16_t g = vqtbl4q_s8(tbl2, i16);
         int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
@@ -1325,7 +1371,7 @@ static inline void pqv2_acc_csrange_l2_lane(
         vst1q_f32(&acc_l2[mm+ 8], vfmaq_f32(vld1q_f32(&acc_l2[mm+ 8]), f2, scl2));
         vst1q_f32(&acc_l2[mm+12], vfmaq_f32(vld1q_f32(&acc_l2[mm+12]), f3, scl2));
     }
-    for (; mm < M; mm++)
+    for (; mm < m1; mm++)
         acc_l2[mm] += (float)l2_lut_q[l2_idx[mm]] * l2_lut_scale;
 }
 
@@ -1364,12 +1410,12 @@ void pqv2_acc_csrange(
     if (m1 > M) m1 = M;
     if (m0 >= m1) return;
 
-    /* L2 (pyramid) residual is only accumulated on a FULL-range call
-     * (m0==0 && m1==M): the row-tiled threaded path is L2-free (l2_cb is
-     * passed NULL there), and the per-lane L2 unpack/gather helper writes
-     * the whole row. Guarding on do_l2 keeps tiled calls from touching L2. */
-    int do_l2 = (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64 &&
-                 m0 == 0 && m1 == M);
+    /* L2 (pyramid) residual. The unpack + gather are row-ranged ([m0,m1)),
+     * so the threaded paged path can carry L2 too: each thread unpacks only
+     * its [m0,m1) slice of the packed L2 row into its own scratch and writes
+     * the disjoint acc_l2[m0:m1] tile (no race). Callers that want a flat
+     * (no-L2) accumulation pass l2_cb=NULL / acc_l2=NULL. */
+    int do_l2 = (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64);
 
     /* Bit-packed L2 rows are unpacked into this M-byte scratch per lane,
      * exactly like the whole-tensor path. Only allocated when packed. */
@@ -1540,8 +1586,8 @@ void pqv2_acc_csrange(
          * (do_l2); the threaded row-tiled path is L2-free. Same per-lane
          * order and gather body as the whole-tensor path. */
         if (do_l2) {
-            const uint8_t *l2_idx = pqv2_l2_row_local(t, local, l2_scratch);
-            pqv2_acc_csrange_l2_lane(t, xs, l2_cb, s, l2_idx, acc_l2);
+            const uint8_t *l2_idx = pqv2_l2_row_local(t, local, l2_scratch, m0, m1);
+            pqv2_acc_csrange_l2_lane(t, xs, l2_cb, s, l2_idx, acc_l2, m0, m1);
         }
     }
 

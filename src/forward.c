@@ -939,14 +939,18 @@ static void drive_pf_issue_raw(ib_drive_pf_state *st, int slot,
     pthread_cond_signal(&st->req_cv_l2);
 }
 
-/* Row-split task for the threaded paged compute: each worker accumulates
- * a disjoint output-row tile [start,end) of one lane-group into acc[].
- * L2-free (a paged tensor with L2 takes the single-thread path). */
+/* Row-split task for the threaded paged compute: each worker accumulates a
+ * disjoint output-row tile [start,end) of one lane-group into acc[] (and
+ * acc_l2[] for pyramid — pqv2_acc_csrange row-ranges the L2 unpack+gather,
+ * so each worker unpacks only its [start,end) L2 slice into its own
+ * scratch and writes disjoint acc_l2 rows). */
 typedef struct {
     const pqv2_t *pq;
     const float  *x;
     const float  *cb;        /* pq->cb_fp32 */
+    const float  *l2_cb;     /* pq->l2_cb_fp32, or NULL (flat) */
     float        *acc;
+    float        *acc_l2;    /* or NULL (flat) */
     uint32_t      cs_start;  /* lane-group start (local lane 0) */
     uint32_t      cs_count;
 } paged_csrange_task;
@@ -954,8 +958,8 @@ typedef struct {
 static void paged_csrange_row_task(void *raw, int tid, int start, int end) {
     (void)tid;
     const paged_csrange_task *a = (const paged_csrange_task *)raw;
-    pqv2_acc_csrange(a->pq, a->x, a->cb, /*l2_cb=*/NULL,
-                     a->acc, /*acc_l2=*/NULL,
+    pqv2_acc_csrange(a->pq, a->x, a->cb, a->l2_cb,
+                     a->acc, a->acc_l2,
                      a->cs_start, a->cs_count,
                      (uint32_t)start, (uint32_t)end);
 }
@@ -970,7 +974,10 @@ static inline void paged_compute_group(const inferbit_model *m, pqv2_t *pq,
                                        int has_l2, uint32_t lane0, uint32_t gc,
                                        uint32_t M, int thread_compute) {
     if (thread_compute) {
-        paged_csrange_task ta = { pq, x, pq->cb_fp32, acc, lane0, gc };
+        paged_csrange_task ta = { pq, x, pq->cb_fp32,
+                                  has_l2 ? pq->l2_cb_fp32 : NULL,
+                                  acc, has_l2 ? acc_l2 : NULL,
+                                  lane0, gc };
         int nt = m->num_threads;
         uint32_t chunk = (M + (uint32_t)nt - 1) / (uint32_t)nt;
         chunk = (chunk + 31u) & ~31u;          /* 32-align for the K256 stride */
@@ -1096,18 +1103,18 @@ static int drive_paged_matvec(const inferbit_model *m,
     if (acc_l2) memset(acc_l2, 0, (size_t)M * sizeof(float));
 
     /* Thread the paged compute by row-splitting each lane-group across the
-     * model thread pool. Gated on:
-     *   - L2-free tensor (the row-tiled kernel is L2-free by construction,
-     *     so pyramid FFN (L2) groups stay single-threaded);
+     * model thread pool (works for flat AND pyramid: pqv2_acc_csrange
+     * row-ranges the L2 unpack+gather, so each worker handles a disjoint
+     * acc/acc_l2 row tile). Gated on:
      *   - M >= 512 (amortise dispatch);
      *   - the in-focus slot is CACHE-RESIDENT (slot_size <= 4 MB) → the
      *     per-group gather is COMPUTE-bound and parallelises well. At large
      *     caps (e.g. the default 8 MB) only lm_head pages and it is
      *     I/O-bound — the prefetch pipeline already hides its compute, so
      *     threading there only adds dispatch overhead (measured -3%). The
-     *     win is at aggressive caps (cap<=4: flat +27% at cap=4) where the
-     *     FFN pages into cache-sized slots. */
-    int thread_compute = (!has_l2 && m->thread_pool && m->num_threads > 1 &&
+     *     win is at aggressive caps (cap<=4) where the FFN pages into
+     *     cache-sized slots. */
+    int thread_compute = (m->thread_pool && m->num_threads > 1 &&
                           M >= 512 && slot_size <= (4u << 20));
     /* A/B + safety knob: IB_PAGE_NOTHREAD=1 forces single-thread paged
      * compute (isolates the threading win; also a fallback). */
