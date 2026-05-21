@@ -353,6 +353,26 @@ struct inferbit_model {
     void  *drive_l2_indices_scratch;
     void  *drive_l2_indices_scratch2;
     size_t drive_l2_indices_scratch_size;
+    /* ── Peak-RAM page cap (drive mode) ──────────────────────────────
+     *
+     * Upper bound on the in-focus L1 index bytes per scratch slot. Set
+     * at drive-mode init from env IB_DRIVE_PAGE_MB (MB → bytes; default
+     * IB_DRIVE_PAGE_MB_DEFAULT when unset). The L1 (and matching L2)
+     * scratch slots are sized to min(largest-tensor-bytes, cap), so a
+     * tensor whose total index bytes exceed the cap is streamed in
+     * contiguous (chunk,subchunk) lane-groups — each group ≤ cap — with
+     * the kernel accumulating partial dot-products into a small acc[M]
+     * across groups (see forward.c paged matmul path). Worst-case
+     * in-focus index RAM = 2 × cap (the 2-slot prefetch ring). 0 means
+     * "no cap" (legacy whole-tensor scratch).
+     *
+     * The paged matmul (forward.c::drive_paged_matvec) accumulates each
+     * tensor's lane-group partials into the existing model-scope
+     * pqv2_thread_acc_pool / pqv2_thread_acc_l2_pool (sized n_threads×
+     * max_M ≥ max_M, freed in model.c). Those pools are idle between
+     * matmuls and the paged path is single-threaded, so no extra
+     * teardown-managed buffer is needed here. */
+    size_t drive_page_bytes;
     /* 2-slot prefetch ring (perf fix). The scratch buffers above act as a
      * double-buffer: while the kernel reads from one slot, a worker thread
      * preads the NEXT tensor's indices into the other slot. drive_pf_state

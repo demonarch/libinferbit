@@ -186,6 +186,33 @@ static inline const uint8_t *pqv2_l2_row(const pqv2_t *t,
     return &t->l2_indices[((size_t)c * ns + s) * M];
 }
 
+/* Drive-mode paging: resolve the L2 index row for a LOCAL lane (the lane's
+ * position within the current scratch lane-group, NOT the global (c,s)).
+ * When paging, t->l2_indices points at the scratch slice whose first byte
+ * is local lane 0, so the row offset is local * row_bytes. Mirrors
+ * pqv2_l2_row but with the local-lane stride; unpacks bit-packed rows into
+ * `scratch[M]` exactly as the whole-tensor path does. (For the whole-tensor
+ * case, callers pass cs_start == 0 so local == global (c*ns+s) and this is
+ * byte-identical to pqv2_l2_row.) */
+static inline const uint8_t *pqv2_l2_row_local(const pqv2_t *t,
+                                                uint32_t local,
+                                                uint8_t *scratch) {
+    uint32_t M = t->M;
+    if (t->l2_idx_bits == 6) {
+        size_t row_bytes = pqv2_l2_packed_row_bytes(M);
+        const uint8_t *packed = t->l2_indices + (size_t)local * row_bytes;
+        pqv2_l2_unpack_row(packed, scratch, M);
+        return scratch;
+    }
+    if (t->l2_idx_bits == 4) {
+        size_t row_bytes = pqv2_l2_packed_row_bytes_4bit(M);
+        const uint8_t *packed = t->l2_indices + (size_t)local * row_bytes;
+        pqv2_l2_unpack_4bit(packed, scratch, M);
+        return scratch;
+    }
+    return &t->l2_indices[(size_t)local * M];
+}
+
 /* L1 indices are always chunk-major on disk: [n_chunks][n_subchunks][M],
  * one contiguous M-byte run per (c, s) slot — exactly what the NEON inner
  * loop (`vld1q_u8`) wants. The kernel reads
@@ -1263,6 +1290,248 @@ void pqv2_acc_tbl_int8_k256_chunks_skip(
                                           c_start, c_end, skip_thresh);
 }
 
+/* Accumulate the L2 (pyramid) residual for one local lane into acc_l2[M].
+ * Identical body to the whole-tensor L2 path; factored out so all three
+ * K-paths of pqv2_acc_csrange share it. l2_idx is the (already-resolved,
+ * possibly-unpacked) M-byte index row for this lane; xs is the input
+ * slice; l2_cb is the fp32 L2 codebook. */
+static inline void pqv2_acc_csrange_l2_lane(
+    const pqv2_t *t, const float *xs, const float *l2_cb,
+    uint32_t s, const uint8_t *l2_idx, float *acc_l2)
+{
+    uint32_t M = t->M, half = t->half;
+    int8_t l2_lut_q[64] __attribute__((aligned(16)));
+    float l2_lut_scale;
+    build_lut_int8(&l2_cb[(size_t)s * t->l2_K * half], xs,
+                    t->l2_K, half, l2_lut_q, &l2_lut_scale);
+    int8x16x4_t tbl2;
+    tbl2.val[0] = vld1q_s8(&l2_lut_q[0]);
+    tbl2.val[1] = vld1q_s8(&l2_lut_q[16]);
+    tbl2.val[2] = vld1q_s8(&l2_lut_q[32]);
+    tbl2.val[3] = vld1q_s8(&l2_lut_q[48]);
+    float32x4_t scl2 = vdupq_n_f32(l2_lut_scale);
+    uint32_t mm = 0;
+    for (; mm + 16 <= M; mm += 16) {
+        uint8x16_t i16 = vld1q_u8(&l2_idx[mm]);
+        int8x16_t g = vqtbl4q_s8(tbl2, i16);
+        int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+        int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+        float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+        float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)));
+        float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+        float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)));
+        vst1q_f32(&acc_l2[mm+ 0], vfmaq_f32(vld1q_f32(&acc_l2[mm+ 0]), f0, scl2));
+        vst1q_f32(&acc_l2[mm+ 4], vfmaq_f32(vld1q_f32(&acc_l2[mm+ 4]), f1, scl2));
+        vst1q_f32(&acc_l2[mm+ 8], vfmaq_f32(vld1q_f32(&acc_l2[mm+ 8]), f2, scl2));
+        vst1q_f32(&acc_l2[mm+12], vfmaq_f32(vld1q_f32(&acc_l2[mm+12]), f3, scl2));
+    }
+    for (; mm < M; mm++)
+        acc_l2[mm] += (float)l2_lut_q[l2_idx[mm]] * l2_lut_scale;
+}
+
+/* ── Drive-mode PAGED lane-range accumulator ──────────────────────
+ *
+ * Accumulate L1 (and L2 when acc_l2 != NULL) over the contiguous lane
+ * range [cs_start, cs_start+cs_count). Lane cs maps to LOCAL lane
+ * (cs - cs_start); the kernel reads t->indices[(cs - cs_start) * M] and
+ * the matching local L2 row, so t->indices / t->l2_indices may point at a
+ * scratch buffer holding ONLY this lane group (the drive paging case), or
+ * at the full tensor with cs_start == 0 (whole-tensor case — identical
+ * order to pqv2_matvec_tbl_int8_*).
+ *
+ * The per-lane accumulation order over (c,s) and the per-lane NEON gather
+ * bodies are byte-for-byte the same as the whole-tensor kernels, so the
+ * sum over all lane groups is bit-identical to a single non-paged matvec. */
+void pqv2_acc_csrange(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t cs_start, uint32_t cs_count)
+{
+    uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half;
+    uint32_t G = t->G;
+    uint32_t n_chunks = t->N / G;
+    uint32_t cs_total = n_chunks * ns;
+    if (cs_start >= cs_total) return;
+    if (cs_start + cs_count > cs_total) cs_count = cs_total - cs_start;
+    if (cs_count == 0) return;
+
+    /* Bit-packed L2 rows are unpacked into this M-byte scratch per lane,
+     * exactly like the whole-tensor path. Only allocated when packed. */
+    uint8_t *l2_scratch = (acc_l2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
+        ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
+
+    const uint8x16_t mask63 = vdupq_n_u8(63);
+    const uint8x16_t one_v  = vdupq_n_u8(1);
+    const uint8x16_t bank_bit = vdupq_n_u8(64);
+
+    for (uint32_t cs = cs_start; cs < cs_start + cs_count; cs++) {
+        uint32_t c = cs / ns;
+        uint32_t s = cs % ns;
+        uint32_t local = cs - cs_start;
+        const float *xs = &x[(size_t)c * G + (size_t)s * half];
+        const uint8_t *idx = &t->indices[(size_t)local * M];
+
+        if (K == 256) {
+            int8_t lut[4][64] __attribute__((aligned(16)));
+            float lut_scale;
+            build_lut_int8_k256(&cb[(size_t)s * K * half], xs, half,
+                                  lut, &lut_scale);
+            int8x16x4_t b0, b1, b2, b3;
+            #define LOAD_BANK(B, ARR) \
+                B.val[0] = vld1q_s8(&ARR[0]); B.val[1] = vld1q_s8(&ARR[16]); \
+                B.val[2] = vld1q_s8(&ARR[32]); B.val[3] = vld1q_s8(&ARR[48]);
+            LOAD_BANK(b0, lut[0]); LOAD_BANK(b1, lut[1]);
+            LOAD_BANK(b2, lut[2]); LOAD_BANK(b3, lut[3]);
+            #undef LOAD_BANK
+            float32x4_t scl = vdupq_n_f32(lut_scale);
+            uint32_t m = 0;
+            for (; m + 32 <= M; m += 32) {
+                if (m + 256 < M) __builtin_prefetch(&idx[m + 256], 0, 0);
+                uint8x16_t iA = vld1q_u8(&idx[m]);
+                uint8x16_t iB = vld1q_u8(&idx[m + 16]);
+                uint8x16_t i6A = vandq_u8(iA, mask63);
+                uint8x16_t i6B = vandq_u8(iB, mask63);
+                int8x16_t gA0 = vqtbl4q_s8(b0, i6A); int8x16_t gB0 = vqtbl4q_s8(b0, i6B);
+                int8x16_t gA1 = vqtbl4q_s8(b1, i6A); int8x16_t gB1 = vqtbl4q_s8(b1, i6B);
+                int8x16_t gA2 = vqtbl4q_s8(b2, i6A); int8x16_t gB2 = vqtbl4q_s8(b2, i6B);
+                int8x16_t gA3 = vqtbl4q_s8(b3, i6A); int8x16_t gB3 = vqtbl4q_s8(b3, i6B);
+                uint8x16_t selA_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(iA, 6), one_v), one_v);
+                uint8x16_t selA_msb = vceqq_u8(vshrq_n_u8(iA, 7), one_v);
+                uint8x16_t selB_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(iB, 6), one_v), one_v);
+                uint8x16_t selB_msb = vceqq_u8(vshrq_n_u8(iB, 7), one_v);
+                int8x16_t gA = vbslq_s8(selA_msb, vbslq_s8(selA_lsb, gA3, gA2),
+                                                    vbslq_s8(selA_lsb, gA1, gA0));
+                int8x16_t gB = vbslq_s8(selB_msb, vbslq_s8(selB_lsb, gB3, gB2),
+                                                    vbslq_s8(selB_lsb, gB1, gB0));
+                int16x8_t lA = vmovl_s8(vget_low_s8(gA)); int16x8_t hA = vmovl_s8(vget_high_s8(gA));
+                int16x8_t lB = vmovl_s8(vget_low_s8(gB)); int16x8_t hB = vmovl_s8(vget_high_s8(gB));
+                float32x4_t fA0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lA)));
+                float32x4_t fA1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lA)));
+                float32x4_t fA2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hA)));
+                float32x4_t fA3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hA)));
+                float32x4_t fB0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lB)));
+                float32x4_t fB1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lB)));
+                float32x4_t fB2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hB)));
+                float32x4_t fB3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hB)));
+                vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), fA0, scl));
+                vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), fA1, scl));
+                vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), fA2, scl));
+                vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), fA3, scl));
+                vst1q_f32(&acc[m+16], vfmaq_f32(vld1q_f32(&acc[m+16]), fB0, scl));
+                vst1q_f32(&acc[m+20], vfmaq_f32(vld1q_f32(&acc[m+20]), fB1, scl));
+                vst1q_f32(&acc[m+24], vfmaq_f32(vld1q_f32(&acc[m+24]), fB2, scl));
+                vst1q_f32(&acc[m+28], vfmaq_f32(vld1q_f32(&acc[m+28]), fB3, scl));
+            }
+            for (; m + 16 <= M; m += 16) {
+                uint8x16_t i16 = vld1q_u8(&idx[m]);
+                uint8x16_t i6 = vandq_u8(i16, mask63);
+                int8x16_t g0 = vqtbl4q_s8(b0, i6);
+                int8x16_t g1 = vqtbl4q_s8(b1, i6);
+                int8x16_t g2 = vqtbl4q_s8(b2, i6);
+                int8x16_t g3 = vqtbl4q_s8(b3, i6);
+                uint8x16_t sel_lsb = vceqq_u8(vandq_u8(vshrq_n_u8(i16, 6), one_v), one_v);
+                uint8x16_t sel_msb = vceqq_u8(vshrq_n_u8(i16, 7), one_v);
+                int8x16_t g = vbslq_s8(sel_msb, vbslq_s8(sel_lsb, g3, g2),
+                                                    vbslq_s8(sel_lsb, g1, g0));
+                int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+                int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)));
+                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+                float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)));
+                vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), f0, scl));
+                vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), f1, scl));
+                vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
+                vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
+            }
+            for (; m < M; m++) {
+                uint8_t k = idx[m];
+                int8_t v = lut[k >> 6][k & 63];
+                acc[m] += (float)v * lut_scale;
+            }
+        } else if (K == 128) {
+            int8_t lut_lo[64] __attribute__((aligned(16)));
+            int8_t lut_hi[64] __attribute__((aligned(16)));
+            float lut_scale;
+            build_lut_int8_k128(&cb[(size_t)s * K * half], xs, half,
+                                  lut_lo, lut_hi, &lut_scale);
+            int8x16x4_t tbl_lo, tbl_hi;
+            tbl_lo.val[0] = vld1q_s8(&lut_lo[0]);
+            tbl_lo.val[1] = vld1q_s8(&lut_lo[16]);
+            tbl_lo.val[2] = vld1q_s8(&lut_lo[32]);
+            tbl_lo.val[3] = vld1q_s8(&lut_lo[48]);
+            tbl_hi.val[0] = vld1q_s8(&lut_hi[0]);
+            tbl_hi.val[1] = vld1q_s8(&lut_hi[16]);
+            tbl_hi.val[2] = vld1q_s8(&lut_hi[32]);
+            tbl_hi.val[3] = vld1q_s8(&lut_hi[48]);
+            float32x4_t scl = vdupq_n_f32(lut_scale);
+            uint32_t m = 0;
+            for (; m + 16 <= M; m += 16) {
+                uint8x16_t i16 = vld1q_u8(&idx[m]);
+                uint8x16_t i6 = vandq_u8(i16, mask63);
+                int8x16_t glo = vqtbl4q_s8(tbl_lo, i6);
+                int8x16_t ghi = vqtbl4q_s8(tbl_hi, i6);
+                uint8x16_t sel = vceqq_u8(vandq_u8(i16, bank_bit), bank_bit);
+                int8x16_t g = vbslq_s8(sel, ghi, glo);
+                int16x8_t lo16 = vmovl_s8(vget_low_s8(g));
+                int16x8_t hi16 = vmovl_s8(vget_high_s8(g));
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16)));
+                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16)));
+                float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16)));
+                vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), f0, scl));
+                vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), f1, scl));
+                vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
+                vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
+            }
+            for (; m < M; m++) {
+                uint8_t k = idx[m];
+                int8_t v = (k & 64) ? lut_hi[k & 63] : lut_lo[k & 63];
+                acc[m] += (float)v * lut_scale;
+            }
+        } else {
+            /* K ≤ 64 */
+            int8_t lut_q[64] __attribute__((aligned(16)));
+            float lut_scale;
+            build_lut_int8(&cb[(size_t)s * K * half], xs, K, half,
+                            lut_q, &lut_scale);
+            int8x16x4_t tbl;
+            tbl.val[0] = vld1q_s8(&lut_q[0]);
+            tbl.val[1] = vld1q_s8(&lut_q[16]);
+            tbl.val[2] = vld1q_s8(&lut_q[32]);
+            tbl.val[3] = vld1q_s8(&lut_q[48]);
+            float32x4_t scl = vdupq_n_f32(lut_scale);
+            uint32_t m = 0;
+            for (; m + 16 <= M; m += 16) {
+                uint8x16_t i16 = vld1q_u8(&idx[m]);
+                int8x16_t g = vqtbl4q_s8(tbl, i16);
+                int16x8_t lo = vmovl_s8(vget_low_s8(g));
+                int16x8_t hi = vmovl_s8(vget_high_s8(g));
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
+                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+                float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)));
+                vst1q_f32(&acc[m+ 0], vfmaq_f32(vld1q_f32(&acc[m+ 0]), f0, scl));
+                vst1q_f32(&acc[m+ 4], vfmaq_f32(vld1q_f32(&acc[m+ 4]), f1, scl));
+                vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
+                vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
+            }
+            for (; m < M; m++)
+                acc[m] += (float)lut_q[idx[m]] * lut_scale;
+        }
+
+        /* L2 (pyramid) residual for this lane — only K_L2 ≤ 64 supported.
+         * Same per-lane order and gather body as the whole-tensor path. */
+        if (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64) {
+            const uint8_t *l2_idx = pqv2_l2_row_local(t, local, l2_scratch);
+            pqv2_acc_csrange_l2_lane(t, xs, l2_cb, s, l2_idx, acc_l2);
+        }
+    }
+
+    if (l2_scratch) free(l2_scratch);
+}
+
 /* Single-thread K=256 matvec: alloc scratch, accumulate over all chunks,
  * apply row_scale + L2, write y. Threading lives outside the kernel
  * (forward.c invokes pqv2_acc_tbl_int8_k256_chunks per worker). */
@@ -2233,6 +2502,58 @@ void pqv2_acc_tbl_int8_k256_chunks_batch(
                                       cb, l2_cb, ab, ab2,
                                       c_start, c_end);
     }
+}
+/* Non-NEON fallback for the paged lane-range accumulator. Scalar gather
+ * with raw-fp32 LUTs — matches the non-NEON whole-tensor path
+ * (pqv2_matvec_lut) so the per-lane sum order and arithmetic are
+ * bit-identical to a non-paged scalar matvec. */
+void pqv2_acc_csrange(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t cs_start, uint32_t cs_count)
+{
+    uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half;
+    uint32_t G = t->G;
+    uint32_t n_chunks = t->N / G;
+    uint32_t cs_total = n_chunks * ns;
+    if (cs_start >= cs_total) return;
+    if (cs_start + cs_count > cs_total) cs_count = cs_total - cs_start;
+    if (cs_count == 0) return;
+
+    uint8_t *l2_scratch = (acc_l2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
+        ? (uint8_t *)malloc((size_t)M) : NULL;
+    float *lut = (float *)malloc((size_t)K * sizeof(float));
+    float *l2_lut = (acc_l2 && t->l2_kind == 2)
+        ? (float *)malloc((size_t)t->l2_K * sizeof(float)) : NULL;
+
+    for (uint32_t cs = cs_start; cs < cs_start + cs_count; cs++) {
+        uint32_t c = cs / ns;
+        uint32_t s = cs % ns;
+        uint32_t local = cs - cs_start;
+        const float *xs = &x[(size_t)c * G + (size_t)s * half];
+        const uint8_t *idx = &t->indices[(size_t)local * M];
+        for (uint32_t k = 0; k < K; k++) {
+            const float *cw = &cb[((size_t)s * K + k) * half];
+            float d = 0.0f;
+            for (uint32_t h = 0; h < half; h++) d += cw[h] * xs[h];
+            lut[k] = d;
+        }
+        for (uint32_t m = 0; m < M; m++) acc[m] += lut[idx[m]];
+
+        if (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64) {
+            for (uint32_t k = 0; k < t->l2_K; k++) {
+                const float *cw = &l2_cb[((size_t)s * t->l2_K + k) * half];
+                float d = 0.0f;
+                for (uint32_t h = 0; h < half; h++) d += cw[h] * xs[h];
+                l2_lut[k] = d;
+            }
+            const uint8_t *l2_idx = pqv2_l2_row_local(t, local, l2_scratch);
+            for (uint32_t m = 0; m < M; m++) acc_l2[m] += l2_lut[l2_idx[m]];
+        }
+    }
+    free(lut); if (l2_lut) free(l2_lut);
+    if (l2_scratch) free(l2_scratch);
 }
 void pqv2_matvec_lut_neon(const pqv2_t *t, const float *x, float *y) {
     pqv2_matvec_lut(t, x, y);

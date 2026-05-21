@@ -567,6 +567,72 @@ static int mome_try_fused_gateup(inferbit_model *m,
     return 1;
 }
 
+/* ── drive-mode sequential dispatch (peak-RAM optimisation) ─────────
+ *
+ * In residency_mode == 1 (DRIVE) the engine streams every PQv2 tensor's
+ * indices through ONE shared page-aligned scratch buffer (see
+ * forward.c::drive_load_indices + the 2-slot prefetch ring). The
+ * design goal is "one expert in focus" — only a single expert's working
+ * set is resident at any instant, so peak RAM is independent of K.
+ *
+ * The parallel path (mome_expert_thread) and the fused gate+up path
+ * (mome_try_fused_gateup) both violate that: the parallel path holds K
+ * experts' scratch slots simultaneously AND has K pthreads racing on
+ * the single shared drive scratch + global prefetch state; the fused
+ * path reads ALL 2K experts' pq->indices in one sweep, which the
+ * one-slot drive scratch cannot satisfy. So drive mode takes this
+ * dedicated sequential path instead.
+ *
+ * Semantics in drive mode are FIXED to exact reconstruction: run ALL K
+ * experts (e = 0..K-1) in ASCENDING index order with uniform weight
+ * 1.0 — identical math to the zero-router fallback at n_active == K.
+ * router_logits / a top_n < K passed by the caller are intentionally
+ * IGNORED here (the trivial row-split only reconstructs the un-split
+ * FFN when every expert runs; a top_n subset would be a lossy
+ * approximation that drive mode must never silently take). Ascending
+ * order matches the drive prefetcher's tensor-registration walk so the
+ * next expert's I/O overlaps the current expert's compute.
+ *
+ * This path performs NO per-token heap allocation and never holds more
+ * than one expert's working set: it reuses the caller-supplied hb / hb2
+ * scratch exactly as the RAM-mode sequential fallback does. Output is
+ * bit-identical to that fallback when it runs all K experts with weight
+ * 1.0 (same matmul kernel, same fp32 accumulation order). */
+static void mome_dispatch_ffn_drive_seq(inferbit_model *m,
+                                        const ib_layer_meta *layer,
+                                        const float *x_in,
+                                        float *hb, float *hb2,
+                                        float *xb_out,
+                                        int K, int rows_per_expert,
+                                        int hidden, float *scale_buf)
+{
+    for (int e = 0; e < K; e++) {
+        const ib_tensor_meta *gate_e = &layer->gate_proj_experts[e];
+        const ib_tensor_meta *up_e   = &layer->up_proj_experts[e];
+        const ib_tensor_meta *down_e = &layer->down_proj_experts[e];
+
+        if (gate_e->shape[0] != rows_per_expert ||
+            up_e->shape[0]   != rows_per_expert ||
+            down_e->shape[1] != rows_per_expert) {
+            continue;
+        }
+
+        ib_tensor_matmul_cpu(m, gate_e, hb,  x_in, rows_per_expert, hidden, scale_buf);
+        ib_tensor_matmul_cpu(m, up_e,   hb2, x_in, rows_per_expert, hidden, scale_buf);
+
+        for (int r = 0; r < rows_per_expert; r++) {
+            hb[r] = mome_silu(hb[r]) * hb2[r];
+        }
+
+        ib_tensor_matmul_cpu(m, down_e, hb2, hb, hidden, rows_per_expert,
+                             scale_buf);
+        /* Uniform weight 1.0 — exact un-split FFN reconstruction. */
+        for (int h = 0; h < hidden; h++) {
+            xb_out[h] += hb2[h];
+        }
+    }
+}
+
 /* ── dispatch ────────────────────────────────────────────────────── */
 
 void mome_dispatch_ffn(inferbit_model *m,
@@ -592,6 +658,25 @@ void mome_dispatch_ffn(inferbit_model *m,
      * otherwise destroy the input. */
     float x_in[hidden];
     memcpy(x_in, x, (size_t)hidden * sizeof(float));
+
+    /* ── Drive mode: one-expert-in-focus sequential dispatch ─────────
+     *
+     * residency_mode == 1 streams every tensor's PQ indices through a
+     * single shared scratch buffer. Both the pthread-parallel path and
+     * the fused gate+up path require multiple experts resident at once
+     * (and the parallel path races on the shared drive scratch), so
+     * neither is safe here. Take the dedicated sequential path that
+     * runs ALL K experts in ascending order with uniform weight 1.0
+     * (exact reconstruction). The caller's router_logits / active /
+     * n_active are intentionally overridden to all-K-exact in drive
+     * mode — never a top_n < K subset. mome_slots_prepare is NOT called
+     * (no resident per-expert slots are allocated). */
+    if (m->residency_mode == 1) {
+        memset(xb_out, 0, (size_t)hidden * sizeof(float));
+        mome_dispatch_ffn_drive_seq(m, layer, x_in, hb, hb2, xb_out,
+                                    K, rows_per_expert, hidden, scale_buf);
+        return;
+    }
 
     /* Compute weights. Two regimes:
      *   - router_logits == NULL  → zero-router fallback, n_active = K,

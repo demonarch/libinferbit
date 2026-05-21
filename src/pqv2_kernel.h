@@ -218,6 +218,39 @@ void pqv2_acc_tbl_int8_k256_chunks_batch(
     float *acc_batch, float *acc_l2_batch,
     uint32_t c_start, uint32_t c_end);
 
+/* ── Drive-mode PAGED accumulation (peak-RAM cap) ───────────────────
+ *
+ * Process a contiguous range of (chunk, subchunk) "lanes" and ACCUMULATE
+ * the partial dot-product into caller-owned acc[M] (L1) and acc_l2[M]
+ * (L2, NULL when the tensor has no pyramid stage). Lanes are numbered
+ *   cs = c * n_subchunks + s   (the chunk-major on-disk order),
+ * iterated in strictly increasing cs over [cs_start, cs_start+cs_count).
+ *
+ * CRITICAL — index rebasing for drive-mode paging: when paging, t->indices
+ * (and t->l2_indices) point at a SCRATCH buffer that holds ONLY this lane
+ * group, with lane cs_start at scratch offset 0. The kernel therefore
+ * indexes lane cs as local lane (cs - cs_start): L1 byte run at
+ * indices[(cs - cs_start) * M], L2 packed row at the matching local
+ * offset. Pass cs_start == 0 (and the full tensor in scratch) for a
+ * non-paged whole-tensor accumulation.
+ *
+ * Does NOT zero acc/acc_l2, NOT apply row_scale, NOT write y. The caller
+ * sums over all lane groups, then applies row_scale once at the end:
+ *   y[m] = acc[m] * row_scale[m] + acc_l2[m].
+ * Because the per-lane fp32 contributions are added in the SAME increasing
+ * cs order as the non-paged kernels (pqv2_matvec_tbl_int8_k256 et al.),
+ * the summed result is bit-identical to the non-paged matvec.
+ *
+ * Handles every K (256 / 128 / ≤64) and the L2 (l2_K ≤ 64) residual via
+ * the same build_lut_* helpers and NEON gather bodies as the whole-tensor
+ * kernels. cb / l2_cb are the fp32 codebooks (t->cb_fp32 / t->l2_cb_fp32);
+ * pass l2_cb=NULL and acc_l2=NULL for flat tensors. */
+void pqv2_acc_csrange(
+    const pqv2_t *t, const float *x,
+    const float *cb, const float *l2_cb,
+    float *acc, float *acc_l2,
+    uint32_t cs_start, uint32_t cs_count);
+
 /* fp16 helpers (IEEE half) */
 float pqv2_h2f(uint16_t h);
 uint16_t pqv2_f2h(float f);

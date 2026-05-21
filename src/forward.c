@@ -888,6 +888,187 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
     return 0;
 }
 
+/* ── Peak-RAM PAGED drive matmul ────────────────────────────────────
+ *
+ * For tensors whose total L1 index bytes exceed the (capped) scratch
+ * slot, stream the indices in contiguous (chunk,subchunk) lane-groups —
+ * each group ≤ the slot — and accumulate the partial dot-products into a
+ * persistent acc[M] (and acc_l2[M] for pyramid) across groups. row_scale
+ * is applied ONCE at the end:  y[m] = acc[m]*row_scale[m] + acc_l2[m].
+ *
+ * Bit-identity: the lanes are processed in strictly increasing
+ *   cs = c*ns + s
+ * order across all groups, and pqv2_acc_csrange uses the SAME per-lane
+ * LUT-build + NEON gather body as the non-paged kernels, so the summed
+ * acc is identical to a single whole-tensor matvec; applying row_scale
+ * once at the end (not per-group) keeps the fp32 arithmetic identical.
+ *
+ * Layout: the on-disk L1 region is chunk-major [n_chunks][n_subchunks][M],
+ * i.e. nc*ns contiguous M-byte "lanes". A lane-group [g0, g0+gc) is ONE
+ * contiguous pread of gc*M bytes at indices_file_offset + g0*M. The
+ * matching L2 region is [n_chunks][n_subchunks][row_bytes(M)] (row_bytes
+ * branches on l2_idx_bits), so the L2 group is gc*row_bytes at
+ * l2_indices_file_offset + g0*row_bytes.
+ *
+ * Returns 1 if it handled the matmul, 0 if not applicable (caller falls
+ * back to the normal load+dispatch path).
+ *
+ * Pipelining: CURRENTLY SYNCHRONOUS — each lane-group is pread then
+ * computed. The two scratch slots are used in alternation so a future
+ * async extension (issue group g+1's pread while the kernel runs group g)
+ * can drop in without restructuring. TODO(peak-ram): extend the 2-slot
+ * prefetch ring's worker to take a (offset, length, slot) request so
+ * lane-group I/O overlaps compute the way whole-tensor prefetch does. */
+static int drive_paged_matvec(const inferbit_model *m,
+                              const ib_tensor_meta *t,
+                              const float *x, float *y) {
+    if (!m || m->residency_mode != 1) return 0;
+    if (!t || !t->pq) return 0;
+    if (m->drive_fd < 0 || !m->drive_indices_scratch) return 0;
+    pqv2_t *pq = (pqv2_t *)t->pq;
+    if (!pq->cb_fp32) return 0;                 /* csrange needs fp32 cb */
+    off_t off = (off_t)pq->indices_file_offset;
+    if (off == 0) return 0;                     /* not redirected */
+
+    uint32_t M = pq->M;
+    uint32_t ns = pq->n_subchunks;
+    uint32_t nc = pq->N / pq->G;
+    size_t total_lanes = (size_t)nc * ns;
+    size_t lane_bytes = (size_t)M;              /* one (c,s) lane = M bytes */
+    if (lane_bytes == 0 || total_lanes == 0) return 0;
+    size_t total_bytes = total_lanes * lane_bytes;
+
+    size_t slot_size = m->drive_indices_scratch_size;
+    int l1_fits = (total_bytes <= slot_size);
+
+    /* ── L2 (pyramid) parameters + fit check ─────────────────────────
+     * A tensor that fits the L1 slot can STILL overflow the (capped) L2
+     * scratch: the non-paged drive_load_indices/prefetch path writes the
+     * tensor's WHOLE L2 residual into the L2 slot, and that slot is sized
+     * to a lane-GROUP (not the whole tensor) when the page cap is active.
+     * So we must PAGE whenever EITHER L1 or L2 does not fit its slot —
+     * otherwise the non-paged path corrupts memory (observed: pyramid
+     * crash/garbage in the cap band where FFN L1 fits but FFN L2 does not). */
+    int has_l2 = (pq->l2_kind == 2 && pq->l2_cb_fp32 && pq->l2_K <= 64);
+    size_t l2_row = 0, l2_slot_size = 0, l2_total = 0;
+    off_t l2_off = 0;
+    if (has_l2) {
+        l2_row       = pqv2_l2_row_bytes(M, pq->l2_idx_bits);
+        l2_slot_size = m->drive_l2_indices_scratch_size;
+        l2_total     = pqv2_l2_total_index_bytes(pq);
+        l2_off       = (off_t)pq->l2_indices_file_offset;
+        if (l2_row == 0) has_l2 = 0;   /* defensive: nothing to page */
+    }
+    int l2_fits = (!has_l2) || (l2_total <= l2_slot_size);
+
+    /* Both fit a slot → the unchanged non-paged path is safe; skip paging. */
+    if (l1_fits && l2_fits) return 0;
+
+    /* From here we WILL page. Require the accumulator pools (and, for a
+     * pyramid tensor, the L2 scratch ring + L2 acc pool). We REUSE the
+     * model-scope threaded-matmul acc pools (sized n_threads × max_M ≥ M
+     * floats, freed in model.c): they are idle between matmuls and the
+     * paged path is single-threaded, so there is no overlap with the
+     * threaded K=256 path. model.c disables the page cap when these pools
+     * are unavailable (sizing every slot to the whole tensor), in which
+     * case l1_fits && l2_fits held above and we already returned — so
+     * reaching here without them is an unexpected config; fall back to the
+     * non-paged path (whose own size guards prevent an overflow) rather
+     * than page incorrectly. */
+    if (!m->pqv2_thread_acc_pool ||
+        m->pqv2_thread_acc_pool_floats < (size_t)M) return 0;
+    if (has_l2 &&
+        (!m->drive_l2_indices_scratch ||
+         pq->l2_indices_file_offset == 0 ||
+         !m->pqv2_thread_acc_l2_pool ||
+         m->pqv2_thread_acc_l2_pool_floats < (size_t)M)) {
+        return 0;   /* can't page L2 safely → let caller fall back */
+    }
+
+    /* Lanes per group: the L1 slot bounds it; if L2 is paged, the L2 slot
+     * may bound it tighter. At least 1 lane per group (slots are sized
+     * with a one-lane floor at setup, so this never starves). */
+    size_t lanes_per_group = slot_size / lane_bytes;
+    if (has_l2 && l2_row > 0) {
+        size_t l2_lpg = l2_slot_size / l2_row;
+        if (l2_lpg < lanes_per_group) lanes_per_group = l2_lpg;
+    }
+    if (lanes_per_group == 0) lanes_per_group = 1;
+
+    float *acc = m->pqv2_thread_acc_pool;
+    float *acc_l2 = has_l2 ? m->pqv2_thread_acc_l2_pool : NULL;
+    memset(acc, 0, (size_t)M * sizeof(float));
+    if (acc_l2) memset(acc_l2, 0, (size_t)M * sizeof(float));
+
+    /* Drain any in-flight whole-tensor prefetch before reusing the slots
+     * synchronously (avoids racing the prefetch worker on scratch[]). */
+    ib_drive_pf_state *st = drive_pf_get(m);
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        pf_wait_idle_locked(st);
+        st->done_tensor = NULL;
+        st->done_slot = -1;
+        pthread_mutex_unlock(&st->mu);
+    }
+
+    void *slot_l1[2]  = { m->drive_indices_scratch,
+                          m->drive_indices_scratch2 };
+    void *slot_l2[2]  = { m->drive_l2_indices_scratch,
+                          m->drive_l2_indices_scratch2 };
+    int have_slot1 = (slot_l1[1] != NULL);
+
+    int gi = 0;   /* alternating slot index (slot ping-pong) */
+    for (size_t lane0 = 0; lane0 < total_lanes; lane0 += lanes_per_group) {
+        size_t gc = lanes_per_group;
+        if (lane0 + gc > total_lanes) gc = total_lanes - lane0;
+        int slot = (have_slot1 ? (gi & 1) : 0);
+        gi++;
+
+        /* L1: one contiguous pread of gc lanes into the chosen slot. */
+        size_t l1_bytes = gc * lane_bytes;
+        if (!drive_pread_full(m->drive_fd, slot_l1[slot], l1_bytes,
+                              off + (off_t)(lane0 * lane_bytes))) {
+            return 0;   /* I/O error → bail; caller's path will report it */
+        }
+        pq->indices = (const uint8_t *)slot_l1[slot];
+
+        /* L2: matching contiguous slice into the L2 slot. */
+        if (has_l2) {
+            size_t l2_bytes = gc * l2_row;
+            void *l2dst = slot_l2[have_slot1 ? slot : 0];
+            /* l2dst is guaranteed non-NULL here (L2 ring slots are
+             * allocated as a pair at setup, and the has_l2 guard above
+             * required slot 0). Bail rather than drop the residual if a
+             * future change ever leaves it NULL — never silently corrupt
+             * a pyramid result by paging only part of its L2. */
+            if (!l2dst) return 0;
+            if (!drive_pread_full(m->drive_fd, l2dst, l2_bytes,
+                                  l2_off + (off_t)(lane0 * l2_row))) {
+                return 0;
+            }
+            pq->l2_indices = (const uint8_t *)l2dst;
+        }
+
+        /* Accumulate this lane-group's partials. Lane lane0 is local
+         * lane 0 in the scratch slot (csrange rebases indexing). */
+        pqv2_acc_csrange(pq, x, pq->cb_fp32, has_l2 ? pq->l2_cb_fp32 : NULL,
+                         acc, acc_l2,
+                         (uint32_t)lane0, (uint32_t)gc);
+
+#if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
+        (void)posix_fadvise(m->drive_fd, off + (off_t)(lane0 * lane_bytes),
+                            (off_t)l1_bytes, POSIX_FADV_DONTNEED);
+#endif
+    }
+
+    /* Final reduction: apply row_scale once + fold in the L2 residual. */
+    for (uint32_t mm = 0; mm < M; mm++) {
+        float rs = pqv2_h2f(pq->row_scale[mm]);
+        y[mm] = acc[mm] * rs + (acc_l2 ? acc_l2[mm] : 0.0f);
+    }
+    return 1;
+}
+
 /* ── FP16 conversion ────────────────────────────────────────── */
 
 static inline float fp16_to_fp32(uint16_t h) {
@@ -1370,8 +1551,13 @@ static void tensor_matmul(
         const pqv2_t* pq = t->pq;
         /* Path D drive mode (Solution 5): pread the indices from disk
          * into the model's scratch buffer (which pq->indices was
-         * redirected to at load). Kernel then reads from scratch. */
+         * redirected to at load). Kernel then reads from scratch.
+         * Peak-RAM cap: tensors larger than the scratch slot are streamed
+         * in lane-groups by drive_paged_matvec (which writes `out` and
+         * returns 1). Tensors that fit a slot take the unchanged
+         * load+dispatch path below. */
         if (m->residency_mode == 1) {
+            if (drive_paged_matvec(m, t, input, out)) return;
             (void)drive_load_indices(m, t);
         }
         if (pq->K == 256 && m->thread_pool && m->num_threads > 1) {
@@ -1661,8 +1847,25 @@ static void tensor_matmul_batch(
     if (t->pq) {
         const pqv2_t* pq = t->pq;
         /* Drive mode: pread indices ONCE for this tensor; the batched
-         * kernel below reuses the same scratch for all B positions. */
+         * kernel below reuses the same scratch for all B positions.
+         * Peak-RAM cap: when this tensor is too large for a scratch slot
+         * (e.g. lm_head, or an oversized MoME expert), stream it in
+         * lane-groups PER POSITION — each pass holds only one lane-group,
+         * never the whole tensor (and the per-expert `for e` loop in the
+         * batched MoME dispatcher keeps only one expert in focus). The
+         * shared model-scope acc pool is reused single-threaded per
+         * position, so we loop B explicitly rather than batch. drive_paged_matvec
+         * returns 0 when the tensor fits a slot, so the normal batched
+         * path below runs unchanged for the common (fits) case. */
         if (m->residency_mode == 1) {
+            if (drive_paged_matvec(m, t, input, out)) {
+                for (int b = 1; b < B; b++) {
+                    (void)drive_paged_matvec(m, t,
+                                             input + (size_t)b * N,
+                                             out + (size_t)b * M);
+                }
+                return;
+            }
             (void)drive_load_indices(m, t);
         }
         if (pq->K == 256 && B >= 1 && B <= 8 &&

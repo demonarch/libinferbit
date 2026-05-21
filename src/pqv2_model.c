@@ -13,6 +13,15 @@
 #include <fcntl.h>
 #include <errno.h>
 
+/* Drive-mode peak-RAM page cap default (MB), used when IB_DRIVE_PAGE_MB
+ * is unset or invalid. 8 MB caps the in-focus index bytes per scratch
+ * slot at 8 MB → worst-case in-focus index RAM = 2 × 8 = 16 MB (the
+ * 2-slot prefetch ring), versus ~33 MB per slot for a 32k-vocab lm_head
+ * (65 MB doubled) before the cap. */
+#ifndef IB_DRIVE_PAGE_MB_DEFAULT
+#define IB_DRIVE_PAGE_MB_DEFAULT 8
+#endif
+
 /* Forward decl for drive-mode pre-transposed sidecar builder. Defined
  * later in this file; called from the drive-mode setup. */
 static int build_pretransposed_sidecar(inferbit_model *m,
@@ -694,8 +703,24 @@ static inferbit_model* pqv2_load_internal(const char* path,
     if (m->residency_mode == 1) {
         const uint8_t *file_base = (const uint8_t *)f->_buffer;
         size_t max_idx_bytes = 0;
-        /* First pass: max indices size + store original offsets. */
-        const ib_tensor_meta *tslots[2 + 7 * 256];   /* head + per-layer 7 */
+        /* First pass: max indices size + store original offsets. The slot
+         * list holds output_head + per-layer {q,k,v,o,gate,up,down} and,
+         * for MoME layers (mome_experts > 1), each layer's gate/up/down
+         * expert sub-tensors. Capacity is computed up-front so the heap
+         * array never overflows (MoME multiplies the per-layer count by
+         * 3*K, well past the old fixed 7-per-layer bound). */
+        int slot_cap = 1;   /* output_head */
+        for (int li = 0; li < m->header.num_layers; li++) {
+            ib_layer_meta *L = &m->layers[li];
+            slot_cap += 7;
+            if (L->mome_experts > 1) slot_cap += 3 * L->mome_experts;
+        }
+        const ib_tensor_meta **tslots =
+            (const ib_tensor_meta **)malloc((size_t)slot_cap * sizeof(*tslots));
+        if (!tslots) {
+            fprintf(stderr, "ib pqv2: drive mode tslots alloc failed — falling back to RAM mode\n");
+            m->residency_mode = 0;
+        } else {
         int nslots = 0;
         /* token_embedding is intentionally NOT redirected: cpu_embed_lookup
          * reads emb->pq->indices directly (not via tensor_matmul) so its
@@ -713,12 +738,32 @@ static inferbit_model* pqv2_load_internal(const char* path,
             for (int i = 0; i < 7; i++) {
                 if (s7[i]->pq) tslots[nslots++] = s7[i];
             }
+            /* MoME experts: gate/up/down per expert. Add to the drive walk
+             * so each gets indices_file_offset honored, contributes to
+             * scratch sizing (under the cap), and enters drive_pq_order
+             * for prefetch. The base gate/up/down_proj above are unused
+             * when mome_experts > 1, but harmless to include (their pq is
+             * a zeroed struct → pq == NULL → skipped). */
+            if (L->mome_experts > 1 &&
+                L->gate_proj_experts && L->up_proj_experts &&
+                L->down_proj_experts) {
+                for (int e = 0; e < L->mome_experts; e++) {
+                    if (L->gate_proj_experts[e].pq)
+                        tslots[nslots++] = &L->gate_proj_experts[e];
+                    if (L->up_proj_experts[e].pq)
+                        tslots[nslots++] = &L->up_proj_experts[e];
+                    if (L->down_proj_experts[e].pq)
+                        tslots[nslots++] = &L->down_proj_experts[e];
+                }
+            }
         }
         size_t max_l2_idx_bytes = 0;
+        uint32_t max_drive_M = 0;
         for (int i = 0; i < nslots; i++) {
             const pqv2_t *pq = tslots[i]->pq;
             size_t b = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
             if (b > max_idx_bytes) max_idx_bytes = b;
+            if (pq->M > max_drive_M) max_drive_M = pq->M;
             /* Goal C3 — compute L2 indices size for pyramid tensors.
              * Goal N36 fix: branch on l2_idx_bits (4/6/8) via the shared
              * kernel helper. The 4-bit packing is ceil(M/2) per row, not the
@@ -733,8 +778,101 @@ static inferbit_model* pqv2_load_internal(const char* path,
         /* Page-align the scratch. */
         long ps = sysconf(_SC_PAGESIZE);
         if (ps <= 0) ps = 4096;
-        size_t scratch_size = (max_idx_bytes + (size_t)ps - 1) & ~((size_t)ps - 1);
-        size_t l2_scratch_size = (max_l2_idx_bytes + (size_t)ps - 1) & ~((size_t)ps - 1);
+        /* ── Peak-RAM page cap ───────────────────────────────────────
+         * IB_DRIVE_PAGE_MB sets the per-slot in-focus index cap (the
+         * user's RAM dial: smaller cap → lower peak RAM, more preads).
+         * Default IB_DRIVE_PAGE_MB_DEFAULT MB when unset/invalid. When
+         * the largest tensor already fits under the cap, scratch keeps
+         * the smaller whole-tensor size (no behavior change). Tensors
+         * larger than the cap are paged in lane-groups by forward.c.
+         *
+         * The L1 cap must hold at least ONE full lane (M bytes) so a
+         * single (c,s) lane always fits — clamp up to M bytes if a tiny
+         * IB_DRIVE_PAGE_MB was given. The L2 cap is scaled by the same
+         * lane-group count so L1 and L2 page in lockstep. */
+        size_t page_cap = (size_t)IB_DRIVE_PAGE_MB_DEFAULT * 1024u * 1024u;
+        {
+            const char *e = getenv("IB_DRIVE_PAGE_MB");
+            if (e && e[0]) {
+                char *endp = NULL;
+                long mb = strtol(e, &endp, 10);
+                if (endp != e && mb > 0)
+                    page_cap = (size_t)mb * 1024u * 1024u;
+            }
+        }
+        /* Page-align the cap (round up to page size). */
+        page_cap = (page_cap + (size_t)ps - 1) & ~((size_t)ps - 1);
+        m->drive_page_bytes = page_cap;
+        /* L1 cap floor: at least one full (c,s) lane = max_drive_M bytes,
+         * page-aligned, so the smallest paged group is always one lane. */
+        size_t l1_lane_floor = ((size_t)max_drive_M + (size_t)ps - 1)
+                               & ~((size_t)ps - 1);
+        size_t l1_cap_eff = page_cap;
+        if (l1_cap_eff < l1_lane_floor) l1_cap_eff = l1_lane_floor;
+        /* ── Paged-matmul accumulator availability check ─────────────
+         * forward.c::drive_paged_matvec accumulates each tensor's paged
+         * partials into the model-scope threaded-matmul acc pools
+         * (pqv2_thread_acc_pool / _l2_pool, sized n_threads×max_M ≥ max_M
+         * and freed in model.c) — REQUIRED for a correct paged result,
+         * and the L2 pool is required to avoid dropping a pyramid
+         * residual. Those pools are allocated above when max_M > 0 (and
+         * the L2 pool when has_any_l2). If the required pool is missing
+         * (alloc failed earlier), DISABLE the cap (l1_cap_eff =
+         * whole-tensor) so every tensor fits a slot and the unchanged
+         * whole-tensor path runs — never produce a partial/wrong result. */
+        int need_paging = (max_idx_bytes > l1_cap_eff) && (max_drive_M > 0);
+        if (need_paging) {
+            int acc_ok = (m->pqv2_thread_acc_pool != NULL) &&
+                         (m->pqv2_thread_acc_pool_floats >= (size_t)max_drive_M) &&
+                         (!has_any_l2 ||
+                          (m->pqv2_thread_acc_l2_pool != NULL &&
+                           m->pqv2_thread_acc_l2_pool_floats >= (size_t)max_drive_M));
+            if (!acc_ok) {
+                fprintf(stderr, "ib pqv2: drive page-acc pool unavailable — disabling page cap (whole-tensor scratch)\n");
+                /* No cap: scratch sized to the whole largest tensor. */
+                l1_cap_eff = (max_idx_bytes + (size_t)ps - 1)
+                             & ~((size_t)ps - 1);
+                if (l1_cap_eff < l1_lane_floor) l1_cap_eff = l1_lane_floor;
+            }
+        }
+        /* Number of L1 lanes that fit per group at the effective cap. */
+        size_t lane_bytes_l1 = (max_drive_M > 0) ? (size_t)max_drive_M : 1;
+        size_t lanes_per_group = l1_cap_eff / lane_bytes_l1;
+        if (lanes_per_group == 0) lanes_per_group = 1;
+        /* Scratch size = min(whole-tensor bytes, effective cap),
+         * page-aligned. When the largest tensor already fits, keep the
+         * smaller size (no paging needed for any tensor). */
+        size_t scratch_full = (max_idx_bytes + (size_t)ps - 1) & ~((size_t)ps - 1);
+        size_t scratch_size = scratch_full;
+        if (l1_cap_eff < scratch_size) scratch_size = l1_cap_eff;
+        scratch_size = (scratch_size + (size_t)ps - 1) & ~((size_t)ps - 1);
+        /* L2 scratch: size to the WHOLE largest L2 residual, NOT a capped
+         * lane-group. Rationale: the page cap exists to bound the L1 index
+         * stream, whose dominant tensor (the un-tied/​tied lm_head, M=vocab)
+         * is huge and carries NO L2. The L2 residual streams are small (a
+         * 4-bit residual is ≈ half an L1 row, and only on FFN/attn tensors,
+         * all far smaller than lm_head). Capping the L2 slot to a lane-group
+         * would force every L2-bearing tensor whose whole L2 exceeds that
+         * tiny slot to PAGE — even when its L1 fits the slot and it would
+         * otherwise run the (more accurate, batched) non-paged kernel. That
+         * needlessly diverged pyramid output (~+0.17% PPL) and slowed it.
+         * Keeping the whole L2 resident costs only a few MB (it tracks the
+         * largest FFN L2, ~3 MB on TinyLlama) and lets only the L1-oversized
+         * lm_head page — so the default cap stays ~bit-exact for pyramid.
+         * (A future very-large-L2 model could reintroduce an L2-specific
+         * cap; for now L1 is the axis that matters.) max_l2_row is still
+         * needed by forward.c to bound a paged tensor's L2 lane-group. */
+        size_t max_l2_row = 0;
+        for (int i = 0; i < nslots; i++) {
+            const pqv2_t *pq = tslots[i]->pq;
+            if (pq->l2_kind == 2 && pq->l2_indices) {
+                size_t rb = pqv2_l2_row_bytes(pq->M, pq->l2_idx_bits);
+                if (rb > max_l2_row) max_l2_row = rb;
+            }
+        }
+        (void)max_l2_row;   /* informational; forward.c clamps per-tensor */
+        size_t l2_scratch_full = (max_l2_idx_bytes + (size_t)ps - 1) & ~((size_t)ps - 1);
+        size_t l2_scratch_size = l2_scratch_full;
         void *scratch = NULL;
         if (scratch_size > 0) scratch = aligned_alloc((size_t)ps, scratch_size);
         if (!scratch) {
@@ -788,9 +926,13 @@ static inferbit_model* pqv2_load_internal(const char* path,
             }
             /* Build the decode-order tensor list used by the prefetcher to
              * predict the next pread target. Order: per layer Q,K,V,O,
-             * gate,up,down; output_head appended last. Same order as the
-             * layer loop in forward.c. */
-            int order_cap = m->header.num_layers * 7 + 1;
+             * gate,up,down then (for MoME layers) each expert's gate/up/
+             * down; output_head appended last. Same traversal order as the
+             * tslots[] walk above and the forward.c layer loop. The
+             * prefetch order need only be a reasonable next-tensor guess;
+             * MoME experts dispatch e=0..K-1 within a layer so this order
+             * tracks the batched-FFN expert loop. */
+            int order_cap = slot_cap;   /* same upper bound as tslots[] */
             const ib_tensor_meta **order = (const ib_tensor_meta **)
                 malloc((size_t)order_cap * sizeof(*order));
             int order_n = 0;
@@ -803,6 +945,18 @@ static inferbit_model* pqv2_load_internal(const char* path,
                     };
                     for (int i = 0; i < 7; i++) {
                         if (s7[i]->pq) order[order_n++] = s7[i];
+                    }
+                    if (L->mome_experts > 1 &&
+                        L->gate_proj_experts && L->up_proj_experts &&
+                        L->down_proj_experts) {
+                        for (int e = 0; e < L->mome_experts; e++) {
+                            if (L->gate_proj_experts[e].pq)
+                                order[order_n++] = &L->gate_proj_experts[e];
+                            if (L->up_proj_experts[e].pq)
+                                order[order_n++] = &L->up_proj_experts[e];
+                            if (L->down_proj_experts[e].pq)
+                                order[order_n++] = &L->down_proj_experts[e];
+                        }
                     }
                 }
                 if (m->output_head.pq) order[order_n++] = &m->output_head;
@@ -857,9 +1011,15 @@ static inferbit_model* pqv2_load_internal(const char* path,
                 free(sidecar_list);
             }
             free(mpq_list);
-            fprintf(stderr, "ib pqv2: drive mode ON. scratch=%zu B, fd=%d, sidecar_fd=%d, %d tensors\n",
-                    scratch_size, m->drive_fd, m->drive_fd_pretransposed, nslots);
+            fprintf(stderr, "ib pqv2: drive mode ON. scratch=%zu B (cap=%zu B, page=%zu B), fd=%d, sidecar_fd=%d, %d tensors\n",
+                    scratch_size, l1_cap_eff, m->drive_page_bytes,
+                    m->drive_fd, m->drive_fd_pretransposed, nslots);
         }
+        /* tslots[] is consumed by both passes + the sidecar list build;
+         * free once the drive setup (success or scratch-alloc failure) is
+         * done. drive_pq_order keeps its own malloc'd copy. */
+        free(tslots);
+        }   /* close: if (!tslots) ... else { ... } */
     }
     /* Perf: pre-decode fp16 scale/norm buffers (covers raw-fp16 norm
      * tensors and any legacy quantized sub-tensors a hybrid PQv2 file
