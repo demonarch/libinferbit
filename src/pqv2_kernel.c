@@ -1346,7 +1346,8 @@ void pqv2_acc_csrange(
     const pqv2_t *t, const float *x,
     const float *cb, const float *l2_cb,
     float *acc, float *acc_l2,
-    uint32_t cs_start, uint32_t cs_count)
+    uint32_t cs_start, uint32_t cs_count,
+    uint32_t m0, uint32_t m1)
 {
     uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half;
     uint32_t G = t->G;
@@ -1355,10 +1356,24 @@ void pqv2_acc_csrange(
     if (cs_start >= cs_total) return;
     if (cs_start + cs_count > cs_total) cs_count = cs_total - cs_start;
     if (cs_count == 0) return;
+    /* Output-row window [m0, m1). The whole-tensor call passes (0, M);
+     * the threaded paged path passes 32-aligned tiles so the vectorised
+     * blocks land on the same boundaries as the single-thread kernel
+     * (bit-identical). Each thread owns a disjoint acc[] row range -> no
+     * race, no reduction. */
+    if (m1 > M) m1 = M;
+    if (m0 >= m1) return;
+
+    /* L2 (pyramid) residual is only accumulated on a FULL-range call
+     * (m0==0 && m1==M): the row-tiled threaded path is L2-free (l2_cb is
+     * passed NULL there), and the per-lane L2 unpack/gather helper writes
+     * the whole row. Guarding on do_l2 keeps tiled calls from touching L2. */
+    int do_l2 = (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64 &&
+                 m0 == 0 && m1 == M);
 
     /* Bit-packed L2 rows are unpacked into this M-byte scratch per lane,
      * exactly like the whole-tensor path. Only allocated when packed. */
-    uint8_t *l2_scratch = (acc_l2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
+    uint8_t *l2_scratch = (do_l2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
         ? (uint8_t *)aligned_alloc(64, ((size_t)M + 63) & ~63) : NULL;
 
     const uint8x16_t mask63 = vdupq_n_u8(63);
@@ -1385,9 +1400,9 @@ void pqv2_acc_csrange(
             LOAD_BANK(b2, lut[2]); LOAD_BANK(b3, lut[3]);
             #undef LOAD_BANK
             float32x4_t scl = vdupq_n_f32(lut_scale);
-            uint32_t m = 0;
-            for (; m + 32 <= M; m += 32) {
-                if (m + 256 < M) __builtin_prefetch(&idx[m + 256], 0, 0);
+            uint32_t m = m0;
+            for (; m + 32 <= m1; m += 32) {
+                if (m + 256 < m1) __builtin_prefetch(&idx[m + 256], 0, 0);
                 uint8x16_t iA = vld1q_u8(&idx[m]);
                 uint8x16_t iB = vld1q_u8(&idx[m + 16]);
                 uint8x16_t i6A = vandq_u8(iA, mask63);
@@ -1423,7 +1438,7 @@ void pqv2_acc_csrange(
                 vst1q_f32(&acc[m+24], vfmaq_f32(vld1q_f32(&acc[m+24]), fB2, scl));
                 vst1q_f32(&acc[m+28], vfmaq_f32(vld1q_f32(&acc[m+28]), fB3, scl));
             }
-            for (; m + 16 <= M; m += 16) {
+            for (; m + 16 <= m1; m += 16) {
                 uint8x16_t i16 = vld1q_u8(&idx[m]);
                 uint8x16_t i6 = vandq_u8(i16, mask63);
                 int8x16_t g0 = vqtbl4q_s8(b0, i6);
@@ -1445,7 +1460,7 @@ void pqv2_acc_csrange(
                 vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
                 vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
             }
-            for (; m < M; m++) {
+            for (; m < m1; m++) {
                 uint8_t k = idx[m];
                 int8_t v = lut[k >> 6][k & 63];
                 acc[m] += (float)v * lut_scale;
@@ -1466,8 +1481,8 @@ void pqv2_acc_csrange(
             tbl_hi.val[2] = vld1q_s8(&lut_hi[32]);
             tbl_hi.val[3] = vld1q_s8(&lut_hi[48]);
             float32x4_t scl = vdupq_n_f32(lut_scale);
-            uint32_t m = 0;
-            for (; m + 16 <= M; m += 16) {
+            uint32_t m = m0;
+            for (; m + 16 <= m1; m += 16) {
                 uint8x16_t i16 = vld1q_u8(&idx[m]);
                 uint8x16_t i6 = vandq_u8(i16, mask63);
                 int8x16_t glo = vqtbl4q_s8(tbl_lo, i6);
@@ -1485,7 +1500,7 @@ void pqv2_acc_csrange(
                 vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
                 vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
             }
-            for (; m < M; m++) {
+            for (; m < m1; m++) {
                 uint8_t k = idx[m];
                 int8_t v = (k & 64) ? lut_hi[k & 63] : lut_lo[k & 63];
                 acc[m] += (float)v * lut_scale;
@@ -1502,8 +1517,8 @@ void pqv2_acc_csrange(
             tbl.val[2] = vld1q_s8(&lut_q[32]);
             tbl.val[3] = vld1q_s8(&lut_q[48]);
             float32x4_t scl = vdupq_n_f32(lut_scale);
-            uint32_t m = 0;
-            for (; m + 16 <= M; m += 16) {
+            uint32_t m = m0;
+            for (; m + 16 <= m1; m += 16) {
                 uint8x16_t i16 = vld1q_u8(&idx[m]);
                 int8x16_t g = vqtbl4q_s8(tbl, i16);
                 int16x8_t lo = vmovl_s8(vget_low_s8(g));
@@ -1517,13 +1532,14 @@ void pqv2_acc_csrange(
                 vst1q_f32(&acc[m+ 8], vfmaq_f32(vld1q_f32(&acc[m+ 8]), f2, scl));
                 vst1q_f32(&acc[m+12], vfmaq_f32(vld1q_f32(&acc[m+12]), f3, scl));
             }
-            for (; m < M; m++)
+            for (; m < m1; m++)
                 acc[m] += (float)lut_q[idx[m]] * lut_scale;
         }
 
-        /* L2 (pyramid) residual for this lane — only K_L2 ≤ 64 supported.
-         * Same per-lane order and gather body as the whole-tensor path. */
-        if (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64) {
+        /* L2 (pyramid) residual for this lane — only on a FULL-range call
+         * (do_l2); the threaded row-tiled path is L2-free. Same per-lane
+         * order and gather body as the whole-tensor path. */
+        if (do_l2) {
             const uint8_t *l2_idx = pqv2_l2_row_local(t, local, l2_scratch);
             pqv2_acc_csrange_l2_lane(t, xs, l2_cb, s, l2_idx, acc_l2);
         }

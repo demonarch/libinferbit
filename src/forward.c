@@ -939,6 +939,50 @@ static void drive_pf_issue_raw(ib_drive_pf_state *st, int slot,
     pthread_cond_signal(&st->req_cv_l2);
 }
 
+/* Row-split task for the threaded paged compute: each worker accumulates
+ * a disjoint output-row tile [start,end) of one lane-group into acc[].
+ * L2-free (a paged tensor with L2 takes the single-thread path). */
+typedef struct {
+    const pqv2_t *pq;
+    const float  *x;
+    const float  *cb;        /* pq->cb_fp32 */
+    float        *acc;
+    uint32_t      cs_start;  /* lane-group start (local lane 0) */
+    uint32_t      cs_count;
+} paged_csrange_task;
+
+static void paged_csrange_row_task(void *raw, int tid, int start, int end) {
+    (void)tid;
+    const paged_csrange_task *a = (const paged_csrange_task *)raw;
+    pqv2_acc_csrange(a->pq, a->x, a->cb, /*l2_cb=*/NULL,
+                     a->acc, /*acc_l2=*/NULL,
+                     a->cs_start, a->cs_count,
+                     (uint32_t)start, (uint32_t)end);
+}
+
+/* Accumulate one lane-group [lane0, lane0+gc) into acc (and acc_l2).
+ * When thread_compute, row-split the output across the model thread pool
+ * (32-aligned tiles → bit-identical, disjoint rows → no race); else run
+ * the single-thread kernel. thread_compute is only set for L2-free
+ * tensors, so the threaded path never touches L2. */
+static inline void paged_compute_group(const inferbit_model *m, pqv2_t *pq,
+                                       const float *x, float *acc, float *acc_l2,
+                                       int has_l2, uint32_t lane0, uint32_t gc,
+                                       uint32_t M, int thread_compute) {
+    if (thread_compute) {
+        paged_csrange_task ta = { pq, x, pq->cb_fp32, acc, lane0, gc };
+        int nt = m->num_threads;
+        uint32_t chunk = (M + (uint32_t)nt - 1) / (uint32_t)nt;
+        chunk = (chunk + 31u) & ~31u;          /* 32-align for the K256 stride */
+        if (chunk < 32u) chunk = 32u;
+        ib_pool_run(m->thread_pool, paged_csrange_row_task, &ta,
+                    (int)M, (int)chunk);
+    } else {
+        pqv2_acc_csrange(pq, x, pq->cb_fp32, has_l2 ? pq->l2_cb_fp32 : NULL,
+                         acc, acc_l2, lane0, gc, 0, M);
+    }
+}
+
 /* ── Peak-RAM PAGED drive matmul ────────────────────────────────────
  *
  * For tensors whose total L1 index bytes exceed the (capped) scratch
@@ -1051,6 +1095,27 @@ static int drive_paged_matvec(const inferbit_model *m,
     memset(acc, 0, (size_t)M * sizeof(float));
     if (acc_l2) memset(acc_l2, 0, (size_t)M * sizeof(float));
 
+    /* Thread the paged compute by row-splitting each lane-group across the
+     * model thread pool. Gated on:
+     *   - L2-free tensor (the row-tiled kernel is L2-free by construction,
+     *     so pyramid FFN (L2) groups stay single-threaded);
+     *   - M >= 512 (amortise dispatch);
+     *   - the in-focus slot is CACHE-RESIDENT (slot_size <= 4 MB) → the
+     *     per-group gather is COMPUTE-bound and parallelises well. At large
+     *     caps (e.g. the default 8 MB) only lm_head pages and it is
+     *     I/O-bound — the prefetch pipeline already hides its compute, so
+     *     threading there only adds dispatch overhead (measured -3%). The
+     *     win is at aggressive caps (cap<=4: flat +27% at cap=4) where the
+     *     FFN pages into cache-sized slots. */
+    int thread_compute = (!has_l2 && m->thread_pool && m->num_threads > 1 &&
+                          M >= 512 && slot_size <= (4u << 20));
+    /* A/B + safety knob: IB_PAGE_NOTHREAD=1 forces single-thread paged
+     * compute (isolates the threading win; also a fallback). */
+    {
+        const char *e = getenv("IB_PAGE_NOTHREAD");
+        if (e && e[0] == '1') thread_compute = 0;
+    }
+
     /* Drain any in-flight whole-tensor prefetch before reusing the slots
      * (avoids racing the prefetch worker on scratch[]). */
     ib_drive_pf_state *st = drive_pf_get(m);
@@ -1111,8 +1176,8 @@ static int drive_paged_matvec(const inferbit_model *m,
 
             pq->indices = (const uint8_t *)slot_l1[slot];
             if (has_l2) pq->l2_indices = (const uint8_t *)slot_l2[slot];
-            pqv2_acc_csrange(pq, x, pq->cb_fp32, has_l2 ? pq->l2_cb_fp32 : NULL,
-                             acc, acc_l2, (uint32_t)lane0, (uint32_t)gc);
+            paged_compute_group(m, pq, x, acc, acc_l2, has_l2,
+                                (uint32_t)lane0, (uint32_t)gc, M, thread_compute);
         }
 
         /* Restore clean ring state: clear the raw flag + stale done_tensor
@@ -1144,8 +1209,8 @@ static int drive_paged_matvec(const inferbit_model *m,
                 }
                 pq->l2_indices = (const uint8_t *)l2dst;
             }
-            pqv2_acc_csrange(pq, x, pq->cb_fp32, has_l2 ? pq->l2_cb_fp32 : NULL,
-                             acc, acc_l2, (uint32_t)lane0, (uint32_t)gc);
+            paged_compute_group(m, pq, x, acc, acc_l2, has_l2,
+                                (uint32_t)lane0, (uint32_t)gc, M, thread_compute);
 #if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
             (void)posix_fadvise(m->drive_fd, off + (off_t)(lane0 * lane_bytes),
                                 (off_t)l1_bytes, POSIX_FADV_DONTNEED);

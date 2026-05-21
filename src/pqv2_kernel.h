@@ -244,12 +244,21 @@ void pqv2_acc_tbl_int8_k256_chunks_batch(
  * Handles every K (256 / 128 / ≤64) and the L2 (l2_K ≤ 64) residual via
  * the same build_lut_* helpers and NEON gather bodies as the whole-tensor
  * kernels. cb / l2_cb are the fp32 codebooks (t->cb_fp32 / t->l2_cb_fp32);
- * pass l2_cb=NULL and acc_l2=NULL for flat tensors. */
+ * pass l2_cb=NULL and acc_l2=NULL for flat tensors.
+ *
+ * [m0, m1) is the OUTPUT-ROW window to accumulate (clamped to [0, M)).
+ * Whole-tensor / single-thread callers pass (0, M). The threaded paged
+ * path row-splits a lane-group across the pool, passing 32-aligned tiles
+ * so each thread owns a disjoint acc[] range (no race, no reduction) and
+ * the vectorised blocks land on the same boundaries as the single-thread
+ * kernel (bit-identical). The L2 residual is accumulated ONLY on a
+ * full-range call (m0==0 && m1==M); pass l2_cb=NULL for tiled calls. */
 void pqv2_acc_csrange(
     const pqv2_t *t, const float *x,
     const float *cb, const float *l2_cb,
     float *acc, float *acc_l2,
-    uint32_t cs_start, uint32_t cs_count);
+    uint32_t cs_start, uint32_t cs_count,
+    uint32_t m0, uint32_t m1);
 
 /* fp16 helpers (IEEE half) */
 float pqv2_h2f(uint16_t h);
