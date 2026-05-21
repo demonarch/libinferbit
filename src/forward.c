@@ -499,6 +499,16 @@ typedef struct ib_drive_pf_state {
     int             req_in_flight_l1;   /* 1 between L1 dequeue and completion */
     int             req_in_flight_l2;   /* 1 between L2 dequeue and completion */
     int             req_ok_l1;          /* set by L1 worker on success */
+    /* Raw byte-range request mode (drive_paged_matvec lane-group pipeline).
+     * When req_raw != 0 the workers pread the explicit file ranges below
+     * into scratch[req_slot] / l2_scratch[req_slot] instead of deriving the
+     * range from req_tensor. req_raw_l2_len == 0 => skip L2 for this group.
+     * Every issue site sets req_raw (raw issues =1, tensor issues =0). */
+    int             req_raw;
+    off_t           req_raw_l1_off;
+    size_t          req_raw_l1_len;
+    off_t           req_raw_l2_off;
+    size_t          req_raw_l2_len;
     /* Result of the most recently completed request. */
     const ib_tensor_meta *done_tensor;
     int             done_slot;
@@ -553,12 +563,20 @@ static void *ib_drive_pf_worker(void *arg) {
         if (st->stop) break;
         const ib_tensor_meta *t = st->req_tensor;
         int slot = st->req_slot;
+        int raw = st->req_raw;
+        off_t raw_off = st->req_raw_l1_off;
+        size_t raw_len = st->req_raw_l1_len;
         st->req_pending_l1 = 0;
         st->req_in_flight_l1 = 1;
         pthread_mutex_unlock(&st->mu);
 
         int ok = 0;
-        if (t && t->pq && slot >= 0 && slot < 2 && st->scratch[slot]) {
+        if (raw) {
+            if (slot >= 0 && slot < 2 && st->scratch[slot] &&
+                raw_len > 0 && raw_len <= st->scratch_size) {
+                ok = drive_pread_full(st->fd, st->scratch[slot], raw_len, raw_off);
+            }
+        } else if (t && t->pq && slot >= 0 && slot < 2 && st->scratch[slot]) {
             const pqv2_t *pq = t->pq;
             size_t bytes = (size_t)pq->M * (pq->N / pq->G) * pq->n_subchunks;
             off_t off = (off_t)pq->indices_file_offset;
@@ -572,10 +590,12 @@ static void *ib_drive_pf_worker(void *arg) {
         st->req_in_flight_l1 = 0;
         /* Publish result only when BOTH workers have finished. The last
          * one to finish wins the publish; the other waits on its own cv
-         * for the next request. */
+         * for the next request. Raw (lane-group) requests never publish a
+         * done_tensor — the paged loop waits on the idle flags, and a stale
+         * tensor here could be mis-read as a prefetched whole tensor. */
         if (!st->req_in_flight_l2 && !st->req_pending_l2) {
-            st->done_tensor = ok ? t : NULL;
-            st->done_slot = ok ? slot : -1;
+            st->done_tensor = (ok && !raw) ? t : NULL;
+            st->done_slot = (ok && !raw) ? slot : -1;
             pthread_cond_broadcast(&st->done_cv);
         }
     }
@@ -598,11 +618,20 @@ static void *ib_drive_pf_worker_l2(void *arg) {
         if (st->stop) break;
         const ib_tensor_meta *t = st->req_tensor;
         int slot = st->req_slot;
+        int raw = st->req_raw;
+        off_t raw_off = st->req_raw_l2_off;
+        size_t raw_len = st->req_raw_l2_len;
         st->req_pending_l2 = 0;
         st->req_in_flight_l2 = 1;
         pthread_mutex_unlock(&st->mu);
 
-        if (t && t->pq && slot >= 0 && slot < 2 &&
+        if (raw) {
+            if (raw_len > 0 && slot >= 0 && slot < 2 &&
+                st->l2_scratch[slot] && raw_len <= st->l2_scratch_size) {
+                (void)drive_pread_full(st->fd, st->l2_scratch[slot],
+                                       raw_len, raw_off);
+            }
+        } else if (t && t->pq && slot >= 0 && slot < 2 &&
             st->l2_scratch[slot] && t->pq->l2_kind == 2 &&
             t->pq->l2_indices_file_offset != 0) {
             const pqv2_t *pq = t->pq;
@@ -618,9 +647,9 @@ static void *ib_drive_pf_worker_l2(void *arg) {
         st->req_in_flight_l2 = 0;
         if (!st->req_in_flight_l1 && !st->req_pending_l1) {
             /* L1 worker already finished — publish the result it left in
-             * req_ok_l1. */
-            st->done_tensor = st->req_ok_l1 ? t : NULL;
-            st->done_slot = st->req_ok_l1 ? slot : -1;
+             * req_ok_l1. Raw lane-group requests never publish a tensor. */
+            st->done_tensor = (st->req_ok_l1 && !raw) ? t : NULL;
+            st->done_slot = (st->req_ok_l1 && !raw) ? slot : -1;
             pthread_cond_broadcast(&st->done_cv);
         }
     }
@@ -715,6 +744,7 @@ static ib_drive_pf_state *drive_pf_get(const inferbit_model *m) {
         pthread_mutex_lock(&st->mu);
         st->req_tensor = mm->drive_pq_order[0];
         st->req_slot = 0;
+        st->req_raw = 0;
         st->req_ok_l1 = 0;
         st->req_pending_l1 = 1;
         st->req_pending_l2 = 1;
@@ -872,6 +902,7 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
         pthread_mutex_lock(&st->mu);
         st->req_tensor = t_next;
         st->req_slot = next_slot;
+        st->req_raw = 0;
         st->req_ok_l1 = 0;
         st->req_pending_l1 = 1;
         st->req_pending_l2 = 1;
@@ -886,6 +917,26 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
     (void)posix_fadvise(m->drive_fd, off, (off_t)bytes, POSIX_FADV_DONTNEED);
 #endif
     return 0;
+}
+
+/* Issue a raw lane-group prefetch into `slot`: L1 [l1_off, l1_len) and,
+ * when l2_len>0, L2 [l2_off, l2_len). Caller MUST hold st->mu and have
+ * ensured the ring is idle (no pending/in-flight request). Wakes both
+ * workers; they pread in parallel into scratch[slot] / l2_scratch[slot]. */
+static void drive_pf_issue_raw(ib_drive_pf_state *st, int slot,
+                               off_t l1_off, size_t l1_len,
+                               off_t l2_off, size_t l2_len) {
+    st->req_raw = 1;
+    st->req_slot = slot;
+    st->req_raw_l1_off = l1_off;
+    st->req_raw_l1_len = l1_len;
+    st->req_raw_l2_off = l2_off;
+    st->req_raw_l2_len = l2_len;
+    st->req_ok_l1 = 0;
+    st->req_pending_l1 = 1;
+    st->req_pending_l2 = 1;
+    pthread_cond_signal(&st->req_cv);
+    pthread_cond_signal(&st->req_cv_l2);
 }
 
 /* ── Peak-RAM PAGED drive matmul ────────────────────────────────────
@@ -1001,7 +1052,7 @@ static int drive_paged_matvec(const inferbit_model *m,
     if (acc_l2) memset(acc_l2, 0, (size_t)M * sizeof(float));
 
     /* Drain any in-flight whole-tensor prefetch before reusing the slots
-     * synchronously (avoids racing the prefetch worker on scratch[]). */
+     * (avoids racing the prefetch worker on scratch[]). */
     ib_drive_pf_state *st = drive_pf_get(m);
     if (st) {
         pthread_mutex_lock(&st->mu);
@@ -1016,49 +1067,90 @@ static int drive_paged_matvec(const inferbit_model *m,
     void *slot_l2[2]  = { m->drive_l2_indices_scratch,
                           m->drive_l2_indices_scratch2 };
     int have_slot1 = (slot_l1[1] != NULL);
+    /* Pipelining needs the 2-slot ring AND, for pyramid, both L2 slots so
+     * the next group's L2 can land in the OTHER slot while we compute. */
+    int can_pipeline = (st && have_slot1 &&
+                        (!has_l2 || (slot_l2[0] && slot_l2[1])));
 
-    int gi = 0;   /* alternating slot index (slot ping-pong) */
-    for (size_t lane0 = 0; lane0 < total_lanes; lane0 += lanes_per_group) {
-        size_t gc = lanes_per_group;
-        if (lane0 + gc > total_lanes) gc = total_lanes - lane0;
-        int slot = (have_slot1 ? (gi & 1) : 0);
-        gi++;
+    if (can_pipeline) {
+        /* ── Pipelined: prefetch group g+1 (into the other slot) while the
+         * kernel accumulates group g. Only one request is ever in flight;
+         * the 2-slot ping-pong guarantees the in-flight slot != the slot
+         * being read, so there is no scratch race. L1 and L2 of a group
+         * are pread in parallel by the two ring workers. */
+        size_t gc0 = (lanes_per_group < total_lanes) ? lanes_per_group
+                                                     : total_lanes;
+        pthread_mutex_lock(&st->mu);
+        drive_pf_issue_raw(st, /*slot=*/0,
+                           off, gc0 * lane_bytes,
+                           has_l2 ? l2_off : 0,
+                           has_l2 ? gc0 * l2_row : 0);
+        pthread_mutex_unlock(&st->mu);
 
-        /* L1: one contiguous pread of gc lanes into the chosen slot. */
-        size_t l1_bytes = gc * lane_bytes;
-        if (!drive_pread_full(m->drive_fd, slot_l1[slot], l1_bytes,
-                              off + (off_t)(lane0 * lane_bytes))) {
-            return 0;   /* I/O error → bail; caller's path will report it */
-        }
-        pq->indices = (const uint8_t *)slot_l1[slot];
+        int gi = 0;
+        for (size_t lane0 = 0; lane0 < total_lanes;
+             lane0 += lanes_per_group, gi++) {
+            size_t gc = lanes_per_group;
+            if (lane0 + gc > total_lanes) gc = total_lanes - lane0;
+            int slot = gi & 1;
 
-        /* L2: matching contiguous slice into the L2 slot. */
-        if (has_l2) {
-            size_t l2_bytes = gc * l2_row;
-            void *l2dst = slot_l2[have_slot1 ? slot : 0];
-            /* l2dst is guaranteed non-NULL here (L2 ring slots are
-             * allocated as a pair at setup, and the has_l2 guard above
-             * required slot 0). Bail rather than drop the residual if a
-             * future change ever leaves it NULL — never silently corrupt
-             * a pyramid result by paging only part of its L2. */
-            if (!l2dst) return 0;
-            if (!drive_pread_full(m->drive_fd, l2dst, l2_bytes,
-                                  l2_off + (off_t)(lane0 * l2_row))) {
-                return 0;
+            pthread_mutex_lock(&st->mu);
+            pf_wait_idle_locked(st);          /* group gi ready in `slot` */
+            /* Kick the NEXT group into the other slot, overlapping compute. */
+            size_t lane0_n = lane0 + lanes_per_group;
+            if (lane0_n < total_lanes) {
+                size_t gc_n = lanes_per_group;
+                if (lane0_n + gc_n > total_lanes) gc_n = total_lanes - lane0_n;
+                drive_pf_issue_raw(st, /*slot=*/(gi + 1) & 1,
+                                   off + (off_t)(lane0_n * lane_bytes),
+                                   gc_n * lane_bytes,
+                                   has_l2 ? l2_off + (off_t)(lane0_n * l2_row) : 0,
+                                   has_l2 ? gc_n * l2_row : 0);
             }
-            pq->l2_indices = (const uint8_t *)l2dst;
+            pthread_mutex_unlock(&st->mu);
+
+            pq->indices = (const uint8_t *)slot_l1[slot];
+            if (has_l2) pq->l2_indices = (const uint8_t *)slot_l2[slot];
+            pqv2_acc_csrange(pq, x, pq->cb_fp32, has_l2 ? pq->l2_cb_fp32 : NULL,
+                             acc, acc_l2, (uint32_t)lane0, (uint32_t)gc);
         }
 
-        /* Accumulate this lane-group's partials. Lane lane0 is local
-         * lane 0 in the scratch slot (csrange rebases indexing). */
-        pqv2_acc_csrange(pq, x, pq->cb_fp32, has_l2 ? pq->l2_cb_fp32 : NULL,
-                         acc, acc_l2,
-                         (uint32_t)lane0, (uint32_t)gc);
-
+        /* Restore clean ring state: clear the raw flag + stale done_tensor
+         * so the next whole-tensor matmul's prefetch logic starts fresh. */
+        pthread_mutex_lock(&st->mu);
+        pf_wait_idle_locked(st);
+        st->req_raw = 0;
+        st->done_tensor = NULL;
+        st->done_slot = -1;
+        pthread_mutex_unlock(&st->mu);
+    } else {
+        /* ── Synchronous fallback (prefetcher unavailable / single slot) ──
+         * Pread each lane-group then compute it. Uses slot 0 only. */
+        for (size_t lane0 = 0; lane0 < total_lanes; lane0 += lanes_per_group) {
+            size_t gc = lanes_per_group;
+            if (lane0 + gc > total_lanes) gc = total_lanes - lane0;
+            size_t l1_bytes = gc * lane_bytes;
+            if (!drive_pread_full(m->drive_fd, slot_l1[0], l1_bytes,
+                                  off + (off_t)(lane0 * lane_bytes))) {
+                return 0;   /* I/O error → bail */
+            }
+            pq->indices = (const uint8_t *)slot_l1[0];
+            if (has_l2) {
+                void *l2dst = slot_l2[0];
+                if (!l2dst) return 0;   /* never drop a pyramid residual */
+                if (!drive_pread_full(m->drive_fd, l2dst, gc * l2_row,
+                                      l2_off + (off_t)(lane0 * l2_row))) {
+                    return 0;
+                }
+                pq->l2_indices = (const uint8_t *)l2dst;
+            }
+            pqv2_acc_csrange(pq, x, pq->cb_fp32, has_l2 ? pq->l2_cb_fp32 : NULL,
+                             acc, acc_l2, (uint32_t)lane0, (uint32_t)gc);
 #if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
-        (void)posix_fadvise(m->drive_fd, off + (off_t)(lane0 * lane_bytes),
-                            (off_t)l1_bytes, POSIX_FADV_DONTNEED);
+            (void)posix_fadvise(m->drive_fd, off + (off_t)(lane0 * lane_bytes),
+                                (off_t)l1_bytes, POSIX_FADV_DONTNEED);
 #endif
+        }
     }
 
     /* Final reduction: apply row_scale once + fold in the L2 residual. */
