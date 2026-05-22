@@ -618,10 +618,13 @@ typedef struct {
     int kind;          /* IB_PQV2_KIND_* */
     int ndim;
     int32_t shape[4];
-    /* Blob: built into a heap buffer, written at finalization. */
+    /* Blob. Incremental-write mode: streamed to the manifest temp file at
+     * `blob_tmp_off` and freed immediately (blob == NULL). Fallback (no
+     * temp file): kept in this heap buffer, written at finalization. */
     void *blob;
     size_t blob_size;
-    /* Allocated offset (filled in pass 2). */
+    uint64_t blob_tmp_off;   /* offset in mf->tmp when blob streamed (blob==NULL) */
+    /* Allocated offset in the final file (filled in pass 2). */
     uint64_t blob_offset;
 } ib6_entry;
 
@@ -629,6 +632,14 @@ typedef struct {
     ib6_entry *entries;
     int n;
     int cap;
+    /* Incremental-write spool: blobs are streamed here as they are encoded
+     * so peak RAM is one tensor, not the whole IBF (essential for large
+     * models on modest hardware). write_ibf6_file copies them into the
+     * final file. Lives on the OUTPUT volume so it never fills the boot
+     * disk. NULL => legacy in-RAM mode (blobs kept in ib6_entry.blob). */
+    FILE   *tmp;
+    uint64_t tmp_pos;
+    char    tmp_path[1024];
 } ib6_manifest;
 
 static int ib6_push(ib6_manifest *mf, const char *name, int kind, int ndim,
@@ -653,9 +664,23 @@ static int ib6_push(ib6_manifest *mf, const char *name, int kind, int ndim,
     e->kind = kind;
     e->ndim = ndim;
     for (int i = 0; i < 4; i++) e->shape[i] = shape[i];
-    e->blob = blob;
     e->blob_size = blob_size;
     e->blob_offset = 0;
+    e->blob_tmp_off = 0;
+    if (mf->tmp) {
+        /* Incremental write: spool this blob to the temp file now and free
+         * it, so the manifest never holds more than one tensor in RAM. */
+        e->blob_tmp_off = mf->tmp_pos;
+        if (blob_size > 0 &&
+            fwrite(blob, 1, blob_size, mf->tmp) != blob_size) {
+            free(blob); free(e->name); mf->n--; return -1;
+        }
+        mf->tmp_pos += blob_size;
+        free(blob);
+        e->blob = NULL;
+    } else {
+        e->blob = blob;   /* legacy in-RAM mode (small models / temp unavailable) */
+    }
     return 0;
 }
 
@@ -663,9 +688,11 @@ static void ib6_free(ib6_manifest *mf) {
     if (!mf) return;
     for (int i = 0; i < mf->n; i++) {
         free(mf->entries[i].name);
-        free(mf->entries[i].blob);
+        free(mf->entries[i].blob);   /* NULL in incremental mode — free(NULL) is safe */
     }
     free(mf->entries);
+    if (mf->tmp) fclose(mf->tmp);
+    if (mf->tmp_path[0]) remove(mf->tmp_path);   /* delete the blob spool */
     memset(mf, 0, sizeof(*mf));
 }
 
@@ -1973,6 +2000,9 @@ static int write_ibf6_file(const char *path, ib6_manifest *mf,
             pad -= chunk;
         }
     }
+    /* Incremental mode: flush the spool so we can read blobs back from it. */
+    if (mf->tmp) fflush(mf->tmp);
+    static uint8_t copybuf[1u << 20];   /* 1 MiB spool→final copy buffer */
     for (int i = 0; i < mf->n; i++) {
         const ib6_entry *e = &mf->entries[i];
         long pos = ftell(f);
@@ -1986,7 +2016,22 @@ static int write_ibf6_file(const char *path, ib6_manifest *mf,
                 pad -= chunk;
             }
         }
-        if (fwrite(e->blob, 1, e->blob_size, f) != e->blob_size) goto wfail;
+        if (e->blob) {
+            /* Legacy in-RAM blob. */
+            if (fwrite(e->blob, 1, e->blob_size, f) != e->blob_size) goto wfail;
+        } else if (e->blob_size > 0) {
+            /* Incremental: copy this blob from the temp spool in chunks so
+             * peak RAM stays at one copy buffer, not the whole tensor. */
+            if (!mf->tmp) goto wfail;
+            if (fseeko(mf->tmp, (off_t)e->blob_tmp_off, SEEK_SET) != 0) goto wfail;
+            size_t remain = e->blob_size;
+            while (remain > 0) {
+                size_t chunk = remain > sizeof(copybuf) ? sizeof(copybuf) : remain;
+                if (fread(copybuf, 1, chunk, mf->tmp) != chunk) goto wfail;
+                if (fwrite(copybuf, 1, chunk, f) != chunk) goto wfail;
+                remain -= chunk;
+            }
+        }
         /* trailing pad up to alignment for the NEXT blob is handled by
          * the leading-pad logic above on the next iteration. */
     }
@@ -2291,6 +2336,40 @@ int pqv2_convert(const char *input_path,
     (void)intermediate;
 
     ib6_manifest mf; memset(&mf, 0, sizeof(mf));
+
+    /* Incremental-write blob spool on the OUTPUT volume. Blobs stream here
+     * as they're encoded and are freed immediately, so peak converter RAM
+     * is ONE tensor instead of the whole IBF — which is what lets large
+     * models (e.g. 70B) convert on a modest-RAM machine. write_ibf6_file
+     * copies the spool into the final file. Placed next to the output so a
+     * cross-volume convert never fills the boot disk. IB_NO_BLOB_SPOOL=1
+     * forces the legacy in-RAM writer (A/B verification + fallback). */
+    if (!getenv("IB_NO_BLOB_SPOOL")) {
+        /* Spool location. Default: next to the output (same volume → the
+         * final copy is same-volume). IB_BLOB_SPOOL_DIR=<dir> overrides it
+         * (e.g. put the spool on a big external while the final IBF lands
+         * on a smaller internal — the output volume then needs only 1x the
+         * IBF size, not 2x). */
+        const char *spool_dir = getenv("IB_BLOB_SPOOL_DIR");
+        int pl;
+        if (spool_dir && spool_dir[0]) {
+            const char *base = strrchr(output_path, '/');
+            base = base ? base + 1 : output_path;
+            pl = snprintf(mf.tmp_path, sizeof(mf.tmp_path),
+                          "%s/%s.blobtmp", spool_dir, base);
+        } else {
+            pl = snprintf(mf.tmp_path, sizeof(mf.tmp_path),
+                          "%s.blobtmp", output_path);
+        }
+        if (pl > 0 && pl < (int)sizeof(mf.tmp_path))
+            mf.tmp = fopen(mf.tmp_path, "wb+");
+        if (!mf.tmp) {
+            mf.tmp_path[0] = '\0';
+            fprintf(stderr, "ib pqv2: blob spool unavailable (%s) "
+                            "— using in-RAM writer (peak RAM = full IBF)\n",
+                    spool_dir && spool_dir[0] ? spool_dir : output_path);
+        }
+    }
 
     /* Embedding — PQv2 flat (Stage 5f). Encoded as flat (pyramid=0) even
      * when the caller requested pyramid: forward.c::cpu_embed_lookup only
