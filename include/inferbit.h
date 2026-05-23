@@ -530,6 +530,70 @@ IB_API int inferbit_dflash_detach(inferbit_model* model);
 IB_API int inferbit_dflash_last_full_count(const inferbit_model* model);
 IB_API int inferbit_dflash_last_early_count(const inferbit_model* model);
 
+/* ── Burst / cool-down duty cycle (M1 scaffolding) ──────────────────
+ *
+ * A per-decode-step controller that alternates between two "compute
+ * profiles": BURST (cheap/coarse — pyramid L1-only, fewer experts,
+ * activation-skip, optional early-exit) and COOLDOWN (precise/anchoring
+ * — full L1+L2, all experts). The pyramid PQ format already carries L1
+ * (coarse) + L2 (residual); a BURST step reads L1-only, a COOLDOWN step
+ * reads L1+L2. Speculative decoding's verify pass is the cool-down anchor.
+ *
+ * M1 (this stage) ships the public surface, the controller state machine,
+ * and the metric plumbing. The kernels that consume a profile (early-exit,
+ * L1-only matmul, gate-energy expert selection, runtime KV re-quant) are
+ * filled in by later (M2) agents — every stub here delegates to the EXACT
+ * path so behaviour with the feature DISABLED (the default) is byte-
+ * identical to today. */
+
+/* Which compute profile a decode step is running under. */
+typedef enum {
+    IB_PROFILE_EXACT    = 0,   /* full L1+L2, all experts, no skip (today's path) */
+    IB_PROFILE_BURST    = 1,   /* cheap/coarse */
+    IB_PROFILE_COOLDOWN = 2,   /* precise/anchoring */
+} ib_profile_kind;
+
+/* A single compute profile — the dials a step runs with. All-zero is the
+ * EXACT profile (full depth, L1+L2, all experts, no skip), so a zero-init
+ * config carries no behaviour change. */
+typedef struct {
+    int   max_layer;          /* -1 = full depth; else run layers [0,max_layer) */
+    int   precision_tier;     /* 0 = L1+L2 exact; 1 = L1-only coarse */
+    int   mome_top_n;         /* -1 = all-K; else top-n experts by gate energy */
+    float skip_thresh_ratio;  /* 0 = off; activation-skip aggressiveness */
+    int   kv_bits;            /* 0 = unchanged; else 16/8/4 */
+    int   backend_hint;       /* 0 auto, 1 P-core+GPU, 2 E-core low-power */
+} ib_compute_profile;
+
+/* Duty-cycle controller config. `enabled = 0` (the zero-init default) keeps
+ * the feature OFF and the decode path byte-identical to today. */
+typedef struct {
+    int   enabled;            /* 0 = duty cycle off (default) */
+    int   cooldown_period;    /* force cool-down after N burst steps */
+    float accept_floor;       /* spec accept-rate below this -> cool down */
+    float margin_floor;       /* logit margin below this -> cool down */
+    int   thermal_aware;      /* reserved (M3) */
+    ib_compute_profile burst;
+    ib_compute_profile cooldown;
+} ib_burst_config;
+
+/* Attach a duty-cycle config to the model (copies cfg). Pass enabled=0 (or
+ * a NULL/zero cfg) to leave the model in the EXACT profile. */
+IB_API void inferbit_burst_attach(inferbit_model* model, const ib_burst_config* cfg);
+
+/* Force the active compute profile now (does not reload/realloc). */
+IB_API void inferbit_set_compute_profile(inferbit_model* model, ib_profile_kind kind);
+
+/* Truncated forward — run only layers [0, max_layer). M1 stub delegates to
+ * the full single-token forward (max_layer ignored); M2 wires early-exit. */
+IB_API int  inferbit_forward_truncated(inferbit_model* model, int32_t token, int pos, int max_layer, float* out_logits);
+
+/* Read the latest per-step controller metrics (any out-pointer may be NULL):
+ *   margin      — last logit top-1/top-2 margin observed.
+ *   hidden_norm — last decode-step hidden-state L2 norm.
+ *   accept_rate — EMA of the speculative accept rate. */
+IB_API void inferbit_get_step_metrics(inferbit_model* model, float* out_margin, float* out_hidden_norm, float* out_accept_rate);
+
 #ifdef __cplusplus
 }
 #endif

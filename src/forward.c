@@ -18,6 +18,81 @@
 #endif
 
 #include "mome.h"
+#include "sparse_gate.h"   /* training-free sparse-FFN cluster gate (BURST draft) */
+
+/* ── Training-free sparse-FFN cluster dispatch (BURST draft only) ──────
+ *
+ * On a CLUSTERED layer (ffn_n_clusters > 1) running under the BURST
+ * compute profile, the FFN intermediate dim was permuted at convert so
+ * each cluster owns a CONTIGUOUS output-row range of gate/up and the
+ * matching input-column range of down. sparse_gate_select() scores the
+ * post-attn-norm hidden vector against the per-cluster centroids and
+ * returns the active clusters; we then compute gate/up ONLY for those
+ * clusters' row ranges, leave the rest of the intermediate at zero, run
+ * silu_mul on the active rows, and run down_proj over the (mostly-zero)
+ * intermediate (multiply-by-zero on inactive cols => correct draft).
+ *
+ * This is the DRAFT half of the self-speculative loop: it need not be
+ * exact — the COOLDOWN verify (which runs EXACT, never sparse) corrects
+ * the emitted tokens. The invariant: when a layer has no clusters
+ * (ffn_n_clusters <= 1) OR the active profile is NOT BURST, this whole
+ * block is bypassed and the FFN runs every row exactly as before
+ * (byte-identical).
+ *
+ * Env knobs (read once, cached):
+ *   IB_FFN_THRESH  float, |silu(dot(x,centroid))| threshold for keeping a
+ *                  cluster. Default 0.0 (keep nothing on threshold alone;
+ *                  selection then falls to the top_min floor).
+ *   IB_FFN_TOPMIN  int, minimum clusters to keep. Default -1 => use
+ *                  max(1, n_clusters/4) per layer.
+ *   IB_FFN_LOG     when set, accumulate mean active-cluster fraction and
+ *                  print a one-line summary at generation end.
+ */
+#define IB_FFN_MAXK 256   /* max clusters supported per layer (stack active[]) */
+
+static float ffn_gate_thresh(void) {
+    static float cached = -1e30f;
+    if (cached < -1e29f) {
+        const char* e = getenv("IB_FFN_THRESH");
+        cached = (e && e[0]) ? (float)atof(e) : 0.0f;
+    }
+    return cached;
+}
+/* Returns the configured top_min, or -1 meaning "derive per-layer as
+ * max(1, n_clusters/4)". */
+static int ffn_top_min_cfg(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char* e = getenv("IB_FFN_TOPMIN");
+        cached = (e && e[0]) ? atoi(e) : -1;
+    }
+    return cached;
+}
+/* Telemetry accumulators for IB_FFN_LOG (mean active-cluster fraction). */
+static double  g_ffn_active_frac_sum = 0.0;
+static uint64_t g_ffn_gate_calls     = 0;
+
+/* Print the sparse-FFN active-cluster telemetry. Registered via atexit when
+ * IB_FFN_LOG is set (so we need not edit generate.c to hook generation end).
+ * No-op when the gate never ran. */
+static void ffn_log_atexit(void) {
+    if (g_ffn_gate_calls == 0) return;
+    double mean = g_ffn_active_frac_sum / (double)g_ffn_gate_calls;
+    fprintf(stderr,
+            "[ib_ffn] sparse-FFN gate: %llu calls, mean active-cluster "
+            "fraction = %.3f (%.1f%% of FFN clusters computed)\n",
+            (unsigned long long)g_ffn_gate_calls, mean, mean * 100.0);
+}
+
+static int ffn_log_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("IB_FFN_LOG");
+        cached = (e && e[0]) ? 1 : 0;
+        if (cached) atexit(ffn_log_atexit);
+    }
+    return cached;
+}
 
 /* W4A8 path is on by default. Set IB_W4A8=0 in env to force the FP32
  * activation fallback (used for A/B comparison and debugging). */
@@ -175,19 +250,40 @@ int ib_hotset_enabled(void) {
     return cached;
 }
 
+/* Real hot-pool bodies live in ibf_loader.c as *_impl (named to avoid a
+ * duplicate-symbol clash with these canonical entry points). Redirect to them.
+ * Both impls are strict no-ops when the pool is disabled (hot_pool == NULL /
+ * cap == 0), so with IB_HOT_POOL_MB unset this is byte-identical to the old
+ * stub: lookup → NULL, promote → 1 ("not promoted"). */
+extern const void *ib_hot_lookup_impl(const inferbit_model *m, const ib_tensor_meta *t);
+extern const void *ib_hot_lookup_key(const inferbit_model *m, size_t key);
+extern int ib_hot_promote_impl(inferbit_model *m, const ib_tensor_meta *t);
+extern int ib_hot_promote_bytes(inferbit_model *m, size_t key,
+                                const void *src, size_t nbytes);
+extern void *ib_hot_reserve(inferbit_model *m, size_t key, size_t nbytes);
+
+/* Hot-pool keys are the on-disk file offsets of the index streams:
+ * pq->indices_file_offset for L1, pq->l2_indices_file_offset for L2. These are
+ * unique and nonzero per tensor in drive mode (t->offset is 0/unused there, so
+ * it must NOT be used as a key — doing so collides every tensor onto key 0). */
+
+/* Forward decls — defined later in this file but called by the drive-mode
+ * resident fast-path in drive_paged_matvec (above their definitions). */
+static void pqv2_matvec_dispatch(const pqv2_t *t, const float *x, float *y);
+static void pqv2_threaded_matvec_k256(const inferbit_model *m,
+                                      struct ib_thread_pool *tp, int n_threads,
+                                      const pqv2_t *t, const float *x, float *y);
+static void pqv2_threaded_matvec_k256_batch(const inferbit_model *m,
+                                            struct ib_thread_pool *tp, int n_threads,
+                                            const pqv2_t *t, const float *x_batch,
+                                            int B, float *y_batch);
+
 const void *ib_hot_lookup(const inferbit_model *m, const ib_tensor_meta *t) {
-    /* Stub: no promotion logic yet, so nothing is ever in the pool. */
-    (void)m; (void)t;
-    return NULL;
+    return ib_hot_lookup_impl(m, t);
 }
 
 int ib_hot_promote(inferbit_model *m, const ib_tensor_meta *t) {
-    /* Stub: deliberately a no-op. When the adaptive policy lands this
-     * will memcpy the tensor's bytes into m->hot_pool and bookkeep an
-     * (offset → hot-pool slot) mapping. Returning non-zero signals
-     * "not promoted" to callers that want to fall back. */
-    (void)m; (void)t;
-    return 1;
+    return ib_hot_promote_impl(m, t);
 }
 
 /* Walk every ib_tensor_meta the model owns and visit it via `fn`.
@@ -853,11 +949,54 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
     off_t off = (off_t)pq->indices_file_offset;
     if (off == 0) return 0;     /* not redirected; mmap'd path */
 
+    /* L2 (pyramid residual) presence + size for this tensor. */
+    int t_has_l2 = (pq->l2_kind == 2 && pq->l2_indices_file_offset != 0 &&
+                    m->drive_l2_indices_scratch != NULL);
+    size_t l2_bytes = 0;
+    if (t_has_l2) {
+        l2_bytes = drive_l2_indices_bytes(pq);
+        if (l2_bytes == 0 || l2_bytes > m->drive_l2_indices_scratch_size)
+            t_has_l2 = 0;   /* can't cache L2 → fall through to normal stream */
+    }
+
+    /* ── RAM-residency throttle (the "burst"): serve from RAM when this tensor's
+     * L1 indices — AND, for pyramid, its L2 residual indices — are resident in
+     * the hot-pool, then skip the disk stream + prefetch entirely. Cached bytes
+     * are identical to streamed bytes → BIT-EXACT; only residency/speed change,
+     * never the output. The pool fills on misses (promote below); its size IS
+     * the dial (IB_HOT_POOL_MB → more tensors served from RAM → fewer disk
+     * reads → faster, at exact quality). The arena copies are stable for this
+     * matmul (a later promote/compaction runs only on a future miss). NOTE:
+     * both L1 and L2 must be resident before short-circuiting — otherwise
+     * pq->l2_indices would be left pointing at a stale scratch slot. */
+    {
+        const void *hotL1 = ib_hot_lookup_key(m, (size_t)off);
+        const void *hotL2 = t_has_l2
+            ? ib_hot_lookup_key(m, (size_t)pq->l2_indices_file_offset)
+            : (const void *)1;   /* flat: no L2 to serve */
+        if (hotL1 && hotL2) {
+            ((pqv2_t *)pq)->indices = (const uint8_t *)hotL1;
+            if (t_has_l2) ((pqv2_t *)pq)->l2_indices = (const uint8_t *)hotL2;
+            return 0;
+        }
+    }
+
     ib_drive_pf_state *st = drive_pf_get(m);
     if (!st) {
         /* Prefetcher unavailable → legacy synchronous path into slot 0. */
         int rc = drive_sync_load_to_slot(m, t, 0);
-        if (rc == 0) drive_repoint_indices(m, t, 0);
+        if (rc == 0) {
+            drive_repoint_indices(m, t, 0);
+            /* Promote the just-streamed L1 (and L2) indices into the RAM
+             * hot-pool so the next token serves them from RAM (bit-exact).
+             * pq->indices / pq->l2_indices now point at scratch slot 0. */
+            (void)ib_hot_promote_bytes((inferbit_model *)m, (size_t)off,
+                                       (const void *)pq->indices, bytes);
+            if (t_has_l2)
+                (void)ib_hot_promote_bytes((inferbit_model *)m,
+                                           (size_t)pq->l2_indices_file_offset,
+                                           (const void *)pq->l2_indices, l2_bytes);
+        }
 #if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
         (void)posix_fadvise(m->drive_fd, off, (off_t)bytes, POSIX_FADV_DONTNEED);
 #endif
@@ -889,6 +1028,17 @@ static int drive_load_indices(const inferbit_model* m, const ib_tensor_meta* t) 
         ready_slot = 0;
     }
     drive_repoint_indices(m, t, ready_slot);
+
+    /* Promote the just-streamed L1 (and L2) indices into the RAM hot-pool
+     * (bit-exact) BEFORE kicking the next prefetch — pq->indices/l2_indices
+     * point at scratch `ready_slot`, which the next prefetch (other slot) won't
+     * touch, so the copy is stable. Next token's lookup hits and skips disk. */
+    (void)ib_hot_promote_bytes((inferbit_model *)m, (size_t)off,
+                               (const void *)pq->indices, bytes);
+    if (t_has_l2)
+        (void)ib_hot_promote_bytes((inferbit_model *)m,
+                                   (size_t)pq->l2_indices_file_offset,
+                                   (const void *)pq->l2_indices, l2_bytes);
 
     /* Kick the prefetch for the NEXT tensor in decode order, into the
      * OTHER slot. If t isn't in the order list (sparse / output_head
@@ -953,6 +1103,7 @@ typedef struct {
     float        *acc_l2;    /* or NULL (flat) */
     uint32_t      cs_start;  /* lane-group start (local lane 0) */
     uint32_t      cs_count;
+    int           use_l2;    /* burst: 0 = L1-only (skip L2 unpack+gather) */
 } paged_csrange_task;
 
 static void paged_csrange_row_task(void *raw, int tid, int start, int end) {
@@ -961,7 +1112,8 @@ static void paged_csrange_row_task(void *raw, int tid, int start, int end) {
     pqv2_acc_csrange(a->pq, a->x, a->cb, a->l2_cb,
                      a->acc, a->acc_l2,
                      a->cs_start, a->cs_count,
-                     (uint32_t)start, (uint32_t)end);
+                     (uint32_t)start, (uint32_t)end,
+                     a->use_l2);   /* burst: profile-driven L1+L2 vs L1-only */
 }
 
 /* Accumulate one lane-group [lane0, lane0+gc) into acc (and acc_l2).
@@ -971,13 +1123,19 @@ static void paged_csrange_row_task(void *raw, int tid, int start, int end) {
  * tensors, so the threaded path never touches L2. */
 static inline void paged_compute_group(const inferbit_model *m, pqv2_t *pq,
                                        const float *x, float *acc, float *acc_l2,
-                                       int has_l2, uint32_t lane0, uint32_t gc,
+                                       int has_l2, int use_l2,
+                                       uint32_t lane0, uint32_t gc,
                                        uint32_t M, int thread_compute) {
+    /* `has_l2` is the structural "this tensor has a pyramid L2 residual";
+     * `use_l2` is the active profile's runtime gate (0 = L1-only burst). The
+     * kernel only reads/computes L2 when both hold. The caller has already
+     * skipped the L2 prefetch/stream when use_l2==0, so acc_l2 stays zeroed. */
+    int do_l2 = has_l2 && use_l2;
     if (thread_compute) {
         paged_csrange_task ta = { pq, x, pq->cb_fp32,
-                                  has_l2 ? pq->l2_cb_fp32 : NULL,
-                                  acc, has_l2 ? acc_l2 : NULL,
-                                  lane0, gc };
+                                  do_l2 ? pq->l2_cb_fp32 : NULL,
+                                  acc, do_l2 ? acc_l2 : NULL,
+                                  lane0, gc, use_l2 };
         int nt = m->num_threads;
         uint32_t chunk = (M + (uint32_t)nt - 1) / (uint32_t)nt;
         chunk = (chunk + 31u) & ~31u;          /* 32-align for the K256 stride */
@@ -985,8 +1143,9 @@ static inline void paged_compute_group(const inferbit_model *m, pqv2_t *pq,
         ib_pool_run(m->thread_pool, paged_csrange_row_task, &ta,
                     (int)M, (int)chunk);
     } else {
-        pqv2_acc_csrange(pq, x, pq->cb_fp32, has_l2 ? pq->l2_cb_fp32 : NULL,
-                         acc, acc_l2, lane0, gc, 0, M);
+        pqv2_acc_csrange(pq, x, pq->cb_fp32, do_l2 ? pq->l2_cb_fp32 : NULL,
+                         acc, do_l2 ? acc_l2 : NULL, lane0, gc, 0, M,
+                         use_l2);   /* burst: profile-driven L1+L2 vs L1-only */
     }
 }
 
@@ -1021,16 +1180,28 @@ static inline void paged_compute_group(const inferbit_model *m, pqv2_t *pq,
  * can drop in without restructuring. TODO(peak-ram): extend the 2-slot
  * prefetch ring's worker to take a (offset, length, slot) request so
  * lane-group I/O overlaps compute the way whole-tensor prefetch does. */
+/* Paged drive matvec, batched over B input positions.
+ *
+ * x is [B][N] (position b at x + b*pq->N), y is [B][M] (b at y + b*pq->M).
+ * THE AMORTISATION: each lane-group's indices are streamed from disk ONCE
+ * and then accumulated for ALL B positions (B separate acc slabs), so the
+ * expensive disk read is shared across the batch instead of repeated B times.
+ * This is what makes the speculative/batched verify cheap in drive mode —
+ * read the model once per round, apply to k positions. B=1 is byte-identical
+ * to the original single-position path. Caller must ensure B<=8 (the acc pool
+ * is sized for 8 column-slabs; larger B falls back to per-position). */
 static int drive_paged_matvec(const inferbit_model *m,
                               const ib_tensor_meta *t,
-                              const float *x, float *y) {
+                              const float *x, int B, float *y) {
     if (!m || m->residency_mode != 1) return 0;
     if (!t || !t->pq) return 0;
     if (m->drive_fd < 0 || !m->drive_indices_scratch) return 0;
+    if (B < 1) B = 1;
     pqv2_t *pq = (pqv2_t *)t->pq;
     if (!pq->cb_fp32) return 0;                 /* csrange needs fp32 cb */
     off_t off = (off_t)pq->indices_file_offset;
     if (off == 0) return 0;                     /* not redirected */
+    const size_t Nstride = (size_t)pq->N;       /* per-position x stride */
 
     uint32_t M = pq->M;
     uint32_t ns = pq->n_subchunks;
@@ -1052,6 +1223,22 @@ static int drive_paged_matvec(const inferbit_model *m,
      * otherwise the non-paged path corrupts memory (observed: pyramid
      * crash/garbage in the cap band where FFN L1 fits but FFN L2 does not). */
     int has_l2 = (pq->l2_kind == 2 && pq->l2_cb_fp32 && pq->l2_K <= 64);
+
+    /* Burst L1-only: the active compute profile may select the coarse tier
+     * (precision_tier==1), in which case the kernel skips the L2 unpack+
+     * gather. To make L1-only actually save disk/RAM bytes we ALSO skip the
+     * L2 index prefetch/stream/read below — not just the compute. This only
+     * applies to genuine pyramid tensors (has_l2); flat tensors are
+     * unaffected. With burst disabled (the default) ib_active_use_l2()==1, so
+     * use_l2 stays 1 and every L2 path below is byte-identical to today. */
+    int use_l2 = ib_active_use_l2((inferbit_model *)m);
+
+    /* Compute the L2 geometry from the STRUCTURAL has_l2 (independent of the
+     * burst tier) so the page-vs-no-page decision below is byte-identical to
+     * today: a tensor that pages because its L2 overflows the slot must STILL
+     * page in L1-only mode (the non-paged fallback would read a stale/garbage
+     * L2 residual from the slot — see the corruption note above). The runtime
+     * tier only gates the actual L2 prefetch/stream/read/compute via page_l2. */
     size_t l2_row = 0, l2_slot_size = 0, l2_total = 0;
     off_t l2_off = 0;
     if (has_l2) {
@@ -1063,8 +1250,63 @@ static int drive_paged_matvec(const inferbit_model *m,
     }
     int l2_fits = (!has_l2) || (l2_total <= l2_slot_size);
 
-    /* Both fit a slot → the unchanged non-paged path is safe; skip paging. */
+    /* page_l2 == "this matmul will actually read+compute L2": structural L2
+     * present AND the active profile wants it (burst L1-only sets use_l2==0).
+     * When 0 we skip every L2 prefetch/stream/read and zero the L2 residual,
+     * but we DO NOT change the page-vs-no-page decision (l2_fits, above). */
+    int page_l2 = has_l2 && use_l2;
+
+    /* Both fit a slot → the unchanged non-paged path is safe; skip paging.
+     * (Unchanged from today: uses the structural l1_fits/l2_fits. In L1-only
+     * mode the non-paged path still reads L2 — it lacks a use_l2 gate — so an
+     * L1-only step that takes this fall-through produces the EXACT L1+L2
+     * result, i.e. correct but without the coarse byte savings. The savings
+     * land on tensors that page, which is where L1-only matters for RAM.) */
     if (l1_fits && l2_fits) return 0;
+
+    /* ── RAM-residency throttle for big (would-page) tensors ──────────────
+     * Before streaming this tensor from disk in lane-groups, try to make it
+     * RESIDENT in the hot-pool: serve a cached copy, or promote it from disk
+     * once (fill-once). If resident, run the normal non-paged matmul on the
+     * full resident indices and report "handled" (return 1) so the caller
+     * skips the streaming path entirely. Bit-exact (same bytes) — only
+     * residency/speed change. The hot-pool budget (IB_HOT_POOL_MB) is the
+     * dial: more budget → more big tensors resident → fewer disk reads. Only
+     * taken when L2 is read normally (page_l2 == has_l2) so we never cache an
+     * L2 the burst tier won't read; burst L1-only keeps paging. */
+    if (page_l2 == has_l2) {
+        const void *hotL1 = ib_hot_lookup_key(m, (size_t)off);
+        const void *hotL2 = has_l2 ? ib_hot_lookup_key(m, (size_t)l2_off)
+                                   : (const void *)1;
+        if (!hotL1) {
+            void *dst = ib_hot_reserve((inferbit_model *)m, (size_t)off, total_bytes);
+            if (dst && drive_pread_full(m->drive_fd, dst, total_bytes, off))
+                hotL1 = dst;
+        }
+        if (has_l2 && hotL1 && !hotL2) {
+            void *dst2 = ib_hot_reserve((inferbit_model *)m, (size_t)l2_off, l2_total);
+            if (dst2 && drive_pread_full(m->drive_fd, dst2, l2_total, l2_off))
+                hotL2 = dst2;
+        }
+        if (hotL1 && hotL2) {
+            pq->indices = (const uint8_t *)hotL1;
+            if (has_l2) pq->l2_indices = (const uint8_t *)hotL2;
+            /* Resident: weights are in RAM; the batched kernel reads them once
+             * and applies to all B positions (amortised). */
+            if (B > 1 && pq->K == 256 && m->thread_pool && m->num_threads > 1) {
+                pqv2_threaded_matvec_k256_batch(m, m->thread_pool, m->num_threads,
+                                                pq, x, B, y);
+            } else if (pq->K == 256 && m->thread_pool && m->num_threads > 1) {
+                pqv2_threaded_matvec_k256(m, m->thread_pool, m->num_threads,
+                                          pq, x, y);
+            } else {
+                for (int b = 0; b < B; b++)
+                    pqv2_matvec_dispatch(pq, x + (size_t)b * Nstride,
+                                         y + (size_t)b * (size_t)M);
+            }
+            return 1;   /* handled resident — caller skips the streaming path */
+        }
+    }
 
     /* From here we WILL page. Require the accumulator pools (and, for a
      * pyramid tensor, the L2 scratch ring + L2 acc pool). We REUSE the
@@ -1078,12 +1320,12 @@ static int drive_paged_matvec(const inferbit_model *m,
      * non-paged path (whose own size guards prevent an overflow) rather
      * than page incorrectly. */
     if (!m->pqv2_thread_acc_pool ||
-        m->pqv2_thread_acc_pool_floats < (size_t)M) return 0;
-    if (has_l2 &&
+        m->pqv2_thread_acc_pool_floats < (size_t)B * (size_t)M) return 0;
+    if (page_l2 &&
         (!m->drive_l2_indices_scratch ||
          pq->l2_indices_file_offset == 0 ||
          !m->pqv2_thread_acc_l2_pool ||
-         m->pqv2_thread_acc_l2_pool_floats < (size_t)M)) {
+         m->pqv2_thread_acc_l2_pool_floats < (size_t)B * (size_t)M)) {
         return 0;   /* can't page L2 safely → let caller fall back */
     }
 
@@ -1091,16 +1333,16 @@ static int drive_paged_matvec(const inferbit_model *m,
      * may bound it tighter. At least 1 lane per group (slots are sized
      * with a one-lane floor at setup, so this never starves). */
     size_t lanes_per_group = slot_size / lane_bytes;
-    if (has_l2 && l2_row > 0) {
+    if (page_l2 && l2_row > 0) {
         size_t l2_lpg = l2_slot_size / l2_row;
         if (l2_lpg < lanes_per_group) lanes_per_group = l2_lpg;
     }
     if (lanes_per_group == 0) lanes_per_group = 1;
 
     float *acc = m->pqv2_thread_acc_pool;
-    float *acc_l2 = has_l2 ? m->pqv2_thread_acc_l2_pool : NULL;
-    memset(acc, 0, (size_t)M * sizeof(float));
-    if (acc_l2) memset(acc_l2, 0, (size_t)M * sizeof(float));
+    float *acc_l2 = page_l2 ? m->pqv2_thread_acc_l2_pool : NULL;
+    memset(acc, 0, (size_t)B * (size_t)M * sizeof(float));
+    if (acc_l2) memset(acc_l2, 0, (size_t)B * (size_t)M * sizeof(float));
 
     /* Thread the paged compute by row-splitting each lane-group across the
      * model thread pool (works for flat AND pyramid: pqv2_acc_csrange
@@ -1140,9 +1382,11 @@ static int drive_paged_matvec(const inferbit_model *m,
                           m->drive_l2_indices_scratch2 };
     int have_slot1 = (slot_l1[1] != NULL);
     /* Pipelining needs the 2-slot ring AND, for pyramid, both L2 slots so
-     * the next group's L2 can land in the OTHER slot while we compute. */
+     * the next group's L2 can land in the OTHER slot while we compute.
+     * (page_l2, not has_l2: an L1-only burst step never touches L2 slots,
+     * so a pyramid tensor can still pipeline on L1 alone.) */
     int can_pipeline = (st && have_slot1 &&
-                        (!has_l2 || (slot_l2[0] && slot_l2[1])));
+                        (!page_l2 || (slot_l2[0] && slot_l2[1])));
 
     if (can_pipeline) {
         /* ── Pipelined: prefetch group g+1 (into the other slot) while the
@@ -1155,8 +1399,8 @@ static int drive_paged_matvec(const inferbit_model *m,
         pthread_mutex_lock(&st->mu);
         drive_pf_issue_raw(st, /*slot=*/0,
                            off, gc0 * lane_bytes,
-                           has_l2 ? l2_off : 0,
-                           has_l2 ? gc0 * l2_row : 0);
+                           page_l2 ? l2_off : 0,
+                           page_l2 ? gc0 * l2_row : 0);
         pthread_mutex_unlock(&st->mu);
 
         int gi = 0;
@@ -1176,15 +1420,19 @@ static int drive_paged_matvec(const inferbit_model *m,
                 drive_pf_issue_raw(st, /*slot=*/(gi + 1) & 1,
                                    off + (off_t)(lane0_n * lane_bytes),
                                    gc_n * lane_bytes,
-                                   has_l2 ? l2_off + (off_t)(lane0_n * l2_row) : 0,
-                                   has_l2 ? gc_n * l2_row : 0);
+                                   page_l2 ? l2_off + (off_t)(lane0_n * l2_row) : 0,
+                                   page_l2 ? gc_n * l2_row : 0);
             }
             pthread_mutex_unlock(&st->mu);
 
             pq->indices = (const uint8_t *)slot_l1[slot];
-            if (has_l2) pq->l2_indices = (const uint8_t *)slot_l2[slot];
-            paged_compute_group(m, pq, x, acc, acc_l2, has_l2,
-                                (uint32_t)lane0, (uint32_t)gc, M, thread_compute);
+            if (page_l2) pq->l2_indices = (const uint8_t *)slot_l2[slot];
+            for (int b = 0; b < B; b++)
+                paged_compute_group(m, pq, x + (size_t)b * Nstride,
+                                    acc + (size_t)b * (size_t)M,
+                                    acc_l2 ? acc_l2 + (size_t)b * (size_t)M : NULL,
+                                    has_l2, use_l2,
+                                    (uint32_t)lane0, (uint32_t)gc, M, thread_compute);
         }
 
         /* Restore clean ring state: clear the raw flag + stale done_tensor
@@ -1207,7 +1455,7 @@ static int drive_paged_matvec(const inferbit_model *m,
                 return 0;   /* I/O error → bail */
             }
             pq->indices = (const uint8_t *)slot_l1[0];
-            if (has_l2) {
+            if (page_l2) {
                 void *l2dst = slot_l2[0];
                 if (!l2dst) return 0;   /* never drop a pyramid residual */
                 if (!drive_pread_full(m->drive_fd, l2dst, gc * l2_row,
@@ -1216,8 +1464,12 @@ static int drive_paged_matvec(const inferbit_model *m,
                 }
                 pq->l2_indices = (const uint8_t *)l2dst;
             }
-            paged_compute_group(m, pq, x, acc, acc_l2, has_l2,
-                                (uint32_t)lane0, (uint32_t)gc, M, thread_compute);
+            for (int b = 0; b < B; b++)
+                paged_compute_group(m, pq, x + (size_t)b * Nstride,
+                                    acc + (size_t)b * (size_t)M,
+                                    acc_l2 ? acc_l2 + (size_t)b * (size_t)M : NULL,
+                                    has_l2, use_l2,
+                                    (uint32_t)lane0, (uint32_t)gc, M, thread_compute);
 #if !defined(__APPLE__) && defined(POSIX_FADV_DONTNEED)
             (void)posix_fadvise(m->drive_fd, off + (off_t)(lane0 * lane_bytes),
                                 (off_t)l1_bytes, POSIX_FADV_DONTNEED);
@@ -1225,10 +1477,15 @@ static int drive_paged_matvec(const inferbit_model *m,
         }
     }
 
-    /* Final reduction: apply row_scale once + fold in the L2 residual. */
-    for (uint32_t mm = 0; mm < M; mm++) {
-        float rs = pqv2_h2f(pq->row_scale[mm]);
-        y[mm] = acc[mm] * rs + (acc_l2 ? acc_l2[mm] : 0.0f);
+    /* Final reduction (per position): apply row_scale once + fold L2. */
+    for (int b = 0; b < B; b++) {
+        const float *acc_b   = acc + (size_t)b * (size_t)M;
+        const float *accl2_b = acc_l2 ? acc_l2 + (size_t)b * (size_t)M : NULL;
+        float *y_b = y + (size_t)b * (size_t)M;
+        for (uint32_t mm = 0; mm < M; mm++) {
+            float rs = pqv2_h2f(pq->row_scale[mm]);
+            y_b[mm] = acc_b[mm] * rs + (accl2_b ? accl2_b[mm] : 0.0f);
+        }
     }
     return 1;
 }
@@ -1518,7 +1775,15 @@ static void pqv2_threaded_matvec_k256_batch(
         pqv2_matvec_tbl_int8_k256_batch(t, x_batch, B, y_batch);
         return;
     }
-    int has_l2 = (t->l2_kind == 2 && t->l2_cb_fp32 && t->l2_K <= 64);
+    /* Burst L1-only gate (read once per matvec). When use_l2==0 we drop the
+     * L2 stage for every position in the batch — no acc_l2 pool, no residual
+     * fold — matching the single-position path and the drive use_l2==0 path.
+     * Default (burst off) → 1, so this is byte-identical to today.
+     * NB: the per-position fallback below (pqv2_matvec_tbl_int8_k256_batch)
+     * still folds L2 unconditionally, but it is only reached when this
+     * threaded path bails out on geometry/alloc, not on the L1-only gate. */
+    int use_l2 = ib_active_use_l2((inferbit_model *)m);
+    int has_l2 = (t->l2_kind == 2 && t->l2_cb_fp32 && t->l2_K <= 64) && use_l2;
     int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
     int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
     size_t pool_floats = (size_t)n_slots * B * M;
@@ -1598,7 +1863,17 @@ static void pqv2_threaded_matvec_k256(
         pqv2_matvec_dispatch(t, x, y);
         return;
     }
-    int has_l2 = (t->l2_kind == 2 && t->l2_cb_fp32 && t->l2_K <= 64);
+    /* Burst L1-only gate: read ONCE per matvec (not per row/chunk). When the
+     * active profile selects the L1-only coarse tier, ib_active_use_l2()==0
+     * and we drop the entire L2 stage for this call — no acc_l2 scratch, no
+     * L2 index read, no residual gather/fold — exactly as the drive-mode
+     * paged kernel does with use_l2==0. With burst disabled (the default)
+     * this is 1, so has_l2 is unchanged and every L2 path below is
+     * byte-identical to today. The chunk kernel engages L2 iff acc_l2 is
+     * non-NULL, so gating has_l2 here (→ acc_l2_pool stays NULL) is the
+     * single point that produces the L1-only reconstruction. */
+    int use_l2 = ib_active_use_l2((inferbit_model *)m);
+    int has_l2 = (t->l2_kind == 2 && t->l2_cb_fp32 && t->l2_K <= 64) && use_l2;
     int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
     int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
     size_t pool_floats = (size_t)n_slots * M;
@@ -1651,24 +1926,27 @@ static void pqv2_threaded_matvec_k256(
         }
         memset(acc_l2_pool, 0, pool_floats * sizeof(float));
     }
-    /* Activation-aware skip: when IB_PQV2_SKIP env is set (e.g. "0.01"),
-     * skip (c,s) iters with max|x_slice| < ratio * max|x|. 1% threshold
-     * is essentially lossless on transformer activations. Skip rate
-     * naturally adapts: outlier-heavy early layers skip a lot, diffuse
-     * later layers skip little. */
+    /* Activation-aware skip: skip (c,s) iters with max|x_slice| < ratio *
+     * max|x|. 1% threshold is essentially lossless on transformer
+     * activations. Skip rate naturally adapts: outlier-heavy early layers
+     * skip a lot, diffuse later layers skip little.
+     *
+     * The ratio is the cached `m->active_skip_thresh_ratio` (M1 burst):
+     * inferbit_burst_attach seeds it from IB_PQV2_SKIP at load, and a later
+     * BURST profile overrides it per step. Reading the cached float here
+     * (instead of getenv/atof per matmul) preserves today's behaviour
+     * exactly for the default, burst-disabled run while removing the
+     * per-call env parse from the hot path. */
     float skip_thresh = 0.0f;
     {
-        const char *env = getenv("IB_PQV2_SKIP");
-        if (env && env[0]) {
-            float ratio = (float)atof(env);
-            if (ratio > 0.0f && ratio < 1.0f) {
-                float xmax = 0.0f;
-                for (uint32_t i = 0; i < t->N; i++) {
-                    float v = x[i]; if (v < 0) v = -v;
-                    if (v > xmax) xmax = v;
-                }
-                skip_thresh = ratio * xmax;
+        float ratio = m ? m->active_skip_thresh_ratio : 0.0f;
+        if (ratio > 0.0f && ratio < 1.0f) {
+            float xmax = 0.0f;
+            for (uint32_t i = 0; i < t->N; i++) {
+                float v = x[i]; if (v < 0) v = -v;
+                if (v > xmax) xmax = v;
             }
+            skip_thresh = ratio * xmax;
         }
     }
     ib_pqv2_chunks_arg arg = {
@@ -1721,7 +1999,7 @@ static void tensor_matmul(
          * returns 1). Tensors that fit a slot take the unchanged
          * load+dispatch path below. */
         if (m->residency_mode == 1) {
-            if (drive_paged_matvec(m, t, input, out)) return;
+            if (drive_paged_matvec(m, t, input, 1, out)) return;
             (void)drive_load_indices(m, t);
         }
         if (pq->K == 256 && m->thread_pool && m->num_threads > 1) {
@@ -1907,7 +2185,13 @@ void ib_tensor_matmul_cpu_isolated(const inferbit_model *m,
                 pqv2_matvec_dispatch(pq, input, out);
                 return;
             }
-            int has_l2 = (pq->l2_kind == 2 && pq->l2_cb_fp32 && pq->l2_K <= 64);
+            /* Burst L1-only gate (read once). Same semantics as
+             * pqv2_threaded_matvec_k256: use_l2==0 drops the L2 stage by
+             * leaving al2 NULL, so the chunk kernel produces the L1-only
+             * result. Default (burst off) → 1 → byte-identical to today. */
+            int use_l2 = ib_active_use_l2((inferbit_model *)m);
+            int has_l2 = (pq->l2_kind == 2 && pq->l2_cb_fp32 && pq->l2_K <= 64)
+                         && use_l2;
             int chunks_per_task = ((int)n_chunks + n_threads - 1) / n_threads;
             int n_slots = ((int)n_chunks + chunks_per_task - 1) / chunks_per_task;
             size_t need = (size_t)n_slots * Mt;
@@ -2022,13 +2306,21 @@ static void tensor_matmul_batch(
          * returns 0 when the tensor fits a slot, so the normal batched
          * path below runs unchanged for the common (fits) case. */
         if (m->residency_mode == 1) {
-            if (drive_paged_matvec(m, t, input, out)) {
-                for (int b = 1; b < B; b++) {
-                    (void)drive_paged_matvec(m, t,
-                                             input + (size_t)b * N,
-                                             out + (size_t)b * M);
+            /* Batched paged matvec: stream each lane-group ONCE and accumulate
+             * all B positions (read-once / compute-B amortisation). B<=8 fits
+             * the acc pool; for larger B fall back to per-position paging.
+             * Returns 1 if it paged (handled all B), 0 if the tensor fits a
+             * slot (the batched kernel below handles it). */
+            if (B <= 8) {
+                if (drive_paged_matvec(m, t, input, B, out)) return;
+            } else {
+                if (drive_paged_matvec(m, t, input, 1, out)) {
+                    for (int b = 1; b < B; b++)
+                        (void)drive_paged_matvec(m, t,
+                                                 input + (size_t)b * N, 1,
+                                                 out + (size_t)b * M);
+                    return;
                 }
-                return;
             }
             (void)drive_load_indices(m, t);
         }
@@ -2161,6 +2453,197 @@ static void tensor_matmul_sparse(
         }
         out[i] = sum * scales_eff[i];
     }
+}
+
+/* ── Sparse-FFN: row-windowed matvec (BURST draft path) ─────────────────
+ *
+ * Compute ONLY output rows [m0, m1) of W[M,N] @ input[N] into out[m0:m1).
+ * Rows outside [m0, m1) are left UNTOUCHED — the caller pre-zeroes the
+ * full output buffer (so inactive intermediate rows stay 0, which the
+ * subsequent down_proj treats as multiply-by-zero). This is the DRAFT
+ * path: it never runs on EXACT/COOLDOWN, so it does not need to be
+ * bit-identical to the full matvec.
+ *
+ * PQv2 (the v6 FFN format): accumulate the full lane range with the
+ * kernel's [m0,m1) output window via pqv2_acc_csrange, then fold
+ * row_scale + the L2 (pyramid) residual for the windowed rows. L2 use is
+ * gated by the active profile (ib_active_use_l2), matching the dense
+ * threaded path. Non-PQ tensors fall back to a per-row scalar window over
+ * INT8/INT4/INT2/FP16 weights (same row layout as tensor_matmul_sparse).
+ */
+static void ffn_matvec_rows(const inferbit_model* m, const ib_tensor_meta* t,
+                            float* out, const float* input,
+                            int M, int N, int m0, int m1, float* scale_buf) {
+    if (m0 < 0)  m0 = 0;
+    if (m1 > M)  m1 = M;
+    if (m0 >= m1) return;
+
+    if (t->pq) {
+        const pqv2_t* pq = t->pq;
+        /* Drive mode: ensure indices are resident in scratch (whole-tensor
+         * load). The paged streaming path does not support an output-row
+         * window, so for the sparse draft we use the resident-load path. */
+        if (m->residency_mode == 1) {
+            (void)drive_load_indices(m, t);
+        }
+        uint32_t n_chunks = pq->N / pq->G;
+        uint32_t cs_total = n_chunks * pq->n_subchunks;
+        int use_l2 = ib_active_use_l2((inferbit_model*)m);
+        int has_l2 = (pq->l2_kind == 2 && pq->l2_cb_fp32 && pq->l2_K <= 64) && use_l2;
+        uint32_t rows = (uint32_t)(m1 - m0);
+        /* pqv2_acc_csrange indexes acc/acc_l2 with ABSOLUTE row m in [m0,m1),
+         * so the buffers must be addressable up to index m1-1. Allocate full
+         * M floats (intermediate dim is bounded; this is a small per-call
+         * malloc, not in the dense hot path). Only the [m0,m1) slice is
+         * written + read back. */
+        float* acc = (float*)calloc((size_t)M, sizeof(float));
+        float* acc_l2 = has_l2 ? (float*)calloc((size_t)M, sizeof(float)) : NULL;
+        if (!acc || (has_l2 && !acc_l2)) {
+            free(acc); free(acc_l2);
+            float* full = (float*)malloc((size_t)M * sizeof(float));
+            if (full) {
+                tensor_matmul(m, t, full, input, M, N, scale_buf);
+                memcpy(out + m0, full + m0, (size_t)rows * sizeof(float));
+                free(full);
+            }
+            return;
+        }
+        pqv2_acc_csrange(pq, input, pq->cb_fp32,
+                         has_l2 ? pq->l2_cb_fp32 : NULL,
+                         acc, has_l2 ? acc_l2 : NULL,
+                         0, cs_total, (uint32_t)m0, (uint32_t)m1, use_l2);
+        for (int r = m0; r < m1; r++) {
+            float rs = pqv2_h2f(pq->row_scale[r]);
+            out[r] = acc[r] * rs + (acc_l2 ? acc_l2[r] : 0.0f);
+        }
+        free(acc);
+        free(acc_l2);
+        return;
+    }
+
+    /* Non-PQ fallback: scalar per-row window. Same weight row layouts as
+     * tensor_matmul_sparse. */
+    const void* weights = tensor_data(m, t);
+    const void* scales_raw = tensor_scales_raw(m, t);
+    const float* scales_eff;
+    if (t->scales_fp32) {
+        scales_eff = t->scales_fp32;
+    } else if (scales_raw) {
+        scales_to_fp32(scale_buf, scales_raw, M);
+        scales_eff = scale_buf;
+    } else {
+        for (int i = 0; i < M; i++) scale_buf[i] = 1.0f;
+        scales_eff = scale_buf;
+    }
+    for (int i = m0; i < m1; i++) {
+        float sum = 0.0f;
+        if (t->bits == 8) {
+            const int8_t* w = (const int8_t*)weights + (size_t)i * N;
+            for (int j = 0; j < N; j++) sum += (float)w[j] * input[j];
+            out[i] = sum * scales_eff[i];
+        } else if (t->bits == 4) {
+            const uint8_t* w = (const uint8_t*)weights + (size_t)i * (N / 2);
+            for (int j = 0; j < N; j += 2) {
+                uint8_t byte = w[j / 2];
+                sum += (float)((int8_t)(byte & 0x0F) - 8) * input[j];
+                if (j + 1 < N) sum += (float)((int8_t)((byte >> 4) & 0x0F) - 8) * input[j + 1];
+            }
+            out[i] = sum * scales_eff[i];
+        } else if (t->bits == 2) {
+            const uint8_t* w = (const uint8_t*)weights + (size_t)i * (N / 4);
+            for (int j = 0; j < N; j += 4) {
+                uint8_t byte = w[j / 4];
+                sum += (float)((byte & 0x03) - 1) * input[j];
+                if (j+1 < N) sum += (float)(((byte >> 2) & 0x03) - 1) * input[j+1];
+                if (j+2 < N) sum += (float)(((byte >> 4) & 0x03) - 1) * input[j+2];
+                if (j+3 < N) sum += (float)(((byte >> 6) & 0x03) - 1) * input[j+3];
+            }
+            out[i] = sum * scales_eff[i];
+        } else if (t->bits == 16) {
+            const uint16_t* w = (const uint16_t*)weights + (size_t)i * N;
+            for (int j = 0; j < N; j++) sum += fp16_to_fp32(w[j]) * input[j];
+            out[i] = sum;
+        }
+    }
+}
+
+/* ── Sparse-FFN dispatch (BURST draft on a clustered layer) ─────────────
+ *
+ * Pre-conditions (checked by the caller): layer->ffn_n_clusters > 1 AND
+ * the active profile is IB_PROFILE_BURST. Computes the FFN result into
+ * `out_xb` (the post-norm input `xb` is overwritten, same role as the
+ * dense down_proj output). `hb`/`hb2` are the [inter] MLP scratch buffers.
+ *
+ * Steps:
+ *   1. Gate: sparse_gate_select() on the post-norm hidden `xb`.
+ *   2. Zero hb/hb2, then compute gate_proj & up_proj ONLY for active
+ *      clusters' row ranges [offsets[c], offsets[c+1]).
+ *   3. silu_mul on active rows only (inactive stay 0).
+ *   4. down_proj over the full (mostly-zero) intermediate: inactive
+ *      columns are multiply-by-zero, so this is correct. (We DO NOT skip
+ *      inactive down columns — a clean PQv2 lane-range that maps a
+ *      contiguous intermediate-COLUMN range is not bit-clean, and the
+ *      draft tolerance does not justify the complexity. The gate/up
+ *      read+compute saving is the win; down still reads full but on a
+ *      mostly-zero input.)
+ */
+static void ffn_sparse_dispatch(inferbit_model* m, ib_layer_meta* layer,
+                                float* out_xb, float* xb, float* hb, float* hb2,
+                                int inter, int hidden, float* scale_buf) {
+    int n_clusters = (int)layer->ffn_n_clusters;
+    if (n_clusters > IB_FFN_MAXK) n_clusters = IB_FFN_MAXK;
+
+    int top_min = ffn_top_min_cfg();
+    if (top_min < 0) {
+        top_min = n_clusters / 4;
+        if (top_min < 1) top_min = 1;
+    }
+    if (top_min > n_clusters) top_min = n_clusters;
+
+    int active[IB_FFN_MAXK];
+    int k = sparse_gate_select(layer->ffn_centroids_fp16, n_clusters,
+                               hidden, xb, ffn_gate_thresh(), top_min, active);
+    if (k <= 0) {
+        /* Defensive: gate returned nothing (shouldn't happen with top_min>=1).
+         * Fall back to the dense FFN so the draft is still produced. */
+        tensor_matmul_hybrid(m, (int)(layer - m->layers), &layer->gate_proj,
+                             hb, xb, inter, hidden, scale_buf);
+        tensor_matmul_hybrid(m, (int)(layer - m->layers), &layer->up_proj,
+                             hb2, xb, inter, hidden, scale_buf);
+        ib_kern.silu_mul(hb, hb, hb2, inter);
+        tensor_matmul_hybrid(m, (int)(layer - m->layers), &layer->down_proj,
+                             out_xb, hb, hidden, inter, scale_buf);
+        return;
+    }
+
+    if (ffn_log_enabled()) {
+        g_ffn_active_frac_sum += (double)k / (double)n_clusters;
+        g_ffn_gate_calls++;
+    }
+
+    /* Inactive intermediate rows must be exactly 0 so the full down_proj
+     * treats them as multiply-by-zero. */
+    memset(hb,  0, (size_t)inter * sizeof(float));
+    memset(hb2, 0, (size_t)inter * sizeof(float));
+
+    /* gate_proj + up_proj only for active clusters' contiguous row ranges. */
+    for (int ai = 0; ai < k; ai++) {
+        int c = active[ai];
+        int r0 = (int)layer->ffn_cluster_offsets[c];
+        int r1 = (int)layer->ffn_cluster_offsets[c + 1];
+        if (r0 < 0) r0 = 0;
+        if (r1 > inter) r1 = inter;
+        if (r0 >= r1) continue;
+        ffn_matvec_rows(m, &layer->gate_proj, hb,  xb, inter, hidden, r0, r1, scale_buf);
+        ffn_matvec_rows(m, &layer->up_proj,   hb2, xb, inter, hidden, r0, r1, scale_buf);
+        /* silu_mul on this active row range only (inactive rows stay 0). */
+        ib_kern.silu_mul(hb + r0, hb + r0, hb2 + r0, r1 - r0);
+    }
+
+    /* down_proj over the full (mostly-zero) intermediate. Inactive columns
+     * are multiply-by-zero => correct draft. */
+    tensor_matmul_hybrid(m, (int)(layer - m->layers), &layer->down_proj,
+                         out_xb, hb, hidden, inter, scale_buf);
 }
 
 /* ── RMSNorm with FP16 weights ──────────────────────────────── */
@@ -2405,11 +2888,19 @@ static void mome_ffn_dispatch(inferbit_model *m, const ib_layer_meta *layer,
                               float *scale_buf, int8_t *q_scratch,
                               float *sa_scratch);
 
-static int forward_single_ex(inferbit_model* m, int token_id, int pos,
-                             float* logits, int compute_logits,
-                             float* hidden_out) {
+static int forward_single_ex_trunc(inferbit_model* m, int token_id, int pos,
+                                   float* logits, int compute_logits,
+                                   float* hidden_out, int max_layer) {
     int hidden   = m->header.hidden_size;
     int n_layers = m->header.num_layers;
+    /* Burst early-exit / self-speculation: run only layers [0, max_layer).
+     * max_layer < 0 or >= depth ⇒ full depth (the default, byte-identical to
+     * the legacy forward). The finalize (output_norm + LM head) still runs on
+     * whatever hidden state the truncated stack produced. NOTE: callers using
+     * a partial depth leave KV holes in layers >= max_layer for this position
+     * — only safe when a later full/verify pass backfills them (M3). The
+     * default decode path passes -1, so no holes are created today. */
+    if (max_layer >= 0 && max_layer < n_layers) n_layers = max_layer;
     int n_heads  = m->header.num_heads;
     int n_kv     = m->header.num_kv_heads;
     int head_dim = m->header.head_dim;
@@ -2566,6 +3057,24 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
                 mome_handled = 1;
             }
 
+            /* Training-free sparse-FFN cluster dispatch (BURST draft only).
+             * Active iff: not a MoME layer, no activation-sparsity mask, the
+             * layer is CLUSTERED (ffn_n_clusters > 1), AND the active compute
+             * profile is BURST. The BURST draft is approximate — the COOLDOWN
+             * verify (which runs EXACT, never reaches this branch) corrects
+             * the emitted tokens (the spec-verify firewall). On EXACT /
+             * COOLDOWN, or a non-clustered layer, this branch is skipped and
+             * the dense FFN below runs every row exactly as before
+             * (byte-identical). */
+            int sparse = (!mome_handled && !sp_mask &&
+                          layer->ffn_n_clusters > 1 &&
+                          layer->ffn_cluster_offsets && layer->ffn_centroids_fp16 &&
+                          m->burst.cur == IB_PROFILE_BURST);
+            if (sparse) {
+                ffn_sparse_dispatch(m, layer, xb, xb, hb, hb2, inter, hidden, scale_buf);
+                mome_handled = 1;   /* reuse the "FFN already produced" flag */
+            }
+
             if (!mome_handled) {
                 if (sp_mask) {
                     tensor_matmul_sparse(m, &layer->gate_proj, hb, xb, inter, hidden, scale_buf, sp_mask);
@@ -2637,6 +3146,16 @@ static int forward_single_ex(inferbit_model* m, int token_id, int pos,
     return INFERBIT_OK;
 }
 
+/* Full-depth single-token forward (the legacy entry point). Thin wrapper over
+ * forward_single_ex_trunc with max_layer=-1 → byte-identical to the previous
+ * forward_single_ex. */
+static int forward_single_ex(inferbit_model* m, int token_id, int pos,
+                             float* logits, int compute_logits,
+                             float* hidden_out) {
+    return forward_single_ex_trunc(m, token_id, pos, logits, compute_logits,
+                                   hidden_out, /*max_layer=*/-1);
+}
+
 static int forward_single(inferbit_model* m, int token_id, int pos, float* logits) {
     return forward_single_ex(m, token_id, pos, logits, 1, NULL);
 }
@@ -2646,6 +3165,23 @@ static int forward_single(inferbit_model* m, int token_id, int pos, float* logit
  * orchestrator in the first place). */
 int ib_forward_single(inferbit_model* m, int token_id, int pos, float* logits) {
     return forward_single(m, token_id, pos, logits);
+}
+
+/* Truncated forward — run only layers [0, max_layer), then finalize logits
+ * through the existing output_norm + LM-head path. max_layer < 0 or >= depth
+ * runs the full stack (byte-identical to forward_single). Available for future
+ * self-speculation; NOT wired into the default burst profile because skipped-
+ * layer positions leave KV holes in layers >= max_layer that need a later
+ * full/verify pass to backfill (= M3). */
+int inferbit_forward_truncated(inferbit_model* model, int32_t token, int pos,
+                               int max_layer, float* out_logits) {
+    if (!model || !out_logits) {
+        ib_set_error("NULL argument to inferbit_forward_truncated");
+        return INFERBIT_ERROR_PARAM;
+    }
+    return forward_single_ex_trunc(model, (int)token, pos, out_logits,
+                                   /*compute_logits=*/1, /*hidden_out=*/NULL,
+                                   max_layer);
 }
 
 /* Factored: final-RMSNorm + LM-head matmul over a single hidden vector.
@@ -2878,6 +3414,54 @@ static void mome_ffn_dispatch(inferbit_model *m, const ib_layer_meta *layer,
         const int hidden = m->header.hidden_size;
         int top_n = mome_get_top_n(K_ex);
         int active[IB_MOME_MAX_TOP_N];
+
+        /* ── BURST gate-energy expert sparsity (M2) ──────────────────
+         * When the active compute profile selects a top-n < K (burst), pick
+         * the n highest-energy experts by THIS step's gate activation and run
+         * only those. ib_active_profile()->mome_top_n is -1 on EXACT/COOLDOWN
+         * (and with burst disabled, which is the default), in which case
+         * mome_select_experts_burst returns all-K → byte-identical to the
+         * legacy path below; we only divert when it actually narrows.
+         *
+         * We must hand mome_select_experts_burst the FULL gate activation,
+         * expert-contiguous, length K*(inter/K). The experts are separate
+         * sub-tensors, so we materialise it with one gate matmul per expert
+         * into hb_batch ([inter]) — the same K-matmul cost the IB_MOME_GATE_
+         * ENERGY probe pays. The dispatch below recomputes gate internally,
+         * so reusing hb_batch as the selection scratch is safe (selection
+         * finishes before dispatch overwrites it). active_buf is int[K]
+         * (K ≤ IB_MOME_MAX_EXPERTS), per the helper's contract. */
+        {
+            const ib_compute_profile *prof = ib_active_profile(m);
+            int prof_top_n = prof ? prof->mome_top_n : -1;
+            if (prof_top_n >= 0 && prof_top_n < K_ex && K_ex <= IB_MOME_MAX_EXPERTS &&
+                layer->gate_proj_experts) {
+                const int inter = m->header.intermediate_size;
+                const int rpe   = inter / K_ex;
+                if (rpe > 0 && rpe * K_ex <= inter) {
+                    int ok = 1;
+                    for (int e = 0; e < K_ex; e++) {
+                        const ib_tensor_meta *gate_e = &layer->gate_proj_experts[e];
+                        if (gate_e->shape[0] != rpe) { ok = 0; break; }
+                        ib_tensor_matmul_cpu(m, gate_e, hb_batch + (size_t)e * rpe,
+                                             xb_in_batch, rpe, hidden, scale_buf);
+                    }
+                    int active_buf[IB_MOME_MAX_EXPERTS];
+                    int n_active = ok ? mome_select_experts_burst(
+                                            m, layer, hb_batch, K_ex, active_buf)
+                                      : 0;
+                    if (ok && n_active > 0 && n_active < K_ex) {
+                        mome_dispatch_ffn(m, layer, xb_in_batch, hb_batch,
+                                          hb2_batch, xb_out_batch,
+                                          /*router_logits=*/NULL, active_buf,
+                                          /*n_active=*/n_active, scale_buf);
+                        return;
+                    }
+                    /* n_active == K_ex (all-K) or selection failed → fall
+                     * through to the legacy exact path (bit-identical). */
+                }
+            }
+        }
 
         /* ── Gate-energy router (QUALITY PROBE, IB_MOME_GATE_ENERGY) ──
          * Training-free runtime router for MoME. Computes gate(x) for ALL

@@ -93,6 +93,86 @@
  * pattern. They will fail to find gate_proj/up_proj/down_proj and
  * the model won't run — but they will not crash. New loaders see
  * both kinds and pick the right slot.
+ *
+ * ─── Training-free sparse-FFN cluster record (2026-05-23) ───────────
+ *
+ * An OPTIONAL per-layer record that lets the runtime cheaply predict
+ * which contiguous slices ("clusters") of a layer's FFN intermediate
+ * dimension are likely to fire for a given input, so it can skip the
+ * rest. It is DATA-FREE: the clustering uses only the gate_proj weight
+ * rows (cosine similarity), no calibration set.
+ *
+ * This record is ORTHOGONAL to MoME (the .expert{e} split above): it is
+ * emitted only on the NON-MoME FFN path (single gate_proj/up_proj/
+ * down_proj tensors per layer). It is gated behind ffn_clusters > 1 at
+ * convert time (env IB_FFN_CLUSTERS, see pqv2_encode.c). When disabled
+ * (ffn_clusters <= 1) NO record is emitted and the file is byte-
+ * identical to today's output.
+ *
+ * On-disk presence: a single manifest tensor per layer, named
+ *
+ *   Lk.mlp.ffn_clusters    — kind == IB_PQV2_KIND_RAW_INT32 (3).
+ *
+ * The blob is a raw little-endian byte stream with this EXACT layout
+ * (field order is load-bearing — the loader mirrors it verbatim). It is
+ * SELF-DESCRIBING: a 28-byte fixed header (== sizeof(ib_ffn_cluster_hdr)
+ * in src/sparse_gate.h, the authoritative struct) preceded by magic +
+ * version, then the variable arrays:
+ *
+ *   char   magic[8] = "IBFFNCL1" // IB_FFN_CLUSTER_MAGIC
+ *   uint32 version  = 1          // IB_FFN_CLUSTER_VERSION
+ *   uint32 flags                 // bit0 = inter_perm present (always set
+ *                             //    here — the encoder always writes perm).
+ *   uint32 ffn_n_clusters     // N. 0 or 1 = disabled (record absent in
+ *                             //    practice; never written when N<=1).
+ *   uint32 ffn_inter          // = intermediate_size (sanity check).
+ *   uint32 ffn_hidden         // = hidden_size       (sanity check).
+ *   uint32 cluster_offsets[ffn_n_clusters + 1]
+ *                             // start row (in the PERMUTED inter space)
+ *                             // of each cluster. Clusters are CONTIGUOUS.
+ *                             // cluster_offsets[0] == 0,
+ *                             // cluster_offsets[ffn_n_clusters] == ffn_inter.
+ *   fp16   centroids[ffn_n_clusters * ffn_hidden]
+ *                             // per-cluster centroid in INPUT (hidden)
+ *                             // space = the mean of that cluster's
+ *                             // gate_proj rows (each gate row is a
+ *                             // hidden-dim vector). Stored as IEEE
+ *                             // half-precision (uint16 bit pattern),
+ *                             // row-major [cluster][hidden].
+ *   uint32 inter_perm[ffn_inter]
+ *                             // present iff flags bit0. inter_perm[new_row]
+ *                             //   = old_row, i.e. the permutation already
+ *                             //   baked into the stored gate/up rows and
+ *                             //   down columns. NOT required at runtime
+ *                             //   (the perm is baked into the weights);
+ *                             //   present so the perm can be inspected.
+ *
+ * The blob's total size is therefore:
+ *   28                                  (magic+version+flags+3×uint32 hdr)
+ *   + 4 * (ffn_n_clusters + 1)          (cluster_offsets)
+ *   + 2 * ffn_n_clusters * ffn_hidden   (centroids, fp16)
+ *   + 4 * ffn_inter                     (inter_perm, present when flag set)
+ * The manifest entry's blob_size is authoritative; a loader can also
+ * recompute it from the header fields to validate.
+ *
+ * Weight consistency invariant (REQUIRED for exactness): when this
+ * record is present, the encoder has applied the SAME inter-permutation
+ * to (a) the ROWS of gate_proj, (b) the ROWS of up_proj, and (c) the
+ * COLUMNS of down_proj, BEFORE PQ-encoding them. Because the FFN sums
+ * down_proj @ (silu(gate) * up) over the inter axis, this permutation
+ * cancels out and the FFN output is mathematically unchanged when ALL
+ * clusters run. The stored PQ indices are thus already in permuted
+ * order; the loader needs no un-permutation. ffn_inter / ffn_hidden are
+ * stored so the loader can assert the record matches the layer it loads.
+ *
+ * Magic/version: the file magic stays "IBFV6PQ2" and version stays 1.
+ * This record adds NO new file-level header field and NO new tensor
+ * kind — it is a normal RAW_INT32 manifest tensor whose NAME suffix
+ * (".mlp.ffn_clusters") and documented blob layout are the contract.
+ * Older loaders that do not know the suffix silently ignore the tensor
+ * (same forward-compat property as the MoME expert tensors above), so
+ * adding the record does not break old readers. No magic/version bump
+ * is needed.
  */
 
 typedef enum {

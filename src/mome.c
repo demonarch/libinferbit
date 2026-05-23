@@ -68,6 +68,10 @@ extern void ib_tensor_matmul_cpu_isolated(const inferbit_model *m,
 
 /* ── public helpers ──────────────────────────────────────────────── */
 
+/* Forward decl — the definition lives further down (activation helpers).
+ * mome_select_experts_burst (below) needs it before that point. */
+static inline float mome_silu(float x);
+
 /* fp16 → fp32 conversion used by the router matmul follow-up path
  * (calibrated router weights, future stage). v1's zero-router path
  * never touches this; the router matmul itself is a future patch.
@@ -96,6 +100,101 @@ int mome_get_top_n(int K) {
     if (n < 1) n = 1;
     if (n > K) n = K;
     if (n > IB_MOME_MAX_TOP_N) n = IB_MOME_MAX_TOP_N;
+    return n;
+}
+
+/* BURST gate-energy expert selection (M2 — data-free).
+ *
+ * BURST runs the top-n highest-energy experts; COOL-DOWN / EXACT runs all
+ * K. The selection is purely data-free: it ranks experts by the magnitude
+ * of THIS step's gate activations — no router weights, no calibration, no
+ * training. An expert whose gated rows are all ~0 contributes ~nothing to
+ * the FFN output (down_proj @ (silu(gate)*up) ≈ 0 for that block), so
+ * dropping the lowest-energy experts is the data-free sparsity dial.
+ *
+ * The active profile's mome_top_n (-1 = all-K) drives the regime:
+ *   - n < 0 or n >= K  → COOL-DOWN / EXACT: fill 0..K-1, return K. This
+ *     is byte-identical to the old M1 stub (and to the non-burst all-K
+ *     dispatch the FFN runs by default).
+ *   - 0 < n < K        → BURST: score each expert and return its top-n.
+ *
+ * Scoring: score[e] = sum over the expert's rows of |silu(gate[i])|, where
+ * silu(x) = x / (1+exp(-x)). silu is the actual gating nonlinearity the
+ * FFN applies (ffn = silu(gate) * up), so |silu(gate)| summed over a
+ * block is the genuine firing energy of that expert — strictly truer to
+ * the contribution than raw |gate| or gate^2 (silu saturates large
+ * negatives toward 0, exactly the rows that should NOT count). It is one
+ * pass over `gate` (length M = K * rows_per_expert), no allocation.
+ *
+ * `gate` is the full FFN-intermediate gate activation, length
+ * M = K * rows_per_expert, laid out expert-contiguous: expert e owns
+ * gate[e*rpe .. (e+1)*rpe). `layer` is unused — K and `gate` suffice.
+ *
+ * active_out must be a caller-allocated int[K]; on return its first
+ * (return value) entries hold the selected expert indices (descending
+ * energy, deterministic; ties resolve to the lower index via mome_top_n). */
+int mome_select_experts_burst(inferbit_model *m, const void *layer,
+                              const float *gate, int K, int *active_out) {
+    (void)layer;   /* K + gate suffice; the layer meta is not needed here. */
+    if (!active_out || K <= 0) return 0;
+
+    /* Resolve the requested burst width. n < 0 (the -1 sentinel) or
+     * n >= K means "run them all" — the COOL-DOWN / EXACT path. Fill the
+     * identity order and return K, byte-identical to the M1 stub. */
+    int n = -1;
+    const ib_compute_profile *prof = ib_active_profile(m);
+    if (prof) n = prof->mome_top_n;
+    if (n < 0 || n >= K) {
+        for (int e = 0; e < K; e++) active_out[e] = e;
+        return K;
+    }
+    if (n == 0) return 0;
+
+    /* Without gate energy we cannot rank — degrade to all-K (exact) rather
+     * than silently corrupt the output by picking arbitrary experts. */
+    if (!gate) {
+        for (int e = 0; e < K; e++) active_out[e] = e;
+        return K;
+    }
+
+    /* Guard the scratch array; K is capped by the loader but be defensive. */
+    if (K > IB_MOME_MAX_EXPERTS) {
+        for (int e = 0; e < K; e++) active_out[e] = e;
+        return K;
+    }
+
+    /* Per-expert firing energy, one pass over the expert-contiguous gate.
+     * `gate` length is M = K * rows_per_expert; M is not passed in, so
+     * derive rows_per_expert = intermediate_size / K from the model header
+     * — the SAME formula mome_dispatch_ffn uses, so the block boundaries
+     * line up exactly with the experts the dispatcher will run. */
+    float score[IB_MOME_MAX_EXPERTS];
+    for (int e = 0; e < K; e++) score[e] = 0.0f;
+
+    int rows_per_expert = 0;
+    if (m) {
+        int inter = m->header.intermediate_size;
+        if (inter > 0) rows_per_expert = inter / K;
+    }
+    if (rows_per_expert <= 0) {
+        /* Cannot determine block size → cannot rank safely; run all-K. */
+        for (int e = 0; e < K; e++) active_out[e] = e;
+        return K;
+    }
+
+    for (int e = 0; e < K; e++) {
+        const float *blk = gate + (size_t)e * (size_t)rows_per_expert;
+        float acc = 0.0f;
+        for (int r = 0; r < rows_per_expert; r++) {
+            acc += fabsf(mome_silu(blk[r]));
+        }
+        score[e] = acc;
+    }
+
+    /* Reuse the existing partial-selection helper: it returns the indices
+     * of the top-n highest values from a length-K array — exactly a
+     * top-n-by-energy ranking. No signature change, deterministic, O(K*n). */
+    mome_top_n(score, K, n, active_out);
     return n;
 }
 
@@ -873,6 +972,242 @@ reduce:
             xb_out[h] += w_e * hb2[h];
         }
     }
+}
+
+/* ── Training-free sparse-FFN clustering (CONVERT-TIME, data-free) ───
+ *
+ * See mome.h::ffn_compute_cluster_perm for the public contract. This is
+ * the convert-time half of the sparse-FFN feature: it clusters a layer's
+ * FFN intermediate dimension into N contiguous groups by cosine
+ * similarity of the gate_proj rows and emits a permutation + cluster
+ * offsets + per-cluster centroids. The matching on-disk record layout
+ * lives in pqv2_format.h; the writer that emits it lives in
+ * pqv2_encode.c (read_and_push_pqv2 / the FFN clustering pass).
+ *
+ * Algorithm: the SAME high-D spherical (cosine) k-means as the dormant
+ * MoME cosine probe (pqv2_encode.c::mome_compute_cosine_perm). Cosine
+ * similarity = dot product on L2-normalised rows, so "nearest center" =
+ * "largest dot" and the centroid update is mean-then-renormalise. The
+ * key difference from the MoME probe — and the FIX for its documented
+ * perm/boundary inconsistency — is that we do NOT chop the row order
+ * into forced-equal inter/K blocks. The MoME probe's balanced-overflow
+ * step let a block boundary fall in the MIDDLE of a k-means cluster, so
+ * the per-expert "cluster" boundaries (inter/K) did not match the
+ * cluster labels — that mismatch is exactly what the dormant probe's
+ * comment flags as the residual +1.9% PPL inconsistency. Here we instead
+ * lay rows out cluster-by-cluster and record the NATURAL cluster sizes
+ * in cluster_offsets, so the permutation and the cluster boundaries are
+ * consistent by construction (each cluster_offsets block contains
+ * exactly the rows of one k-means cluster). */
+
+/* fp32 → fp16 (IEEE half) bit pattern. Self-contained to keep mome.c
+ * free of the pq_decode.h include (mirrors the inline fp16→fp32 decode
+ * already used in mome_router_is_nonzero). Round-to-nearest-even is not
+ * required for these centroid signatures (a coarse runtime predictor),
+ * so this uses simple truncation with the standard exponent rebias and
+ * overflow/underflow clamping. */
+static uint16_t ffn_f32_to_f16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (((x >> 23) & 0xFF) == 0xFF) {
+        /* inf / nan */
+        return (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0u));
+    }
+    if (exp >= 0x1F) {
+        /* overflow → inf */
+        return (uint16_t)(sign | 0x7C00u);
+    }
+    if (exp <= 0) {
+        /* subnormal or underflow to zero */
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;             /* restore implicit 1 */
+        int shift = 14 - exp;          /* 14 = 23 - 10 + (1 - exp)... */
+        uint32_t sub = mant >> shift;
+        return (uint16_t)(sign | (sub & 0x3FFu));
+    }
+    return (uint16_t)(sign | (uint32_t)(exp << 10) | (mant >> 13));
+}
+
+int ffn_compute_cluster_perm(const float *W_gate, int inter, int hidden,
+                             int n_clusters, uint32_t seed,
+                             int *perm_out, uint32_t *offsets_out,
+                             uint16_t *centroids_fp16_out)
+{
+    if (!W_gate || !perm_out || !offsets_out || !centroids_fp16_out) return -1;
+    if (inter <= 0 || hidden <= 0 || n_clusters <= 1 || n_clusters > inter)
+        return -1;
+
+    /* L2-normalise each gate row into a scratch copy (cosine k-means =
+     * Euclidean k-means on unit vectors). Keep the row norm so we can
+     * later average the UN-normalised rows for the input-space centroid. */
+    float *Wn = (float *)malloc((size_t)inter * (size_t)hidden * sizeof(float));
+    if (!Wn) return -1;
+    for (int r = 0; r < inter; r++) {
+        const float *src = W_gate + (size_t)r * hidden;
+        float *dst = Wn + (size_t)r * hidden;
+        double ss = 0.0;
+        for (int i = 0; i < hidden; i++) ss += (double)src[i] * (double)src[i];
+        float invn = (ss > 1e-20) ? (float)(1.0 / sqrt(ss)) : 0.0f;
+        for (int i = 0; i < hidden; i++) dst[i] = src[i] * invn;
+    }
+
+    float   *centers = (float *)malloc((size_t)n_clusters * hidden * sizeof(float));
+    int32_t *labels  = (int32_t *)malloc((size_t)inter * sizeof(int32_t));
+    if (!centers || !labels) { free(Wn); free(centers); free(labels); return -1; }
+    for (int r = 0; r < inter; r++) labels[r] = 0;
+
+    /* k-means++ / farthest-point seeding on cosine distance, then Lloyd
+     * iterations with renormalised (spherical) centroid updates. */
+    {
+        uint32_t rng = seed ? seed : 1234u;
+        rng = rng * 1664525u + 1013904223u;
+        int seed0 = (int)(rng % (uint32_t)inter);
+        memcpy(centers, Wn + (size_t)seed0 * hidden,
+               (size_t)hidden * sizeof(float));
+        float *mindist = (float *)malloc((size_t)inter * sizeof(float));
+        if (!mindist) { free(Wn); free(centers); free(labels); return -1; }
+        for (int r = 0; r < inter; r++) {
+            const float *x = Wn + (size_t)r * hidden;
+            float dot = 0.0f;
+            for (int i = 0; i < hidden; i++) dot += x[i] * centers[i];
+            mindist[r] = 1.0f - dot;
+        }
+        for (int kk = 1; kk < n_clusters; kk++) {
+            int best = 0; float bestd = -1.0f;
+            for (int r = 0; r < inter; r++)
+                if (mindist[r] > bestd) { bestd = mindist[r]; best = r; }
+            memcpy(centers + (size_t)kk * hidden, Wn + (size_t)best * hidden,
+                   (size_t)hidden * sizeof(float));
+            const float *c = centers + (size_t)kk * hidden;
+            for (int r = 0; r < inter; r++) {
+                const float *x = Wn + (size_t)r * hidden;
+                float dot = 0.0f;
+                for (int i = 0; i < hidden; i++) dot += x[i] * c[i];
+                float d = 1.0f - dot;
+                if (d < mindist[r]) mindist[r] = d;
+            }
+        }
+        free(mindist);
+
+        double *csum = (double *)malloc((size_t)n_clusters * hidden * sizeof(double));
+        if (!csum) { free(Wn); free(centers); free(labels); return -1; }
+        int max_iter = 25;
+        {
+            const char *e = getenv("IB_FFN_CLUSTER_ITERS");
+            if (e && *e) { int v = atoi(e); if (v > 0) max_iter = v; }
+        }
+        for (int it = 0; it < max_iter; it++) {
+            int changed = 0;
+            for (int r = 0; r < inter; r++) {
+                const float *x = Wn + (size_t)r * hidden;
+                int bestk = 0; float bestdot = -2.0f;
+                for (int k = 0; k < n_clusters; k++) {
+                    const float *c = centers + (size_t)k * hidden;
+                    float dot = 0.0f;
+                    for (int i = 0; i < hidden; i++) dot += x[i] * c[i];
+                    if (dot > bestdot) { bestdot = dot; bestk = k; }
+                }
+                if (labels[r] != bestk) changed = 1;
+                labels[r] = bestk;
+            }
+            memset(csum, 0, (size_t)n_clusters * hidden * sizeof(double));
+            int *cnt = (int *)calloc((size_t)n_clusters, sizeof(int));
+            if (!cnt) { free(csum); free(Wn); free(centers); free(labels); return -1; }
+            for (int r = 0; r < inter; r++) {
+                int k = labels[r];
+                const float *x = Wn + (size_t)r * hidden;
+                double *acc = csum + (size_t)k * hidden;
+                for (int i = 0; i < hidden; i++) acc[i] += x[i];
+                cnt[k]++;
+            }
+            for (int k = 0; k < n_clusters; k++) {
+                float *c = centers + (size_t)k * hidden;
+                if (cnt[k] == 0) continue;
+                const double *acc = csum + (size_t)k * hidden;
+                double ss = 0.0;
+                for (int i = 0; i < hidden; i++) ss += acc[i] * acc[i];
+                float invn = (ss > 1e-20) ? (float)(1.0 / sqrt(ss)) : 0.0f;
+                for (int i = 0; i < hidden; i++) c[i] = (float)(acc[i] * invn);
+            }
+            free(cnt);
+            if (!changed && it > 0) break;
+        }
+        free(csum);
+    }
+    free(centers);   /* unit centers no longer needed; we recompute the
+                        input-space centroid from the raw rows below. */
+    free(Wn);
+
+    /* Cluster sizes (natural k-means partition — NO forced balancing). */
+    int *csize = (int *)calloc((size_t)n_clusters, sizeof(int));
+    if (!csize) { free(labels); return -1; }
+    for (int r = 0; r < inter; r++) {
+        int c = labels[r];
+        if (c < 0 || c >= n_clusters) c = 0;
+        csize[c]++;
+    }
+    if (getenv("IB_FFN_CLUSTER_DEBUG")) {
+        fprintf(stderr, "[ffn_cluster] sizes:");
+        for (int c = 0; c < n_clusters; c++) fprintf(stderr, " %d", csize[c]);
+        fprintf(stderr, "\n");
+    }
+
+    /* Contiguous cluster offsets in PERMUTED space. Clusters are laid out
+     * in label order 0..n_clusters-1; cluster c occupies
+     * [offsets[c], offsets[c+1]). offsets[0] == 0, offsets[N] == inter. */
+    offsets_out[0] = 0u;
+    for (int c = 0; c < n_clusters; c++)
+        offsets_out[c + 1] = offsets_out[c] + (uint32_t)csize[c];
+    /* offsets_out[n_clusters] now equals inter by construction. */
+
+    /* Build the permutation: emit rows cluster-by-cluster in label order
+     * so each cluster's rows are contiguous, matching offsets above.
+     * perm_out[new_row] = old_row. */
+    int pos = 0;
+    for (int c = 0; c < n_clusters; c++) {
+        for (int r = 0; r < inter && pos < inter; r++)
+            if (labels[r] == c) perm_out[pos++] = r;
+    }
+    /* Safety: append any out-of-range-labelled rows (shouldn't happen). */
+    if (pos < inter) {
+        char *seen = (char *)calloc((size_t)inter, 1);
+        if (seen) {
+            for (int i = 0; i < pos; i++) seen[perm_out[i]] = 1;
+            for (int r = 0; r < inter && pos < inter; r++)
+                if (!seen[r]) perm_out[pos++] = r;
+            free(seen);
+        }
+    }
+    if (pos != inter) { free(labels); free(csize); return -1; }
+
+    /* Per-cluster centroid in INPUT (hidden) space = arithmetic mean of
+     * that cluster's UN-normalised gate rows. This is the input-space
+     * "signature" the runtime compares the activation against — the mean
+     * raw row, not the unit-normalised k-means center. */
+    double *acc = (double *)malloc((size_t)hidden * sizeof(double));
+    if (!acc) { free(labels); free(csize); return -1; }
+    for (int c = 0; c < n_clusters; c++) {
+        for (int i = 0; i < hidden; i++) acc[i] = 0.0;
+        int cnt = 0;
+        for (int r = 0; r < inter; r++) {
+            if (labels[r] != c) continue;
+            const float *row = W_gate + (size_t)r * hidden;
+            for (int i = 0; i < hidden; i++) acc[i] += (double)row[i];
+            cnt++;
+        }
+        double inv = (cnt > 0) ? 1.0 / (double)cnt : 0.0;
+        uint16_t *dst = centroids_fp16_out + (size_t)c * (size_t)hidden;
+        for (int i = 0; i < hidden; i++)
+            dst[i] = ffn_f32_to_f16((float)(acc[i] * inv));
+    }
+    free(acc);
+
+    free(labels);
+    free(csize);
+    return 0;
 }
 
 /* ── TODOs (v1 deliberately deferred) ────────────────────────────────

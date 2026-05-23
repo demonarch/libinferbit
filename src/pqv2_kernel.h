@@ -189,7 +189,14 @@ void pqv2_matvec_tbl_int8_k256_batch(
  *
  * Used for chunk-parallel threading: each worker gets a chunk slice and
  * accumulates into its own thread-local acc buffer; main thread reduces
- * across workers and applies row_scale at the end. */
+ * across workers and applies row_scale at the end.
+ *
+ * L1-only (M1 burst): there is NO use_l2 parameter here. The L2 (pyramid)
+ * residual is engaged iff acc_l2 != NULL (and l2_cb != NULL). A BURST
+ * L1-only matvec simply passes acc_l2 = NULL (and never allocates the L2
+ * scratch), so the kernel produces the coarse L1-only reconstruction —
+ * bit-identical to pqv2_acc_csrange(..., use_l2=0). The exact L1+L2 path
+ * (every existing caller) passes a non-NULL acc_l2 and is unchanged. */
 void pqv2_acc_tbl_int8_k256_chunks(
     const pqv2_t *t, const float *x,
     const float *cb, const float *l2_cb,
@@ -199,7 +206,8 @@ void pqv2_acc_tbl_int8_k256_chunks(
 /* Skip-aware chunk-range accumulator (K=256). Same as the plain chunks
  * variant but bypasses (c,s) iterations whose input slice has
  * max|x[c*G+s*half .. c*G+(s+1)*half]| < skip_thresh. Pass 0 to disable
- * the skip check entirely. Caller still owns + zeroes acc. */
+ * the skip check entirely. Caller still owns + zeroes acc.
+ * L1-only burst: pass acc_l2 = NULL to skip the L2 residual. */
 void pqv2_acc_tbl_int8_k256_chunks_skip(
     const pqv2_t *t, const float *x,
     const float *cb, const float *l2_cb,
@@ -211,7 +219,8 @@ void pqv2_acc_tbl_int8_k256_chunks_skip(
  * Same per-position summation order as the single-position chunks variant
  * (so a B=1 call is bitwise-equivalent to pqv2_acc_tbl_int8_k256_chunks).
  * acc_batch and acc_l2_batch are laid out [B, M]. Caller zeroes both once.
- * Pass l2_cb=NULL and acc_l2_batch=NULL when the tensor has no L2 stage. */
+ * Pass l2_cb=NULL and acc_l2_batch=NULL when the tensor has no L2 stage
+ * (also the L1-only burst path). */
 void pqv2_acc_tbl_int8_k256_chunks_batch(
     const pqv2_t *t, const float *x_batch, int B,
     const float *cb, const float *l2_cb,
@@ -253,12 +262,19 @@ void pqv2_acc_tbl_int8_k256_chunks_batch(
  * the vectorised blocks land on the same boundaries as the single-thread
  * kernel (bit-identical). The L2 residual is accumulated ONLY on a
  * full-range call (m0==0 && m1==M); pass l2_cb=NULL for tiled calls. */
+/* `use_l2` (M1 burst scaffolding): the L2 (pyramid) residual gate. Pass 1
+ * for the exact L1+L2 result (today's behaviour — every existing caller
+ * does this). A later (M2) agent will pass 0 from a BURST profile to read
+ * L1-only; with use_l2==0 the kernel skips the L2 unpack+gather entirely.
+ * use_l2 is ANDed with the existing l2_cb/acc_l2/l2_kind/l2_K conditions,
+ * so passing 1 is exactly the prior gating. */
 void pqv2_acc_csrange(
     const pqv2_t *t, const float *x,
     const float *cb, const float *l2_cb,
     float *acc, float *acc_l2,
     uint32_t cs_start, uint32_t cs_count,
-    uint32_t m0, uint32_t m1);
+    uint32_t m0, uint32_t m1,
+    int use_l2);
 
 /* fp16 helpers (IEEE half) */
 float pqv2_h2f(uint16_t h);

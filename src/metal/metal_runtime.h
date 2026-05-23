@@ -862,6 +862,80 @@ int ib_metal_forward_token(ib_metal_ctx *ctx,
                             int pos,
                             float *logits_out);
 
+/* ── Async whole-token forward (CPU∥GPU co-execution) ────────────────
+ *
+ * ib_metal_forward_token submits the per-token forward AND blocks until
+ * the GPU finishes (commit + waitUntilCompleted) before returning logits.
+ * On Apple unified memory the CPU sits idle during that wait — wasted
+ * time that could be spent streaming + dequantizing a drive-resident
+ * (cold) tensor for the NEXT step.
+ *
+ * These functions split that single blocking call into a non-blocking
+ * SUBMIT and a later WAIT/POLL, so the integrator can run CPU work
+ * (drive pread + dequant of cold weights) BETWEEN them while the GPU
+ * computes the hot, resident matmuls. The math is byte-identical to the
+ * sync path — this is pure scheduling overlap, hence LOSSLESS.
+ *
+ * Granularity is one whole token forward (the existing forward is
+ * monolithic — all layers + final norm + lm_head are recorded into one
+ * command buffer). That is the cleanest first cut; finer-grained
+ * (per-matmul) overlap is already available via the recorder + the
+ * commit_async / wait_committed primitives below.
+ *
+ * In-flight depth: this submit keeps a SMALL depth (1, optionally 2 via
+ * IB_METAL_ASYNC_DEPTH=2). The handle owns a retained MTLCommandBuffer;
+ * completion is detected with addCompletedHandler (sets an atomic flag,
+ * usable by _poll without blocking) and waitUntilCompleted (in _wait).
+ *
+ * Lifetime / ordering contract:
+ *   - bufs->x and bufs->logits are SHARED state inside the model buffers;
+ *     a given `bufs` may have at most IB_METAL_ASYNC_DEPTH submits in
+ *     flight at once. Submitting again before waiting on an outstanding
+ *     handle for the SAME `bufs` past that depth returns NULL.
+ *   - The caller MUST eventually wait (or poll-to-done) on every handle
+ *     returned, then it is freed. Waiting twice on the same handle is a
+ *     no-op-safe error (returns -1).
+ *   - logits_out passed to _submit is captured and filled by _wait
+ *     (it must stay valid until the matching _wait/_poll-done returns).
+ *
+ * Usage (overlap one cold tensor stream behind the GPU forward):
+ *   ib_metal_async_handle *h =
+ *       ib_metal_forward_token_async_submit(ctx, bufs, embed, pos, logits);
+ *   // GPU now runs the hot forward; CPU is free:
+ *   stream_and_dequant_cold_tensor_for_next_step(...);
+ *   ib_metal_async_wait(h);          // blocks until GPU done, fills logits
+ *   // logits now valid
+ */
+typedef struct ib_metal_async_handle ib_metal_async_handle;
+
+/* Non-blocking submit. Mirrors ib_metal_forward_token's inputs exactly
+ * (same cpu_embed_in / pos / logits_out semantics) but commits the
+ * command buffer WITHOUT waiting. Returns an opaque handle, or NULL on
+ * error or if the in-flight depth for this `bufs` is already saturated
+ * (caller should wait on an outstanding handle first). `logits_out` is
+ * filled by the matching ib_metal_async_wait (NOT before it returns). */
+ib_metal_async_handle *ib_metal_forward_token_async_submit(
+    ib_metal_ctx *ctx,
+    ib_metal_model_buffers *bufs,
+    const float *cpu_embed_in,
+    int pos,
+    float *logits_out);
+
+/* Block until the submitted command buffer completes, copy logits into
+ * the logits_out captured at submit time, free the handle. Returns 0 on
+ * success, -1 on GPU error or invalid/already-consumed handle. After
+ * this returns the handle pointer is invalid (do not reuse). */
+int ib_metal_async_wait(ib_metal_async_handle *h);
+
+/* Non-blocking status check. Returns:
+ *    1  → command buffer completed (logits copied out, handle FREED —
+ *         do not call wait/poll again on this handle)
+ *    0  → still in flight (call again later, or ib_metal_async_wait)
+ *   -1  → GPU error or invalid handle (handle FREED on error)
+ * When poll returns 1 it has already performed the logits copy + free,
+ * so the caller need not (and must not) call ib_metal_async_wait. */
+int ib_metal_async_poll(ib_metal_async_handle *h);
+
 /* Batched prefill forward: runs B tokens through all layers in a single
  * command buffer, batching the per-layer matmuls (Q/K/V/O/gate/up/down)
  * across all B tokens to amortize weight-load bandwidth. Per-token ops
@@ -903,6 +977,24 @@ int ib_metal_recorder_checkpoint(ib_metal_recorder *rec);
  * CPU pread/transpose with GPU compute on the prior CB. */
 void *ib_metal_recorder_commit_async(ib_metal_recorder *rec);
 int   ib_metal_recorder_wait_committed(void *cb_handle);
+
+/* Commit the recorder's command buffer WITHOUT waiting, install a
+ * completion handler that stores 1 into *done_flag (the impl treats
+ * done_flag as a pointer to std::atomic<int>; pass NULL to skip), retain
+ * and return the command buffer for later wait/poll, and FREE the
+ * recorder (it is no longer usable). Returns NULL on error. This is the
+ * whole-token async building block used by
+ * ib_metal_forward_token_async_submit; callers waiting on the returned
+ * handle use ib_metal_recorder_wait_committed (or check status via the
+ * done flag for a non-blocking poll). */
+void *ib_metal_recorder_commit_async_done(ib_metal_recorder *rec,
+                                          void *done_flag);
+
+/* Non-blocking status check for a handle returned by
+ * ib_metal_recorder_commit_async / _done. Returns 1 if the command
+ * buffer has completed, 0 if still in flight, -1 on error. Does NOT
+ * wait, does NOT release the handle. */
+int ib_metal_cb_completed(void *cb_handle);
 
 /* All-logits variant of forward_prefill: outputs per-position logits
  * for all n_tokens (vs the standard last-token only). Used by

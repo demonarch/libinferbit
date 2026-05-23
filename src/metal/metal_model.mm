@@ -26,6 +26,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <atomic>      /* async-handle completion flag */
+#include <unordered_map> /* async-handle in-flight depth gate */
 
 /* pqv2_kernel.h is wrapped in extern "C" so pqv2_h2f / pqv2_f2h are
  * C-linkage when included from this .mm — no forward decls needed. */
@@ -1979,6 +1981,166 @@ ib_metal_forward_token(ib_metal_ctx *ctx,
 
     memcpy(logits_out, b->logits, (size_t)b->vocab * sizeof(float));
     return 0;
+}
+
+/* ── Async whole-token forward (CPU∥GPU co-execution) ────────────────
+ *
+ * Splits ib_metal_forward_token into submit (record + commit, NO wait)
+ * and wait/poll. Bit-identical math to the sync path — we only move the
+ * waitUntilCompleted out of the submit so the CPU can do useful work
+ * (stream + dequant a cold drive-resident tensor for the next step)
+ * while the GPU runs this token's hot, resident matmuls.
+ *
+ * The handle holds the just-committed MTLCommandBuffer (retained via
+ * CFRetain so it outlives the autoreleasepool), plus where to copy the
+ * logits when it completes. Completion is signalled two ways:
+ *   - addCompletedHandler sets `done` (atomic) → lets _poll check status
+ *     with zero blocking and no Metal-API call from the polling thread.
+ *   - _wait calls waitUntilCompleted directly (the canonical block).
+ */
+struct ib_metal_async_handle {
+    ib_metal_model_buffers *b;
+    void *cb;                 /* retained id<MTLCommandBuffer> as void*  */
+    float *logits_out;        /* caller buffer to fill on completion     */
+    int vocab;
+    std::atomic<int> *done;   /* set 1 by completion handler             */
+    int consumed;             /* 1 once logits copied + cb released       */
+};
+
+/* Per-bufs in-flight depth gate. Whole-token submits share bufs->x /
+ * bufs->logits, so we cap concurrent in-flight submits per `bufs`. Depth
+ * 1 by default (safe: one token's logits in flight); IB_METAL_ASYNC_DEPTH=2
+ * lets the integrator keep a second token queued behind the first. We
+ * track the count in a process-global map keyed by the bufs pointer to
+ * avoid touching the public struct layout. */
+static std::unordered_map<void *, int> g_async_inflight;
+
+static int async_depth_cap(void) {
+    static int cap = -1;
+    if (cap < 0) {
+        const char *e = getenv("IB_METAL_ASYNC_DEPTH");
+        cap = (e && e[0] == '2') ? 2 : 1;
+        if (cap < 1) cap = 1;
+        if (cap > 2) cap = 2;
+    }
+    return cap;
+}
+
+extern "C" ib_metal_async_handle *
+ib_metal_forward_token_async_submit(ib_metal_ctx *ctx,
+                                     ib_metal_model_buffers *b,
+                                     const float *cpu_embed_in,
+                                     int pos,
+                                     float *logits_out)
+{
+    if (!ctx || !b || !cpu_embed_in || !logits_out) return NULL;
+    if (pos < 0 || pos >= b->max_logical_pos) return NULL;
+
+    /* In-flight depth gate (per bufs). */
+    {
+        auto it = g_async_inflight.find((void *)b);
+        int cur = (it == g_async_inflight.end()) ? 0 : it->second;
+        if (cur >= async_depth_cap()) return NULL;  /* saturated */
+    }
+
+    memcpy(b->x, cpu_embed_in, (size_t)b->hidden * sizeof(float));
+
+    ib_metal_recorder *r = ib_metal_recorder_begin(ctx);
+    if (!r) return NULL;
+    /* Drive-mode ring counters start clean on each new recorder/CB —
+     * identical to the sync forward_token. */
+    b->gpu_drive_idx_in_flight = 0;
+    b->gpu_drive_idx_slot = 0;
+    b->gpu_drive_cur_sr = 0;
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
+
+    record_single_forward_step(r, b, pos);
+
+    /* Drain the drive-mode in-flight CB before committing the final CB,
+     * exactly as the sync path does. (This in-flight CB is an INTERNAL
+     * drive-streaming overlap, distinct from the whole-token async we
+     * are returning to the caller.) */
+    if (b->gpu_drive_pending_cb) {
+        (void)ib_metal_recorder_wait_committed(b->gpu_drive_pending_cb);
+        b->gpu_drive_pending_cb = NULL;
+    }
+
+    /* Commit WITHOUT waiting. ib_metal_recorder_commit_async_done commits
+     * the recorder's final CB, installs the completion handler that flips
+     * our `done` flag, retains the CB, and frees the recorder shell. The
+     * recorder internals stay encapsulated in metal_runtime.mm. */
+    ib_metal_async_handle *h = new ib_metal_async_handle();
+    h->b = b;
+    h->logits_out = logits_out;
+    h->vocab = b->vocab;
+    h->consumed = 0;
+    h->done = new std::atomic<int>(0);
+
+    void *cb_handle = ib_metal_recorder_commit_async_done(r, (void *)h->done);
+    if (!cb_handle) {
+        delete h->done;
+        delete h;
+        return NULL;
+    }
+    h->cb = cb_handle;
+
+    g_async_inflight[(void *)b] += 1;
+    return h;
+}
+
+/* Internal: finalize a completed handle — copy logits, release cb,
+ * decrement the in-flight count, free the handle. Caller must have
+ * established that the cb finished (status check or waitUntilCompleted).
+ * Returns 0 on clean completion, -1 if the cb reported an error. */
+static int async_finalize(ib_metal_async_handle *h, id<MTLCommandBuffer> cb) {
+    bool err = (cb.status == MTLCommandBufferStatusError);
+    if (err) {
+        fprintf(stderr, "Metal async forward: cmd buffer error: %s\n",
+                cb.error ? [[cb.error localizedDescription] UTF8String] : "n/a");
+    } else {
+        memcpy(h->logits_out, h->b->logits, (size_t)h->vocab * sizeof(float));
+    }
+    /* Decrement in-flight count for this bufs. */
+    auto it = g_async_inflight.find((void *)h->b);
+    if (it != g_async_inflight.end()) {
+        if (--it->second <= 0) g_async_inflight.erase(it);
+    }
+    h->consumed = 1;
+    delete h->done;
+    h->done = nullptr;
+    delete h;
+    return err ? -1 : 0;
+}
+
+extern "C" int ib_metal_async_wait(ib_metal_async_handle *h) {
+    if (!h || h->consumed || !h->cb) return -1;
+    @autoreleasepool {
+        /* __bridge_transfer balances the CFRetain done at submit. */
+        id<MTLCommandBuffer> cb =
+            (__bridge_transfer id<MTLCommandBuffer>)(CFTypeRef)h->cb;
+        h->cb = NULL;
+        [cb waitUntilCompleted];
+        return async_finalize(h, cb);
+    }
+}
+
+extern "C" int ib_metal_async_poll(ib_metal_async_handle *h) {
+    if (!h || h->consumed || !h->cb) return -1;
+    /* Check the completion flag set by addCompletedHandler — no Metal
+     * call, fully non-blocking. */
+    if (h->done->load(std::memory_order_acquire) == 0) {
+        return 0;  /* still in flight */
+    }
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb =
+            (__bridge_transfer id<MTLCommandBuffer>)(CFTypeRef)h->cb;
+        h->cb = NULL;
+        int rc = async_finalize(h, cb);  /* copies logits + frees handle */
+        return (rc == 0) ? 1 : -1;
+    }
 }
 
 extern "C" int

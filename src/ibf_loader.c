@@ -15,18 +15,256 @@
 #include "platform.h"
 #include "cJSON.h"
 #include "pq_decode.h"   /* ib_fp16_to_fp32 — used for static scale caching */
+#include "sparse_gate.h" /* FFN cluster record layout (magic/version/header) */
+#include "pqv2_format.h" /* ib_pqv2_file / ib_pqv2_find — locate ffn_clusters by name */
 
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/mman.h>   /* mlock — best-effort hot-pool residency lock */
+#endif
 
 #define IBF_MAGIC      "INFERBIT"
 #define IBF_MAGIC_SIZE 8
 #define IBF_PREAMBLE   32
 #define IBF_ALIGNMENT  64
 #define IBF_VERSION    1
+
+/* ── Hot-pool threading shim ────────────────────────────────────────
+ *
+ * The hot pool is read (lookup) and written (promote) from the matmul
+ * path, which runs on the thread pool's workers. A single mutex around
+ * the small entry table is enough for the existing access pattern (the
+ * table is tiny and operations are O(entries) with entries bounded by
+ * the MB budget / smallest tensor). Mirror the minimal pthread shim
+ * forward.c uses so this stays portable without pulling in threading.c's
+ * full Windows layer. */
+#ifdef _WIN32
+typedef SRWLOCK ib_hp_mutex_t;
+#define IB_HP_MUTEX_INIT(m)   InitializeSRWLock(m)
+#define IB_HP_MUTEX_LOCK(m)   AcquireSRWLockExclusive(m)
+#define IB_HP_MUTEX_UNLOCK(m) ReleaseSRWLockExclusive(m)
+#define IB_HP_MUTEX_DESTROY(m) ((void)0)
+#else
+#include <pthread.h>
+typedef pthread_mutex_t ib_hp_mutex_t;
+#define IB_HP_MUTEX_INIT(m)   pthread_mutex_init((m), NULL)
+#define IB_HP_MUTEX_LOCK(m)   pthread_mutex_lock(m)
+#define IB_HP_MUTEX_UNLOCK(m) pthread_mutex_unlock(m)
+#define IB_HP_MUTEX_DESTROY(m) pthread_mutex_destroy(m)
+#endif
+
+/* ── Hot-pool layout (Goal H4 — adaptive hot-cache) ─────────────────
+ *
+ * Everything lives inside the single `model->hot_pool` malloc region the
+ * loader already allocates from IB_HOT_POOL_MB. That keeps the data
+ * structure allocation-light (zero extra mallocs) AND means the existing
+ * `free(model->hot_pool)` in model.c frees the whole thing — no new
+ * field on inferbit_model and no change to the free path is required.
+ *
+ * Layout within hot_pool:
+ *   [ ib_hot_hdr ][ ib_hot_entry[cap] ][ ... data arena ... ]
+ *
+ * The control header carries the mutex, the LRU clock, the entry table
+ * capacity/count, and the data-arena bump cursor. Entries are a fixed-
+ * size array (linear scan); `cap` is derived from the budget so the
+ * table can never describe more bytes than the arena holds.
+ *
+ * Eviction policy: LRU. Each lookup/promote stamps the entry with a
+ * monotonically increasing `clock`; when the arena can't fit a new
+ * promotion we evict the entry with the smallest stamp until it fits (or
+ * until the table is empty, in which case the item is simply too big and
+ * we skip it). LRU was chosen over LFU because the burst/cool-down duty
+ * cycle wants the *current* burst's working set resident, not whatever
+ * was hottest across the whole run. */
+
+#define IB_HOT_TABLE_FRAC 64u   /* ~1/64 of the budget reserved for the
+                                 * header+entry table; the rest is arena. */
+
+typedef struct {
+    size_t   key;        /* t->offset — stable per-tensor id (0 = empty slot) */
+    size_t   data_off;   /* byte offset of the copy within the arena */
+    size_t   nbytes;     /* bytes copied */
+    uint64_t stamp;      /* last-access LRU clock */
+    int      in_use;     /* 0 = free slot, 1 = occupied */
+} ib_hot_entry;
+
+typedef struct {
+    ib_hp_mutex_t mu;
+    int           cap;        /* number of entry slots */
+    int           count;      /* occupied slots */
+    uint64_t      clock;      /* monotonic LRU stamp source */
+    size_t        arena_off;  /* offset of the data arena within hot_pool */
+    size_t        arena_cap;  /* arena capacity in bytes */
+    size_t        arena_used; /* bytes currently committed (high-water cursor) */
+} ib_hot_hdr;
+
+/* Initialise the in-buffer control header + entry table. Called once at
+ * load from the IB_HOT_POOL_MB allocation site. `buf`/`bytes` are the raw
+ * malloc'd region. If the budget is too small to hold even the header
+ * plus one entry, cap is left at 0 and the pool degrades to a no-op
+ * (lookup always misses, promote always skips) — never a crash. */
+static void ib_hot_pool_init(void *buf, size_t bytes) {
+    if (!buf || bytes < sizeof(ib_hot_hdr) + sizeof(ib_hot_entry)) {
+        /* Too small to be useful. Zero the header region we can touch so a
+         * later lookup/promote sees cap == 0 and bails. */
+        if (buf && bytes >= sizeof(ib_hot_hdr)) {
+            ib_hot_hdr *h = (ib_hot_hdr *)buf;
+            memset(h, 0, sizeof(*h));
+            IB_HP_MUTEX_INIT(&h->mu);
+        }
+        return;
+    }
+    ib_hot_hdr *h = (ib_hot_hdr *)buf;
+    memset(h, 0, sizeof(*h));
+    IB_HP_MUTEX_INIT(&h->mu);
+
+    /* Reserve ~1/IB_HOT_TABLE_FRAC of the budget for the entry table
+     * (after the header); the remainder is the data arena. At least 1
+     * entry; arena gets whatever is left. */
+    size_t after_hdr = bytes - sizeof(ib_hot_hdr);
+    size_t table_budget = bytes / IB_HOT_TABLE_FRAC;
+    if (table_budget > after_hdr) table_budget = after_hdr;
+    int cap = (int)(table_budget / sizeof(ib_hot_entry));
+    if (cap < 1) cap = 1;
+    size_t table_bytes = (size_t)cap * sizeof(ib_hot_entry);
+
+    h->cap        = cap;
+    h->count      = 0;
+    h->clock      = 0;
+    h->arena_off  = sizeof(ib_hot_hdr) + table_bytes;
+    h->arena_cap  = bytes - h->arena_off;
+    h->arena_used = 0;
+
+    ib_hot_entry *tbl = (ib_hot_entry *)((uint8_t *)buf + sizeof(ib_hot_hdr));
+    memset(tbl, 0, table_bytes);
+}
+
+/* Convenience accessors that resolve the header / table / arena from the
+ * model. Return NULL when the pool is disabled (IB_HOT_POOL_MB unset →
+ * hot_pool == NULL) or alloc-failed, which is what makes the default path
+ * a strict no-op. */
+static inline ib_hot_hdr *ib_hot_hdr_of(const inferbit_model *m) {
+    if (!m || !m->hot_pool || m->hot_pool_bytes < sizeof(ib_hot_hdr))
+        return NULL;
+    return (ib_hot_hdr *)m->hot_pool;
+}
+static inline ib_hot_entry *ib_hot_table_of(ib_hot_hdr *h) {
+    return (ib_hot_entry *)((uint8_t *)h + sizeof(ib_hot_hdr));
+}
+
+/* ── Public hot-cache implementation (Goal H4) ──────────────────────
+ *
+ * NOTE ON LINKAGE: the canonical ib_hot_lookup / ib_hot_promote symbols
+ * are still the no-op stubs in forward.c (owned by another agent). To
+ * avoid a duplicate-symbol link error these real bodies are named
+ * *_impl. The integration step is a two-line redirect in forward.c —
+ * see the report's TODO(burst-M2: forward.c). The signatures here are an
+ * exact match for the header declarations so the redirect is mechanical.
+ *
+ * Default-behaviour guarantee: when hot_pool is NULL (IB_HOT_POOL_MB
+ * unset) or the table cap is 0, lookup returns NULL and promote returns
+ * non-zero ("not promoted") WITHOUT touching any state — byte-identical
+ * to today's stubs. */
+
+const void *ib_hot_lookup_key(const inferbit_model *m, size_t key) {
+    ib_hot_hdr *h = ib_hot_hdr_of(m);
+    if (!h || h->cap <= 0) return NULL;              /* disabled → strict no-op */
+
+    const void *result = NULL;
+    IB_HP_MUTEX_LOCK(&h->mu);
+    ib_hot_entry *tbl = ib_hot_table_of(h);
+    for (int i = 0; i < h->cap; i++) {
+        if (tbl[i].in_use && tbl[i].key == key) {
+            tbl[i].stamp = ++h->clock;               /* bump LRU recency */
+            result = (const uint8_t *)m->hot_pool + h->arena_off + tbl[i].data_off;
+            break;
+        }
+    }
+    IB_HP_MUTEX_UNLOCK(&h->mu);
+    return result;
+}
+
+const void *ib_hot_lookup_impl(const inferbit_model *m, const ib_tensor_meta *t) {
+    if (!t) return NULL;
+    return ib_hot_lookup_key(m, t->offset);
+}
+
+/* Reserve `nbytes` under `key` and return a WRITABLE pointer into the arena
+ * (caller fills it — used by the drive path to pread a tensor's indices
+ * straight from disk into the pool). Fill-once bump allocator: NO eviction.
+ * When the model exceeds the budget the first tensors fill the pool and stay
+ * resident; later tensors get NULL and fall back to streaming/paging. This is
+ * deliberately thrash-free — eviction on an over-budget model would re-promote
+ * the whole working set every token (slower than just paging). Returns the
+ * existing pointer if `key` is already resident (idempotent), or NULL if it
+ * doesn't fit. Pointers are STABLE for the model's life (no compaction). */
+void *ib_hot_reserve(inferbit_model *m, size_t key, size_t nbytes) {
+    ib_hot_hdr *h = ib_hot_hdr_of(m);
+    if (!h || h->cap <= 0 || nbytes == 0 || nbytes > h->arena_cap) return NULL;
+
+    void *result = NULL;
+    IB_HP_MUTEX_LOCK(&h->mu);
+    ib_hot_entry *tbl = ib_hot_table_of(h);
+
+    /* Already resident → return existing (idempotent). */
+    for (int i = 0; i < h->cap; i++) {
+        if (tbl[i].in_use && tbl[i].key == key) {
+            result = (uint8_t *)m->hot_pool + h->arena_off + tbl[i].data_off;
+            IB_HP_MUTEX_UNLOCK(&h->mu);
+            return result;
+        }
+    }
+
+    /* Fill-once: place at the bump cursor if a slot and room remain. */
+    if (h->count < h->cap && h->arena_used + nbytes <= h->arena_cap) {
+        int slot = -1;
+        for (int i = 0; i < h->cap; i++) { if (!tbl[i].in_use) { slot = i; break; } }
+        if (slot >= 0) {
+            size_t off = h->arena_used;
+            tbl[slot].key      = key;
+            tbl[slot].data_off = off;
+            tbl[slot].nbytes   = nbytes;
+            tbl[slot].stamp    = ++h->clock;
+            tbl[slot].in_use   = 1;
+            h->count++;
+            h->arena_used     += nbytes;
+            m->hot_pool_entries = h->count;
+            result = (uint8_t *)m->hot_pool + h->arena_off + off;
+        }
+    }
+
+    IB_HP_MUTEX_UNLOCK(&h->mu);
+    return result;
+}
+
+/* Promote a byte range [src, src+nbytes) under `key`: reserve + copy. Caches
+ * the *streamed index sub-region* (the bytes the matmul reads via pq->indices),
+ * byte-identical to the streamed bytes → the RAM throttle is BIT-EXACT (only
+ * residency/speed change, never the logits). Returns 0 if resident, nonzero if
+ * it didn't fit. */
+int ib_hot_promote_bytes(inferbit_model *m, size_t key,
+                         const void *src, size_t nbytes) {
+    if (!src) return 1;
+    void *dst = ib_hot_reserve(m, key, nbytes);
+    if (!dst) return 1;
+    if (dst != src) memcpy(dst, src, nbytes);
+    return 0;
+}
+
+/* Whole-tensor convenience wrapper: cache the canonical on-disk blob at
+ * m->weight_data + t->offset (t->size bytes), keyed by t->offset. Kept for the
+ * generic API surface; the drive path uses ib_hot_promote_bytes directly to
+ * cache just the L1 index sub-region it streams. */
+int ib_hot_promote_impl(inferbit_model *m, const ib_tensor_meta *t) {
+    if (!m || !t || t->size == 0 || !m->weight_data) return 1;
+    return ib_hot_promote_bytes(m, t->offset,
+                                (const uint8_t *)m->weight_data + t->offset,
+                                t->size);
+}
 
 /* ── Helpers ────────────────────────────────────────────────── */
 
@@ -113,6 +351,18 @@ static ib_layer_meta parse_layer(const cJSON* obj) {
     if (sparsity) {
         layer.sparsity_mask_offset = json_size(sparsity, "offset", 0);
         layer.sparsity_mask_size   = json_size(sparsity, "size", 0);
+    }
+
+    /* Optional sparse-FFN cluster record. Presence is signalled purely by
+     * the JSON object existing (and carrying a non-zero size). When absent
+     * these stay 0 and the gate is disabled — byte-identical to today.
+     * The byte layout / magic / version live in src/sparse_gate.h; the
+     * record itself is resolved + validated post-mmap in
+     * ib_resolve_ffn_clusters(). */
+    cJSON* ffn_cl = cJSON_GetObjectItemCaseSensitive(obj, "ffn_cluster");
+    if (ffn_cl) {
+        layer.ffn_cluster_blob_offset = json_size(ffn_cl, "offset", 0);
+        layer.ffn_cluster_blob_size   = json_size(ffn_cl, "size", 0);
     }
 
     return layer;
@@ -426,6 +676,159 @@ static void cache_one_tensor(inferbit_model* m, ib_tensor_meta* t,
     t->scales_fp32 = dst;
 }
 
+/* ── Sparse-FFN cluster record resolver ──────────────────────────────
+ *
+ * Wire each layer's ffn_* runtime pointers to its on-disk cluster record.
+ *
+ * WHERE THE RECORD LIVES (the cross-agent contract — kept byte-for-byte in
+ * sync with pqv2_encode.c::push_ffn_cluster_record and src/sparse_gate.h):
+ *
+ *   • IBF v6 (PQv2) models — the dominant path. The encoder emits the
+ *     record as a NAMED RAW_INT32 manifest tensor:
+ *
+ *         L<li>.mlp.ffn_clusters
+ *
+ *     (i.e. for layer li, base "L<li>.mlp" + ".ffn_clusters"). We locate
+ *     it by that exact name through the model's pqv2 file backing
+ *     (ib_pqv2_find), which already parsed every manifest tensor's
+ *     {raw_data, raw_size} into the mmap. NO JSON {offset,size} staging is
+ *     involved on this path — the tensor name IS the locator.
+ *
+ *   • Legacy v5 (JSON) models — parse_layer() may stage an `ffn_cluster`
+ *     {offset,size} pointer into model->weight_data. If a layer carries
+ *     that staging and no pqv2 backing tensor was found, we fall back to
+ *     resolving the record at weight_data + offset. (No v5 encoder writes
+ *     this today; the path is kept for forward-compat / symmetry.)
+ *
+ * SELF-DESCRIBING RECORD (identical on both paths; see sparse_gate.h):
+ *
+ *   [0..7]   magic  "IBFFNCL1"   (IB_FFN_CLUSTER_MAGIC)
+ *   [8..11]  u32    version = 1   (IB_FFN_CLUSTER_VERSION)
+ *   [12..15] u32    flags         (bit0 = inter_perm present)
+ *   [16..19] u32    n_clusters
+ *   [20..23] u32    inter
+ *   [24..27] u32    hidden        (== sizeof(ib_ffn_cluster_hdr) = 28)
+ *   [28..]   u32    cluster_offsets[n_clusters + 1]
+ *            fp16   centroids[n_clusters * hidden]
+ *            u32    inter_perm[inter]   (iff flags bit0)
+ *
+ * ROUND-TRIP: convert writes record R for layer L as tensor
+ * "L<L>.mlp.ffn_clusters"; this resolver finds R for layer L by that
+ * name; hdr.n_clusters / inter / hidden, the offsets table, the centroids
+ * and the perm all read back from the same bytes the encoder wrote. When
+ * all clusters are active the permuted FFN reduces to the exact
+ * non-clustered result (the inter-permutation cancels through down_proj),
+ * so the record changes residency/skip behaviour only, never the math.
+ *
+ * Detection / versioning: the record is self-describing — magic + version
+ * gate parsing. Any record that fails magic/version/bounds/consistency is
+ * treated as ABSENT (the layer stays disabled) rather than failing the
+ * load. A model with NO record (the default) leaves every ffn_* field
+ * zero/NULL → byte-identical to today. Pointers index directly into the
+ * mmap (zero-copy); the mapping outlives the model, nothing is owned here.
+ *
+ * Must run AFTER model->weight_data is set. Safe to call when no layer
+ * has a record (it then only zeroes the disabled defaults). */
+static void ib_resolve_ffn_clusters(inferbit_model* m) {
+    if (!m || !m->layers || !m->weight_data) return;
+    const uint8_t* base = (const uint8_t*)m->weight_data;
+    size_t wsize = m->weight_data_size;
+    const ib_pqv2_file* pqf = (const ib_pqv2_file*)m->pqv2_file_backing;
+
+    for (int li = 0; li < m->header.num_layers; li++) {
+        ib_layer_meta* L = &m->layers[li];
+
+        /* Start disabled; only a fully-valid record flips this on. */
+        L->ffn_n_clusters      = 0;
+        L->ffn_inter           = 0;
+        L->ffn_hidden          = 0;
+        L->ffn_cluster_offsets = NULL;
+        L->ffn_centroids_fp16  = NULL;
+        L->ffn_inter_perm      = NULL;
+
+        /* Resolve {rec, blob} = start + byte length of this layer's record.
+         * Prefer the IBF v6 named-tensor locator; fall back to v5 JSON
+         * staging. If neither is present, the layer ships no record. */
+        const uint8_t* rec = NULL;
+        size_t blob = 0;
+
+        if (pqf) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "L%d.mlp.ffn_clusters", li);
+            const ib_pqv2_named_tensor* nt = ib_pqv2_find(pqf, nm);
+            if (nt && nt->raw_data && nt->raw_size > 0) {
+                /* raw_data points into the file mmap/buffer (zero-copy). */
+                rec  = (const uint8_t*)nt->raw_data;
+                blob = nt->raw_size;
+            }
+        }
+
+        if (!rec) {
+            /* Legacy v5 JSON {offset,size} staging into weight_data. */
+            size_t off  = L->ffn_cluster_blob_offset;
+            size_t jsz  = L->ffn_cluster_blob_size;
+            if (off == 0 && jsz == 0) continue;   /* no record staged */
+            /* Bounds: the staged span must lie inside the weight blob. */
+            if (off > wsize || jsz > wsize - off) continue;
+            rec  = base + off;
+            blob = jsz;
+        }
+
+        /* Header must fit inside the blob. */
+        if (blob < sizeof(ib_ffn_cluster_hdr)) continue;
+
+        const ib_ffn_cluster_hdr* hdr = (const ib_ffn_cluster_hdr*)rec;
+
+        if (memcmp(hdr->magic, IB_FFN_CLUSTER_MAGIC,
+                   IB_FFN_CLUSTER_MAGIC_SIZE) != 0) continue;
+        if (hdr->version != IB_FFN_CLUSTER_VERSION) continue;
+
+        uint32_t nc     = hdr->n_clusters;
+        uint32_t inter  = hdr->inter;
+        uint32_t hidden = hdr->hidden;
+
+        /* Disabled-by-content: n_clusters 0 or 1 means the encoder shipped
+         * a placeholder; keep the gate off (no-op, byte-identical). */
+        if (nc <= 1u || inter == 0u || hidden == 0u) continue;
+
+        /* Compute trailing-array byte spans and verify they fit in blob.
+         * Use 64-bit math to avoid uint32 overflow on the products. */
+        size_t hdr_bytes  = sizeof(ib_ffn_cluster_hdr);
+        size_t off_bytes  = ((size_t)nc + 1u) * sizeof(uint32_t);
+        size_t cen_bytes  = (size_t)nc * (size_t)hidden * sizeof(uint16_t);
+        int    have_perm  = (hdr->flags & IB_FFN_CLUSTER_FLAG_PERM) ? 1 : 0;
+        size_t perm_bytes = have_perm ? (size_t)inter * sizeof(uint32_t) : 0u;
+
+        size_t need = hdr_bytes + off_bytes + cen_bytes + perm_bytes;
+        if (need > blob) continue;   /* truncated / inconsistent — disable */
+
+        const uint8_t* p = rec + hdr_bytes;
+        const uint32_t* offsets   = (const uint32_t*)p;  p += off_bytes;
+        const uint16_t* centroids = (const uint16_t*)p;  p += cen_bytes;
+        const uint32_t* perm      = have_perm ? (const uint32_t*)p : NULL;
+
+        /* Sanity-check the offsets: monotonic, [0]=0, [nc]=inter. A
+         * malformed table disables the layer rather than risking an
+         * out-of-range FFN row range at runtime. */
+        if (offsets[0] != 0u || offsets[nc] != inter) continue;
+        int ok = 1;
+        for (uint32_t c = 0; c < nc; c++) {
+            if (offsets[c + 1] < offsets[c] || offsets[c + 1] > inter) {
+                ok = 0; break;
+            }
+        }
+        if (!ok) continue;
+
+        /* All checks passed — wire the (mmap-backed, zero-copy) pointers. */
+        L->ffn_n_clusters      = nc;
+        L->ffn_inter           = inter;
+        L->ffn_hidden          = hidden;
+        L->ffn_cluster_offsets = offsets;
+        L->ffn_centroids_fp16  = centroids;
+        L->ffn_inter_perm      = perm;
+    }
+}
+
 /* Walk every tensor slot on the model and pre-decode its static fp32
  * scales/norm buffer. Called once at the end of every load path
  * (ibf_load + pqv2_load_internal) so both legacy v5 and PQv2 v6 models
@@ -433,6 +836,17 @@ static void cache_one_tensor(inferbit_model* m, ib_tensor_meta* t,
 void ib_cache_model_static_fp32(inferbit_model* m);
 void ib_cache_model_static_fp32(inferbit_model* m) {
     if (!m) return;
+
+    /* Resolve any optional per-layer sparse-FFN cluster records now that
+     * model->weight_data (and, for IBF v6, model->pqv2_file_backing) is
+     * mapped. This finalizer is the SINGLE seam both load paths (PQv2 v6 +
+     * legacy v5) share, so wiring the resolver here makes the cluster
+     * fields populate on BOTH paths. No-op (and byte-identical) for every
+     * model that ships no `Lk.mlp.ffn_clusters` record. Idempotent: it
+     * re-derives the disabled defaults and re-writes the same mmap-backed
+     * pointers on each call. */
+    ib_resolve_ffn_clusters(m);
+
     /* Globals: token_embedding has per-row scales when quantized; output
      * head ditto; output_norm is fp16. token_embedding usually doesn't go
      * through tensor_matmul, but caching is cheap. */
@@ -459,6 +873,14 @@ void ib_cache_model_static_fp32(inferbit_model* m) {
             }
         }
     }
+
+    /* Burst / cool-down duty cycle (M1): seed the controller to the EXACT
+     * profile and cache the activation-skip ratio from IB_PQV2_SKIP. Both
+     * load paths (PQv2 + legacy) call this finalizer, so this is the single
+     * seam that guarantees m->active_profile is non-NULL and that the
+     * env-driven activation skip keeps working WITHOUT any explicit
+     * inferbit_burst_attach call — preserving today's default behaviour. */
+    inferbit_burst_attach(m, NULL);
 }
 
 /* ── Allocate activation buffers ────────────────────────────── */
@@ -585,6 +1007,19 @@ int ib_alloc_buffers(inferbit_model* model) {
             model->hot_pool = malloc(bytes);
             if (model->hot_pool) {
                 model->hot_pool_bytes = bytes;
+                /* Carve the control header + entry table out of the front
+                 * of the same buffer so model.c's free(hot_pool) reclaims
+                 * everything. Lay out: [hdr][entry[cap]][arena]. */
+                ib_hot_pool_init(model->hot_pool, bytes);
+                /* Best-effort residency lock: keep the hot weights pinned in
+                 * RAM so they aren't paged out under memory pressure. POSIX
+                 * mlock can fail without privilege / over RLIMIT_MEMLOCK —
+                 * that's fine, it's purely a lossless stability win, never
+                 * fatal. The pages stay locked until free(hot_pool) (munlock
+                 * is implicit on unmap/free). */
+#ifndef _WIN32
+                (void)mlock(model->hot_pool, bytes);
+#endif
             } else {
                 model->hot_pool_bytes = 0;
             }
@@ -800,7 +1235,10 @@ inferbit_model* ibf_load(const char* path, const inferbit_config* config) {
     model->thread_pool = ib_pool_create(threads);
 
     /* Perf: pre-decode fp16 weight-scales and norm weights into fp32 so
-     * forward.c::tensor_matmul + rmsnorm_fp16 skip per-call conversion. */
+     * forward.c::tensor_matmul + rmsnorm_fp16 skip per-call conversion.
+     * This finalizer also resolves any optional sparse-FFN cluster records
+     * (ib_resolve_ffn_clusters), the single seam shared with the PQv2 v6
+     * load path — so both paths populate the layer cluster fields. */
     ib_cache_model_static_fp32(model);
 
     return model;

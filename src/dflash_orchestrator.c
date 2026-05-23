@@ -214,6 +214,10 @@ int ib_dflash_try_route(inferbit_model* model,
     if (model->dflash_capture_buf) {
         model->dflash_last_norm =
             vec_l2_norm(model->dflash_capture_buf, hidden);
+        /* Mirror into the burst controller so its margin/norm metrics
+         * (inferbit_get_step_metrics, IB_BURST_LOG) are populated when a
+         * DFlash config is attached. Harmless when burst is disabled. */
+        model->burst.last_norm = model->dflash_last_norm;
     }
 
     if (take_early_exit) {

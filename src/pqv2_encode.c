@@ -15,6 +15,8 @@
 #include "pq_kmeans.h"
 #include "inferbit_internal.h"
 #include "platform.h"
+#include "mome.h"           /* ffn_compute_cluster_perm (sparse-FFN) */
+#include "sparse_gate.h"    /* ib_ffn_cluster_hdr + magic/version (record layout) */
 
 #include <errno.h>
 #include <math.h>
@@ -1873,6 +1875,243 @@ static int read_and_push_pqv2(ib6_manifest *mf, const char *name,
     return rc;
 }
 
+/* ── Training-free sparse-FFN clustering (CONVERT-TIME) ───────────────
+ *
+ * Convert-time writer for the sparse-FFN feature documented in
+ * pqv2_format.h ("Training-free sparse-FFN cluster record"). It runs on
+ * the NON-MoME FFN path (single gate_proj/up_proj/down_proj per layer),
+ * orthogonal to MoME's .expert{e} split.
+ *
+ * Plumbing of the N option: there is no clean field on
+ * inferbit_convert_config to carry `ffn_clusters` (inferbit.h is owned by
+ * another module and is not modified here), so N is read from the env var
+ *
+ *     IB_FFN_CLUSTERS    (default 1 = OFF; valid: 1, 16, 32, 64, 128, 256
+ *                         or any divisor-friendly value <= inter)
+ *
+ * inside the encoder. N <= 1 is OFF and produces byte-identical output to
+ * today (no permutation, no record).
+ *
+ * Consistency: the SAME inter-permutation (computed once from gate_proj)
+ * is applied to gate ROWS, up ROWS, and down COLUMNS, BEFORE PQ-encoding.
+ * Because the FFN sums down @ (silu(gate) * up) over the inter axis, the
+ * permutation cancels and all-clusters-on output is exact. The perm is
+ * stashed when gate is processed and reused for up/down (they are encoded
+ * immediately after gate in convert order). */
+
+static int ffn_clusters_resolve(int inter) {
+    const char *e = getenv("IB_FFN_CLUSTERS");
+    if (!e || !e[0]) return 1;            /* OFF by default */
+    int v = atoi(e);
+    if (v <= 1) return 1;                 /* 0 or 1 = OFF */
+    if (inter > 0 && v > inter) return 1; /* nonsensical → OFF */
+    if (inter > 0 && (inter % v) != 0) {
+        /* N must divide inter so the cluster machinery has a sane row
+         * count; if it doesn't, disable for this layer (the contiguous
+         * clusters themselves need not be equal-sized, but a non-dividing
+         * N usually signals a misconfigured option). */
+        return 1;
+    }
+    return v;
+}
+
+/* Process-static handoff for the FFN cluster permutation: gate computes
+ * and stashes it (plus the offsets/centroids needed for the record),
+ * up/down reuse the perm. Single-threaded conversion → no locking. */
+static int      *g_ffn_perm        = NULL;   /* length g_ffn_perm_inter */
+static int       g_ffn_perm_inter  = 0;
+static int       g_ffn_perm_N      = 0;      /* n_clusters this perm encodes */
+static uint32_t *g_ffn_offsets     = NULL;   /* length N+1 */
+static uint16_t *g_ffn_centroids   = NULL;   /* length N*hidden */
+static int       g_ffn_hidden      = 0;
+
+static void ffn_perm_reset(void) {
+    free(g_ffn_perm);      g_ffn_perm = NULL;      g_ffn_perm_inter = 0;
+    free(g_ffn_offsets);   g_ffn_offsets = NULL;
+    free(g_ffn_centroids); g_ffn_centroids = NULL;
+    g_ffn_perm_N = 0; g_ffn_hidden = 0;
+}
+
+/* Emit the on-disk FFN cluster record for one layer.
+ *
+ * CANONICAL, SELF-DESCRIBING LAYOUT (mirrored byte-for-byte by the loader
+ * in ib_resolve_ffn_clusters(); see src/sparse_gate.h for the authoritative
+ * contract + the matching ib_ffn_cluster_hdr struct):
+ *
+ *   [0..7]   char   magic = "IBFFNCL1"      (IB_FFN_CLUSTER_MAGIC)
+ *   [8..11]  u32    version = 1             (IB_FFN_CLUSTER_VERSION)
+ *   [12..15] u32    flags  (bit0 = inter_perm present; we ALWAYS set it)
+ *   [16..19] u32    n_clusters
+ *   [20..23] u32    inter
+ *   [24..27] u32    hidden
+ *   [28..]   u32    cluster_offsets[n_clusters + 1]
+ *            fp16   centroids[n_clusters * hidden]
+ *            u32    inter_perm[inter]        (present iff flags bit0)
+ *
+ * The 28-byte fixed header == sizeof(ib_ffn_cluster_hdr). Pushed as a
+ * RAW_INT32 manifest tensor named `<base_name>.ffn_clusters`
+ * (base_name = e.g. "L3.mlp" → tensor "L3.mlp.ffn_clusters"). The loader
+ * locates it by that exact name via ib_pqv2_find(). Uses the stashed
+ * offsets/centroids/perm. Returns 0 on success, -1 on error. */
+static int push_ffn_cluster_record(ib6_manifest *mf, const char *base_name,
+                                    int n_clusters, int inter, int hidden,
+                                    const uint32_t *offsets,
+                                    const uint16_t *centroids,
+                                    const int *perm)
+{
+    size_t hdr_bytes      = sizeof(ib_ffn_cluster_hdr);   /* 28 */
+    size_t offsets_bytes  = (size_t)(n_clusters + 1) * 4u;
+    size_t centroid_bytes = (size_t)n_clusters * (size_t)hidden * 2u;
+    size_t perm_bytes     = (size_t)inter * 4u;
+    size_t total = hdr_bytes + offsets_bytes + centroid_bytes + perm_bytes;
+
+    uint8_t *buf = (uint8_t *)malloc(total);
+    if (!buf) { ib_set_error("oom: ffn cluster record (%s)", base_name); return -1; }
+    size_t cur = 0;
+    /* Build the fixed header through the shared packed struct so the
+     * field set / size can never drift from the loader's reader. */
+    ib_ffn_cluster_hdr hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, IB_FFN_CLUSTER_MAGIC, IB_FFN_CLUSTER_MAGIC_SIZE);
+    hdr.version    = IB_FFN_CLUSTER_VERSION;
+    hdr.flags      = IB_FFN_CLUSTER_FLAG_PERM;   /* we always write inter_perm */
+    hdr.n_clusters = (uint32_t)n_clusters;
+    hdr.inter      = (uint32_t)inter;
+    hdr.hidden     = (uint32_t)hidden;
+    memcpy(buf + cur, &hdr, hdr_bytes); cur += hdr_bytes;
+    memcpy(buf + cur, offsets, offsets_bytes); cur += offsets_bytes;
+    memcpy(buf + cur, centroids, centroid_bytes); cur += centroid_bytes;
+    /* inter_perm as u32 (perm[] is int; copy through a u32 view). */
+    for (int i = 0; i < inter; i++) {
+        uint32_t v = (uint32_t)perm[i];
+        memcpy(buf + cur, &v, 4); cur += 4;
+    }
+
+    char nm[128];
+    snprintf(nm, sizeof(nm), "%s.ffn_clusters", base_name);
+    /* shape: [n_clusters, hidden] is a useful summary; ndim=1 with the
+     * blob_size authoritative also works. Use a 2-dim [N, hidden] shape so
+     * inspect tools show something meaningful. The loader reads the blob
+     * by the documented layout, not the shape. */
+    int32_t shape[4] = { n_clusters, hidden, 1, 1 };
+    if (ib6_push(mf, nm, IB_PQV2_KIND_RAW_INT32, 2, shape, buf, total) != 0) {
+        free(buf); ib_set_error("manifest oom (%s)", nm); return -1;
+    }
+    return 0;
+}
+
+/* Sparse-FFN-aware FFN tensor pusher (non-MoME path). Mirrors
+ * read_and_push_pqv2 but, when ffn_clusters > 1, permutes the inter axis
+ * consistently across gate/up/down and emits the per-layer cluster record
+ * once (when gate is processed). `proj_kind`: 0=gate, 1=up, 2=down.
+ *
+ * When ffn_clusters <= 1 this is a thin pass-through to the plain PQv2
+ * encode (byte-identical to read_and_push_pqv2 with qk_n_heads=0). */
+static int read_and_push_pqv2_ffn(ib6_manifest *mf, const char *name,
+                                   const char *layer_base,
+                                   const ib_tensor_source *ts, int shard, int t,
+                                   int G, int K, int half, int pyramid,
+                                   int residency_hint, int codebook_dedup,
+                                   int proj_kind, int ffn_clusters,
+                                   uint32_t seed)
+{
+    if (ffn_clusters <= 1) {
+        /* OFF — identical to the plain FFN emit (no QK perm on FFN). */
+        return read_and_push_pqv2(mf, name, ts, shard, t, G, K, half,
+                                   pyramid, residency_hint, codebook_dedup,
+                                   0, 0, seed);
+    }
+
+    const void *raw = ib_ts_tensor_data(ts, shard, t);
+    const char *dtype = ib_ts_tensor_dtype(ts, shard, t);
+    int rows = ib_ts_tensor_shape(ts, shard, t, 0);
+    int cols = ib_ts_tensor_shape(ts, shard, t, 1);
+    if (cols == 0) cols = 1;
+    if ((cols % G) != 0) {
+        ib_set_error("%s: cols=%d not divisible by G=%d", name, cols, G);
+        return -1;
+    }
+    float *W = (float *)malloc((size_t)rows * cols * sizeof(float));
+    if (!W) { ib_set_error("oom reading %s", name); return -1; }
+    if (pqv2_read_matrix_fp32(W, raw, dtype, rows, cols) != 0) {
+        free(W);
+        ib_set_error("%s: unsupported dtype %s", name, dtype);
+        return -1;
+    }
+
+    /* gate_proj / up_proj are [inter, hidden] (rows = inter). down_proj is
+     * [hidden, inter] (cols = inter). Determine inter/hidden from the gate
+     * orientation. */
+    if (proj_kind == 0) {
+        /* gate: rows = inter, cols = hidden. Compute the cluster perm from
+         * this gate matrix and stash it for up/down. */
+        int inter = rows, hidden = cols;
+        ffn_perm_reset();
+        int *perm = (int *)malloc((size_t)inter * sizeof(int));
+        uint32_t *offs = (uint32_t *)malloc((size_t)(ffn_clusters + 1) * sizeof(uint32_t));
+        uint16_t *cents = (uint16_t *)malloc((size_t)ffn_clusters * (size_t)hidden * sizeof(uint16_t));
+        if (!perm || !offs || !cents) {
+            free(perm); free(offs); free(cents); free(W);
+            ib_set_error("oom: ffn cluster scratch (%s)", name); return -1;
+        }
+        if (ffn_compute_cluster_perm(W, inter, hidden, ffn_clusters, seed,
+                                     perm, offs, cents) != 0) {
+            /* Clustering failed → fall back to plain emit, no record.
+             * Leave the stash empty so up/down also stay un-permuted
+             * (consistent fallback → still exact). */
+            free(perm); free(offs); free(cents);
+            int rc = push_pqv2_tensor(mf, name, W, rows, cols, G, K, half,
+                                       pyramid, residency_hint,
+                                       codebook_dedup, seed);
+            free(W);
+            return rc;
+        }
+        /* Apply the perm to gate ROWS, then encode the permuted gate. */
+        if (mome_apply_row_perm(W, rows, cols, perm) != 0) {
+            free(perm); free(offs); free(cents); free(W);
+            ib_set_error("ffn cluster: gate row perm oom"); return -1;
+        }
+        int rc = push_pqv2_tensor(mf, name, W, rows, cols, G, K, half,
+                                   pyramid, residency_hint,
+                                   codebook_dedup, seed);
+        free(W);
+        if (rc != 0) { free(perm); free(offs); free(cents); return rc; }
+        /* Stash for up/down reuse + emit the per-layer record. */
+        g_ffn_perm = perm; g_ffn_perm_inter = inter; g_ffn_perm_N = ffn_clusters;
+        g_ffn_offsets = offs; g_ffn_centroids = cents; g_ffn_hidden = hidden;
+        return push_ffn_cluster_record(mf, layer_base, ffn_clusters,
+                                       inter, hidden, offs, cents, perm);
+    } else if (proj_kind == 1) {
+        /* up: rows = inter, cols = hidden. Reuse gate's row perm when it
+         * was built for this row count + N. */
+        if (g_ffn_perm && g_ffn_perm_inter == rows &&
+            g_ffn_perm_N == ffn_clusters) {
+            if (mome_apply_row_perm(W, rows, cols, g_ffn_perm) != 0) {
+                free(W); ib_set_error("ffn cluster: up row perm oom"); return -1;
+            }
+        }
+        int rc = push_pqv2_tensor(mf, name, W, rows, cols, G, K, half,
+                                   pyramid, residency_hint,
+                                   codebook_dedup, seed);
+        free(W);
+        return rc;
+    } else {
+        /* down: rows = hidden, cols = inter. Reuse gate's perm on the
+         * COLUMNS (down col i ↔ gate row i ↔ up row i). */
+        if (g_ffn_perm && g_ffn_perm_inter == cols &&
+            g_ffn_perm_N == ffn_clusters) {
+            if (mome_apply_col_perm(W, rows, cols, g_ffn_perm) != 0) {
+                free(W); ib_set_error("ffn cluster: down col perm oom"); return -1;
+            }
+        }
+        int rc = push_pqv2_tensor(mf, name, W, rows, cols, G, K, half,
+                                   pyramid, residency_hint,
+                                   codebook_dedup, seed);
+        free(W);
+        return rc;
+    }
+}
+
 /* Read a tensor and push as raw fp16. Applies optional QK permutation. */
 static int read_and_push_fp16(ib6_manifest *mf, const char *name,
                                const ib_tensor_source *ts, int shard, int t,
@@ -2484,6 +2723,15 @@ int pqv2_convert(const char *input_path,
          * keeps the layer functional but downgrades it to mome_experts=1
          * at load time — fine in v1, which is correctness-first. */
         const int K_experts = (cfg->mome_experts > 1) ? cfg->mome_experts : 1;
+        /* Training-free sparse-FFN clustering (env IB_FFN_CLUSTERS). Only
+         * active on the NON-MoME FFN path (K_experts == 1); MoME has its
+         * own row split. Resolved per layer against this layer's inter
+         * (which equals the gate_proj row count). 1 = OFF → byte-identical
+         * output (no perm, no record). Reset the perm stash each layer so a
+         * failed/disabled gate never leaks a stale perm into up/down. */
+        ffn_perm_reset();
+        const int ffn_clusters =
+            (K_experts == 1) ? ffn_clusters_resolve(intermediate) : 1;
         /* Capture gate_proj source for the I4 heuristic router below.   */
         const void *gate_router_src = NULL;
         const char *gate_router_dtype = NULL;
@@ -2509,9 +2757,12 @@ int pqv2_convert(const char *input_path,
                 }
             }
             if (rc_m == +1) {
-                if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
-                                        py_gate, rh_gate, cd,
-                                        0, 0, seed) != 0) goto fail;
+                char base[64];
+                snprintf(base, sizeof(base), "L%d.mlp", l);
+                if (read_and_push_pqv2_ffn(&mf, nm, base, ts, s, t, G, K, half,
+                                            py_gate, rh_gate, cd,
+                                            /*proj_kind=*/0, ffn_clusters,
+                                            seed) != 0) goto fail;
             }
         }
         if (pq6_find_layer(ts, &names, l, names.up_proj, &s, &t) == 0) {
@@ -2527,9 +2778,12 @@ int pqv2_convert(const char *input_path,
                 if (rc_m == -1) goto fail;
             }
             if (rc_m == +1) {
-                if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
-                                        py_up, rh_up, cd,
-                                        0, 0, seed) != 0) goto fail;
+                char base[64];
+                snprintf(base, sizeof(base), "L%d.mlp", l);
+                if (read_and_push_pqv2_ffn(&mf, nm, base, ts, s, t, G, K, half,
+                                            py_up, rh_up, cd,
+                                            /*proj_kind=*/1, ffn_clusters,
+                                            seed) != 0) goto fail;
             }
         }
         if (pq6_find_layer(ts, &names, l, names.down_proj, &s, &t) == 0) {
@@ -2545,9 +2799,12 @@ int pqv2_convert(const char *input_path,
                 if (rc_m == -1) goto fail;
             }
             if (rc_m == +1) {
-                if (read_and_push_pqv2(&mf, nm, ts, s, t, G, K, half,
-                                        py_dn, rh_dn, cd,
-                                        0, 0, seed) != 0) goto fail;
+                char base[64];
+                snprintf(base, sizeof(base), "L%d.mlp", l);
+                if (read_and_push_pqv2_ffn(&mf, nm, base, ts, s, t, G, K, half,
+                                            py_dn, rh_dn, cd,
+                                            /*proj_kind=*/2, ffn_clusters,
+                                            seed) != 0) goto fail;
             }
         }
 
@@ -2591,6 +2848,9 @@ int pqv2_convert(const char *input_path,
             fflush(stderr);
         }
     }
+    /* Release the last layer's FFN-cluster perm stash (each layer's
+     * ffn_perm_reset() frees the prior layer; this frees the final one). */
+    ffn_perm_reset();
 
     /* Final norm + LM head. */
     if (progress) progress(0.92f, "output", prog_ctx);

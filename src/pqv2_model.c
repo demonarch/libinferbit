@@ -681,7 +681,17 @@ static inferbit_model* pqv2_load_internal(const char* path,
     }
     if (max_M > 0) {
         size_t n_threads_eff = (threads > 1) ? (size_t)threads : 1;
-        size_t pool_floats = n_threads_eff * (size_t)max_M;
+        /* Size the acc pool for the LARGER of {n_threads, batched-paged B}
+         * column-slabs of max_M. The batched paged matvec
+         * (drive_paged_matvec with B>1) streams each lane-group ONCE and
+         * accumulates all B positions into B contiguous M-float slabs — that
+         * read-once/compute-B amortisation is what makes the speculative
+         * verify cheap in drive mode. It caps B at 8 (see tensor_matmul_batch),
+         * so reserve >= 8 slabs. The paged path is single-threaded, so it
+         * never overlaps the n_threads use of the same pool. Extra cost is
+         * tiny: (8 - n_threads) * max_M floats. */
+        size_t cols = n_threads_eff < 8 ? 8 : n_threads_eff;
+        size_t pool_floats = cols * (size_t)max_M;
         size_t pool_bytes  = (pool_floats * sizeof(float) + 63) & ~(size_t)63;
         m->pqv2_thread_acc_pool = aligned_alloc(64, pool_bytes);
         m->pqv2_thread_acc_pool_floats = pool_floats;
@@ -1057,6 +1067,63 @@ inferbit_model* pqv2_or_legacy_load(const char* path,
         return pqv2_load_internal(path, config);
     }
     return ibf_load(path, config);
+}
+
+/* Runtime drive-mode page-cap setter (M1 burst scaffolding).
+ *
+ * Stores the requested per-slot in-focus index cap (MB → bytes) into the
+ * existing drive_page_bytes field. mb <= 0 means "no cap" (0 bytes =
+ * legacy whole-tensor scratch).
+ *
+ * SAFE-RESIZE ANALYSIS — why the scratch ring is NOT re-allocated here
+ * ===================================================================
+ * forward.c::drive_paged_matvec derives its lane-group chunking from
+ * `m->drive_indices_scratch_size` (slot_size / lane_bytes), NOT from
+ * drive_page_bytes — drive_page_bytes is only consumed at load to SIZE
+ * that scratch. So a runtime cap change cannot take effect on subsequent
+ * matmuls unless the scratch ring itself is re-sized.
+ *
+ * Re-sizing the ring here is NOT safe from pqv2_model.c, because the
+ * prefetch thread state (ib_drive_pf_state, owned by forward.c) caches
+ * the scratch pointers AND size at first use (drive_pf_get: st->scratch[]
+ * / st->scratch_size). Freeing/realloc'ing m->drive_indices_scratch from
+ * here would leave that worker dereferencing stale (freed) pointers and
+ * paging against a stale size — a use-after-free / overflow. Tearing the
+ * prefetcher down and refreshing its cache requires editing forward.c,
+ * which this agent must not touch.
+ *
+ * CORRECTNESS-FIRST clamp: we still store the requested cap, but never let
+ * it EXCEED the already-allocated slot size. If forward.c is later changed
+ * (M2) to read drive_page_bytes for chunking before the ring is re-sized,
+ * an un-clamped larger cap could compute lanes_per_group that overflows
+ * the existing smaller slot. Clamping to drive_indices_scratch_size makes
+ * that impossible. A smaller cap is always safe (fewer lanes per group).
+ *
+ * TODO(burst-M2: forward.c re-page on cap change): to make a runtime cap
+ * change actually alter paging, the integration agent must, in forward.c:
+ *   1. Quiesce the prefetcher: ensure no matmul is in flight, then
+ *      tear down ib_drive_pf_state (drive_pf_get's cached st->scratch* /
+ *      st->scratch_size) so it re-reads the model's buffers.
+ *   2. Re-allocate m->drive_indices_scratch{,2} (and the L2 ring) to the
+ *      new size — replicating pqv2_load_internal's sizing math
+ *      (l1_cap_eff floor = one full lane = max_drive_M bytes, page-align,
+ *      acc-pool availability gate), then update drive_indices_scratch_size.
+ *   3. Re-point every pq->indices to the new slot-0 buffer (or rely on
+ *      drive_repoint_indices, which already re-points per matmul).
+ * The model would need to retain max_drive_M / max_idx_bytes / page-size
+ * to re-run that math; today those are load-local. */
+void inferbit_set_page_cap_mb(inferbit_model* m, int mb) {
+    if (!m) return;
+    size_t want = (mb > 0) ? (size_t)mb * 1024u * 1024u : 0u;
+    /* Clamp up: a non-zero requested cap may not exceed the slot already
+     * allocated for the drive ring (see analysis above). A cap of 0 ("no
+     * cap" / whole-tensor) is stored verbatim. When drive mode is off
+     * (no scratch allocated) there is nothing to overflow, so store as-is. */
+    if (want != 0 && m->drive_indices_scratch_size != 0 &&
+        want > m->drive_indices_scratch_size) {
+        want = m->drive_indices_scratch_size;
+    }
+    m->drive_page_bytes = want;
 }
 
 /* Pre-transposed sidecar for drive mode.

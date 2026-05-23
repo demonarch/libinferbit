@@ -1147,6 +1147,47 @@ extern "C" int ib_metal_recorder_wait_committed(void *cb_handle) {
     }
 }
 
+/* Whole-token async building block: commit the recorder's CB without
+ * waiting, install a completion handler that flips *done_flag, retain the
+ * CB so it survives the recorder teardown, and free the recorder shell.
+ * Unlike commit_async this does NOT allocate a fresh CB — the recorder is
+ * single-shot here (its forward is fully recorded). The caller later
+ * waits on the returned handle with ib_metal_recorder_wait_committed
+ * (which balances the CFRetain) or polls with ib_metal_cb_completed. */
+extern "C" void *ib_metal_recorder_commit_async_done(ib_metal_recorder *rec,
+                                                     void *done_flag) {
+    if (!rec) return NULL;
+    std::atomic<int> *done = (std::atomic<int> *)done_flag;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = rec->cb;
+        if (done) {
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _cb) {
+                (void)_cb;
+                done->store(1, std::memory_order_release);
+            }];
+        }
+        [cb commit];
+        /* Retain so the CB survives outside this autoreleasepool until
+         * the caller waits/polls + releases (mirrors commit_async). */
+        CFRetain((__bridge CFTypeRef)cb);
+        rec->cb = nil;   /* ownership transferred to the returned handle */
+        delete rec;      /* recorder shell no longer needed              */
+        return (__bridge void *)cb;
+    }
+}
+
+extern "C" int ib_metal_cb_completed(void *cb_handle) {
+    if (!cb_handle) return -1;
+    @autoreleasepool {
+        /* __bridge (NOT transfer): we only peek; ownership stays with
+         * the caller's handle until it waits. */
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)(CFTypeRef)cb_handle;
+        MTLCommandBufferStatus st = cb.status;
+        if (st == MTLCommandBufferStatusError) return -1;
+        return (st == MTLCommandBufferStatusCompleted) ? 1 : 0;
+    }
+}
+
 static id<MTLBuffer> rec_pick(ib_metal_ctx *ctx, const void *p) {
     auto it = ctx->buffers.find((void *)p);
     return it == ctx->buffers.end() ? nil : it->second;

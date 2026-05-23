@@ -198,6 +198,32 @@ static int sample_token(float* logits, int vocab_size, inferbit_sample_params pa
     return sample_top_k_top_p(logits, vocab_size, params.top_k, params.top_p);
 }
 
+/* ── Spec amortization telemetry (IB_SPEC_LOG=1) ────────────────
+ *
+ * One line per generation. Fields:
+ *   rounds    : speculative verify rounds executed
+ *   drafted   : candidate tokens drafted (denominator of accept rate)
+ *   accepted  : drafted tokens the exact model agreed with
+ *   rate      : accepted / drafted (per-token accept rate)
+ *   mean_run  : accepted / rounds (mean accepted-run-length per round)
+ *   amort     : generated / forwards (tokens emitted per expensive forward —
+ *               the amortization factor; higher = more tokens per weight read)
+ *   fwd       : count of expensive (COOLDOWN/full-precision) main-model forwards
+ *               — the batched verify passes plus single-token refresh forwards.
+ */
+static void ib_spec_log_line(const char* tag, long long rounds, long long drafted,
+                             long long accepted, long long generated,
+                             long long forwards) {
+    fprintf(stderr,
+            "[%s] rounds=%lld drafted=%lld accepted=%lld rate=%.3f "
+            "mean_run=%.2f amort=%.2f (fwd=%lld)\n",
+            tag, rounds, drafted, accepted,
+            drafted   ? (double)accepted / drafted   : 0.0,
+            rounds    ? (double)accepted / rounds     : 0.0,
+            forwards  ? (double)generated / forwards  : 0.0,
+            forwards);
+}
+
 /* ── Public API ─────────────────────────────────────────────── */
 
 int inferbit_forward(
@@ -265,18 +291,149 @@ int inferbit_generate(
     int use_lookup = (!use_spec && greedy &&
                       model->lookup_ngram > 0 && model->lookup_k > 0);
 
-    if (!use_spec && !use_lookup) {
+    /* Self-speculative burst: no external draft, no n-gram lookup, but burst
+     * is enabled and we're greedy. The MAIN model drafts cheaply (BURST:
+     * L1-only and/or early-exit), then a full-precision (COOLDOWN) batched
+     * verify accepts the prefix the exact model agrees with and rewrites KV.
+     * Output is therefore TOKEN-IDENTICAL to exact greedy decoding — the
+     * cool-down verify re-anchors state, so the harder squeeze costs zero
+     * quality. This supersedes the old per-token profile toggle, which lost
+     * quality because it never re-anchored the coarse KV the burst wrote. */
+    int use_self_spec = (!use_spec && !use_lookup && greedy &&
+                         model->burst.cfg.enabled);
+
+    if (!use_spec && !use_lookup && !use_self_spec) {
         int32_t next_token = sample_token(logits, vocab, params, input_tokens, num_input_tokens);
         out_tokens[generated++] = next_token;
-        if (next_token == eos) return generated;
+        if (next_token == eos) { ib_burst_log_summary(model); return generated; }
 
         while (generated < max_out_tokens) {
+            /* ── Standalone per-step duty cycle: pick BURST/COOLDOWN for this
+             * MAIN-model decode step. Returns IB_PROFILE_EXACT (no-op,
+             * byte-identical to today) when burst is disabled. This is the
+             * loop that exercises main-model L1-only + expert-sparsity for
+             * PPL/tok-s measurement (spec verify alone only runs COOLDOWN). */
+            ib_burst_step_decide(model);
             rc = ib_forward(model, &next_token, 1, logits);
             if (rc != INFERBIT_OK) return rc;
             next_token = sample_token(logits, vocab, params, out_tokens, generated);
             out_tokens[generated++] = next_token;
             if (next_token == eos) break;
         }
+        ib_burst_log_summary(model);
+        return generated;
+    }
+
+    if (use_self_spec) {
+        int spec_k = model->burst.cfg.cooldown_period > 0
+                         ? model->burst.cfg.cooldown_period : 8;
+        if (spec_k < 2) spec_k = 2;
+        if (spec_k > 32) spec_k = 32;
+        /* IB_SPEC_K overrides the draft length (clamped to IB_BATCH_MAX). Larger
+         * k amortizes the verify weight reads over more tokens when acceptance
+         * is high. Unset → unchanged. */
+        spec_k = ib_spec_k_override(spec_k);
+        if (spec_k < 2) spec_k = 2;
+        int32_t candidates[32];
+        float* logits_batch = (float*)malloc((size_t)spec_k * (size_t)vocab * sizeof(float));
+        float* draft_logits = (float*)malloc((size_t)vocab * sizeof(float));
+        if (!logits_batch || !draft_logits) {
+            free(logits_batch); free(draft_logits);
+            ib_set_error("alloc self-spec buffers");
+            return INFERBIT_ERROR_MEMORY;
+        }
+
+        int spec_log = ib_spec_log_enabled();
+        long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
+        long long stat_forwards = 0;   /* expensive main-model forwards */
+
+        while (generated < max_out_tokens) {
+            int k = spec_k;
+            if (k > (max_out_tokens - generated)) k = max_out_tokens - generated;
+            if (k <= 0) break;
+
+            int base = inferbit_kv_length(model);
+
+            /* ── DRAFT under BURST (cheap). candidates[0] is the exact next
+             * token (argmax of the exact `logits` we already hold) so it is
+             * always accepted and generation always progresses; the remaining
+             * k-1 come from cheap burst forwards (L1-only and/or early-exit).
+             * Burst KV written here is DISCARDED before the verify. The exact
+             * `logits` buffer is preserved (draft writes draft_logits). */
+            inferbit_set_compute_profile(model, IB_PROFILE_BURST);
+            int dml = ib_active_max_layer(model);  /* burst early-exit depth, -1=full */
+            candidates[0] = sample_argmax(logits, vocab);
+            int32_t dtok = candidates[0];
+            for (int i = 1; i < k; i++) {
+                int pos = inferbit_kv_length(model);
+                if (dml >= 0 && dml < model->header.num_layers)
+                    rc = inferbit_forward_truncated(model, dtok, pos, dml, draft_logits);
+                else
+                    rc = ib_forward(model, &dtok, 1, draft_logits);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(draft_logits); return rc; }
+                dtok = sample_argmax(draft_logits, vocab);
+                candidates[i] = dtok;
+            }
+
+            /* Discard burst KV, then verify all k positions at full precision
+             * (COOLDOWN). forward_positions rewrites exact KV for base..base+k-1. */
+            inferbit_kv_truncate(model, base);
+            inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
+            rc = ib_forward_positions(model, candidates, k, logits_batch);
+            if (rc != INFERBIT_OK) { free(logits_batch); free(draft_logits); return rc; }
+            if (spec_log) stat_forwards++;   /* one batched verify */
+
+            /* Accept the prefix the EXACT model agrees with → output is
+             * token-identical to exact greedy. Position 0 vs the pre-round
+             * exact `logits`; position i (>=1) vs logits_batch[i-1]. */
+            int accepted = 0, mismatch = 0; int32_t mismatch_tok = -1; int match_eos = 0;
+            for (int i = 0; i < k && generated < max_out_tokens; i++) {
+                const float* cur = (i == 0) ? logits
+                                            : (logits_batch + (size_t)(i - 1) * (size_t)vocab);
+                int32_t mtok = sample_argmax(cur, vocab);
+                if (mtok == candidates[i]) {
+                    out_tokens[generated++] = mtok;
+                    accepted++;
+                    if (mtok == eos) { match_eos = 1; break; }
+                } else {
+                    mismatch = 1; mismatch_tok = mtok; break;
+                }
+            }
+            ib_burst_feed_accept(model, accepted, k);
+            if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+
+            /* Roll back KV to the accepted length (drops the rejected suffix). */
+            if (accepted < k) inferbit_kv_truncate(model, base + accepted);
+            if (match_eos) goto self_spec_done;
+
+            if (mismatch) {
+                /* The exact correct token at the first divergent position is the
+                 * argmax we just computed. Emit it and refresh `logits`. */
+                out_tokens[generated++] = mismatch_tok;
+                if (mismatch_tok == eos) goto self_spec_done;
+                inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
+                rc = ib_forward(model, &mismatch_tok, 1, logits);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(draft_logits); return rc; }
+                if (spec_log) stat_forwards++;   /* mismatch refresh */
+                continue;
+            }
+            if (generated >= max_out_tokens) break;
+
+            /* All k accepted: bonus token from position k-1, then refresh. */
+            const float* last = logits_batch + (size_t)(k - 1) * (size_t)vocab;
+            int32_t extra = sample_argmax(last, vocab);
+            out_tokens[generated++] = extra;
+            if (extra == eos) goto self_spec_done;
+            inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
+            rc = ib_forward(model, &extra, 1, logits);
+            if (rc != INFERBIT_OK) { free(logits_batch); free(draft_logits); return rc; }
+            if (spec_log) stat_forwards++;   /* bonus-token refresh */
+        }
+    self_spec_done:
+        if (spec_log) ib_spec_log_line("ib-self-spec", stat_rounds, stat_drafted,
+                                       stat_accepted, generated, stat_forwards);
+        ib_burst_log_summary(model);
+        free(logits_batch); free(draft_logits);
         return generated;
     }
 
@@ -290,38 +447,212 @@ int inferbit_generate(
         int ngram      = model->lookup_ngram;
         int lookup_k   = model->lookup_k;
         if (lookup_k > 32) lookup_k = 32;
-        int32_t candidates[32];
+        /* IB_SPEC_K overrides the draft length (clamped to IB_BATCH_MAX). */
+        lookup_k = ib_spec_k_override(lookup_k);
+        int32_t candidates[IB_BATCH_MAX];
 
-        /* Batched verify scratch: room for k per-position logit vectors. */
-        float* logits_batch = (float*)malloc((size_t)lookup_k * (size_t)vocab * sizeof(float));
+        /* Tree / multi-candidate lookup (IB_SPEC_TREE=1): gather several n-gram
+         * continuations and verify them together in one batched forward. The
+         * total positions across all branches share the single IB_BATCH_MAX
+         * verify budget, so per-branch length is bounded. Lossless: the accept
+         * rule below compares against the EXACT verify logits. */
+        int spec_tree = ib_spec_tree_enabled();
+        int tree_per_branch = lookup_k;
+        if (spec_tree) {
+            /* Keep branches short enough that a few fit one verify. */
+            if (tree_per_branch > IB_BATCH_MAX / 2) tree_per_branch = IB_BATCH_MAX / 2;
+            if (tree_per_branch < 1) tree_per_branch = 1;
+        }
+        int32_t tree_tokens[IB_BATCH_MAX];
+        int     tree_off[IB_BATCH_MAX];
+        int     tree_len[IB_BATCH_MAX];
+
+        /* Batched verify scratch: room for IB_BATCH_MAX per-position logits. */
+        float* logits_batch = (float*)malloc((size_t)IB_BATCH_MAX * (size_t)vocab * sizeof(float));
         if (!logits_batch) { free(history); ib_set_error("alloc logits_batch"); return INFERBIT_ERROR_MEMORY; }
 
-        const char* spec_log_env = getenv("IB_SPEC_LOG");
-        int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
+        int spec_log = ib_spec_log_enabled();
         long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
+        long long stat_forwards = 0;   /* expensive main-model forwards */
 
         while (generated < max_out_tokens) {
+            /* ── Burst/cool-down: decide profile for this round.
+             * Returns IB_PROFILE_EXACT (no-op) when burst is disabled. */
+            ib_burst_step_decide(model);
+
+            /* ── Tree branch: gather several candidate continuations, verify
+             * them in one batched forward, accept the branch the EXACT model
+             * follows. Lossless because every emitted token is argmax of exact
+             * logits at the correct KV position. */
+            if (spec_tree) {
+                int nb = ib_prompt_lookup_search_tree(history, hist_n, ngram,
+                                                      tree_per_branch, IB_BATCH_MAX,
+                                                      IB_BATCH_MAX, tree_tokens,
+                                                      tree_off, tree_len);
+                if (nb == 0) {
+                    /* Miss: one standard decode step. */
+                    int32_t t = sample_argmax(logits, vocab);
+                    out_tokens[generated++] = t;
+                    history[hist_n++] = t;
+                    if (t == eos) goto lookup_done;
+                    rc = ib_forward(model, &t, 1, logits);
+                    if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                    if (spec_log) stat_forwards++;
+                    continue;
+                }
+
+                int total = tree_off[nb - 1] + tree_len[nb - 1];
+
+                inferbit_set_compute_profile(model, IB_PROFILE_BURST);
+                int base_main_len = inferbit_kv_length(model);
+                inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
+                rc = ib_forward_positions(model, tree_tokens, total, logits_batch);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                if (spec_log) stat_forwards++;   /* one batched verify */
+
+                /* Accept rule: the exact greedy first token is argmax of the
+                 * pre-round `logits` (independent of any candidate). Find the
+                 * one branch whose first token equals it; if none, it's a
+                 * position-0 mismatch identical to a linear lookup miss. */
+                int32_t gold0 = sample_argmax(logits, vocab);
+                int chosen = -1;
+                for (int b = 0; b < nb; b++) {
+                    if (tree_tokens[tree_off[b]] == gold0) { chosen = b; break; }
+                }
+
+                /* Position-0 margin telemetry (same as linear path). */
+                if (model->burst.cfg.enabled) {
+                    float top1 = -1e38f, top2 = -1e38f;
+                    for (int vi = 0; vi < vocab; vi++) {
+                        float v = logits[vi];
+                        if (v > top1) { top2 = top1; top1 = v; }
+                        else if (v > top2) { top2 = v; }
+                    }
+                    model->burst.last_margin = top1 - top2;
+                }
+
+                if (chosen < 0) {
+                    /* No branch matches the exact first token: emit gold0, drop
+                     * the whole speculated tree, refresh `logits`. */
+                    inferbit_kv_truncate(model, base_main_len);
+                    out_tokens[generated++] = gold0;
+                    history[hist_n++] = gold0;
+                    ib_burst_feed_accept(model, 0, total);
+                    if (spec_log) { stat_drafted += total; stat_rounds++; }
+                    if (gold0 == eos) goto lookup_done;
+                    rc = ib_forward(model, &gold0, 1, logits);
+                    if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                    if (spec_log) stat_forwards++;
+                    continue;
+                }
+
+                /* Walk the chosen branch, accepting the prefix the exact model
+                 * agrees with. Position 0 vs pre-round `logits`; position j>0 vs
+                 * the verify logits at this branch's KV slot (off + j - 1). */
+                int blen = tree_len[chosen];
+                int boff = tree_off[chosen];
+                int accepted = 0, mismatch = 0, match_eos = 0;
+                int32_t mismatch_tok = -1;
+                for (int j = 0; j < blen && generated < max_out_tokens; j++) {
+                    const float* cur = (j == 0)
+                        ? logits
+                        : (logits_batch + (size_t)(boff + j - 1) * (size_t)vocab);
+                    int32_t mtok = sample_argmax(cur, vocab);
+                    if (mtok == tree_tokens[boff + j]) {
+                        out_tokens[generated++] = mtok;
+                        history[hist_n++] = mtok;
+                        accepted++;
+                        if (mtok == eos) { match_eos = 1; break; }
+                    } else {
+                        mismatch = 1; mismatch_tok = mtok; break;
+                    }
+                }
+
+                ib_burst_feed_accept(model, accepted, blen);
+                if (spec_log) { stat_drafted += total; stat_accepted += accepted; stat_rounds++; }
+
+                /* Commit: the verify wrote KV for ALL branches in pass order, so
+                 * the accepted branch's tokens are NOT a contiguous front prefix.
+                 * Truncate to base and replay exactly the accepted tokens (one
+                 * batched forward) so KV holds only the committed sequence and
+                 * `logits` is refreshed to the last committed position. */
+                inferbit_kv_truncate(model, base_main_len);
+                if (match_eos) goto lookup_done;
+
+                if (mismatch) {
+                    /* Replay the accepted prefix (if any), then emit the exact
+                     * divergent token and refresh through it. */
+                    if (accepted > 0) {
+                        rc = ib_forward_positions(model, tree_tokens + boff, accepted, logits_batch);
+                        if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                        if (spec_log) stat_forwards++;
+                    }
+                    out_tokens[generated++] = mismatch_tok;
+                    history[hist_n++] = mismatch_tok;
+                    if (mismatch_tok == eos) goto lookup_done;
+                    rc = ib_forward(model, &mismatch_tok, 1, logits);
+                    if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                    if (spec_log) stat_forwards++;
+                    continue;
+                }
+
+                if (generated >= max_out_tokens) {
+                    /* Replay accepted to keep KV consistent before exiting. */
+                    if (accepted > 0) {
+                        rc = ib_forward_positions(model, tree_tokens + boff, accepted, logits_batch);
+                        if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                        if (spec_log) stat_forwards++;
+                    }
+                    break;
+                }
+
+                /* Whole branch accepted. Replay it (one batched forward); the
+                 * last position's logits give the bonus token. */
+                rc = ib_forward_positions(model, tree_tokens + boff, accepted, logits_batch);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                if (spec_log) stat_forwards++;
+                const float* tlast = logits_batch + (size_t)(accepted - 1) * (size_t)vocab;
+                int32_t extra = sample_argmax(tlast, vocab);
+                out_tokens[generated++] = extra;
+                history[hist_n++] = extra;
+                if (extra == eos) goto lookup_done;
+                rc = ib_forward(model, &extra, 1, logits);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                if (spec_log) stat_forwards++;
+                continue;
+            }
+
             int k = ib_prompt_lookup_search(history, hist_n, ngram, lookup_k, candidates);
             if (k > (max_out_tokens - generated)) k = max_out_tokens - generated;
 
             if (k == 0) {
-                /* Miss: one standard decode step. */
+                /* Miss: one standard decode step (no draft phase, skip burst). */
                 int32_t t = sample_argmax(logits, vocab);
                 out_tokens[generated++] = t;
                 history[hist_n++] = t;
                 if (t == eos) goto lookup_done;
                 rc = ib_forward(model, &t, 1, logits);
                 if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                if (spec_log) stat_forwards++;
                 continue;
             }
 
+            /* Draft phase runs under BURST profile (cheap/coarse).
+             * For lookup, the "draft" is the n-gram match — no model forward
+             * happens, but we set the profile to document the intent and to
+             * ensure that any auxiliary work in this window is profiled. */
+            inferbit_set_compute_profile(model, IB_PROFILE_BURST);
+
             /* Batched verify: one forward over all k candidates, producing k
-             * per-position logit vectors. Position 0 is verified against the
-             * pre-round `logits` (unchanged); position i (1..k-1) against
-             * logits_batch[(i-1)*vocab]. */
+             * per-position logit vectors. Switch to COOLDOWN before verify so
+             * the verify forward runs as the precise anchor. Position 0 is
+             * verified against the pre-round `logits` (unchanged); position
+             * i (1..k-1) against logits_batch[(i-1)*vocab]. */
             int base_main_len = inferbit_kv_length(model);
+            inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
             rc = ib_forward_positions(model, candidates, k, logits_batch);
             if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+            if (spec_log) stat_forwards++;   /* one batched verify */
 
             int accepted = 0, mismatch = 0;
             int32_t mismatch_tok = -1;
@@ -342,7 +673,25 @@ int inferbit_generate(
                 }
             }
 
+            /* Feed acceptance result into the burst controller's EMA. */
+            ib_burst_feed_accept(model, accepted, k);
+
             if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+
+            /* ── Compute top-1/top-2 logit margin for the committed token.
+             * "Committed token" is the first accepted position (position 0),
+             * whose logits are in `logits` (the pre-round main-model output).
+             * Guard behind cfg.enabled to avoid overhead on the default path. */
+            if (model->burst.cfg.enabled) {
+                const float* margin_src = logits; /* position-0 verify logits */
+                float top1 = -1e38f, top2 = -1e38f;
+                for (int vi = 0; vi < vocab; vi++) {
+                    float v = margin_src[vi];
+                    if (v > top1) { top2 = top1; top1 = v; }
+                    else if (v > top2) { top2 = v; }
+                }
+                model->burst.last_margin = top1 - top2;
+            }
 
             /* Roll back main KV if not all k got committed. */
             if (accepted < k) inferbit_kv_truncate(model, base_main_len + accepted);
@@ -358,6 +707,7 @@ int inferbit_generate(
                 if (mismatch_tok == eos) goto lookup_done;
                 rc = ib_forward(model, &mismatch_tok, 1, logits);
                 if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+                if (spec_log) stat_forwards++;
                 continue;
             }
 
@@ -373,15 +723,15 @@ int inferbit_generate(
             if (extra == eos) goto lookup_done;
             rc = ib_forward(model, &extra, 1, logits);
             if (rc != INFERBIT_OK) { free(logits_batch); free(history); return rc; }
+            if (spec_log) stat_forwards++;
         }
 
     lookup_done:
         free(logits_batch);
-        if (spec_log) {
-            fprintf(stderr, "[ib-spec-lookup] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
-                    stat_rounds, stat_drafted, stat_accepted,
-                    stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
-        }
+        if (spec_log) ib_spec_log_line(spec_tree ? "ib-spec-lookup-tree" : "ib-spec-lookup",
+                                       stat_rounds, stat_drafted, stat_accepted,
+                                       generated, stat_forwards);
+        ib_burst_log_summary(model);
         free(history);
         return generated;
     }
@@ -390,21 +740,31 @@ int inferbit_generate(
     float* dlogits = draft->buf_logits;
     int draft_k = model->draft_tokens > 0 ? model->draft_tokens : 4;
     if (draft_k > 32) draft_k = 32;
-    int32_t candidates[32];
+    /* IB_SPEC_K overrides the draft length (clamped to IB_BATCH_MAX). Tree mode
+     * does NOT apply to external-draft (lookup-only). */
+    draft_k = ib_spec_k_override(draft_k);
+    int32_t candidates[IB_BATCH_MAX];
 
     float* logits_batch = (float*)malloc((size_t)draft_k * (size_t)vocab * sizeof(float));
     if (!logits_batch) { ib_set_error("alloc logits_batch"); return INFERBIT_ERROR_MEMORY; }
 
     /* Optional accept-rate telemetry — off unless IB_SPEC_LOG is set. */
-    const char* spec_log_env = getenv("IB_SPEC_LOG");
-    int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
+    int spec_log = ib_spec_log_enabled();
     long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
+    long long stat_forwards = 0;   /* expensive main-model forwards */
 
     while (generated < max_out_tokens) {
         int base_draft_len = inferbit_kv_length(draft);
 
+        /* ── Burst/cool-down: decide profile for this round.
+         * Returns IB_PROFILE_EXACT (no-op) when burst is disabled. */
+        ib_burst_step_decide(model);
+
         int k = draft_k;
         if (k > (max_out_tokens - generated)) k = max_out_tokens - generated;
+
+        /* Draft phase: run under BURST profile (cheap/coarse). */
+        inferbit_set_compute_profile(model, IB_PROFILE_BURST);
 
         int32_t dtok = sample_argmax(dlogits, vocab);
         for (int i = 0; i < k; i++) {
@@ -414,11 +774,15 @@ int inferbit_generate(
             dtok = sample_argmax(dlogits, vocab);
         }
 
-        /* Batched verify over main: one forward producing k per-position logits.
-         * Position 0 checks against pre-round `logits`; 1..k-1 against logits_batch. */
+        /* Verify phase: switch to COOLDOWN so the batched verify is the precise
+         * anchor. Batched verify over main: one forward producing k per-position
+         * logits. Position 0 checks against pre-round `logits`; 1..k-1 against
+         * logits_batch. */
         int base_main_len = inferbit_kv_length(model);
+        inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
         rc = ib_forward_positions(model, candidates, k, logits_batch);
         if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
+        if (spec_log) stat_forwards++;   /* one batched verify */
 
         int accepted = 0;
         int mismatch = 0;
@@ -440,17 +804,32 @@ int inferbit_generate(
             }
         }
 
+        /* Feed acceptance result into the burst controller's EMA. */
+        ib_burst_feed_accept(model, accepted, k);
+
         if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+
+        /* ── Compute top-1/top-2 logit margin for the committed token.
+         * Use the position-0 logits (pre-round `logits`) as the main-model
+         * output for the first committed token. Guard behind cfg.enabled to
+         * avoid overhead on the default path. */
+        if (model->burst.cfg.enabled) {
+            const float* margin_src = logits; /* position-0 verify logits */
+            float top1 = -1e38f, top2 = -1e38f;
+            for (int vi = 0; vi < vocab; vi++) {
+                float v = margin_src[vi];
+                if (v > top1) { top2 = top1; top1 = v; }
+                else if (v > top2) { top2 = v; }
+            }
+            model->burst.last_margin = top1 - top2;
+        }
 
         /* Roll back main KV if we did not commit all k positions. */
         if (accepted < k) inferbit_kv_truncate(model, base_main_len + accepted);
 
         if (match_eos) {
-            if (spec_log) {
-                fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
-                        stat_rounds, stat_drafted, stat_accepted,
-                        stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
-            }
+            if (spec_log) ib_spec_log_line("ib-spec", stat_rounds, stat_drafted,
+                                           stat_accepted, generated, stat_forwards);
             free(logits_batch);
             return generated;
         }
@@ -458,16 +837,14 @@ int inferbit_generate(
         if (mismatch) {
             out_tokens[generated++] = mismatch_tok;
             if (mismatch_tok == eos) {
-                if (spec_log) {
-                    fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
-                            stat_rounds, stat_drafted, stat_accepted,
-                            stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
-                }
+                if (spec_log) ib_spec_log_line("ib-spec", stat_rounds, stat_drafted,
+                                               stat_accepted, generated, stat_forwards);
                 free(logits_batch);
                 return generated;
             }
             rc = ib_forward(model, &mismatch_tok, 1, logits);
             if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
+            if (spec_log) stat_forwards++;   /* mismatch refresh (main) */
 
             inferbit_kv_truncate(draft, base_draft_len + accepted);
             rc = ib_forward(draft, &mismatch_tok, 1, dlogits);
@@ -482,26 +859,22 @@ int inferbit_generate(
         int32_t extra = sample_argmax(last, vocab);
         out_tokens[generated++] = extra;
         if (extra == eos) {
-            if (spec_log) {
-                fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
-                        stat_rounds, stat_drafted, stat_accepted,
-                        stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
-            }
+            if (spec_log) ib_spec_log_line("ib-spec", stat_rounds, stat_drafted,
+                                           stat_accepted, generated, stat_forwards);
             free(logits_batch);
             return generated;
         }
 
         rc = ib_forward(model, &extra, 1, logits);
         if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
+        if (spec_log) stat_forwards++;   /* bonus-token refresh (main) */
         rc = ib_forward(draft, &extra, 1, dlogits);
         if (rc != INFERBIT_OK) { free(logits_batch); return rc; }
     }
 
-    if (spec_log) {
-        fprintf(stderr, "[ib-spec] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
-                stat_rounds, stat_drafted, stat_accepted,
-                stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
-    }
+    if (spec_log) ib_spec_log_line("ib-spec", stat_rounds, stat_drafted,
+                                   stat_accepted, generated, stat_forwards);
+    ib_burst_log_summary(model);
     free(logits_batch);
     return generated;
 }
@@ -571,11 +944,15 @@ int inferbit_generate_stream(
         generated++;
 
         if (next_token == eos || callback(next_token, ctx) == 0) {
+            ib_burst_log_summary(model);
             free(recent);
             return generated;
         }
 
         while (generated < params.max_tokens) {
+            /* ── Standalone per-step duty cycle (see inferbit_generate).
+             * EXACT no-op when burst is disabled. */
+            ib_burst_step_decide(model);
             rc = ib_forward(model, &next_token, 1, logits);
             if (rc != INFERBIT_OK) { free(recent); return rc; }
 
@@ -587,6 +964,7 @@ int inferbit_generate_stream(
             if (next_token == eos || callback(next_token, ctx) == 0) break;
         }
 
+        ib_burst_log_summary(model);
         free(recent);
         return generated;
     }
@@ -597,32 +975,181 @@ int inferbit_generate_stream(
         int ngram    = model->lookup_ngram;
         int lookup_k = model->lookup_k;
         if (lookup_k > 32) lookup_k = 32;
-        int32_t candidates[32];
+        /* IB_SPEC_K overrides the draft length (clamped to IB_BATCH_MAX). */
+        lookup_k = ib_spec_k_override(lookup_k);
+        int32_t candidates[IB_BATCH_MAX];
         int stopped = 0;
 
-        float* logits_batch = (float*)malloc((size_t)lookup_k * (size_t)vocab * sizeof(float));
+        /* Tree / multi-candidate lookup (IB_SPEC_TREE=1) — see inferbit_generate
+         * for the accept-rule rationale; identical here with callback/stop flow. */
+        int spec_tree = ib_spec_tree_enabled();
+        int tree_per_branch = lookup_k;
+        if (spec_tree) {
+            if (tree_per_branch > IB_BATCH_MAX / 2) tree_per_branch = IB_BATCH_MAX / 2;
+            if (tree_per_branch < 1) tree_per_branch = 1;
+        }
+        int32_t tree_tokens[IB_BATCH_MAX];
+        int     tree_off[IB_BATCH_MAX];
+        int     tree_len[IB_BATCH_MAX];
+
+        float* logits_batch = (float*)malloc((size_t)IB_BATCH_MAX * (size_t)vocab * sizeof(float));
         if (!logits_batch) { free(recent); ib_set_error("alloc logits_batch"); return INFERBIT_ERROR_MEMORY; }
 
-        const char* spec_log_env = getenv("IB_SPEC_LOG");
-        int spec_log = (spec_log_env && spec_log_env[0] && spec_log_env[0] != '0');
+        int spec_log = ib_spec_log_enabled();
         long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
+        long long stat_forwards = 0;   /* expensive main-model forwards */
 
         while (generated < params.max_tokens && !stopped) {
+            /* ── Burst/cool-down: decide profile for this round.
+             * Returns IB_PROFILE_EXACT (no-op) when burst is disabled. */
+            ib_burst_step_decide(model);
+
+            /* ── Tree branch: gather several continuations, verify together,
+             * accept the branch the EXACT model follows. Lossless: every
+             * emitted token is argmax of exact logits at the right KV slot. */
+            if (spec_tree) {
+                int nb = ib_prompt_lookup_search_tree(recent, recent_len, ngram,
+                                                      tree_per_branch, IB_BATCH_MAX,
+                                                      IB_BATCH_MAX, tree_tokens,
+                                                      tree_off, tree_len);
+                if (nb == 0) {
+                    int32_t t = sample_argmax(logits, vocab);
+                    recent[recent_len++] = t; generated++;
+                    if (t == eos || callback(t, ctx) == 0) { stopped = 1; break; }
+                    rc = ib_forward(model, &t, 1, logits);
+                    if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                    if (spec_log) stat_forwards++;
+                    continue;
+                }
+
+                int total = tree_off[nb - 1] + tree_len[nb - 1];
+
+                inferbit_set_compute_profile(model, IB_PROFILE_BURST);
+                int base_main_len = inferbit_kv_length(model);
+                inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
+                rc = ib_forward_positions(model, tree_tokens, total, logits_batch);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                if (spec_log) stat_forwards++;   /* one batched verify */
+
+                int32_t gold0 = sample_argmax(logits, vocab);
+                int chosen = -1;
+                for (int b = 0; b < nb; b++) {
+                    if (tree_tokens[tree_off[b]] == gold0) { chosen = b; break; }
+                }
+
+                if (model->burst.cfg.enabled) {
+                    float top1 = -1e38f, top2 = -1e38f;
+                    for (int vi = 0; vi < vocab; vi++) {
+                        float v = logits[vi];
+                        if (v > top1) { top2 = top1; top1 = v; }
+                        else if (v > top2) { top2 = v; }
+                    }
+                    model->burst.last_margin = top1 - top2;
+                }
+
+                if (chosen < 0) {
+                    inferbit_kv_truncate(model, base_main_len);
+                    recent[recent_len++] = gold0; generated++;
+                    ib_burst_feed_accept(model, 0, total);
+                    if (spec_log) { stat_drafted += total; stat_rounds++; }
+                    if (gold0 == eos || callback(gold0, ctx) == 0) { stopped = 1; break; }
+                    rc = ib_forward(model, &gold0, 1, logits);
+                    if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                    if (spec_log) stat_forwards++;
+                    continue;
+                }
+
+                int blen = tree_len[chosen];
+                int boff = tree_off[chosen];
+                int accepted = 0, mismatch = 0, match_eos_or_stop = 0;
+                int32_t mismatch_tok = -1;
+                for (int j = 0; j < blen && generated < params.max_tokens; j++) {
+                    const float* cur = (j == 0)
+                        ? logits
+                        : (logits_batch + (size_t)(boff + j - 1) * (size_t)vocab);
+                    int32_t mtok = sample_argmax(cur, vocab);
+                    if (mtok == tree_tokens[boff + j]) {
+                        recent[recent_len++] = mtok; generated++;
+                        accepted++;
+                        if (mtok == eos || callback(mtok, ctx) == 0) {
+                            stopped = 1; match_eos_or_stop = 1; break;
+                        }
+                    } else {
+                        mismatch = 1; mismatch_tok = mtok; break;
+                    }
+                }
+
+                ib_burst_feed_accept(model, accepted, blen);
+                if (spec_log) { stat_drafted += total; stat_accepted += accepted; stat_rounds++; }
+
+                /* Commit: truncate to base, replay only the accepted branch
+                 * tokens (the verify wrote ALL branches, non-contiguously). */
+                inferbit_kv_truncate(model, base_main_len);
+                if (match_eos_or_stop) continue;   /* loop exits via stopped */
+
+                if (mismatch) {
+                    if (accepted > 0) {
+                        rc = ib_forward_positions(model, tree_tokens + boff, accepted, logits_batch);
+                        if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                        if (spec_log) stat_forwards++;
+                    }
+                    recent[recent_len++] = mismatch_tok; generated++;
+                    if (mismatch_tok == eos || callback(mismatch_tok, ctx) == 0) { stopped = 1; continue; }
+                    rc = ib_forward(model, &mismatch_tok, 1, logits);
+                    if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                    if (spec_log) stat_forwards++;
+                    continue;
+                }
+
+                if (generated >= params.max_tokens) {
+                    if (accepted > 0) {
+                        rc = ib_forward_positions(model, tree_tokens + boff, accepted, logits_batch);
+                        if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                        if (spec_log) stat_forwards++;
+                    }
+                    break;
+                }
+
+                /* Whole branch accepted — replay it, bonus from last position. */
+                rc = ib_forward_positions(model, tree_tokens + boff, accepted, logits_batch);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                if (spec_log) stat_forwards++;
+                const float* tlast = logits_batch + (size_t)(accepted - 1) * (size_t)vocab;
+                int32_t extra = sample_argmax(tlast, vocab);
+                recent[recent_len++] = extra; generated++;
+                if (extra == eos || callback(extra, ctx) == 0) { stopped = 1; break; }
+                rc = ib_forward(model, &extra, 1, logits);
+                if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                if (spec_log) stat_forwards++;
+                continue;
+            }
+
             int k = ib_prompt_lookup_search(recent, recent_len, ngram, lookup_k, candidates);
             if (k > (params.max_tokens - generated)) k = params.max_tokens - generated;
 
             if (k == 0) {
+                /* Miss: one standard decode step (no draft phase, skip burst). */
                 int32_t t = sample_argmax(logits, vocab);
                 recent[recent_len++] = t; generated++;
                 if (t == eos || callback(t, ctx) == 0) { stopped = 1; break; }
                 rc = ib_forward(model, &t, 1, logits);
                 if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                if (spec_log) stat_forwards++;
                 continue;
             }
 
+            /* Draft phase: run under BURST profile (cheap/coarse).
+             * For lookup, the draft is the n-gram match — no model forward here,
+             * but we set the profile to document the phase boundary. */
+            inferbit_set_compute_profile(model, IB_PROFILE_BURST);
+
+            /* Verify phase: switch to COOLDOWN before the batched verify so that
+             * the verify forward runs as the precise anchor. */
             int base_main_len = inferbit_kv_length(model);
+            inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
             rc = ib_forward_positions(model, candidates, k, logits_batch);
             if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+            if (spec_log) stat_forwards++;   /* one batched verify */
 
             int accepted = 0, mismatch = 0;
             int32_t mismatch_tok = -1;
@@ -644,7 +1171,23 @@ int inferbit_generate_stream(
                 }
             }
 
+            /* Feed acceptance result into the burst controller's EMA. */
+            ib_burst_feed_accept(model, accepted, k);
+
             if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+
+            /* ── Compute top-1/top-2 logit margin for the committed token.
+             * Guard behind cfg.enabled to avoid overhead on the default path. */
+            if (model->burst.cfg.enabled) {
+                const float* margin_src = logits; /* position-0 verify logits */
+                float top1 = -1e38f, top2 = -1e38f;
+                for (int vi = 0; vi < vocab; vi++) {
+                    float v = margin_src[vi];
+                    if (v > top1) { top2 = top1; top1 = v; }
+                    else if (v > top2) { top2 = v; }
+                }
+                model->burst.last_margin = top1 - top2;
+            }
 
             if (accepted < k) inferbit_kv_truncate(model, base_main_len + accepted);
 
@@ -655,6 +1198,7 @@ int inferbit_generate_stream(
                 if (mismatch_tok == eos || callback(mismatch_tok, ctx) == 0) { stopped = 1; continue; }
                 rc = ib_forward(model, &mismatch_tok, 1, logits);
                 if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+                if (spec_log) stat_forwards++;
                 continue;
             }
 
@@ -667,13 +1211,13 @@ int inferbit_generate_stream(
             if (extra == eos || callback(extra, ctx) == 0) { stopped = 1; break; }
             rc = ib_forward(model, &extra, 1, logits);
             if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+            if (spec_log) stat_forwards++;
         }
 
-        if (spec_log) {
-            fprintf(stderr, "[ib-spec-lookup] rounds=%lld drafted=%lld accepted=%lld rate=%.3f\n",
-                    stat_rounds, stat_drafted, stat_accepted,
-                    stat_drafted ? (double)stat_accepted / stat_drafted : 0.0);
-        }
+        if (spec_log) ib_spec_log_line(spec_tree ? "ib-spec-lookup-tree" : "ib-spec-lookup",
+                                       stat_rounds, stat_drafted, stat_accepted,
+                                       generated, stat_forwards);
+        ib_burst_log_summary(model);
         free(logits_batch);
         free(recent);
         return generated;
@@ -684,18 +1228,31 @@ int inferbit_generate_stream(
     float* dlogits = draft->buf_logits;
     int draft_k = model->draft_tokens > 0 ? model->draft_tokens : 4;
     if (draft_k > 32) draft_k = 32;
-    int32_t candidates[32];
+    /* IB_SPEC_K overrides the draft length (clamped to IB_BATCH_MAX). Tree mode
+     * does NOT apply to external-draft (lookup-only). */
+    draft_k = ib_spec_k_override(draft_k);
+    int32_t candidates[IB_BATCH_MAX];
     int stopped = 0;
 
     float* logits_batch = (float*)malloc((size_t)draft_k * (size_t)vocab * sizeof(float));
     if (!logits_batch) { free(recent); ib_set_error("alloc logits_batch"); return INFERBIT_ERROR_MEMORY; }
 
+    int spec_log = ib_spec_log_enabled();
+    long long stat_drafted = 0, stat_accepted = 0, stat_rounds = 0;
+    long long stat_forwards = 0;   /* expensive main-model forwards */
+
     while (generated < params.max_tokens && !stopped) {
         int base_draft_len = inferbit_kv_length(draft);
-        int base_main_len  = inferbit_kv_length(model);
+
+        /* ── Burst/cool-down: decide profile for this round.
+         * Returns IB_PROFILE_EXACT (no-op) when burst is disabled. */
+        ib_burst_step_decide(model);
 
         int k = draft_k;
         if (k > (params.max_tokens - generated)) k = params.max_tokens - generated;
+
+        /* Draft phase: run under BURST profile (cheap/coarse). */
+        inferbit_set_compute_profile(model, IB_PROFILE_BURST);
 
         int32_t dtok = sample_argmax(dlogits, vocab);
         for (int i = 0; i < k; i++) {
@@ -705,9 +1262,14 @@ int inferbit_generate_stream(
             dtok = sample_argmax(dlogits, vocab);
         }
 
-        /* Batched verify over main: one forward producing k per-position logits. */
+        /* Verify phase: switch to COOLDOWN so the batched verify is the precise
+         * anchor. Batched verify over main: one forward producing k per-position
+         * logits. */
+        int base_main_len  = inferbit_kv_length(model);
+        inferbit_set_compute_profile(model, IB_PROFILE_COOLDOWN);
         rc = ib_forward_positions(model, candidates, k, logits_batch);
         if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+        if (spec_log) stat_forwards++;   /* one batched verify */
 
         int accepted = 0;
         int mismatch = 0;
@@ -730,6 +1292,24 @@ int inferbit_generate_stream(
             }
         }
 
+        /* Feed acceptance result into the burst controller's EMA. */
+        ib_burst_feed_accept(model, accepted, k);
+
+        if (spec_log) { stat_drafted += k; stat_accepted += accepted; stat_rounds++; }
+
+        /* ── Compute top-1/top-2 logit margin for the committed token.
+         * Guard behind cfg.enabled to avoid overhead on the default path. */
+        if (model->burst.cfg.enabled) {
+            const float* margin_src = logits; /* position-0 verify logits */
+            float top1 = -1e38f, top2 = -1e38f;
+            for (int vi = 0; vi < vocab; vi++) {
+                float v = margin_src[vi];
+                if (v > top1) { top2 = top1; top1 = v; }
+                else if (v > top2) { top2 = v; }
+            }
+            model->burst.last_margin = top1 - top2;
+        }
+
         if (accepted < k) inferbit_kv_truncate(model, base_main_len + accepted);
 
         if (match_eos_or_stop) continue;   /* loop exits via stopped */
@@ -739,6 +1319,7 @@ int inferbit_generate_stream(
             if (mismatch_tok == eos || callback(mismatch_tok, ctx) == 0) { stopped = 1; continue; }
             rc = ib_forward(model, &mismatch_tok, 1, logits);
             if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+            if (spec_log) stat_forwards++;   /* mismatch refresh (main) */
             inferbit_kv_truncate(draft, base_draft_len + accepted);
             rc = ib_forward(draft, &mismatch_tok, 1, dlogits);
             if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
@@ -753,9 +1334,13 @@ int inferbit_generate_stream(
         if (extra == eos || callback(extra, ctx) == 0) { stopped = 1; break; }
         rc = ib_forward(model, &extra, 1, logits);
         if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
+        if (spec_log) stat_forwards++;   /* bonus-token refresh (main) */
         rc = ib_forward(draft, &extra, 1, dlogits);
         if (rc != INFERBIT_OK) { free(logits_batch); free(recent); return rc; }
     }
+    if (spec_log) ib_spec_log_line("ib-spec", stat_rounds, stat_drafted,
+                                   stat_accepted, generated, stat_forwards);
+    ib_burst_log_summary(model);
     free(logits_batch);
 
     free(recent);

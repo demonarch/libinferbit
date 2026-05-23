@@ -1129,6 +1129,13 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
     uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half;
     uint32_t G = t->G;
     if (K != 256) return;
+    /* L1-only (M1 burst): the L2 (pyramid) residual is engaged iff acc_l2
+     * is non-NULL. A BURST L1-only RAM-mode matvec passes acc_l2 == NULL
+     * (and never allocates the L2 scratch in forward.c), so the whole L2
+     * stage below — scratch alloc, l2_idx read, LUT build, residual gather —
+     * is skipped, producing the coarse L1-only reconstruction that matches
+     * pqv2_acc_csrange(use_l2=0). The exact L1+L2 path passes acc_l2 != NULL
+     * and is byte-identical to before. */
     int8_t lut[4][64] __attribute__((aligned(16)));
     int8_t l2_lut_q[64] __attribute__((aligned(16)));
     float lut_scale, l2_lut_scale;
@@ -1243,7 +1250,8 @@ static void pqv2_acc_tbl_int8_k256_chunks_inner(
                 int8_t v = lut[k >> 6][k & 63];
                 acc[m] += (float)v * lut_scale;
             }
-            /* L2 path (K_L2 ≤ 64) */
+            /* L2 path (K_L2 ≤ 64) — engaged iff acc_l2 != NULL. A BURST
+             * L1-only matvec passes acc_l2 == NULL and skips this entirely. */
             if (acc_l2) {
                 double prof_l2_0 = prof ? pqv2_now() : 0.0;
                 build_lut_int8(&l2_cb[(size_t)s * t->l2_K * half], xs,
@@ -1393,7 +1401,8 @@ void pqv2_acc_csrange(
     const float *cb, const float *l2_cb,
     float *acc, float *acc_l2,
     uint32_t cs_start, uint32_t cs_count,
-    uint32_t m0, uint32_t m1)
+    uint32_t m0, uint32_t m1,
+    int use_l2)
 {
     uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half;
     uint32_t G = t->G;
@@ -1414,8 +1423,12 @@ void pqv2_acc_csrange(
      * so the threaded paged path can carry L2 too: each thread unpacks only
      * its [m0,m1) slice of the packed L2 row into its own scratch and writes
      * the disjoint acc_l2[m0:m1] tile (no race). Callers that want a flat
-     * (no-L2) accumulation pass l2_cb=NULL / acc_l2=NULL. */
-    int do_l2 = (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64);
+     * (no-L2) accumulation pass l2_cb=NULL / acc_l2=NULL.
+     *
+     * `use_l2` (M1 burst): the BURST L1-only gate. ANDed in below — every
+     * existing caller passes use_l2=1, so the L2 condition is unchanged. A
+     * later (M2) agent passes 0 from a BURST profile to read L1-only. */
+    int do_l2 = use_l2 && (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64);
 
     /* Bit-packed L2 rows are unpacked into this M-byte scratch per lane,
      * exactly like the whole-tensor path. Only allocated when packed. */
@@ -2544,7 +2557,8 @@ void pqv2_acc_tbl_int8_k256_chunks_skip(
     float *acc, float *acc_l2,
     uint32_t c_start, uint32_t c_end, float skip_thresh) {
     (void)skip_thresh;
-    pqv2_acc_tbl_int8_k256_chunks(t, x, cb, l2_cb, acc, acc_l2, c_start, c_end);
+    pqv2_acc_tbl_int8_k256_chunks(t, x, cb, l2_cb, acc, acc_l2,
+                                  c_start, c_end);
 }
 /* Non-ARM fallback for the batched chunk accumulator — the ARM variant
  * (inside the __ARM_NEON branch above) had no x86/scalar counterpart,
@@ -2573,7 +2587,8 @@ void pqv2_acc_csrange(
     const pqv2_t *t, const float *x,
     const float *cb, const float *l2_cb,
     float *acc, float *acc_l2,
-    uint32_t cs_start, uint32_t cs_count)
+    uint32_t cs_start, uint32_t cs_count,
+    int use_l2)
 {
     uint32_t M = t->M, K = t->K, ns = t->n_subchunks, half = t->half;
     uint32_t G = t->G;
@@ -2583,10 +2598,16 @@ void pqv2_acc_csrange(
     if (cs_start + cs_count > cs_total) cs_count = cs_total - cs_start;
     if (cs_count == 0) return;
 
-    uint8_t *l2_scratch = (acc_l2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
+    /* `use_l2` (M1 burst): ANDed into every L2 condition below so an L1-only
+     * BURST call (use_l2==0) skips the residual scratch/LUT entirely. Every
+     * existing caller passes 1 → behaviour unchanged.
+     * Mirrors the NEON definition exactly: do_l2 implies acc_l2, l2_cb,
+     * l2_kind==2, and l2_K<=64, so downstream L2 blocks need no extra guards. */
+    int do_l2 = use_l2 && (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64);
+    uint8_t *l2_scratch = (do_l2 && (t->l2_idx_bits == 6 || t->l2_idx_bits == 4))
         ? (uint8_t *)malloc((size_t)M) : NULL;
     float *lut = (float *)malloc((size_t)K * sizeof(float));
-    float *l2_lut = (acc_l2 && t->l2_kind == 2)
+    float *l2_lut = do_l2
         ? (float *)malloc((size_t)t->l2_K * sizeof(float)) : NULL;
 
     for (uint32_t cs = cs_start; cs < cs_start + cs_count; cs++) {
@@ -2603,7 +2624,7 @@ void pqv2_acc_csrange(
         }
         for (uint32_t m = 0; m < M; m++) acc[m] += lut[idx[m]];
 
-        if (acc_l2 && l2_cb && t->l2_kind == 2 && t->l2_K <= 64) {
+        if (do_l2) {
             for (uint32_t k = 0; k < t->l2_K; k++) {
                 const float *cw = &l2_cb[((size_t)s * t->l2_K + k) * half];
                 float d = 0.0f;

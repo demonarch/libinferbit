@@ -7,6 +7,7 @@
 
 #include "inferbit_internal.h"
 #include "platform.h"
+#include "threading.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -429,4 +430,174 @@ int ib_quantize_input_int8_g128(const float* input, int8_t* out_q,
         out_scales[groups++] = scale;
     }
     return groups;
+}
+
+/* ── Single-worker async job queue (ib_async_*) ──────────────────────────
+ *
+ * ADDITIVE: this is a separate facility from the barrier matmul pool above.
+ * It exists so the decode path can overlap blocking I/O (pread) with
+ * compute via "submit job → keep computing → wait later", without spawning
+ * a thread per request. One dedicated worker drains a FIFO so reads on a
+ * given queue land in submission order (required by the drive prefetch
+ * ring's slot ping-pong). Use multiple queues for independent concurrent
+ * streams (e.g. one for L1 indices, one for L2).
+ *
+ * The matmul pool above is untouched: these symbols are only reachable if
+ * a caller explicitly creates a queue. Reuses the same pthread shims set
+ * up at the top of this file (Windows native or POSIX pthreads).
+ *
+ * Handle lifecycle (the only subtle bit):
+ *   - A handle starts with refcount = 2: one ref held by the submitter
+ *     (released via ib_async_wait / ib_async_discard) and one by the queue
+ *     (released by the worker once fn has run, or by destroy on drain).
+ *   - Whoever drops the count to 0 frees it. This makes fire-and-forget
+ *     (discard before the job runs) safe: the worker still runs the job
+ *     and then frees the handle.
+ */
+
+struct ib_async_handle {
+    ib_async_fn      fn;
+    void*            arg;
+    int              result;          /* fn() return value (valid when done) */
+    int              done;            /* set by worker after fn() returns */
+    int              refcount;        /* 2 at submit; freed at 0 */
+    pthread_mutex_t  mu;              /* guards result/done/refcount */
+    pthread_cond_t   cv;             /* signalled when done flips to 1 */
+    struct ib_async_handle* next;    /* FIFO link (queue-owned) */
+};
+
+struct ib_async_queue {
+    pthread_t        worker;
+    pthread_mutex_t  mu;
+    pthread_cond_t   cv;             /* worker waits here for head != NULL */
+    ib_async_handle* head;           /* FIFO: dequeue from head */
+    ib_async_handle* tail;           /* FIFO: enqueue at tail */
+    int              stop;           /* destroy signal (drain then exit) */
+    int              started;        /* worker thread successfully created */
+};
+
+/* Drop one ref; free when it hits zero. Must NOT hold h->mu on entry. */
+static void ib_async_handle_release(ib_async_handle* h) {
+    pthread_mutex_lock(&h->mu);
+    int rc = --h->refcount;
+    pthread_mutex_unlock(&h->mu);
+    if (rc == 0) {
+        pthread_mutex_destroy(&h->mu);
+        pthread_cond_destroy(&h->cv);
+        free(h);
+    }
+}
+
+static void* ib_async_worker_fn(void* raw) {
+    ib_async_queue* q = (ib_async_queue*)raw;
+    for (;;) {
+        pthread_mutex_lock(&q->mu);
+        while (!q->head && !q->stop) {
+            pthread_cond_wait(&q->cv, &q->mu);
+        }
+        /* Drain remaining jobs even after stop is set so every submitted
+         * handle completes (no caller is left blocked in ib_async_wait). */
+        if (!q->head && q->stop) {
+            pthread_mutex_unlock(&q->mu);
+            break;
+        }
+        ib_async_handle* h = q->head;
+        q->head = h->next;
+        if (!q->head) q->tail = NULL;
+        pthread_mutex_unlock(&q->mu);
+
+        int r = h->fn ? h->fn(h->arg) : 0;
+
+        pthread_mutex_lock(&h->mu);
+        h->result = r;
+        h->done = 1;
+        pthread_cond_broadcast(&h->cv);
+        pthread_mutex_unlock(&h->mu);
+
+        /* Release the queue's ref on this handle. */
+        ib_async_handle_release(h);
+    }
+    return NULL;
+}
+
+ib_async_queue* ib_async_queue_create(void) {
+    ib_async_queue* q = (ib_async_queue*)calloc(1, sizeof(*q));
+    if (!q) return NULL;
+    if (pthread_mutex_init(&q->mu, NULL) != 0) { free(q); return NULL; }
+    if (pthread_cond_init(&q->cv, NULL) != 0) {
+        pthread_mutex_destroy(&q->mu); free(q); return NULL;
+    }
+    if (pthread_create(&q->worker, NULL, ib_async_worker_fn, q) != 0) {
+        pthread_cond_destroy(&q->cv);
+        pthread_mutex_destroy(&q->mu);
+        free(q);
+        return NULL;
+    }
+    q->started = 1;
+    return q;
+}
+
+void ib_async_queue_destroy(ib_async_queue* q) {
+    if (!q) return;
+    pthread_mutex_lock(&q->mu);
+    q->stop = 1;
+    pthread_cond_broadcast(&q->cv);
+    pthread_mutex_unlock(&q->mu);
+    if (q->started) pthread_join(q->worker, NULL);
+    /* Worker has drained the FIFO and released the queue's ref on every
+     * handle; any handle the submitter never waited on was freed by the
+     * worker's release (or will be by a pending ib_async_wait/discard). */
+    pthread_cond_destroy(&q->cv);
+    pthread_mutex_destroy(&q->mu);
+    free(q);
+}
+
+ib_async_handle* ib_async_submit(ib_async_queue* q, ib_async_fn fn, void* arg) {
+    if (!q || !fn) return NULL;
+    ib_async_handle* h = (ib_async_handle*)calloc(1, sizeof(*h));
+    if (!h) return NULL;
+    if (pthread_mutex_init(&h->mu, NULL) != 0) { free(h); return NULL; }
+    if (pthread_cond_init(&h->cv, NULL) != 0) {
+        pthread_mutex_destroy(&h->mu); free(h); return NULL;
+    }
+    h->fn = fn;
+    h->arg = arg;
+    h->result = 0;
+    h->done = 0;
+    h->refcount = 2;        /* submitter + queue */
+    h->next = NULL;
+
+    pthread_mutex_lock(&q->mu);
+    if (q->tail) q->tail->next = h; else q->head = h;
+    q->tail = h;
+    pthread_cond_signal(&q->cv);
+    pthread_mutex_unlock(&q->mu);
+    return h;
+}
+
+int ib_async_wait(ib_async_handle* h) {
+    if (!h) return 0;
+    pthread_mutex_lock(&h->mu);
+    while (!h->done) {
+        pthread_cond_wait(&h->cv, &h->mu);
+    }
+    int r = h->result;
+    pthread_mutex_unlock(&h->mu);
+    ib_async_handle_release(h);   /* drop submitter's ref */
+    return r;
+}
+
+int ib_async_poll(ib_async_handle* h, int* out_result) {
+    if (!h) { if (out_result) *out_result = 0; return 1; }
+    pthread_mutex_lock(&h->mu);
+    int done = h->done;
+    int r = h->result;
+    pthread_mutex_unlock(&h->mu);
+    if (done && out_result) *out_result = r;
+    return done;   /* handle NOT released here (poll is read-only) */
+}
+
+void ib_async_discard(ib_async_handle* h) {
+    if (!h) return;
+    ib_async_handle_release(h);   /* drop submitter's ref; worker frees rest */
 }

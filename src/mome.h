@@ -61,6 +61,35 @@ extern "C" {
  * but callers may cache. */
 int mome_get_top_n(int K);
 
+/* BURST gate-energy expert selection (M2 — data-free).
+ *
+ *   m          : owning model. The active compute profile's `mome_top_n`
+ *                (-1 = all-K) drives the regime; intermediate_size / K is
+ *                used to find each expert's row-block in `gate`.
+ *   layer      : current ib_layer_meta (opaque void* here to avoid forcing
+ *                a concrete type at the burst call site). Currently unused
+ *                — K + gate suffice.
+ *   gate       : full FFN-intermediate gate activation, length
+ *                M = K * (intermediate_size / K), laid out expert-
+ *                contiguous (expert e owns gate[e*rpe .. (e+1)*rpe)).
+ *   K          : number of experts on this layer.
+ *   active_out : caller-allocated int[K] (must hold up to K indices),
+ *                receives the selected expert indices.
+ *   returns    : number of experts written into active_out (n on burst,
+ *                K on cool-down/exact, 0 on bad args / top_n == 0).
+ *
+ * Semantics:
+ *   - mome_top_n < 0 (the -1 all-K sentinel) or >= K → COOL-DOWN / EXACT:
+ *     fills active_out[e]=e, returns K — bit-identical to the non-burst
+ *     all-K path and to the prior M1 stub.
+ *   - 0 < mome_top_n < K → BURST: scores each expert by its summed firing
+ *     energy sum|silu(gate[i])| over its row-block and returns the top-n
+ *     indices (descending energy). Purely data-free: runtime gate
+ *     magnitude only, no router weights, no calibration. Falls back to
+ *     all-K if gate is NULL or the block size is indeterminable. */
+int mome_select_experts_burst(inferbit_model *m, const void *layer,
+                              const float *gate, int K, int *active_out);
+
 /* Detect a zero-init router.
  *
  *   router : either NULL or an ib_tensor_meta whose `bits == 16` and
@@ -127,6 +156,57 @@ void mome_dispatch_ffn(inferbit_model *m,
                        const float *router_logits,
                        const int *active, int n_active,
                        float *scale_buf);
+
+/* ── Training-free sparse-FFN clustering (CONVERT-TIME, data-free) ────
+ *
+ * Cluster a layer's FFN intermediate dimension into `n_clusters`
+ * CONTIGUOUS clusters by cosine similarity of the gate_proj weight rows
+ * (each gate row is a hidden-dim vector), producing:
+ *   - a permutation of the inter dimension that makes each cluster
+ *     contiguous, and
+ *   - per-cluster centroids in INPUT (hidden) space (= mean of the
+ *     cluster's gate rows), which the runtime uses as cheap "cluster
+ *     signatures" to predict which clusters fire and skip the rest.
+ *
+ * This shares the spherical (cosine) k-means used by the dormant MoME
+ * cosine-clustering probe in pqv2_encode.c, but — unlike that path —
+ * it does NOT force exactly inter/K rows per cluster (the balanced-
+ * overflow step in the MoME probe was the source of the documented
+ * perm/cluster-boundary inconsistency). Here cluster boundaries follow
+ * the natural k-means partition exactly: cluster c owns the contiguous
+ * block [cluster_offsets[c], cluster_offsets[c+1]) of the PERMUTED inter
+ * space, so the offsets and the permutation are consistent by
+ * construction.
+ *
+ * Inputs:
+ *   W_gate     : [inter, hidden] fp32 gate_proj weight, row-major.
+ *   inter      : intermediate_size (= rows of W_gate).
+ *   hidden     : hidden_size       (= cols of W_gate).
+ *   n_clusters : N (must be > 1, <= inter; 1 means "disabled" — caller
+ *                should not call this when n_clusters <= 1).
+ *   seed       : deterministic k-means seed.
+ *
+ * Outputs (all caller-allocated):
+ *   perm_out         : int[inter]. perm_out[new_row] = old_row, applied
+ *                      by gathering src row perm_out[i] into dst row i —
+ *                      identical convention to mome_apply_row_perm in
+ *                      pqv2_encode.c.
+ *   offsets_out      : uint32[n_clusters + 1]. Contiguous cluster starts
+ *                      in permuted space; offsets_out[0] == 0,
+ *                      offsets_out[n_clusters] == inter.
+ *   centroids_fp16_out : uint16[n_clusters * hidden]. Per-cluster
+ *                      centroid in hidden space, IEEE fp16 bit pattern,
+ *                      row-major [cluster][hidden]. The centroid is the
+ *                      arithmetic mean of the UN-normalised gate rows in
+ *                      that cluster (the natural input-space signature),
+ *                      NOT the unit-normalised k-means center.
+ *
+ * Returns 0 on success, -1 on bad args / allocation failure (caller
+ * should fall back to NOT clustering — emit the plain FFN, no record). */
+int ffn_compute_cluster_perm(const float *W_gate, int inter, int hidden,
+                             int n_clusters, uint32_t seed,
+                             int *perm_out, uint32_t *offsets_out,
+                             uint16_t *centroids_fp16_out);
 
 #ifdef __cplusplus
 }

@@ -52,6 +52,7 @@ set(INFERBIT_SOURCES
     src/forward.c
     src/forward_hiddens.c
     src/dflash_orchestrator.c
+    src/burst_ctrl.c
     src/threading.c
     src/ibf_loader.c
     src/gguf.c
@@ -72,6 +73,7 @@ set(INFERBIT_SOURCES
     src/pqv2_model.c
     src/pqv2_encode.c
     src/mome.c
+    src/sparse_gate.c
     src/ibf_pack.c
 )
 

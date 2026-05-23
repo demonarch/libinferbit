@@ -159,6 +159,14 @@ typedef struct {
     size_t sparsity_mask_offset;
     size_t sparsity_mask_size;
 
+    /* Sparse-FFN cluster record — raw blob {offset,size} from the layer
+     * JSON (`ffn_cluster`). Resolved into the ffn_* pointers below once
+     * model->weight_data is mapped (see ib_resolve_ffn_clusters). Both 0
+     * when the layer ships no record — the disabled default. Mirrors the
+     * sparsity_mask offset/size staging idiom above. */
+    size_t ffn_cluster_blob_offset;
+    size_t ffn_cluster_blob_size;
+
     /* ── Stage 3a — MoME (docs/v2/00_CORRECTION.md) ──────────────────
      *
      * Post-hoc Mix-of-Mini-Experts router metadata. v1 scaffolding:
@@ -198,6 +206,45 @@ typedef struct {
     ib_tensor_meta *up_proj_experts;
     ib_tensor_meta *down_proj_experts;
     ib_tensor_meta router;
+
+    /* ── Training-free sparse-FFN cluster gate (loader + runtime) ─────
+     *
+     * Optional per-layer "FFN cluster" record. The encoder partitions
+     * the FFN intermediate dim into `ffn_n_clusters` contiguous
+     * row-ranges (in a permuted inter space) and ships one cheap
+     * centroid signature per cluster in hidden(input) space. At runtime
+     * sparse_gate_select() scores the incoming hidden vector against the
+     * centroids to pick which clusters' FFN rows are worth computing.
+     *
+     * See src/sparse_gate.h for the on-disk record layout. The loader
+     * parses the record when a layer's JSON carries an `ffn_cluster`
+     * {offset,size} pointer into the weight-data blob; otherwise these
+     * stay zero/NULL and the FFN path is unchanged (byte-identical).
+     *
+     *   ffn_n_clusters      — cluster count. 0 or 1 => disabled (gate is
+     *                         a no-op; default for every existing model).
+     *   ffn_inter           — FFN intermediate size from the record.
+     *   ffn_hidden          — FFN input/hidden size from the record (=
+     *                         centroid dimensionality).
+     *   ffn_cluster_offsets — points into the mmap: uint32[ffn_n_clusters
+     *                         + 1] contiguous cluster start rows in
+     *                         permuted inter space; [0]=0, [N]=ffn_inter.
+     *                         NULL when disabled. NOT owned (mmap-backed).
+     *   ffn_centroids_fp16  — points into the mmap: fp16[ffn_n_clusters *
+     *                         ffn_hidden] per-cluster centroid in hidden
+     *                         space. NULL when disabled. The gate
+     *                         signatures, kept resident via the mapping.
+     *                         NOT owned (mmap-backed, zero-copy).
+     *   ffn_inter_perm      — optional uint32[ffn_inter] permutation,
+     *                         present only if the record's flags set it.
+     *                         Stored for completeness; unused at runtime.
+     *                         NULL when absent. NOT owned (mmap-backed). */
+    uint32_t        ffn_n_clusters;
+    uint32_t        ffn_inter;
+    uint32_t        ffn_hidden;
+    const uint32_t *ffn_cluster_offsets;   /* [ffn_n_clusters + 1], mmap-backed */
+    const uint16_t *ffn_centroids_fp16;    /* [ffn_n_clusters * ffn_hidden], mmap-backed */
+    const uint32_t *ffn_inter_perm;        /* [ffn_inter] or NULL, mmap-backed */
 } ib_layer_meta;
 
 /* ── KV cache ───────────────────────────────────────────────── */
@@ -211,6 +258,26 @@ typedef struct {
     int    capacity;       /* Max tokens allocated */
     bool   dynamic;        /* Whether cache grows dynamically */
 } ib_kv_cache;
+
+/* ── Burst / cool-down duty-cycle controller (M1) ───────────────
+ *
+ * Runtime state for the per-decode-step compute-profile controller. The
+ * config (`cfg`) is copied in by inferbit_burst_attach; `cur` /
+ * since_cooldown / the EMAs are advanced by ib_burst_step_decide. With
+ * cfg.enabled == 0 (default) the controller always returns
+ * IB_PROFILE_EXACT and never leaves the exact path — the behaviour-
+ * preserving invariant. Counters/byte-tallies are diagnostics only.
+ * Defined + implemented in src/burst_ctrl.c. */
+typedef struct {
+    ib_burst_config cfg;
+    ib_profile_kind cur;
+    int   since_cooldown;
+    float ema_accept;
+    float last_margin;
+    float last_norm;
+    unsigned long long burst_steps, cooldown_steps;
+    unsigned long long burst_bytes, cooldown_bytes;
+} ib_burst_ctrl;
 
 /* ── Model struct ───────────────────────────────────────────── */
 
@@ -451,6 +518,21 @@ struct inferbit_model {
     void  *hot_pool;
     size_t hot_pool_bytes;
     int    hot_pool_entries;
+
+    /* ── Burst / cool-down duty cycle (M1) ───────────────────────────
+     *
+     * `burst` is the controller state (config + counters). `active_profile`
+     * points at the dials the CURRENT step runs with — it is
+     * &burst.cfg.burst / .cooldown when the duty cycle picks a profile, and
+     * &g_profile_exact (a file-static all-zero EXACT profile in
+     * burst_ctrl.c) whenever the feature is disabled. `active_skip_thresh_
+     * ratio` is the cached activation-skip ratio for the active profile,
+     * read by the threaded matmul instead of getenv() per call. At attach
+     * time it is seeded from IB_PQV2_SKIP (if set) so the default,
+     * burst-disabled run reproduces today's env-driven behaviour exactly. */
+    ib_burst_ctrl              burst;
+    const ib_compute_profile  *active_profile;
+    float                      active_skip_thresh_ratio;
 };
 
 /* ── Config struct ──────────────────────────────────────────── */
@@ -611,6 +693,22 @@ void ib_init_kernels(ib_simd_level level);
  * before overlapping the suffix is skipped. */
 int ib_prompt_lookup_search(const int32_t* history, int hist_len,
                             int ngram, int k, int32_t* out_candidates);
+
+/* Multi-candidate (tree) prompt-lookup drafter — see speculative.c. Gathers up
+ * to max_branches distinct n-gram continuations into one flat out_tokens buffer
+ * (total positions capped at total_cap so the whole tree fits one batched
+ * verify), writing per-branch offsets/lengths. Returns the branch count. */
+int ib_prompt_lookup_search_tree(const int32_t* history, int hist_len,
+                                 int ngram, int per_branch_k, int max_branches,
+                                 int total_cap,
+                                 int32_t* out_tokens,
+                                 int* branch_off, int* branch_len);
+
+/* Spec-tuning env helpers (speculative.c). All default to OFF / fallback so the
+ * default decode path is byte-identical when the env vars are unset. */
+int ib_spec_k_override(int fallback);   /* IB_SPEC_K, clamped to IB_BATCH_MAX */
+int ib_spec_tree_enabled(void);         /* IB_SPEC_TREE=1 */
+int ib_spec_log_enabled(void);          /* IB_SPEC_LOG=1 */
 
 /* ── Safetensors parser ─────────────────────────────────────── */
 
@@ -793,6 +891,37 @@ void ib_tensor_matmul_cpu(const inferbit_model *m, const ib_tensor_meta *t,
  * expensive than ib_forward by one LM head per token. */
 int ib_forward_positions(inferbit_model* model, const int32_t* tokens,
                          int num_tokens, float* out_logits);
+
+/* ── Burst / cool-down duty-cycle controller (M1) ───────────────
+ *
+ * Implemented in src/burst_ctrl.c. These are the controller's own helpers
+ * (the kernels that consume a profile live in their owning files). When the
+ * feature is disabled they all behave as the EXACT path. */
+
+/* Pick the profile for this decode step, advancing the controller's
+ * counters/EMAs and switching m->active_profile via
+ * inferbit_set_compute_profile. Returns IB_PROFILE_EXACT (and forces the
+ * exact profile) whenever the duty cycle is disabled. */
+ib_profile_kind ib_burst_step_decide(inferbit_model* m);
+
+/* Feed one speculative-verify result into the accept-rate EMA. `accepted`
+ * tokens out of `drafted`; drafted==0 leaves the EMA unchanged. */
+void ib_burst_feed_accept(inferbit_model* m, int accepted, int drafted);
+
+/* The dials the current step runs with (m->active_profile, or the exact
+ * profile when NULL / disabled). */
+const ib_compute_profile* ib_active_profile(inferbit_model* m);
+
+/* 1 unless the active profile is L1-only coarse (precision_tier==1). */
+int  ib_active_use_l2(inferbit_model* m);
+
+/* -1 (full depth) unless the active profile requests early exit. */
+int  ib_active_max_layer(inferbit_model* m);
+
+/* Print a one-line burst/cool-down summary (step counts + accept-rate EMA +
+ * last margin/norm) to stderr when IB_BURST_LOG=1; no-op otherwise. Called at
+ * generate end from generate.c. */
+void ib_burst_log_summary(inferbit_model* m);
 
 /* ── Goal H4 — hot-cache framework (scaffolding only) ───────────
  *
