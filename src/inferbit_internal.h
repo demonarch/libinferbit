@@ -794,6 +794,12 @@ typedef struct {
     int   tie_word_embeddings;
     int   bos_token_id;
     int   eos_token_id;
+    /* MoE (Qwen3-MoE / qwen3_vl_moe etc.). num_experts == 0 => dense. */
+    int   num_experts;          /* routed experts per MoE layer (0 = dense)   */
+    int   num_experts_per_tok;  /* top-k router selection                      */
+    int   moe_intermediate_size;/* per-expert FFN intermediate dim            */
+    int   qk_norm;              /* 1 = per-head RMSNorm on q,k (Qwen3 family)  */
+    int   mrope;                /* 1 = multimodal RoPE (rope_scaling.mrope_*)  */
 } ib_model_config;
 
 int ib_parse_config_json(const char* path, ib_model_config* cfg);

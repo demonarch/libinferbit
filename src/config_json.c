@@ -87,60 +87,77 @@ int ib_parse_config_json(const char* path, ib_model_config* cfg) {
 
     memset(cfg, 0, sizeof(*cfg));
 
-    /* Model type / architecture */
+    /* Model type / architecture (always from the top-level object) */
     const char* model_type = jstr(root, "model_type", NULL);
     detect_arch_name(model_type, cfg->arch, sizeof(cfg->arch));
 
+    /* Multimodal / nested configs (e.g. qwen3_vl_moe) put the LM params under
+     * "text_config". Descend into it for the core dims; fall back to root for
+     * plain text models. vocab_size may live at either level. */
+    cJSON* core = cJSON_GetObjectItemCaseSensitive(root, "text_config");
+    if (!cJSON_IsObject(core)) core = root;
+
     /* Core dimensions */
-    cfg->hidden_size       = jint(root, "hidden_size", 0);
-    cfg->num_layers        = jint(root, "num_hidden_layers", 0);
-    cfg->num_heads         = jint(root, "num_attention_heads", 0);
-    cfg->intermediate_size = jint(root, "intermediate_size", 0);
-    cfg->vocab_size        = jint(root, "vocab_size", 0);
+    cfg->hidden_size       = jint(core, "hidden_size", 0);
+    cfg->num_layers        = jint(core, "num_hidden_layers", 0);
+    cfg->num_heads         = jint(core, "num_attention_heads", 0);
+    cfg->intermediate_size = jint(core, "intermediate_size", 0);
+    cfg->vocab_size        = jint(core, "vocab_size", jint(root, "vocab_size", 0));
 
     /* KV heads — various naming conventions */
-    cfg->num_kv_heads = jint(root, "num_key_value_heads",
-                         jint(root, "num_kv_heads",
-                          jint(root, "multi_query_group_num", cfg->num_heads)));
+    cfg->num_kv_heads = jint(core, "num_key_value_heads",
+                         jint(core, "num_kv_heads",
+                          jint(core, "multi_query_group_num", cfg->num_heads)));
 
     /* Head dim — explicit or derived */
-    cfg->head_dim = jint(root, "head_dim",
+    cfg->head_dim = jint(core, "head_dim",
                      cfg->num_heads > 0 ? cfg->hidden_size / cfg->num_heads : 128);
 
+    /* MoE params (qwen3_moe / qwen3_vl_moe). 0 num_experts => dense FFN. */
+    cfg->num_experts          = jint(core, "num_experts", 0);
+    cfg->num_experts_per_tok  = jint(core, "num_experts_per_tok", 0);
+    cfg->moe_intermediate_size = jint(core, "moe_intermediate_size", 0);
+    /* Qwen3 family applies per-head RMSNorm to q and k (qk-norm). */
+    cfg->qk_norm = (model_type && (strstr(model_type, "qwen3") || strstr(model_type, "Qwen3"))) ? 1 : 0;
+    /* M-RoPE iff rope_scaling carries an mrope_section. */
+    cJSON* rs = cJSON_GetObjectItemCaseSensitive(core, "rope_scaling");
+    cfg->mrope = (cJSON_IsObject(rs) &&
+                  cJSON_GetObjectItemCaseSensitive(rs, "mrope_section")) ? 1 : 0;
+
     /* Context length — various naming conventions */
-    cfg->max_context_length = jint(root, "max_position_embeddings",
-                               jint(root, "max_sequence_length",
-                                jint(root, "seq_length",
-                                 jint(root, "sliding_window", 4096))));
+    cfg->max_context_length = jint(core, "max_position_embeddings",
+                               jint(core, "max_sequence_length",
+                                jint(core, "seq_length",
+                                 jint(core, "sliding_window", 4096))));
 
     /* RoPE */
-    cfg->rope_theta = (float)jdbl(root, "rope_theta", 10000.0);
+    cfg->rope_theta = (float)jdbl(core, "rope_theta", 10000.0);
 
     /* Normalization */
-    cfg->norm_epsilon = (float)jdbl(root, "rms_norm_eps",
-                         jdbl(root, "layer_norm_eps",
-                          jdbl(root, "layer_norm_epsilon", 1e-5)));
+    cfg->norm_epsilon = (float)jdbl(core, "rms_norm_eps",
+                         jdbl(core, "layer_norm_eps",
+                          jdbl(core, "layer_norm_epsilon", 1e-5)));
 
     /* Detect norm type */
     /* Most modern models use RMSNorm; check for layernorm indicators */
-    if (cJSON_GetObjectItemCaseSensitive(root, "rms_norm_eps")) {
+    if (cJSON_GetObjectItemCaseSensitive(core, "rms_norm_eps")) {
         strncpy(cfg->norm_type, "rmsnorm", sizeof(cfg->norm_type) - 1);
-    } else if (cJSON_GetObjectItemCaseSensitive(root, "layer_norm_eps")) {
+    } else if (cJSON_GetObjectItemCaseSensitive(core, "layer_norm_eps")) {
         strncpy(cfg->norm_type, "layernorm", sizeof(cfg->norm_type) - 1);
     } else {
         strncpy(cfg->norm_type, "rmsnorm", sizeof(cfg->norm_type) - 1);
     }
 
     /* Activation */
-    const char* act = jstr(root, "hidden_act", jstr(root, "activation_function", "silu"));
+    const char* act = jstr(core, "hidden_act", jstr(core, "activation_function", "silu"));
     strncpy(cfg->activation, act, sizeof(cfg->activation) - 1);
 
-    /* Tied embeddings */
+    /* Tied embeddings (top-level flag, even for VL models) */
     cfg->tie_word_embeddings = jbool(root, "tie_word_embeddings", 0);
 
     /* Special tokens */
-    cfg->bos_token_id = jint(root, "bos_token_id", 1);
-    cfg->eos_token_id = jint(root, "eos_token_id", 2);
+    cfg->bos_token_id = jint(core, "bos_token_id", 1);
+    cfg->eos_token_id = jint(core, "eos_token_id", 2);
 
     cJSON_Delete(root);
     return 0;

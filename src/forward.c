@@ -2646,6 +2646,144 @@ static void ffn_sparse_dispatch(inferbit_model* m, ib_layer_meta* layer,
                          out_xb, hb, hidden, inter, scale_buf);
 }
 
+/* ── Stochastic importance-sampled FFN draft probe (IB_FFN_STOCH) ────
+ * Tests the "Monte-Carlo matmul as draft" invention: estimate the FFN
+ * intermediate h by importance-sampling only a fraction of the input lanes
+ * (each lane = one (chunk,subchunk) = `half` input dims), p ∝ ||W_lane||
+ * (data-free) · ||x_lane|| (runtime), unbiased reweighting. Reads only
+ * s/n_lanes of the index bytes. Compares, against exact h:
+ *   - pyramid draft (all lanes, L1)          — reads 100% of L1
+ *   - stochastic at {12.5,25,50}% lanes       — reads that fraction
+ *   - oracle stochastic (p ∝ ||lane contrib||) — cheap-proxy ceiling
+ * Metrics: rel h-error ||ĥ-h||/||h|| + top-5% active-set recall.
+ * MEASUREMENT-ONLY (never alters output). Enable IB_FFN_STOCH=1. */
+static inline float ffn_st_siluf(float g){ return g/(1.0f+expf(-g)); }
+static int ffn_st_cmpdesc(const void*a,const void*b){ float x=*(const float*)a,y=*(const float*)b; return (x<y)-(x>y); }
+
+#define IB_FFN_ST_NBUD 3
+static int    g_ffn_st_on = -1;
+static const float g_ffn_st_bud[IB_FFN_ST_NBUD] = {0.125f, 0.25f, 0.5f};
+static unsigned g_ffn_st_seed = 0x12345678u;
+static int    g_ffn_st_M=0, g_ffn_st_K=0, g_ffn_st_nlanes=0, g_ffn_st_L=0;
+static float **g_ffn_st_laneWg=NULL, **g_ffn_st_laneWu=NULL;   /* [L][nlanes] data-free */
+static float *g_ffn_st_cg=NULL, *g_ffn_st_cu=NULL;            /* [nlanes*M] lane contribs */
+static float *g_ffn_st_lut=NULL, *g_ffn_st_p=NULL, *g_ffn_st_cdf=NULL, *g_ffn_st_xln=NULL;
+static int   *g_ffn_st_cnt=NULL;
+static float *g_ffn_st_g=NULL, *g_ffn_st_u=NULL, *g_ffn_st_hh=NULL, *g_ffn_st_sort=NULL;
+static double g_ffn_st_err_pr=0, g_ffn_st_rec_pr=0; static long long g_ffn_st_n=0;
+static double g_ffn_st_err[IB_FFN_ST_NBUD]={0}, g_ffn_st_rec[IB_FFN_ST_NBUD]={0}, g_ffn_st_err_or[IB_FFN_ST_NBUD]={0};
+
+static unsigned ffn_st_rng(void){ g_ffn_st_seed=g_ffn_st_seed*1664525u+1013904223u; return g_ffn_st_seed; }
+static double ffn_st_recall(const float*sc,const float*h,int M,float frac,float*sb){
+    int k=(int)(frac*M+0.5f); if(k<1)k=1; if(k>M)k=M;
+    for(int i=0;i<M;i++)sb[i]=fabsf(h[i]);  qsort(sb,M,sizeof(float),ffn_st_cmpdesc); float tt=sb[k-1];
+    for(int i=0;i<M;i++)sb[i]=fabsf(sc[i]); qsort(sb,M,sizeof(float),ffn_st_cmpdesc); float ts=sb[k-1];
+    long long ov=0,tc=0; for(int i=0;i<M;i++){ if(fabsf(h[i])>=tt){tc++; if(fabsf(sc[i])>=ts)ov++; } }
+    return tc?(double)ov/(double)tc:0.0;
+}
+static double ffn_st_relerr(const float*a,const float*b,int M){
+    double dd=0,nn=0; for(int i=0;i<M;i++){ double d=(double)a[i]-b[i]; dd+=d*d; nn+=(double)b[i]*b[i]; }
+    return nn>1e-20?sqrt(dd/nn):0.0;
+}
+static void ffn_st_contribs(const pqv2_t*pq,const float*x,int M,int K,int ns,int G,int half,int n_chunks,float*lut,float*contrib){
+    for(int c=0;c<n_chunks;c++)for(int s=0;s<ns;s++){
+        const float*xs=x+(size_t)c*G+(size_t)s*half;
+        for(int k=0;k<K;k++){ const float*cw=pq->cb_fp32+((size_t)s*K+k)*half; float d=0; for(int hh=0;hh<half;hh++)d+=cw[hh]*xs[hh]; lut[k]=d; }
+        const uint8_t*idx=pq->indices+((size_t)c*ns+s)*M; float*dst=contrib+(size_t)(c*ns+s)*M;
+        for(int mm=0;mm<M;mm++)dst[mm]=lut[idx[mm]];
+    }
+}
+static void ffn_st_laneW(const pqv2_t*pq,int M,int K,int ns,int G,int half,int n_chunks,float*out){
+    (void)G;
+    for(int c=0;c<n_chunks;c++)for(int s=0;s<ns;s++){
+        double w=0; const uint8_t*idx=pq->indices+((size_t)c*ns+s)*M;
+        for(int mm=0;mm<M;mm++){ float rs=pqv2_h2f(pq->row_scale[mm]); const float*cw=pq->cb_fp32+((size_t)s*K+idx[mm])*half;
+            for(int d=0;d<half;d++){ float v=cw[d]*rs; w+=(double)v*v; } }
+        out[c*ns+s]=(float)sqrt(w);
+    }
+}
+static void ffn_st_estimate(const float*contrib,const float*prob,int nlanes,int M,const uint16_t*row_scale,int s,float*cdf,int*cnt,float*out){
+    double tot=0; for(int i=0;i<nlanes;i++)tot+=prob[i];
+    if(tot<=0){ for(int mm=0;mm<M;mm++)out[mm]=0; return; }
+    double acc=0; for(int i=0;i<nlanes;i++){ acc+=prob[i]; cdf[i]=(float)acc; }
+    for(int i=0;i<nlanes;i++)cnt[i]=0;
+    for(int t=0;t<s;t++){ double u=((double)ffn_st_rng()/4294967296.0)*tot; int lo=0,hi=nlanes-1;
+        while(lo<hi){ int mid=(lo+hi)>>1; if(cdf[mid]<u)lo=mid+1; else hi=mid; } cnt[lo]++; }
+    for(int mm=0;mm<M;mm++)out[mm]=0;
+    for(int i=0;i<nlanes;i++){ if(!cnt[i])continue; double w=(double)cnt[i]*tot/((double)s*(double)prob[i]);
+        const float*src=contrib+(size_t)i*M; for(int mm=0;mm<M;mm++)out[mm]+=(float)(w*src[mm]); }
+    for(int mm=0;mm<M;mm++)out[mm]*=pqv2_h2f(row_scale[mm]);
+}
+static void ffn_stoch_summary(void){
+    if(g_ffn_st_n<=0)return; double n=(double)g_ffn_st_n;
+    fprintf(stderr,"[ib-ffn-stoch] importance-sampled FFN draft vs pyramid, over %lld layer-tokens (n_lanes=%d):\n",g_ffn_st_n,g_ffn_st_nlanes);
+    fprintf(stderr,"  %-26s | h rel-err | recall@5%% | ~reads\n","draft");
+    fprintf(stderr,"  %-26s |  %6.3f   |  %5.1f%%   | 100%% of L1\n","pyramid (all-lane L1)",g_ffn_st_err_pr/n,100.0*g_ffn_st_rec_pr/n);
+    for(int b=0;b<IB_FFN_ST_NBUD;b++)
+        fprintf(stderr,"  stochastic %4.1f%% lanes      |  %6.3f   |  %5.1f%%   | %.1f%% of L1\n",100.0*g_ffn_st_bud[b],g_ffn_st_err[b]/n,100.0*g_ffn_st_rec[b]/n,100.0*g_ffn_st_bud[b]);
+    for(int b=0;b<IB_FFN_ST_NBUD;b++)
+        fprintf(stderr,"  oracle     %4.1f%% lanes      |  %6.3f   |    --     | (ceiling)\n",100.0*g_ffn_st_bud[b],g_ffn_st_err_or[b]/n);
+}
+static void ffn_stoch_probe(const inferbit_model*m,int layer_idx,int pos,const float*h,int inter,const float*x,int hidden,const pqv2_t*pg,const pqv2_t*pu){
+    (void)pos;(void)hidden;
+    if(g_ffn_st_on<0){ const char*e=getenv("IB_FFN_STOCH"); g_ffn_st_on=(e&&e[0]&&e[0]!='0')?1:0; if(g_ffn_st_on)atexit(ffn_stoch_summary); }
+    if(!g_ffn_st_on||!m||!h||!x||!pg||!pg->cb_fp32||!pu||!pu->cb_fp32)return;
+    int M=(int)pg->M,K=(int)pg->K,ns=(int)pg->n_subchunks,G=(int)pg->G,half=(int)pg->half;
+    int n_chunks=(int)(pg->N/pg->G),nlanes=n_chunks*ns,L=m->header.num_layers;
+    if(M!=inter||nlanes<=0||(int)pu->M!=M)return;
+    if(g_ffn_st_M!=M||g_ffn_st_K!=K||g_ffn_st_nlanes!=nlanes){
+        free(g_ffn_st_cg);g_ffn_st_cg=malloc((size_t)nlanes*M*sizeof(float));
+        free(g_ffn_st_cu);g_ffn_st_cu=malloc((size_t)nlanes*M*sizeof(float));
+        free(g_ffn_st_lut);g_ffn_st_lut=malloc((size_t)K*sizeof(float));
+        free(g_ffn_st_p);g_ffn_st_p=malloc((size_t)nlanes*sizeof(float));
+        free(g_ffn_st_cdf);g_ffn_st_cdf=malloc((size_t)nlanes*sizeof(float));
+        free(g_ffn_st_xln);g_ffn_st_xln=malloc((size_t)nlanes*sizeof(float));
+        free(g_ffn_st_cnt);g_ffn_st_cnt=malloc((size_t)nlanes*sizeof(int));
+        free(g_ffn_st_g);g_ffn_st_g=malloc((size_t)M*sizeof(float));
+        free(g_ffn_st_u);g_ffn_st_u=malloc((size_t)M*sizeof(float));
+        free(g_ffn_st_hh);g_ffn_st_hh=malloc((size_t)M*sizeof(float));
+        free(g_ffn_st_sort);g_ffn_st_sort=malloc((size_t)M*sizeof(float));
+        free(g_ffn_st_laneWg);g_ffn_st_laneWg=(float**)calloc(L,sizeof(float*));
+        free(g_ffn_st_laneWu);g_ffn_st_laneWu=(float**)calloc(L,sizeof(float*));
+        g_ffn_st_M=M;g_ffn_st_K=K;g_ffn_st_nlanes=nlanes;g_ffn_st_L=L;
+        g_ffn_st_err_pr=0;g_ffn_st_rec_pr=0;g_ffn_st_n=0;
+        for(int b=0;b<IB_FFN_ST_NBUD;b++){g_ffn_st_err[b]=0;g_ffn_st_rec[b]=0;g_ffn_st_err_or[b]=0;}
+    }
+    if(!g_ffn_st_cg||!g_ffn_st_cu||!g_ffn_st_laneWg||!g_ffn_st_laneWu||layer_idx<0||layer_idx>=L)return;
+    if(!g_ffn_st_laneWg[layer_idx]){ g_ffn_st_laneWg[layer_idx]=(float*)malloc((size_t)nlanes*sizeof(float)); if(g_ffn_st_laneWg[layer_idx])ffn_st_laneW(pg,M,K,ns,G,half,n_chunks,g_ffn_st_laneWg[layer_idx]); }
+    if(!g_ffn_st_laneWu[layer_idx]){ g_ffn_st_laneWu[layer_idx]=(float*)malloc((size_t)nlanes*sizeof(float)); if(g_ffn_st_laneWu[layer_idx])ffn_st_laneW(pu,M,K,ns,G,half,n_chunks,g_ffn_st_laneWu[layer_idx]); }
+    const float*lWg=g_ffn_st_laneWg[layer_idx],*lWu=g_ffn_st_laneWu[layer_idx]; if(!lWg||!lWu)return;
+
+    ffn_st_contribs(pg,x,M,K,ns,G,half,n_chunks,g_ffn_st_lut,g_ffn_st_cg);
+    ffn_st_contribs(pu,x,M,K,ns,G,half,n_chunks,g_ffn_st_lut,g_ffn_st_cu);
+    for(int c=0;c<n_chunks;c++)for(int s=0;s<ns;s++){ const float*xs=x+(size_t)c*G+(size_t)s*half; double w=0; for(int d=0;d<half;d++)w+=(double)xs[d]*xs[d]; g_ffn_st_xln[c*ns+s]=(float)sqrt(w); }
+
+    /* pyramid (all-lane L1) */
+    for(int mm=0;mm<M;mm++){ double ag=0,au=0; for(int i=0;i<nlanes;i++){ ag+=g_ffn_st_cg[(size_t)i*M+mm]; au+=g_ffn_st_cu[(size_t)i*M+mm]; }
+        g_ffn_st_g[mm]=(float)ag*pqv2_h2f(pg->row_scale[mm]); g_ffn_st_u[mm]=(float)au*pqv2_h2f(pu->row_scale[mm]); }
+    for(int mm=0;mm<M;mm++)g_ffn_st_hh[mm]=ffn_st_siluf(g_ffn_st_g[mm])*g_ffn_st_u[mm];
+    g_ffn_st_err_pr+=ffn_st_relerr(g_ffn_st_hh,h,M);
+    g_ffn_st_rec_pr+=ffn_st_recall(g_ffn_st_hh,h,M,0.05f,g_ffn_st_sort);
+
+    for(int b=0;b<IB_FFN_ST_NBUD;b++){
+        int s=(int)(g_ffn_st_bud[b]*nlanes+0.5f); if(s<1)s=1; if(s>nlanes)s=nlanes;
+        for(int i=0;i<nlanes;i++)g_ffn_st_p[i]=lWg[i]*g_ffn_st_xln[i];
+        ffn_st_estimate(g_ffn_st_cg,g_ffn_st_p,nlanes,M,pg->row_scale,s,g_ffn_st_cdf,g_ffn_st_cnt,g_ffn_st_g);
+        for(int i=0;i<nlanes;i++)g_ffn_st_p[i]=lWu[i]*g_ffn_st_xln[i];
+        ffn_st_estimate(g_ffn_st_cu,g_ffn_st_p,nlanes,M,pu->row_scale,s,g_ffn_st_cdf,g_ffn_st_cnt,g_ffn_st_u);
+        for(int mm=0;mm<M;mm++)g_ffn_st_hh[mm]=ffn_st_siluf(g_ffn_st_g[mm])*g_ffn_st_u[mm];
+        g_ffn_st_err[b]+=ffn_st_relerr(g_ffn_st_hh,h,M);
+        g_ffn_st_rec[b]+=ffn_st_recall(g_ffn_st_hh,h,M,0.05f,g_ffn_st_sort);
+        for(int i=0;i<nlanes;i++){ double w=0; const float*sg=g_ffn_st_cg+(size_t)i*M; for(int mm=0;mm<M;mm++)w+=(double)sg[mm]*sg[mm]; g_ffn_st_p[i]=(float)sqrt(w); }
+        ffn_st_estimate(g_ffn_st_cg,g_ffn_st_p,nlanes,M,pg->row_scale,s,g_ffn_st_cdf,g_ffn_st_cnt,g_ffn_st_g);
+        for(int i=0;i<nlanes;i++){ double w=0; const float*su=g_ffn_st_cu+(size_t)i*M; for(int mm=0;mm<M;mm++)w+=(double)su[mm]*su[mm]; g_ffn_st_p[i]=(float)sqrt(w); }
+        ffn_st_estimate(g_ffn_st_cu,g_ffn_st_p,nlanes,M,pu->row_scale,s,g_ffn_st_cdf,g_ffn_st_cnt,g_ffn_st_u);
+        for(int mm=0;mm<M;mm++)g_ffn_st_hh[mm]=ffn_st_siluf(g_ffn_st_g[mm])*g_ffn_st_u[mm];
+        g_ffn_st_err_or[b]+=ffn_st_relerr(g_ffn_st_hh,h,M);
+    }
+    g_ffn_st_n++;
+}
+
 /* ── RMSNorm with FP16 weights ──────────────────────────────── */
 
 static void rmsnorm_fp16(float* out, const float* input,
@@ -3103,6 +3241,10 @@ static int forward_single_ex_trunc(inferbit_model* m, int token_id, int pos,
                 } else {
                     ib_kern.silu_mul(hb, hb, hb2, inter);
                 }
+                /* Stochastic importance-sampled FFN draft probe (IB_FFN_STOCH):
+                 * xb still holds the FFN input, hb holds exact h. */
+                ffn_stoch_probe(m, l, pos, hb, inter, xb, hidden,
+                                layer->gate_proj.pq, layer->up_proj.pq);
                 /* down_proj reads from hb which already has zeros for masked rows —
                  * the multiply by zero propagates naturally, no sparse path needed */
                 tensor_matmul_hybrid(m, l, &layer->down_proj, xb, hb, hidden, inter, scale_buf);
